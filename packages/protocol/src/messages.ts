@@ -1849,6 +1849,12 @@ export const RefreshAgentRequestMessageSchema = z.object({
   requestId: z.string(),
 });
 
+// A distinct request prevents older hosts from silently falling back to a
+// refresh that interrupts a newly started turn.
+export const RefreshIdleAgentRequestMessageSchema = RefreshAgentRequestMessageSchema.extend({
+  type: z.literal("refresh_idle_agent_request"),
+});
+
 export const CancelAgentRequestMessageSchema = z.object({
   type: z.literal("cancel_agent_request"),
   agentId: z.string(),
@@ -3339,6 +3345,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   ResumeAgentRequestMessageSchema,
   ImportAgentRequestMessageSchema,
   RefreshAgentRequestMessageSchema,
+  RefreshIdleAgentRequestMessageSchema,
   CancelAgentRequestMessageSchema,
   ShutdownServerRequestMessageSchema,
   RestartServerRequestMessageSchema,

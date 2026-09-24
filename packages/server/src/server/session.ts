@@ -2749,6 +2749,16 @@ export class Session {
     }
   }
 
+  private dispatchAgentReloadMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+    switch (msg.type) {
+      case "refresh_agent_request":
+      case "refresh_idle_agent_request":
+        return this.handleRefreshAgentRequest(msg);
+      default:
+        return undefined;
+    }
+  }
+
   private dispatchAgentLifecycleMessage(msg: SessionInboundMessage): Promise<void> | undefined {
     switch (msg.type) {
       case "fetch_agents_request":
@@ -2781,8 +2791,6 @@ export class Session {
         return this.handleResumeAgentRequest(msg);
       case "import_agent_request":
         return this.handleImportAgentRequest(msg);
-      case "refresh_agent_request":
-        return this.handleRefreshAgentRequest(msg);
       case "cancel_agent_request":
         return this.handleCancelAgentRequest(msg.agentId, msg.requestId);
       case "agent_permission_response":
@@ -2790,7 +2798,7 @@ export class Session {
       case "clear_agent_attention":
         return this.handleClearAgentAttention(msg.agentId, msg.requestId);
       default:
-        return undefined;
+        return this.dispatchAgentReloadMessage(msg);
     }
   }
 
@@ -4647,21 +4655,36 @@ export class Session {
   }
 
   private async handleRefreshAgentRequest(
-    msg: Extract<SessionInboundMessage, { type: "refresh_agent_request" }>,
+    msg: Extract<
+      SessionInboundMessage,
+      { type: "refresh_agent_request" | "refresh_idle_agent_request" }
+    >,
   ): Promise<void> {
     const { agentId, requestId } = msg;
     this.sessionLogger.info({ agentId }, `Refreshing agent ${agentId} from persistence`);
 
     try {
-      await this.restoreOwningWorkspaceForLegacyAgentRefresh(agentId);
-      await unarchiveAgentState(this.agentStorage, this.agentManager, agentId);
+      const onlyIfIdle = msg.type === "refresh_idle_agent_request";
+      if (onlyIfIdle) {
+        const record = await this.agentStorage.get(agentId);
+        if (!record || record.archivedAt || !this.agentManager.getAgent(agentId)) {
+          throw new Error("Idle-only reload requires a loaded, unarchived idle agent");
+        }
+      } else {
+        await this.restoreOwningWorkspaceForLegacyAgentRefresh(agentId);
+        await unarchiveAgentState(this.agentStorage, this.agentManager, agentId);
+      }
       let snapshot: ManagedAgent;
       const existing = this.agentManager.getAgent(agentId);
       if (existing) {
-        await this.interruptAgentIfRunning(agentId);
-        snapshot = await this.agentManager.reloadAgentSession(agentId, undefined, {
-          rehydrateFromDisk: true,
-        });
+        if (onlyIfIdle) {
+          snapshot = await this.agentManager.reloadIdleAgentSession(agentId);
+        } else {
+          await this.interruptAgentIfRunning(agentId);
+          snapshot = await this.agentManager.reloadAgentSession(agentId, undefined, {
+            rehydrateFromDisk: true,
+          });
+        }
       } else {
         const record = await this.agentStorage.get(agentId);
         if (!record) {

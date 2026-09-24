@@ -3262,10 +3262,14 @@ export class DaemonClient {
     return status.agent;
   }
 
-  async refreshAgent(agentId: string, requestId?: string): Promise<AgentRefreshedStatusPayload> {
+  async refreshAgent(
+    agentId: string,
+    requestId?: string,
+    options?: { onlyIfIdle?: boolean },
+  ): Promise<AgentRefreshedStatusPayload> {
     const resolvedRequestId = this.createRequestId(requestId);
     const message = SessionInboundMessageSchema.parse({
-      type: "refresh_agent_request",
+      type: options?.onlyIfIdle ? "refresh_idle_agent_request" : "refresh_agent_request",
       agentId,
       requestId: resolvedRequestId,
     });

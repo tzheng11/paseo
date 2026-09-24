@@ -1710,6 +1710,35 @@ export class AgentManager {
     }
   }
 
+  private readonly idleReloads = new Set<string>();
+
+  reloadIdleAgentSession(agentId: string): Promise<ManagedAgent> {
+    if (this.idleReloads.has(agentId))
+      return Promise.reject(new Error("Agent is not idle; reload was skipped"));
+    return this.trackAgentRegistrationOperation(
+      this.runLifecycleMutation(agentId, () => {
+        const agent = this.requireSessionAgent(agentId);
+        if (
+          this.idleReloads.has(agentId) ||
+          agent.lifecycle !== "idle" ||
+          this.hasInFlightRun(agentId) ||
+          agent.pendingPermissions.size ||
+          agent.inFlightPermissionResponses.size ||
+          this.providerSubagents.list(agentId).some((child) => child.status === "running")
+        ) {
+          return Promise.reject(new Error("Agent is not idle; reload was skipped"));
+        }
+        // Claim synchronously before any I/O. streamAgent checks the same claim.
+        this.idleReloads.add(agentId);
+        return this.reloadAgentSessionInternal(agentId, undefined, {
+          rehydrateFromDisk: true,
+        }).finally(() => {
+          this.idleReloads.delete(agentId);
+        });
+      }),
+    );
+  }
+
   // Hot-reload an active agent session with config overrides. By default the
   // in-memory timeline is preserved (used for voice-mode toggles and similar
   // config swaps). When `rehydrateFromDisk` is set, the timeline is wiped so a
@@ -2766,6 +2795,9 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
   ): AsyncGenerator<AgentStreamEvent> {
+    if (this.idleReloads.has(agentId)) {
+      throw new Error("Agent reload in progress; retry the message shortly");
+    }
     const existingAgent = this.requireSessionAgent(agentId);
     this.logger.trace(
       {

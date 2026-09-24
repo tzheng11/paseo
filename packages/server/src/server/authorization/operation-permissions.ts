@@ -156,6 +156,7 @@ const INBOUND_PERMISSION = {
   "push.unregister.request": "workspace.read",
   read_project_config_request: "workspace.read",
   refresh_agent_request: "workspace.write",
+  refresh_idle_agent_request: "workspace.write",
   refresh_providers_snapshot_request: ["daemon.read", "hub.execute"],
   register_push_token: "workspace.read",
   restart_server_request: "daemon.manage",

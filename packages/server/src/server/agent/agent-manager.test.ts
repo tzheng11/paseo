@@ -12388,3 +12388,65 @@ test("provider metadata reaches clients without materializing plugin timeline hi
     await manager.closeAgent(agent.id);
   }
 });
+
+test("idle-only reload excludes incoming turns until the replacement is registered", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "idle-reload-"));
+  const started = deferred<void>();
+  const proceed = deferred<void>();
+  class IdleClient extends TestAgentClient {
+    override async resumeSession(
+      handle: AgentPersistenceHandle,
+      config?: Partial<AgentSessionConfig>,
+    ): Promise<AgentSession> {
+      started.resolve();
+      await proceed.promise;
+      return new TestAgentSession({ provider: "codex", cwd: config?.cwd ?? workdir });
+    }
+  }
+  const manager = new AgentManager({
+    clients: { codex: new IdleClient() },
+    registry: new AgentStorage(join(workdir, "agents"), logger),
+    logger,
+  });
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    const reloading = manager.reloadIdleAgentSession(agent.id);
+    await started.promise;
+    expect(() => manager.streamAgent(agent.id, "new turn")).toThrow(/reload in progress/);
+    await expect(manager.reloadIdleAgentSession(agent.id)).rejects.toThrow(/not idle/);
+    proceed.resolve();
+    expect((await reloading).id).toBe(agent.id);
+    // The claim is released after success, so another idle reload can proceed.
+    expect((await manager.reloadIdleAgentSession(agent.id)).id).toBe(agent.id);
+  } finally {
+    proceed.resolve();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("idle-only reload never interrupts a turn that won the race", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "idle-reload-busy-"));
+  const client = new TestAgentClient();
+  const resume = vi.spyOn(client, "resumeSession");
+  const interrupt = vi.spyOn(TestAgentSession.prototype, "interrupt");
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: new AgentStorage(join(workdir, "agents"), logger),
+    logger,
+  });
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    const turn = manager.runAgent(agent.id, "keep working");
+    await expect(manager.reloadIdleAgentSession(agent.id)).rejects.toThrow(/not idle/);
+    expect(resume).not.toHaveBeenCalled();
+    expect(interrupt).not.toHaveBeenCalled();
+    await turn;
+  } finally {
+    interrupt.mockRestore();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});

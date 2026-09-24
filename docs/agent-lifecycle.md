@@ -12,6 +12,15 @@ initializing → idle → running → idle (or error → closed)
 
 Each live agent in `AgentManager` carries a `lastStatus` of `initializing`, `idle`, `running`, or `error`. `closed` is the persisted, resumable state for an agent record that has no live provider runtime. State transitions persist to disk and stream to subscribed clients via WebSocket.
 
+## Idle-only reload
+
+`paseo agent reload UUID --only-if-idle` refuses a busy or unloaded agent instead
+of interrupting it. The host serializes lifecycle mutations and holds an idle
+claim until replacement registration finishes; incoming turns must retry while
+the claim is held. Active permission requests and native subagents also prevent
+the reload. Automation uses a distinct wire request so older hosts cannot silently
+fall back to interrupting refresh behavior.
+
 ## Runtime residency
 
 An unarchived agent may be `closed` without being deleted or archived. Closing releases its provider

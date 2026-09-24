@@ -25,11 +25,13 @@ export const reloadSchema: OutputSchema<AgentReloadResult> = {
 export function addReloadOptions(cmd: Command): Command {
   return cmd
     .description("Reload an agent (restarts the underlying process)")
-    .argument("<id>", "Agent ID, prefix, or name");
+    .argument("<id>", "Agent ID, prefix, or name")
+    .option("--only-if-idle", "Refuse to reload an active agent; never interrupt a turn");
 }
 
 export interface AgentReloadOptions extends CommandOptions {
   host?: string;
+  onlyIfIdle?: boolean;
 }
 
 export type AgentReloadCommandResult = SingleResult<AgentReloadResult>;
@@ -63,7 +65,9 @@ export async function runReloadCommand(
       throw error;
     }
 
-    const result = await client.refreshAgent(agentId);
+    const result = await (options.onlyIfIdle
+      ? client.refreshAgent(agentId, undefined, { onlyIfIdle: true })
+      : client.refreshAgent(agentId));
 
     await client.close();
 
