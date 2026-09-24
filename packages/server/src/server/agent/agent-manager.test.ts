@@ -12414,7 +12414,7 @@ test("idle-only reload excludes incoming turns until the replacement is register
     });
     const reloading = manager.reloadIdleAgentSession(agent.id);
     await started.promise;
-    expect(() => manager.streamAgent(agent.id, "new turn")).toThrow(/reload in progress/);
+    await expect(manager.runAgent(agent.id, "new turn")).rejects.toThrow(/reload in progress/);
     await expect(manager.reloadIdleAgentSession(agent.id)).rejects.toThrow(/not idle/);
     proceed.resolve();
     expect((await reloading).id).toBe(agent.id);
@@ -12506,7 +12506,7 @@ test.each([false, true])(
         (error: Error) => error.message,
       );
       await historyStarted.promise;
-      expect(() => manager.streamAgent(agent.id, "too early")).toThrow(/reload in progress/);
+      await expect(manager.runAgent(agent.id, "too early")).rejects.toThrow(/reload in progress/);
       historyAllowed.resolve();
       expect(await result).toBe(failHistory ? "history unavailable" : "reloaded");
       await manager.runAgent(agent.id, "after reload");
