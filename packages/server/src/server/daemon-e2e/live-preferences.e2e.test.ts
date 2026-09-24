@@ -268,13 +268,13 @@ test("idle-only reload round-trips through an isolated daemon and leaves archive
       agentId: agent.id,
       timelineSize: 0,
     });
-    await localCtx.client.archiveAgent(agent.id);
+    const archiveResult = await localCtx.client.archiveAgent(agent.id);
     await expect(localCtx.client.reloadIdleAgent({ agentId: agent.id })).rejects.toMatchObject({
       code: "agent_reload_unavailable",
       requestType: "agent.reload_idle.request",
     });
     const archived = await localCtx.client.fetchAgent({ agentId: agent.id });
-    expect(archived?.agent.archivedAt).toBeTruthy();
+    expect(archived?.agent.archivedAt).toBe(archiveResult.archivedAt);
     // The legacy operation still supports its existing unarchive behavior.
     await expect(localCtx.client.refreshAgent(agent.id)).resolves.toMatchObject({
       status: "agent_refreshed",
