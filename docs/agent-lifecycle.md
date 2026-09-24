@@ -16,10 +16,10 @@ Each live agent in `AgentManager` carries a `lastStatus` of `initializing`, `idl
 
 `paseo agent reload UUID --only-if-idle` refuses a busy or unloaded agent instead
 of interrupting it. The host serializes lifecycle mutations and holds an idle
-claim until replacement registration finishes; incoming turns must retry while
+claim until replacement registration and history replay finish; incoming turns must retry while
 the claim is held. Active permission requests and native subagents also prevent
-the reload. Automation uses a distinct wire request so older hosts cannot silently
-fall back to interrupting refresh behavior.
+the reload. The client checks the host capability before sending the namespaced
+request; older hosts receive no reload request and require an update.
 
 ## Runtime residency
 

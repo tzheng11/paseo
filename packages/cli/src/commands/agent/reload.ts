@@ -65,9 +65,12 @@ export async function runReloadCommand(
       throw error;
     }
 
-    const result = await (options.onlyIfIdle
-      ? client.refreshAgent(agentId, undefined, { onlyIfIdle: true })
-      : client.refreshAgent(agentId));
+    let result;
+    if (options.onlyIfIdle) {
+      result = await client.reloadIdleAgent({ agentId });
+    } else {
+      result = await client.refreshAgent(agentId);
+    }
 
     await client.close();
 

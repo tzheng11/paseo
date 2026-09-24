@@ -12429,8 +12429,6 @@ test("idle-only reload excludes incoming turns until the replacement is register
 test("idle-only reload never interrupts a turn that won the race", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "idle-reload-busy-"));
   const client = new TestAgentClient();
-  const resume = vi.spyOn(client, "resumeSession");
-  const interrupt = vi.spyOn(TestAgentSession.prototype, "interrupt");
   const manager = new AgentManager({
     clients: { codex: client },
     registry: new AgentStorage(join(workdir, "agents"), logger),
@@ -12442,11 +12440,86 @@ test("idle-only reload never interrupts a turn that won the race", async () => {
     });
     const turn = manager.runAgent(agent.id, "keep working");
     await expect(manager.reloadIdleAgentSession(agent.id)).rejects.toThrow(/not idle/);
-    expect(resume).not.toHaveBeenCalled();
-    expect(interrupt).not.toHaveBeenCalled();
     await turn;
+    expect(manager.getAgent(agent.id)?.persistence?.sessionId).toBe(agent.persistence?.sessionId);
+    expect(manager.getAgent(agent.id)?.lifecycle).toBe("idle");
+    expect(manager.getAgent(agent.id)?.lastError).toBeUndefined();
   } finally {
-    interrupt.mockRestore();
     rmSync(workdir, { recursive: true, force: true });
   }
 });
+
+test.each([false, true])(
+  "idle-only reload guards hydration and releases its claim after failure=%s",
+  async (failHistory) => {
+    const workdir = mkdtempSync(join(tmpdir(), "idle-reload-history-"));
+    const historyStarted = deferred<void>();
+    const historyAllowed = deferred<void>();
+    class HistorySession extends TestAgentSession {
+      override async startTurn(): Promise<{ turnId: string }> {
+        const turnId = "after-reload-turn";
+        setTimeout(() => {
+          this.pushEvent({ type: "turn_started", provider: "codex", turnId });
+          this.pushEvent({
+            type: "timeline",
+            provider: "codex",
+            item: { type: "user_message", text: "after reload" },
+          });
+          this.pushEvent({ type: "turn_completed", provider: "codex", turnId });
+        }, 0);
+        return { turnId };
+      }
+      override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+        historyStarted.resolve();
+        await historyAllowed.promise;
+        if (failHistory) throw new Error("history unavailable");
+        yield {
+          type: "timeline",
+          provider: "codex",
+          item: { type: "assistant_message", text: "older history" },
+        };
+      }
+    }
+    class HistoryClient extends TestAgentClient {
+      override async resumeSession(
+        _handle: AgentPersistenceHandle,
+        config?: Partial<AgentSessionConfig>,
+      ): Promise<AgentSession> {
+        return new HistorySession({ provider: "codex", cwd: config?.cwd ?? workdir });
+      }
+    }
+    const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const manager = new AgentManager({
+      clients: { codex: new HistoryClient() },
+      registry: storage,
+      logger,
+    });
+    let agentId: string | undefined;
+    try {
+      const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+        workspaceId: undefined,
+      });
+      agentId = agent.id;
+      const reload = manager.reloadIdleAgentSession(agent.id);
+      const result = reload.then(
+        () => "reloaded",
+        (error: Error) => error.message,
+      );
+      await historyStarted.promise;
+      expect(() => manager.streamAgent(agent.id, "too early")).toThrow(/reload in progress/);
+      historyAllowed.resolve();
+      expect(await result).toBe(failHistory ? "history unavailable" : "reloaded");
+      await manager.runAgent(agent.id, "after reload");
+      const messages = manager
+        .getTimeline(agent.id)
+        .filter((item) => item.type === "user_message" || item.type === "assistant_message")
+        .map((item) => item.text);
+      expect(messages).toEqual(failHistory ? ["after reload"] : ["older history", "after reload"]);
+    } finally {
+      historyAllowed.resolve();
+      if (agentId) await manager.closeAgent(agentId);
+      await storage.flush();
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);

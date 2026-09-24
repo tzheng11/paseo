@@ -102,7 +102,7 @@ import {
   type WorkspaceLabelService,
 } from "./workspace-labels/index.js";
 
-import { AgentManager, AgentRunCancellationError } from "./agent/agent-manager.js";
+import { AgentManager, AgentRunCancellationError, AgentIdleReloadError } from "./agent/agent-manager.js";
 import { streamTimelinePromptIndex } from "./agent/timeline-prompt-index.js";
 import { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import type {
@@ -2752,7 +2752,7 @@ export class Session {
   private dispatchAgentReloadMessage(msg: SessionInboundMessage): Promise<void> | undefined {
     switch (msg.type) {
       case "refresh_agent_request":
-      case "refresh_idle_agent_request":
+      case "agent.reload_idle.request":
         return this.handleRefreshAgentRequest(msg);
       default:
         return undefined;
@@ -4657,18 +4657,18 @@ export class Session {
   private async handleRefreshAgentRequest(
     msg: Extract<
       SessionInboundMessage,
-      { type: "refresh_agent_request" | "refresh_idle_agent_request" }
+      { type: "refresh_agent_request" | "agent.reload_idle.request" }
     >,
   ): Promise<void> {
     const { agentId, requestId } = msg;
     this.sessionLogger.info({ agentId }, `Refreshing agent ${agentId} from persistence`);
 
     try {
-      const onlyIfIdle = msg.type === "refresh_idle_agent_request";
+      const onlyIfIdle = msg.type === "agent.reload_idle.request";
       if (onlyIfIdle) {
         const record = await this.agentStorage.get(agentId);
         if (!record || record.archivedAt || !this.agentManager.getAgent(agentId)) {
-          throw new Error("Idle-only reload requires a loaded, unarchived idle agent");
+          throw new AgentIdleReloadError({ agentId, reason: "unavailable" });
         }
       } else {
         await this.restoreOwningWorkspaceForLegacyAgentRefresh(agentId);
@@ -4707,12 +4707,14 @@ export class Session {
           logger: this.sessionLogger,
         });
       }
-      await this.agentManager.hydrateTimelineFromProvider(agentId, { broadcast: true });
+      if (!onlyIfIdle) {
+        await this.agentManager.hydrateTimelineFromProvider(agentId, { broadcast: true });
+      }
       await this.agentUpdates.forwardLiveAgent(snapshot);
       const timelineSize = this.agentManager.getTimelineCount(agentId);
       if (requestId) {
         this.emit({
-          type: "status",
+          type: onlyIfIdle ? "agent.reload_idle.response" : "status",
           payload: {
             status: "agent_refreshed",
             agentId,
@@ -4731,7 +4733,10 @@ export class Session {
             requestId,
             requestType: msg.type,
             error: message,
-            code: error instanceof WorktreeRequestError ? error.code : "agent_refresh_failed",
+            code:
+              error instanceof WorktreeRequestError || error instanceof AgentIdleReloadError
+                ? error.code
+                : "agent_refresh_failed",
           },
         });
       }
