@@ -15,7 +15,9 @@ by processes that have exited.
 Each source event advances the stream sequence, then replaces the previous tool state or merges
 into the current text item. Intermediate payloads are never retained for history or catch-up.
 History imports stage events on disk before changing the readable timeline, then commit batches
-of 64 events, yielding an event-loop turn between batches. Replay uses the same per-agent queue
+of at most 64 events and 512 KiB. A shared replay write queue yields before each batch, so many
+tabs reopening together cannot each consume a full write budget in the same event-loop turn.
+A single larger item is processed alone. Replay uses the same per-agent queue
 as live events, so new events wait behind the complete import while other agents and connections
 remain responsive. History requests wait for that queue until the agent's history is primed.
 A failed provider stream leaves the previous timeline readable. Deferred publication
@@ -41,7 +43,9 @@ The invariants are:
 > through backward pagination.
 
 Tool output is bounded before it enters either delivery path. Canonical shell tool output is sliced
-to 64 KiB, and the same bounded item is used for runtime timeline rows and live stream events.
+to 64 KiB. Plain-text content and string values nested in unknown structured tool inputs/results
+have the same display limit with a truncation notice. The same bounded item is used for runtime
+timeline rows and live stream events; native provider transcripts and permission requests are unchanged.
 Provider history hydration applies the same rule so reopening an agent cannot restore an oversized
 tool payload.
 

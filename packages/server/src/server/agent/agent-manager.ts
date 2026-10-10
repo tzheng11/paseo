@@ -563,13 +563,21 @@ async function* historyTimelineBatches(
   history: AgentHistoryReplay<HistoryReplayEvent>,
 ): AsyncGenerator<Extract<HistoryReplayEvent, { type: "timeline" }>[]> {
   let batch: Extract<HistoryReplayEvent, { type: "timeline" }>[] = [];
+  let bytes = 0;
   for await (const event of history.events()) {
     if (event.type !== "timeline") continue;
+    const eventBytes = Buffer.byteLength(JSON.stringify(event), "utf8");
+    if (batch.length && bytes + eventBytes > 512 * 1024) {
+      yield batch;
+      batch = [];
+      bytes = 0;
+    }
     batch.push(event);
+    bytes += eventBytes;
     if (batch.length === 64) {
       yield batch;
       batch = [];
-      await setImmediate();
+      bytes = 0;
     }
   }
   if (batch.length) yield batch;
@@ -779,6 +787,7 @@ export class AgentManager {
   private readonly providerSubagents = new ProviderSubagentStore();
   private readonly agentsAwaitingInitialSnapshotPersist = new Set<string>();
   private readonly sessionEventTails = new Map<string, Promise<void>>();
+  private historyReplayBatchTail: Promise<void> = Promise.resolve();
   private readonly steerEventBarriers = new Map<string, SteerEventBarrier>();
   private readonly foregroundMutationTails = new Map<string, Promise<void>>();
   private readonly runs = new AgentRunState();
@@ -4189,7 +4198,7 @@ export class AgentManager {
           if (broadcast) this.dispatch({ type: "provider_subagent", event: update });
         }
         for await (const batch of historyTimelineBatches(history)) {
-          const rows = this.recordTimelineBatch(agent.id, batch);
+          const rows = await this.recordHistoryTimelineBatch(agent.id, batch);
           if (broadcastTimeline)
             for (let index = 0; index < batch.length; index++) {
               const row = rows[index];
@@ -4245,7 +4254,7 @@ export class AgentManager {
         }
         const startSeq = this.timelineStore.getNextSeq(agent.id);
         for await (const batch of historyTimelineBatches(history)) {
-          const rows = this.recordTimelineBatch(agent.id, batch);
+          const rows = await this.recordHistoryTimelineBatch(agent.id, batch);
           if (!deferredBroadcast && broadcast)
             for (let index = 0; index < batch.length; index++) {
               const row = rows[index];
@@ -4955,6 +4964,23 @@ export class AgentManager {
     const row = this.timelineStore.append(agentId, item, options);
     this.enqueueDurableTimelineAppend(agentId, row);
     return row;
+  }
+
+  private recordHistoryTimelineBatch(
+    agentId: string,
+    events: readonly Extract<HistoryReplayEvent, { type: "timeline" }>[],
+  ): Promise<AgentTimelineRow[]> {
+    // Reopened tabs share one write slot per event-loop turn. Yielding once per
+    // agent still allows dozens of large batches to monopolize the same turn.
+    const result = this.historyReplayBatchTail.then(async () => {
+      await setImmediate();
+      return this.recordTimelineBatch(agentId, events);
+    });
+    this.historyReplayBatchTail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
   }
 
   private recordTimelineBatch(
