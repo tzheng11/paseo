@@ -22,7 +22,7 @@ export interface CodexUserMessageTurnIndex {
 
 type CodexThreadHistoryMode = "legacy" | "paginated";
 
-async function readCodexThreadHistoryMode(
+export async function readCodexThreadHistoryMode(
   client: CodexRewindClient,
   threadId: string,
 ): Promise<CodexThreadHistoryMode> {

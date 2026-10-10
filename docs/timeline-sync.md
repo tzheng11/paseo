@@ -23,9 +23,12 @@ replays the staged file instead of retaining another full timeline array.
 
 Ordinary pages read only selected rows from disk. Explicit full-history reads (`limit: 0`, exports,
 and forks) and tails expanded by interleaved lifecycle updates can still allocate large responses.
-The row-cache budget excludes those responses and provider-owned history-loading buffers. Claude's
-transcript reader and Codex's `thread/read` still materialize provider history before yielding it;
-this change bounds retained daemon history and manager replay buffers, not every provider's peak.
+The row-cache budget excludes those responses and provider-owned history-loading buffers. On
+Codex 0.159.2+, resume omits turns and history loads through paged endpoints: paginated threads
+use metadata-only turn pages and bounded item pages; legacy threads load one full turn at a time.
+Their persisted history mode is preserved. Older Codex binaries and Claude's transcript reader
+still materialize provider history before yielding it. Projected provider items can also accumulate
+before replay; these bounds do not cover every provider's peak allocation.
 Codex and JSONL RPC transports bound each stdout frame to 64 MiB before decoding it. An oversized
 frame closes only that provider process and rejects its pending requests. Provider transcripts
 remain unchanged; the transport does not discard a response and keep pretending the session is healthy.
