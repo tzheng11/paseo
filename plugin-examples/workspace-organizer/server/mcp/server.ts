@@ -9,7 +9,7 @@ import {
   removeNode,
   updateNode,
   type Organization,
-} from "../shared/organization";
+} from "../../shared/organization";
 
 export type OrganizerRpc = (method: string, input: unknown) => Promise<unknown>;
 const id = z.string().min(1).max(200);

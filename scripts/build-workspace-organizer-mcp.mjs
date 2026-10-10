@@ -1,6 +1,6 @@
 import { build } from "esbuild";
 await build({
-  entryPoints: ["plugin-examples/workspace-organizer/mcp/serve.ts"],
+  entryPoints: ["plugin-examples/workspace-organizer/server/mcp/serve.ts"],
   outfile: "plugin-examples/workspace-organizer/dist/mcp.mjs",
   bundle: true,
   platform: "node",

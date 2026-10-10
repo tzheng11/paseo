@@ -3,7 +3,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { createOrganizerMcpServer } from "./server";
-import { organizationSchema, type Organization } from "../shared/organization";
+import { organizationSchema, type Organization } from "../../shared/organization";
 
 const cleanup: (() => Promise<void>)[] = [];
 afterEach(async () => {

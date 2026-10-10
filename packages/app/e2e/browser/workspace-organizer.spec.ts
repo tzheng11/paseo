@@ -15,7 +15,7 @@ import { buildHostWorkspaceRoute } from "@/utils/host-routes";
 import { expectAppRoute } from "../support/helpers/route-assertions";
 import { openSidebarDisplayPage, selectSidebarStatusGrouping } from "../support/helpers/sidebar";
 import { organizationSchema } from "../../../../plugin-examples/workspace-organizer/shared/organization";
-import { createOrganizerMcpServer } from "../../../../plugin-examples/workspace-organizer/mcp/server";
+import { createOrganizerMcpServer } from "../../../../plugin-examples/workspace-organizer/server/mcp/server";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
