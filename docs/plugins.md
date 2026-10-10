@@ -326,6 +326,15 @@ created by plugin code. Paseo removes registered contributions, unmounts surface
 state, rejects pending RPCs, closes the plugin's daemon session, and stops the subprocess. Cleanup
 errors are logged and do not interrupt host teardown.
 
+The fork's `@getpaseo/plugin/client/ui` also exposes `SortableTree` for web sidebar trees. Pass flat
+items with stable IDs, folder-only parent relationships, labels and collapse state, plus a themed
+row renderer. Put the supplied `dragHandle` in the row's trailing content. `onMove` returns
+`{ id, parentId, beforeId }`; persist it through your revision-checked settings write. The component
+does not own persistence. Mouse and touch dragging support sibling order, folder destinations and
+top-level extraction; keyboard users can start/cancel a drag or use the organizer's editor controls.
+Native clients use the editor controls. See the [pinned folders example](../plugin-examples/workspace-organizer/OVERVIEW.md)
+for the shared tree and its stdio MCP bridge. This component requires the matching fork client.
+
 Paseo owns the route, screen header, Lucide icon validation, close action, theme DTO, layout facts,
 and render error boundary. The contributed component owns the complete body below the header.
 The plugin owns the header's text through the screen's `title` (`resolvePluginScreenTitle` in

@@ -360,6 +360,9 @@ jobs:
       - name: Run workspace organizer tests
         run: npx vitest run plugin-examples/workspace-organizer --bail=1
 
+      - name: Build workspace organizer MCP bridge
+        run: node scripts/build-workspace-organizer-mcp.mjs
+
       - name: Run protocol tests
         run: npm run test --workspace=@getpaseo/protocol
 

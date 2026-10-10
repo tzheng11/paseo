@@ -84,3 +84,26 @@ export interface SidebarRowProps {
 export declare const SidebarRow: ComponentType<SidebarRowProps>;
 /** A line between groups of rows. Render it from a sidebar item's `Component`. */
 export declare const SidebarSeparator: ComponentType;
+
+export interface SortableTreeItem {
+  id: string;
+  parentId: string | null;
+  label: string;
+  acceptsChildren: boolean;
+  collapsed?: boolean;
+}
+export interface SortableTreeMove {
+  id: string;
+  parentId: string | null;
+  beforeId: string | null;
+}
+export interface SortableTreeProps {
+  items: readonly SortableTreeItem[];
+  renderItem(input: { id: string; depth: number; dragHandle: ReactNode }): ReactNode;
+  onMove(move: SortableTreeMove): void;
+  disabled?: boolean;
+  testID?: string;
+  colors: { accent: string; muted: string; border: string; background: string; foreground: string };
+}
+/** Web mouse, touch and keyboard dragging. Native clients keep the editor's move controls. */
+export declare const SortableTree: ComponentType<SortableTreeProps>;

@@ -151,6 +151,31 @@ export function moveNode(document: Organization, id: string, direction: -1 | 1):
   return organizationSchema.parse({ nodes });
 }
 
+/** Move one reference and its subtree, inserting before a sibling or at the end. */
+export function relocateNode(
+  document: Organization,
+  input: { id: string; parentId: string | null; beforeId: string | null },
+): Organization {
+  const node = document.nodes.find((entry) => entry.id === input.id);
+  if (!node) throw new Error("Organization entry not found");
+  if (input.beforeId === input.id && input.parentId === node.parentId) return document;
+  if (input.parentId !== null) {
+    const parent = document.nodes.find((entry) => entry.id === input.parentId);
+    if (!parent || parent.kind !== "folder") throw new Error("Choose an existing folder");
+    if (descendants(document.nodes, node.id).has(input.parentId))
+      throw new Error("An entry cannot be nested inside itself or a descendant");
+  }
+  const nodes = document.nodes.filter((entry) => entry.id !== node.id);
+  let index = nodes.length;
+  if (input.beforeId !== null) {
+    index = nodes.findIndex((entry) => entry.id === input.beforeId);
+    if (index === -1 || nodes[index].parentId !== input.parentId)
+      throw new Error("The insertion target is no longer a sibling. Reload the organization.");
+  }
+  nodes.splice(index, 0, { ...node, parentId: input.parentId });
+  return organizationSchema.parse({ nodes });
+}
+
 // Removing a navigation reference never archives a workspace. Children take its place in the tree.
 export function removeNode(document: Organization, id: string): Organization {
   const removed = document.nodes.find((node) => node.id === id);

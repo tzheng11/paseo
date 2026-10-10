@@ -15,6 +15,10 @@ import { buildHostWorkspaceRoute } from "@/utils/host-routes";
 import { expectAppRoute } from "../support/helpers/route-assertions";
 import { openSidebarDisplayPage, selectSidebarStatusGrouping } from "../support/helpers/sidebar";
 import { organizationSchema } from "../../../../plugin-examples/workspace-organizer/shared/organization";
+import { createOrganizerMcpServer } from "../../../../plugin-examples/workspace-organizer/mcp/server";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
 
 const pluginId = "workspace-organizer";
 const sidebarPrefix = `plugin-sidebar-${pluginId}-organization`;
@@ -44,12 +48,48 @@ async function preserveRegistry(page: Page) {
     ),
   );
 }
+async function dragTree(page: Page, id: string, destination: string) {
+  const source = await page.getByTestId(`organizer-sidebar-tree-handle-${id}`).boundingBox();
+  if (!source) throw new Error("Drag handle is not visible");
+  await page.mouse.move(source.x + source.width / 2, source.y + source.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(source.x + source.width / 2 - 8, source.y + source.height / 2, {
+    steps: 3,
+  });
+  await expect(page.getByTestId("organizer-sidebar-tree-root")).toBeVisible();
+  const target = await page.getByTestId(destination).boundingBox();
+  if (!target) throw new Error("Drop target is not visible");
+  await page.mouse.move(target.x + target.width / 2, target.y + target.height / 2, { steps: 6 });
+  await page.mouse.up();
+}
+async function touchTree(page: Page, id: string, destination: string) {
+  const source = await page.getByTestId(`organizer-sidebar-tree-handle-${id}`).boundingBox();
+  if (!source) throw new Error("Touch drag handle is not visible");
+  const cdp = await page.context().newCDPSession(page);
+  try {
+    await cdp.send("Input.dispatchTouchEvent", {
+      type: "touchStart",
+      touchPoints: [{ x: source.x + source.width / 2, y: source.y + source.height / 2 }],
+    });
+    // The long-press sensor activates after its configured delay.
+    await expect(page.getByTestId("organizer-sidebar-tree-root")).toBeVisible();
+    const target = await page.getByTestId(destination).boundingBox();
+    if (!target) throw new Error("Touch drop target is not visible");
+    await cdp.send("Input.dispatchTouchEvent", {
+      type: "touchMove",
+      touchPoints: [{ x: target.x + target.width / 2, y: target.y + target.height / 2 }],
+    });
+    await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+  } finally {
+    await cdp.detach();
+  }
+}
 
 test("pinned folders contain cross-host workspace leaves, share links/order and protect drafts", async ({
   page,
   browser,
 }) => {
-  test.setTimeout(240_000);
+  test.setTimeout(300_000);
   const directory = await mkdtemp(path.join(tmpdir(), "paseo-organizer-"));
   const primary = await connectNewWorkspaceDaemonClient();
   const secondary = await startIsolatedHostDaemon("organizer-secondary");
@@ -59,6 +99,15 @@ test("pinned folders contain cross-host workspace leaves, share links/order and 
   });
   const previous = await primary.getDaemonConfig();
   const example = await copyPluginExample("workspace-organizer");
+  const mcp = createOrganizerMcpServer((method, input) =>
+    primary.invokePluginRpc(pluginId, method, input),
+  );
+  const mcpClient = new Client({ name: "organizer-e2e", version: "1" });
+  const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
+  await mcp.connect(serverTransport);
+  await mcpClient.connect(clientTransport);
+  const callMcp = async (name: string, args: Record<string, unknown>) =>
+    CallToolResultSchema.parse(await mcpClient.callTool({ name, arguments: args }));
   let peerContext: Awaited<ReturnType<typeof browser.newContext>> | undefined;
   const read = async () =>
     readSchema.parse(await primary.invokePluginRpc(pluginId, "settings.organization.read", {}));
@@ -139,6 +188,7 @@ test("pinned folders contain cross-host workspace leaves, share links/order and 
     const initial = await read();
     const folder = initial.values.nodes.find((node) => node.title === "Hyperbola")!;
     const development = initial.values.nodes.find((node) => node.title === "Development")!;
+    const other = initial.values.nodes.find((node) => node.title === "Other projects")!;
     const studio = initial.values.nodes.find(
       (node) => node.kind === "workspace" && node.workspaceId === studioWorkspace.workspaceId,
     )!;
@@ -161,17 +211,79 @@ test("pinned folders contain cross-host workspace leaves, share links/order and 
     ).toBeVisible();
     expect(laptop.links[0].url).toBe("https://www.notion.so/hyperbola-project");
     // Separate storage and WebSocket connection, as on another device.
-    peerContext = await browser.newContext({ storageState: await page.context().storageState() });
+    peerContext = await browser.newContext({
+      storageState: await page.context().storageState(),
+      hasTouch: true,
+    });
     const peer = await peerContext.newPage();
     await peer.goto(page.url());
     await expect(
       peer.getByRole("button", { name: `Edit ${laptopWorkspace.workspaceName}`, exact: true }),
     ).toBeVisible();
+    // Real mouse gestures reorder, nest, extract and reject descendant drops.
+    await dragTree(page, other.id, `organizer-sidebar-tree-before-${folder.id}`);
+    await expect
+      .poll(async () =>
+        (await read()).values.nodes.filter((node) => node.parentId === null).map((node) => node.id),
+      )
+      .toEqual([other.id, folder.id]);
+    await dragTree(page, other.id, `organizer-sidebar-tree-target-${development.id}`);
+    await expect
+      .poll(async () => (await read()).values.nodes.find((node) => node.id === other.id)?.parentId)
+      .toBe(development.id);
+    await expect(peer.getByTestId("organizer-sidebar-tree-handle-" + other.id)).toBeVisible();
+    await touchTree(peer, other.id, "organizer-sidebar-tree-root");
+    await expect
+      .poll(async () => (await read()).values.nodes.find((node) => node.id === other.id)?.parentId)
+      .toBeNull();
+    const beforeInvalidDrop = await read();
+    await dragTree(page, folder.id, `organizer-sidebar-tree-target-${development.id}`);
+    expect((await read()).revision).toBe(beforeInvalidDrop.revision);
+    await page.getByTestId(`organizer-sidebar-tree-handle-${folder.id}`).focus();
+    await page.keyboard.press("Space");
+    await expect(page.getByTestId("organizer-sidebar-tree-root")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("organizer-sidebar-tree-root")).toBeHidden();
+    expect((await read()).revision).toBe(beforeInvalidDrop.revision);
+    // MCP writes use the same daemon store and immediately reach both clients.
+    expect((await mcpClient.listTools()).tools).toHaveLength(8);
+    const created = await callMcp("create_pinned_folder", {
+      revision: (await read()).revision,
+      title: "From MCP",
+    });
+    expect(created.isError).not.toBe(true);
+    const mcpFolder = (await read()).values.nodes.find((node) => node.title === "From MCP")!;
+    await callMcp("set_pinned_project_link", {
+      revision: (await read()).revision,
+      id: mcpFolder.id,
+      title: "Notion from MCP",
+      url: "https://www.notion.so/mcp-project",
+    });
+    const withLink = (await read()).values.nodes.find((node) => node.id === mcpFolder.id)!;
+    await expect(
+      page.getByTestId(`${sidebarPrefix}-link-${mcpFolder.id}-${withLink.links[0].id}`),
+    ).toBeVisible();
+    await expect(
+      peer.getByTestId(`${sidebarPrefix}-link-${mcpFolder.id}-${withLink.links[0].id}`),
+    ).toBeVisible();
+    await callMcp("move_pinned_entry", {
+      revision: (await read()).revision,
+      id: laptop.id,
+      parentId: mcpFolder.id,
+    });
+    await expect
+      .poll(async () => (await read()).values.nodes.find((node) => node.id === laptop.id)?.parentId)
+      .toBe(mcpFolder.id);
+    await callMcp("move_pinned_entry", {
+      revision: (await read()).revision,
+      id: laptop.id,
+      parentId: development.id,
+    });
+    await callMcp("remove_pinned_entry", { revision: (await read()).revision, id: mcpFolder.id });
+    await expect(peer.getByRole("button", { name: "Edit From MCP", exact: true })).toHaveCount(0);
     await page.getByRole("button", { name: "Edit Hyperbola", exact: true }).click();
     await page.getByRole("textbox", { name: "Entry name", exact: true }).fill("Unsaved draft");
-    await peer.getByRole("button", { name: "Edit Other projects", exact: true }).click();
-    await peer.getByRole("button", { name: "Move up", exact: true }).click();
-    await save(peer);
+    await dragTree(peer, other.id, `organizer-sidebar-tree-before-${folder.id}`);
     await expect
       .poll(async () =>
         (await read()).values.nodes
@@ -291,6 +403,8 @@ test("pinned folders contain cross-host workspace leaves, share links/order and 
     );
     expect(remaining?.pinnedAt).toEqual(expect.any(String));
   } finally {
+    await mcpClient.close();
+    await mcp.close();
     await peerContext?.close();
     await remote.close();
     await secondary.close();
