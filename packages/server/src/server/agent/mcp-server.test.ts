@@ -14,6 +14,7 @@ import { createTestLogger } from "../../test-utils/test-logger.js";
 import { createAgentMcpServer as createAgentMcpServerWithDependencies } from "./mcp-server.js";
 import { AgentManager, type ManagedAgent } from "./agent-manager.js";
 import { AgentStorage, type StoredAgentRecord } from "./agent-storage.js";
+import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
 import type {
   AgentClient,
@@ -216,7 +217,9 @@ interface TestDeps {
 }
 
 function buildAgentManagerSpies() {
+  const timelineStore = new InMemoryAgentTimelineStore();
   return {
+    timelineStore,
     createAgent: vi.fn(),
     waitForAgentEvent: vi.fn().mockResolvedValue({
       status: "idle",
@@ -235,6 +238,10 @@ function buildAgentManagerSpies() {
     getAgent: vi.fn(),
     listAgents: vi.fn().mockReturnValue([]),
     getTimeline: vi.fn().mockReturnValue([]),
+    getRecentTimelineItems: vi.fn((agentId: string, limit: number) =>
+      timelineStore.getRecentItems(agentId, limit),
+    ),
+    getTimelineCount: vi.fn((agentId: string) => timelineStore.getCount(agentId)),
     resumeAgentFromPersistence: vi.fn(),
     hydrateTimelineFromProvider: vi.fn().mockResolvedValue(undefined),
     appendTimelineItem: vi.fn().mockResolvedValue(undefined),
@@ -6505,13 +6512,9 @@ describe("agent snapshot MCP serialization", () => {
       .mockReturnValue(snapshot);
     spies.agentStorage.get.mockResolvedValue(record);
     spies.agentManager.resumeAgentFromPersistence.mockResolvedValue(snapshot);
-    spies.agentManager.getTimeline.mockReturnValue([
-      {
-        kind: "status",
-        timestamp: "2026-04-11T00:00:00.000Z",
-        text: "Agent resumed",
-      },
-    ]);
+    spies.agentManager.timelineStore.initialize(snapshot.id, {
+      items: [{ type: "notification", level: "info", message: "Agent resumed" }],
+    });
 
     const server = await createAgentMcpServer({
       agentManager,
@@ -6540,15 +6543,17 @@ describe("agent snapshot MCP serialization", () => {
     const { agentManager, agentStorage, spies } = createTestDeps();
     const snapshot = createManagedAgent({ id: "live-activity-agent", currentModeId: "default" });
     spies.agentManager.getAgent.mockReturnValue(snapshot);
-    spies.agentManager.getTimeline.mockReturnValue([
-      { type: "user_message", text: "Say hi" },
-      { type: "assistant_message", text: "Hello " },
-      { type: "assistant_message", text: "world" },
-      { type: "assistant_message", text: "." },
-      { type: "assistant_message", text: " How" },
-      { type: "assistant_message", text: " are" },
-      { type: "assistant_message", text: " you?" },
-    ]);
+    spies.agentManager.timelineStore.initialize(snapshot.id, {
+      items: [
+        { type: "user_message", text: "Say hi" },
+        { type: "assistant_message", text: "Hello " },
+        { type: "assistant_message", text: "world" },
+        { type: "assistant_message", text: "." },
+        { type: "assistant_message", text: " How" },
+        { type: "assistant_message", text: " are" },
+        { type: "assistant_message", text: " you?" },
+      ],
+    });
 
     const server = await createAgentMcpServer({
       agentManager,
@@ -6560,6 +6565,8 @@ describe("agent snapshot MCP serialization", () => {
     const response = await tool.handler({ agentId: "live-activity-agent", limit: 1 });
 
     const content = String(response.structuredContent.content);
+    expect(response.structuredContent.updateCount).toBe(2);
+    expect(content).toContain("Showing 1 of 2 activities (limited to 1)");
     expect(content).toContain("Hello world. How are you?");
   });
 
@@ -6567,17 +6574,19 @@ describe("agent snapshot MCP serialization", () => {
     const { agentManager, agentStorage, spies } = createTestDeps();
     const snapshot = createManagedAgent({ id: "live-activity-agent-2", currentModeId: "default" });
     spies.agentManager.getAgent.mockReturnValue(snapshot);
-    spies.agentManager.getTimeline.mockReturnValue([
-      { type: "user_message", text: "u1" },
-      { type: "assistant_message", text: "first " },
-      { type: "assistant_message", text: "answer" },
-      { type: "user_message", text: "u2" },
-      { type: "assistant_message", text: "second " },
-      { type: "assistant_message", text: "answer" },
-      { type: "user_message", text: "u3" },
-      { type: "assistant_message", text: "third " },
-      { type: "assistant_message", text: "answer" },
-    ]);
+    spies.agentManager.timelineStore.initialize(snapshot.id, {
+      items: [
+        { type: "user_message", text: "u1" },
+        { type: "assistant_message", text: "first " },
+        { type: "assistant_message", text: "answer" },
+        { type: "user_message", text: "u2" },
+        { type: "assistant_message", text: "second " },
+        { type: "assistant_message", text: "answer" },
+        { type: "user_message", text: "u3" },
+        { type: "assistant_message", text: "third " },
+        { type: "assistant_message", text: "answer" },
+      ],
+    });
 
     const server = await createAgentMcpServer({
       agentManager,
@@ -6589,6 +6598,8 @@ describe("agent snapshot MCP serialization", () => {
     const response = await tool.handler({ agentId: "live-activity-agent-2", limit: 2 });
 
     const content = String(response.structuredContent.content);
+    expect(response.structuredContent.updateCount).toBe(6);
+    expect(content).toContain("Showing 2 of 6 activities (limited to 2)");
     expect(content).toContain("[User] u3");
     expect(content).toContain("third answer");
     expect(content).not.toContain("[User] u2");
