@@ -72,7 +72,7 @@ export interface PluginPopoverProps extends PluginHostProps {
   openScreen(input: PluginOpenScreenInput): void;
 }
 
-export interface PluginSidebarItemProps extends PluginHostProps {
+export interface PluginSidebarItemProps extends PluginNavigableHostProps {
   /** This plugin's screen open on this item's host, with its params, else null. */
   currentScreen: PluginScreenLocation | null;
   openScreen(input: PluginOpenScreenInput): void;

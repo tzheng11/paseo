@@ -951,12 +951,13 @@ of its items, else the first host.
 
 `Component` receives `PluginSidebarItemProps`:
 
-| Field                     | Meaning                                                                                       |
-| ------------------------- | --------------------------------------------------------------------------------------------- |
-| `theme`, `host`, `layout` | As in `PluginScreenProps`.                                                                    |
-| `currentScreen`           | `{ screenId, params }` of this plugin's screen open on the item's host, or `null`.            |
-| `openScreen(input)`       | Opens one of this plugin's screens: `{ screenId, params? }`. Unknown screen IDs throw.        |
-| `openPopover(Content)`    | Opens `Content` anchored to the pressed row on wide layouts and as a bottom sheet on compact. |
+| Field                     | Meaning                                                                                                             |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `theme`, `host`, `layout` | As in `PluginScreenProps`.                                                                                          |
+| `currentScreen`           | `{ screenId, params }` of this plugin's screen open on the item's host, or `null`.                                  |
+| `openScreen(input)`       | Opens one of this plugin's screens: `{ screenId, params? }`. Unknown screen IDs throw.                              |
+| `navigation`              | Optional `openWorkspace` and `openAgent`, as in `PluginScreenProps`. Sidebar navigation closes the compact sidebar. |
+| `openPopover(Content)`    | Opens `Content` anchored to the pressed row on wide layouts and as a bottom sheet on compact.                       |
 
 `Content` receives `theme`, `host`, `layout`, `close()`, and `openScreen(input)`. Opening a screen
 closes the popover.

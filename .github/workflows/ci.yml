@@ -357,6 +357,9 @@ jobs:
       - name: Run plugin SDK tests
         run: npm run test --workspace=@getpaseo/plugin
 
+      - name: Run workspace organizer tests
+        run: npx vitest run plugin-examples/workspace-organizer --bail=1
+
       - name: Run protocol tests
         run: npm run test --workspace=@getpaseo/protocol
 

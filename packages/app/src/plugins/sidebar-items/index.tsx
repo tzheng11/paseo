@@ -39,6 +39,7 @@ import type { PluginSidebarSection } from "../types";
 import { SidebarItemFrameContext, type SidebarItemFrame } from "./frame";
 import { LegacyPluginSidebarRow } from "./legacy";
 import { resolvePluginPlatform } from "../platform";
+import { usePluginHostNavigation } from "../host-navigation";
 
 export { SidebarRow, SidebarSeparator } from "./kit";
 
@@ -166,6 +167,7 @@ function SidebarItemContent({
     useSidebarPopoverAnchor("PluginSidebarItem");
   const hosts = useHosts();
   const compact = useIsCompactFormFactor();
+  const navigation = usePluginHostNavigation(plugin.serverId);
   const hostLabel =
     hosts.find((host) => host.serverId === plugin.serverId)?.label ?? plugin.serverId;
 
@@ -217,8 +219,24 @@ function SidebarItemContent({
     [anchorTo, item.id, item.title, offerAnchor, plugin.id, releaseAnchor, section],
   );
   const itemProps = useMemo<PluginSidebarItemProps>(
-    () => ({ ...hostProps, currentScreen, openScreen, openPopover }),
-    [currentScreen, hostProps, openPopover, openScreen],
+    () => ({
+      ...hostProps,
+      currentScreen,
+      openScreen,
+      openPopover,
+      navigation: {
+        ...navigation,
+        openWorkspace: (input) => {
+          onBeforeNavigate?.();
+          navigation.openWorkspace(input);
+        },
+        openAgent: (input) => {
+          onBeforeNavigate?.();
+          navigation.openAgent(input);
+        },
+      },
+    }),
+    [currentScreen, hostProps, navigation, onBeforeNavigate, openPopover, openScreen],
   );
   const Item = item.Component;
   const Popover = popover;

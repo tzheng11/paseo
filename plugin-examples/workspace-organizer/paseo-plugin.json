@@ -1,0 +1,4 @@
+{
+  "id": "workspace-organizer",
+  "requirements": { "paseo": ">=0.11.2" }
+}
