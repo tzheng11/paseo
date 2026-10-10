@@ -2101,6 +2101,45 @@ describe("WorkspaceGitService checkout observation", () => {
     service.dispose();
   });
 
+  test("a large ignored event burst stays quiet and a following tracked edit still refreshes", async () => {
+    const watcher = createWatcherHarness();
+    const ignoredRoots = Array.from({ length: 198 }, (_, index) => `ignored-${index}/`);
+    ignoredRoots.push("node_modules/");
+    const runGitCommand = vi.fn(async (args: string[]) => ({
+      stdout: args[0] === "rev-parse" ? `${REPO_CWD}\n` : ignoredRoots.join("\n"),
+      stderr: "",
+      truncated: false,
+      exitCode: 0,
+      signal: null,
+    }));
+    const getCheckoutStatus = vi.fn(async (cwd: string) => createCheckoutStatus(cwd));
+    const service = createService(watcher, { getCheckoutStatus, runGitCommand });
+    const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    await vi.waitFor(() => {
+      expect(getWatcherRecordsForDirectory(watcher, REPO_CWD)).toHaveLength(1);
+      expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
+      expect(service.getMetrics().workspaceRefreshInFlightCount).toBe(0);
+    });
+    const [checkoutWatcher] = getWatcherRecordsForDirectory(watcher, REPO_CWD);
+    const statusCalls = getCheckoutStatus.mock.calls.length;
+    const ignoreCalls = runGitCommand.mock.calls.length;
+    const events = Array.from({ length: 26_079 }, (_, index) => ({
+      path: path.join(REPO_CWD, "node_modules", ".pnpm", `pkg-${index}`, "file.js"),
+      type: "create" as const,
+    }));
+
+    checkoutWatcher.callback(null, events);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(getCheckoutStatus).toHaveBeenCalledTimes(statusCalls);
+    expect(runGitCommand).toHaveBeenCalledTimes(ignoreCalls);
+
+    checkoutWatcher.callback(null, [{ path: path.join(REPO_CWD, "tracked.txt"), type: "update" }]);
+    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.waitFor(() => expect(getCheckoutStatus).toHaveBeenCalledTimes(statusCalls + 1));
+    subscription.unsubscribe();
+    service.dispose();
+  });
+
   test("pruneKnownDirectories case-folds a Windows-shaped watch root", () => {
     // `pruneKnownDirectories` only needs to fold case when the watch root
     // *looks* like a Windows path (drive letter or UNC) — see
