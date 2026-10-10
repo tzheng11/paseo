@@ -1296,16 +1296,22 @@ describe("WorkspaceGitServiceImpl", () => {
     service.dispose();
   });
 
-  test("sets a bounded polling fallback when recursive observation is unavailable", async () => {
+  test("sets bounded polling and recovery when recursive observation is unavailable", async () => {
     const subscribe = vi.fn(async () => {
       throw new Error("watcher unavailable");
     });
     const service = createService({ subscribe });
     const subscription = await service.requestWorkingTreeWatch(REPO_CWD, vi.fn());
 
-    expect(vi.getTimerCount()).toBe(1);
+    // One polling timer and one recovery timer; a failed retry replaces its
+    // timer with the next backoff instead of accumulating background work.
+    expect(vi.getTimerCount()).toBe(2);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(subscribe).toHaveBeenCalledTimes(2);
+    expect(vi.getTimerCount()).toBe(2);
 
     subscription.unsubscribe();
+    expect(vi.getTimerCount()).toBe(0);
     service.dispose();
   });
 
