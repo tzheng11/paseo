@@ -5,10 +5,27 @@ Agent chat delivery has two paths:
 1. **Live stream** — `agent_stream` WebSocket messages for immediacy. These may be delta-shaped lifecycle updates.
 2. **Authoritative history** — `fetch_agent_timeline_request` for correctness. This always returns full projected timeline items, never lifecycle deltas.
 
-The daemon retains projected items in memory. Each source event advances the stream sequence,
-then replaces the previous tool state or merges into the current text item. Intermediate payloads
-are never retained for history or catch-up. Provider history is the durable transcript authority
-and rebuilds the projection when an agent resumes.
+The daemon keeps projected items in a disposable SQLite cache under
+`$PASEO_HOME/runtime/timeline-cache/`. A 32 MiB serialized-row cache is shared across all loaded
+agents; SQLite's page cache has a 4 MiB target. Provider history remains the durable transcript
+authority and rebuilds the projection when an agent resumes. You can remove abandoned caches
+while the daemon is stopped. Normal shutdown removes its cache; startup removes caches owned
+by processes that have exited.
+
+Each source event advances the stream sequence, then replaces the previous tool state or merges
+into the current text item. Intermediate payloads are never retained for history or catch-up.
+History imports stage events on disk before changing the readable timeline, then commit batches
+of 64 events. Applying the staged file is synchronous, preserving the previous ordering boundary:
+live events cannot interleave between imported rows. Large imports occupy the event loop while
+applying disk writes, so validate reopen latency on the deployment host. A failed provider stream leaves the previous timeline readable. Deferred publication
+replays the staged file instead of retaining another full timeline array.
+
+Ordinary pages read only selected rows from disk. Explicit full-history reads (`limit: 0`, exports,
+and forks) and tails expanded by interleaved lifecycle updates can still allocate large responses.
+The row-cache budget excludes those responses and provider-owned history-loading buffers. Claude's
+transcript reader and Codex's `thread/read` still materialize provider history before yielding it;
+this change bounds retained daemon history and manager replay buffers, not every provider's peak.
+The cache requires Node 22.13 or later, or Electron's bundled Node with `node:sqlite` support.
 
 The invariants are:
 

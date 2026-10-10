@@ -23,7 +23,6 @@ import {
   toAgentPayload,
 } from "../agent-projections.js";
 import { curateAgentActivity } from "../activity-curator.js";
-import { selectItemsByProjectedLimit } from "../timeline-projection.js";
 import type { AgentStorage } from "../agent-storage.js";
 import { ensureAgentLoaded } from "../agent-loading.js";
 import { isStoredAgentProviderAvailable } from "../../persistence-hooks.js";
@@ -3018,16 +3017,11 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         agentStorage,
         logger: childLogger,
       });
-      const timeline = agentManager.getTimeline(agentId);
+      const timeline = agentManager.getRecentTimelineItems(agentId, limit ?? 0);
       const snapshot = agentManager.getAgent(agentId);
-
-      const selection = selectItemsByProjectedLimit({
-        items: timeline,
-        direction: "tail",
-        limit: limit ?? 0,
-      });
-      const curatedContent = curateAgentActivity(selection.items);
-      const { totalProjected, shownProjected } = selection;
+      const curatedContent = curateAgentActivity(timeline);
+      const totalProjected = agentManager.getTimelineCount(agentId);
+      const shownProjected = timeline.length;
 
       const noun = totalProjected === 1 ? "activity" : "activities";
       const countHeader =
@@ -3041,7 +3035,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         content: [],
         structuredContent: ensureValidJson({
           agentId,
-          updateCount: timeline.length,
+          updateCount: totalProjected,
           currentModeId: snapshot?.currentModeId ?? null,
           content: contentWithCount,
         }),
