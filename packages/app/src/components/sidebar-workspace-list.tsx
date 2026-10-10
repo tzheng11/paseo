@@ -93,6 +93,7 @@ import {
 } from "@/components/sidebar/sidebar-workspace-menu";
 import { useLongPressDragInteraction } from "@/components/sidebar/use-long-press-drag-interaction";
 import { PinnedSectionHeader } from "@/components/sidebar/pinned-section-header";
+import { usePinnedPluginSidebarItems } from "@/plugins/sidebar-items/pinned";
 import { SidebarGroupToggleRow } from "@/components/sidebar/sidebar-group-toggle-row";
 import { useLimitedSidebarGroup } from "@/components/sidebar/use-limited-sidebar-group";
 import {
@@ -2134,6 +2135,7 @@ function ProjectModeList({
   const selectionEnabled = isWorkspaceRoute;
   const activeWorkspaceSelection = useActiveWorkspaceSelection();
   const { pinnedChats, unpinnedProjects } = pinnedGroups;
+  const pinnedPluginItems = usePinnedPluginSidebarItems(onWorkspacePress);
   const {
     visibleItems: visiblePinnedChats,
     expanded: pinnedChatsExpanded,
@@ -2408,11 +2410,12 @@ function ProjectModeList({
 
   const content = (
     <>
-      {pinnedChats.length > 0 ? (
+      {pinnedChats.length > 0 || pinnedPluginItems ? (
         <View style={styles.pinnedSection} testID="sidebar-pinned-section">
           <PinnedSectionHeader collapsed={pinnedCollapsed} onToggle={togglePinnedCollapsed} />
           {pinnedCollapsed ? null : (
             <>
+              {pinnedPluginItems}
               <DraggableList
                 testID="sidebar-pinned-list"
                 data={visiblePinnedChats}

@@ -185,10 +185,22 @@ export function runPluginClientBundle(
     if (!isComponentType(contribution.Component)) {
       throw new Error(`Sidebar item ${normalizedId} is not a component`);
     }
+    if (
+      contribution.placement !== undefined &&
+      contribution.placement !== "navigation" &&
+      (contribution.placement !== "pinned" || section !== "header")
+    ) {
+      throw new Error(`Invalid sidebar ${section} placement: ${contribution.placement}`);
+    }
     ids.add(normalizedId);
     return register(
       collector.sidebarItems[section],
-      { id: normalizedId, title, Component: contribution.Component },
+      {
+        id: normalizedId,
+        title,
+        placement: contribution.placement,
+        Component: contribution.Component,
+      },
       () => ids.delete(normalizedId),
     );
   }

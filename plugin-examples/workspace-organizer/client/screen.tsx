@@ -178,7 +178,7 @@ function NodeEditor({
     return [
       { label: "Top level", value: "" },
       ...draft.document.nodes
-        .filter((candidate) => !excluded.has(candidate.id))
+        .filter((candidate) => candidate.kind === "folder" && !excluded.has(candidate.id))
         .map((candidate) => ({ label: candidate.title, value: candidate.id })),
     ];
   }, [draft.document.nodes, nodeId]);
@@ -282,7 +282,7 @@ function NodeEditor({
           disabled={settings.saving}
         />
         <SettingsSelect
-          label="Nested inside"
+          label="Inside folder"
           value={node.parentId ?? ""}
           options={parents}
           disabled={settings.saving}
@@ -338,8 +338,8 @@ function NodeEditor({
         />
       </SettingsCard>
       <Notice theme={theme}>
-        Changes below are saved together. Removing an entry keeps its workspaces and promotes its
-        nested entries.
+        Changes below are saved together. Removing a folder moves its contents up one level.
+        Removing a workspace here only unpins its reference.
       </Notice>
       {error || settings.saveError ? (
         <Notice theme={theme} alert>
@@ -361,7 +361,7 @@ function NodeEditor({
         />
         <SettingsAction
           label="Navigation reference"
-          actionLabel="Remove from organization"
+          actionLabel={node.kind === "folder" ? "Remove folder" : "Unpin workspace"}
           disabled={settings.saving}
           onPress={remove}
         />
@@ -385,11 +385,15 @@ function OrganizationEditor({
   const [error, setError] = useState<string | null>(null);
   const catalog = useWorkspaceChoices();
   const document = settings.values;
-  const parent = document.nodes.some((node) => node.id === parentId) ? parentId : "";
+  const parent = document.nodes.some((node) => node.kind === "folder" && node.id === parentId)
+    ? parentId
+    : "";
   const parents = useMemo(
     () => [
       { label: "Top level", value: "" },
-      ...document.nodes.map((node) => ({ label: node.title, value: node.id })),
+      ...document.nodes
+        .filter((node) => node.kind === "folder")
+        .map((node) => ({ label: node.title, value: node.id })),
     ],
     [document.nodes],
   );
@@ -454,10 +458,10 @@ function OrganizationEditor({
   return (
     <ScrollView contentContainerStyle={styles.content}>
       <Notice theme={theme}>
-        Shared through {host.label}. Nest folders or workspaces, set their order, and attach Notion
-        project links. Workspace files stay on their original hosts.
+        Pinned folders are shared through {host.label}. Put folders and workspaces from any paired
+        host inside folders, set their order, and attach Notion project links.
       </Notice>
-      <SettingsSection title="Your organization">
+      <SettingsSection title="Pinned folders and workspaces">
         <SettingsCard>
           {document.nodes.length ? (
             <Tree nodes={document.nodes} selected={selected} onSelect={select} theme={theme} />
@@ -487,7 +491,7 @@ function OrganizationEditor({
           {error ?? settings.saveError}
         </Notice>
       ) : null}
-      <SettingsSection title="Add to organization">
+      <SettingsSection title="Add to Pinned">
         <SettingsCard>
           <SettingsSelect
             label="Add inside"

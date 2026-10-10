@@ -74,6 +74,7 @@ import {
   SidebarWorkspaceMenu,
 } from "@/components/sidebar/sidebar-workspace-menu";
 import { PinnedSectionHeader } from "@/components/sidebar/pinned-section-header";
+import { usePinnedPluginSidebarItems } from "@/plugins/sidebar-items/pinned";
 import { SidebarGroupToggleRow } from "@/components/sidebar/sidebar-group-toggle-row";
 import { useLimitedSidebarGroup } from "@/components/sidebar/use-limited-sidebar-group";
 import type { ToggleSidebarWorkspacePin } from "@/hooks/use-sidebar-workspace-pin";
@@ -153,6 +154,7 @@ export function SidebarStatusWorkspaceList({
   const togglePinnedCollapsed = useSidebarCollapsedSectionsStore(
     (state) => state.togglePinnedCollapsed,
   );
+  const pinnedPluginItems = usePinnedPluginSidebarItems(onWorkspacePress);
   const {
     visibleItems: visiblePinnedWorkspaces,
     expanded: pinnedWorkspacesExpanded,
@@ -200,11 +202,12 @@ export function SidebarStatusWorkspaceList({
   );
   const content = (
     <>
-      {pinnedWorkspaces.length > 0 ? (
+      {pinnedWorkspaces.length > 0 || pinnedPluginItems ? (
         <View style={styles.pinnedSection} testID="sidebar-pinned-section">
           <PinnedSectionHeader collapsed={pinnedCollapsed} onToggle={togglePinnedCollapsed} />
           {pinnedCollapsed ? null : (
             <>
+              {pinnedPluginItems}
               <DraggableList
                 testID="sidebar-pinned-list"
                 data={visiblePinnedWorkspaces}

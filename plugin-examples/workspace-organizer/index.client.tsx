@@ -5,17 +5,18 @@ import { OrganizationScreen } from "./client/screen";
 export default function contribute(client: PluginClientContext) {
   client.addScreen({
     id: "organization",
-    title: "Workspace organization",
+    title: "Pinned folders",
     Component: OrganizationScreen,
   });
   client.addSidebarHeaderItem({
     id: "organization",
-    title: "Workspace organization",
+    title: "Pinned folders",
+    placement: "pinned",
     Component: OrganizationSidebar,
   });
   client.addCommandCenterItem({
     id: "organization",
-    title: "Organize workspaces",
+    title: "Organize pinned folders",
     icon: "FolderTree",
     context: "global",
     onSelect: ({ openScreen }) => openScreen({ screenId: "organization" }),

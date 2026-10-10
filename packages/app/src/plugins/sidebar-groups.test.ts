@@ -6,7 +6,11 @@ import {
   pluginScreensHostKey,
   rememberPluginContributionHost,
 } from "./contribution-host";
-import { groupPluginSidebarItems, selectPluginSidebarTarget } from "./sidebar-groups";
+import {
+  filterPluginSidebarPlacement,
+  groupPluginSidebarItems,
+  selectPluginSidebarTarget,
+} from "./sidebar-groups";
 
 function installed(
   serverId: string,
@@ -81,6 +85,29 @@ describe("groupPluginSidebarItems", () => {
     const groups = groupPluginSidebarItems([installed("host-a")], "footer");
 
     expect(groups.map((group) => group.key)).toEqual(["example/sidebar-footer/status"]);
+  });
+
+  it("keeps pinned contributions out of navigation and follows the selected host's placement", () => {
+    const first = installed("host-a", "main", [
+      { id: "legacy", title: "Legacy", icon: "Blocks", surface: "surface" },
+    ]);
+    const second = installed("host-b");
+    second.sidebarItems.header[0].placement = "pinned";
+    const groups = groupPluginSidebarItems([first, second], "header");
+    expect(
+      filterPluginSidebarPlacement(groups, "navigation", "host-a").map(
+        (group) => group.contributionId,
+      ),
+    ).toEqual(["legacy", "main"]);
+    expect(filterPluginSidebarPlacement(groups, "pinned", "host-a")).toEqual([]);
+    expect(
+      filterPluginSidebarPlacement(groups, "navigation", "host-b").map(
+        (group) => group.contributionId,
+      ),
+    ).toEqual(["legacy"]);
+    expect(
+      filterPluginSidebarPlacement(groups, "pinned", "host-b").map((group) => group.contributionId),
+    ).toEqual(["main"]);
   });
 });
 

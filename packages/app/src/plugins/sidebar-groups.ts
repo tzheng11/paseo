@@ -107,3 +107,15 @@ export function selectPluginSidebarTarget<Group extends PluginSidebarGroup>(
     targets[0]
   );
 }
+
+export function filterPluginSidebarPlacement(
+  groups: PluginSidebarGroup[],
+  placement: "navigation" | "pinned",
+  currentHostId: string | null,
+): PluginSidebarGroup[] {
+  return groups.filter((group) => {
+    if (group.kind === "legacy") return placement === "navigation";
+    const { item } = selectPluginSidebarTarget(group, currentHostId);
+    return (item.placement ?? "navigation") === placement;
+  });
+}

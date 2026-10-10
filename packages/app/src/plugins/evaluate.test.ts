@@ -193,6 +193,7 @@ describe("evaluatePluginClientBundle", () => {
         plugin.addScreen({ id: "main", title: " Main ", Component: Screen });
         plugin.addScreen({ id: "bot", title: (params) => params.botId, Component: Screen });
         plugin.addSidebarHeaderItem({ id: "main", title: " Example ", Component: Item });
+        plugin.addSidebarHeaderItem({ id: "folders", title: "Folders", placement: "pinned", Component: Item });
         plugin.addSidebarFooterItem({ id: "main", title: "Status", Component: Item });
       `),
     );
@@ -203,7 +204,9 @@ describe("evaluatePluginClientBundle", () => {
     expect(plugin.surfaces[1]?.title).toBeTypeOf("function");
     expect(plugin.sidebarItems.header.map(({ id, title }) => ({ id, title }))).toEqual([
       { id: "main", title: "Example" },
+      { id: "folders", title: "Folders" },
     ]);
+    expect(plugin.sidebarItems.header[1]?.placement).toBe("pinned");
     expect(plugin.sidebarItems.footer.map(({ id, title }) => ({ id, title }))).toEqual([
       { id: "main", title: "Status" },
     ]);
@@ -211,6 +214,14 @@ describe("evaluatePluginClientBundle", () => {
   });
 
   it.each([
+    [
+      `plugin.addSidebarFooterItem({ id: "bad", title: "Bad", placement: "pinned", Component: Screen });`,
+      "Invalid sidebar footer placement",
+    ],
+    [
+      `plugin.addSidebarHeaderItem({ id: "bad", title: "Bad", placement: "elsewhere", Component: Screen });`,
+      "Invalid sidebar header placement",
+    ],
     [`plugin.addScreen("main", Screen);`, "addScreen takes { id, title, Component }"],
     [`plugin.addScreen({ id: "main", Component: Screen });`, "Screen main needs a title"],
     [

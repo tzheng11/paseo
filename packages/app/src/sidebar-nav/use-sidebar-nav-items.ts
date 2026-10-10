@@ -1,8 +1,10 @@
 import { useCallback, useMemo } from "react";
+import { usePathname } from "expo-router";
 import { useAppSettings } from "@/hooks/use-settings";
 import type { AppSettings } from "@/hooks/use-settings/storage";
 import { useInstalledPlugins } from "@/plugins/registry";
-import { groupPluginSidebarItems } from "@/plugins/sidebar-groups";
+import { filterPluginSidebarPlacement, groupPluginSidebarItems } from "@/plugins/sidebar-groups";
+import { hostIdFromPathname } from "@/plugins/routes";
 import {
   moveSidebarNavItem,
   resolveSidebarNavItems,
@@ -27,10 +29,19 @@ export function useSidebarNavItems<Section extends SidebarSection>(
   section: Section,
 ): UseSidebarNavItemsReturn<Section> {
   const plugins = useInstalledPlugins();
+  const pathname = usePathname();
   const { settings, updateSettings } = useAppSettings();
   const field = PREFERENCE_FIELDS[section];
   const preferences = settings[field];
-  const pluginGroups = useMemo(() => groupPluginSidebarItems(plugins, section), [plugins, section]);
+  const pluginGroups = useMemo(
+    () =>
+      filterPluginSidebarPlacement(
+        groupPluginSidebarItems(plugins, section),
+        "navigation",
+        hostIdFromPathname(pathname),
+      ),
+    [plugins, section, pathname],
+  );
 
   const items = useMemo(
     () => resolveSidebarNavItems({ section, pluginGroups, preferences }),

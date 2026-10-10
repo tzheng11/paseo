@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   descendants,
+  migrateOrganization,
   moveNode,
   organizationSchema,
   removeNode,
@@ -31,22 +32,74 @@ const workspace = (
 });
 
 describe("shared workspace organization", () => {
-  it("starts empty and preserves cross-host references, nested workspaces and links", () => {
+  it("preserves nested folders, cross-host workspace leaves and links", () => {
     expect(organizationSchema.parse({})).toEqual({ nodes: [] });
-    const parent = workspace("studio", "same");
-    const child = workspace("laptop", "same", parent.id);
+    const parent = folder("project");
+    const childFolder = folder("development", parent.id);
+    const studio = workspace("studio", "same", parent.id);
+    const child = workspace("laptop", "same", childFolder.id);
     const document = organizationSchema.parse({
       nodes: [
         parent,
+        childFolder,
+        studio,
         {
           ...child,
           links: [{ id: "notion", title: "Project", url: "https://app.notion.com/p/project" }],
         },
       ],
     });
-    expect(document.nodes).toHaveLength(2);
-    expect(document.nodes[1].parentId).toBe(parent.id);
+    expect(document.nodes).toHaveLength(4);
+    expect(document.nodes[3].parentId).toBe(childFolder.id);
     expect(workspaceIdentity("a:b", "c")).not.toBe(workspaceIdentity("a", "b:c"));
+  });
+
+  it.each(["folder", "workspace"])("rejects a %s inside a workspace", (kind) => {
+    const parent = workspace("studio", "parent");
+    const child =
+      kind === "folder" ? folder("child", parent.id) : workspace("laptop", "child", parent.id);
+    const result = organizationSchema.safeParse({ nodes: [parent, child] });
+    expect(result.success).toBe(false);
+    if (!result.success)
+      expect(result.error.issues[0].message).toBe("Only folders can contain entries");
+  });
+
+  it("upgrades workspace parents to their nearest folder without losing order or links", () => {
+    const project = folder("project");
+    const studio = workspace("studio", "parent", project.id);
+    const laptop = workspace("laptop", "child", studio.id);
+    const nested = {
+      ...folder("nested", laptop.id),
+      links: [{ id: "n", title: "Project", url: "https://notion.so/project" }],
+    };
+    const rootWorkspace = workspace("other", "root");
+    const rootChild = workspace("other", "child", rootWorkspace.id);
+    const result = migrateOrganization(
+      { nodes: [project, studio, laptop, nested, rootWorkspace, rootChild] },
+      1,
+    );
+    expect(result.nodes.map((node) => node.parentId)).toEqual([
+      null,
+      project.id,
+      project.id,
+      project.id,
+      null,
+      null,
+    ]);
+    expect(result.nodes[3].links).toEqual(nested.links);
+    expect(result.nodes.map((node) => node.id)).toEqual(
+      [project, studio, laptop, nested, rootWorkspace, rootChild].map((node) => node.id),
+    );
+  });
+
+  it("refuses corrupt migration input instead of discarding saved data", () => {
+    const a = workspace("studio", "a", "studio-b");
+    const b = workspace("studio", "b", "studio-a");
+    expect(() => migrateOrganization({ nodes: [a, b] }, 1)).toThrow("cycle");
+    expect(() => migrateOrganization({ nodes: [folder("a", "missing")] }, 1)).toThrow(
+      "missing parent",
+    );
+    expect(() => migrateOrganization({ nodes: [] }, 3)).toThrow("Unsupported");
   });
 
   it.each([

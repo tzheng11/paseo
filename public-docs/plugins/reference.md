@@ -940,10 +940,17 @@ screen with other params shows the new params.
 
 `addSidebarHeaderItem` adds a row to the list at the top of the sidebar. `addSidebarFooterItem`
 adds a row to the footer, between **Add project** and the footer's icon row. The icon row is fixed;
-plugins can't add to it. Both take `{ id, title, Component }`. `title` labels the item in
+plugins can't add to it. Both take `{ id, title, Component, placement? }`. The default placement is
+`"navigation"`. `title` labels navigation items in
 Settings > Sidebar, where users reorder and hide items, and is the default label and accessibility
 label of `SidebarRow`. Settings shows a generic plugin icon for these items; a row from the
 deprecated `addSidebarItem` keeps its registered icon.
+
+A header item can set `placement: "pinned"` to render inside the Pinned section in every sidebar
+grouping mode. This slot scrolls and collapses with Pinned, above regular pinned workspaces. It
+does not appear among Settings > Sidebar navigation rows. The plugin owns its content and storage;
+placement alone does not change workspace pin state, sorting, or keyboard shortcuts. Footer items
+reject `"pinned"` placement. Use the matching fork client for this slot.
 
 With the plugin on several hosts, an item renders from the host of the screen the app shows. Off a
 host's screens, it uses the host last picked in one of the plugin's screens or last opened from one

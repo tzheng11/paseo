@@ -82,8 +82,10 @@ export interface PluginSidebarItemProps extends PluginNavigableHostProps {
 
 export interface PluginSidebarItemContribution {
   id: string;
-  /** Settings row label, accessibility label, and default label for SidebarRow. */
+  /** Default SidebarRow label; navigation items also use it in Settings > Sidebar. */
   title: string;
+  /** Header items can render inside Pinned instead of the navigation rows. */
+  placement?: "navigation" | "pinned";
   Component: ComponentType<PluginSidebarItemProps>;
 }
 

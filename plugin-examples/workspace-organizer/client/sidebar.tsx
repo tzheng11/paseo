@@ -1,17 +1,16 @@
 import { useCallback, useMemo, useState } from "react";
-import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { Pressable, StyleSheet, Text, View } from "react-native";
 import {
   openExternalUrl,
   useHosts,
   useSettings,
   type PluginSidebarItemProps,
 } from "@getpaseo/plugin/client";
-import { SidebarRow, SidebarSeparator } from "@getpaseo/plugin/client/ui";
+import { SidebarRow } from "@getpaseo/plugin/client/ui";
 import { organization, type OrganizationNode, type ProjectLink } from "../shared/organization";
 
 const styles = StyleSheet.create({
   nested: { marginLeft: 12 },
-  tree: { maxHeight: 280 },
   toggle: { padding: 8 },
 });
 
@@ -57,7 +56,7 @@ function NodeRow({
     node.kind === "workspace" ? hosts.find((entry) => entry.serverId === node.serverId) : null;
   const offline = node.kind === "workspace" && host?.status !== "online";
   const children = nodes.filter((child) => child.parentId === node.id);
-  const hasChildren = children.length > 0 || node.links.length > 0;
+  const hasChildren = node.kind === "folder" || node.links.length > 0;
   const toggle = useCallback(() => setCollapsed((current) => !current), []);
   const open = useCallback(() => {
     onError(null);
@@ -128,8 +127,8 @@ export function OrganizationSidebar(props: PluginSidebarItemProps) {
   const textStyle = useMemo(() => ({ color: theme.colors.foregroundMuted, padding: 12 }), [theme]);
   return (
     <>
-      <SidebarRow id="manage" icon="FolderTree" label="Organize workspaces" onPress={open} />
-      <ScrollView style={styles.tree} nestedScrollEnabled>
+      <SidebarRow id="manage" icon="FolderTree" label="Organize pinned folders" onPress={open} />
+      <View>
         {settings.status === "ready" ? (
           settings.values.nodes
             .filter((node) => node.parentId === null)
@@ -147,13 +146,12 @@ export function OrganizationSidebar(props: PluginSidebarItemProps) {
             {settings.status === "loading" ? "Loading organization…" : "Organization unavailable"}
           </Text>
         )}
-      </ScrollView>
+      </View>
       {error ? (
         <Text accessibilityRole="alert" style={textStyle}>
           {error}
         </Text>
       ) : null}
-      <SidebarSeparator />
     </>
   );
 }

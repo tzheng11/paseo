@@ -65,6 +65,7 @@ export const organizationSchema = z
         if (!parent) message = "The parent entry does not exist";
         else if (visited.has(parentId))
           message = "An entry cannot be nested inside itself or a descendant";
+        else if (parent.kind !== "folder") message = "Only folders can contain entries";
         else if (visited.size >= 20) message = "Organization nesting supports up to 20 levels";
         if (message) {
           context.addIssue({ code: "custom", path: ["nodes", index, "parentId"], message });
@@ -77,11 +78,36 @@ export const organizationSchema = z
   });
 
 export type Organization = z.output<typeof organizationSchema>;
+
+// The earlier spike allowed workspace parents. Keep every reference and link, lifting each
+// child to its nearest folder ancestor when upgrading to the folder-only tree.
+export function migrateOrganization(values: unknown, fromVersion: number): Organization {
+  if (fromVersion !== 1) throw new Error(`Unsupported organization version: ${fromVersion}`);
+  const previous = z.object({ nodes: z.array(organizationNodeSchema).max(1000) }).parse(values);
+  const byId = new Map(previous.nodes.map((node) => [node.id, node]));
+  return organizationSchema.parse({
+    nodes: previous.nodes.map((node) => {
+      let parentId = node.parentId;
+      const visited = new Set([node.id]);
+      while (parentId !== null) {
+        if (visited.has(parentId)) throw new Error("Saved organization contains a cycle");
+        visited.add(parentId);
+        const parent = byId.get(parentId);
+        if (!parent) throw new Error("Saved organization has a missing parent");
+        if (parent.kind === "folder") break;
+        parentId = parent.parentId;
+      }
+      return Object.assign({}, node, { parentId });
+    }),
+  });
+}
+
 export const organization = defineSettings({
   id: "organization",
   scope: "host",
-  version: 1,
+  version: 2,
   schema: organizationSchema,
+  migrate: migrateOrganization,
 });
 
 // JSON tuple encoding keeps identities distinct even if either component contains a separator.
