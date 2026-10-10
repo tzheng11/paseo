@@ -2,6 +2,8 @@
 
 A Studio-owned organization shared by every client connected to Studio. See [the overview](OVERVIEW.md) for the workflow and limits.
 
+Browser captures: [wide layout](screenshots/web-wide.png) and [compact layout](screenshots/web-compact.png).
+
 ## Run
 
 From this checkout, build the SDK and typecheck the example:
