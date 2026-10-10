@@ -1203,6 +1203,11 @@ export const en = {
     },
     pinned: {
       title: "Pinned",
+      sort: {
+        label: "Sort pinned workspaces",
+        manual: "Manual",
+        alphabetical: "A–Z",
+      },
     },
     host: {
       noHost: "No host",

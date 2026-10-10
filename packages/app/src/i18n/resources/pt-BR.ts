@@ -1221,6 +1221,11 @@ export const ptBR: TranslationResources = {
     },
     pinned: {
       title: "Fixados",
+      sort: {
+        label: "Ordenar espaços de trabalho fixados",
+        manual: "Manual",
+        alphabetical: "A–Z",
+      },
     },
     host: {
       noHost: "Nenhum host",

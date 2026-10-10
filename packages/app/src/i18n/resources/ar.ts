@@ -1195,6 +1195,11 @@ export const ar: TranslationResources = {
     },
     pinned: {
       title: "المثبتة",
+      sort: {
+        label: "ترتيب مساحات العمل المثبّتة",
+        manual: "يدوي",
+        alphabetical: "A–Z",
+      },
     },
     host: {
       noHost: "لا مضيف",

@@ -1187,6 +1187,11 @@ export const zhCN: TranslationResources = {
     },
     pinned: {
       title: "已置顶",
+      sort: {
+        label: "对置顶工作区排序",
+        manual: "手动",
+        alphabetical: "A–Z",
+      },
     },
     host: {
       noHost: "没有 Host",

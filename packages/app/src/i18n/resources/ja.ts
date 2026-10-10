@@ -1209,6 +1209,11 @@ export const ja: TranslationResources = {
     },
     pinned: {
       title: "固定済み",
+      sort: {
+        label: "ピン留めしたワークスペースを並べ替え",
+        manual: "手動",
+        alphabetical: "A–Z",
+      },
     },
     host: {
       noHost: "ホストなし",

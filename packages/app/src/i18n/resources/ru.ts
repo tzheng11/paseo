@@ -1213,6 +1213,11 @@ export const ru: TranslationResources = {
     },
     pinned: {
       title: "Закреплённые",
+      sort: {
+        label: "Сортировка закреплённых рабочих пространств",
+        manual: "Вручную",
+        alphabetical: "A–Z",
+      },
     },
     host: {
       noHost: "Нет хоста",
