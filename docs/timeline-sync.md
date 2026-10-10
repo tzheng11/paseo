@@ -15,9 +15,10 @@ by processes that have exited.
 Each source event advances the stream sequence, then replaces the previous tool state or merges
 into the current text item. Intermediate payloads are never retained for history or catch-up.
 History imports stage events on disk before changing the readable timeline, then commit batches
-of 64 events. Applying the staged file is synchronous, preserving the previous ordering boundary:
-live events cannot interleave between imported rows. Large imports occupy the event loop while
-applying disk writes, so validate reopen latency on the deployment host. A failed provider stream leaves the previous timeline readable. Deferred publication
+of 64 events, yielding an event-loop turn between batches. Replay uses the same per-agent queue
+as live events, so new events wait behind the complete import while other agents and connections
+remain responsive. History requests wait for that queue until the agent's history is primed.
+A failed provider stream leaves the previous timeline readable. Deferred publication
 replays the staged file instead of retaining another full timeline array.
 
 Ordinary pages read only selected rows from disk. Explicit full-history reads (`limit: 0`, exports,
@@ -25,6 +26,9 @@ and forks) and tails expanded by interleaved lifecycle updates can still allocat
 The row-cache budget excludes those responses and provider-owned history-loading buffers. Claude's
 transcript reader and Codex's `thread/read` still materialize provider history before yielding it;
 this change bounds retained daemon history and manager replay buffers, not every provider's peak.
+Codex and JSONL RPC transports bound each stdout frame to 64 MiB before decoding it. An oversized
+frame closes only that provider process and rejects its pending requests. Provider transcripts
+remain unchanged; the transport does not discard a response and keep pretending the session is healthy.
 The cache requires Node 22.13 or later, or Electron's bundled Node with `node:sqlite` support.
 
 The invariants are:

@@ -6,6 +6,7 @@ import type { PluginSessionOpenRequest } from "@getpaseo/plugin/server";
 import { randomUUID } from "node:crypto";
 import { basename, resolve } from "node:path";
 import { stat } from "node:fs/promises";
+import { setImmediate } from "node:timers/promises";
 import {
   AGENT_LIFECYCLE_STATUSES,
   type AgentLifecycleStatus,
@@ -558,16 +559,17 @@ async function* projectHistoryReplay(
   }
 }
 
-function* historyTimelineBatches(
+async function* historyTimelineBatches(
   history: AgentHistoryReplay<HistoryReplayEvent>,
-): Generator<Extract<HistoryReplayEvent, { type: "timeline" }>[]> {
+): AsyncGenerator<Extract<HistoryReplayEvent, { type: "timeline" }>[]> {
   let batch: Extract<HistoryReplayEvent, { type: "timeline" }>[] = [];
-  for (const event of history.eventsSync()) {
+  for await (const event of history.events()) {
     if (event.type !== "timeline") continue;
     batch.push(event);
     if (batch.length === 64) {
       yield batch;
       batch = [];
+      await setImmediate();
     }
   }
   if (batch.length) yield batch;
@@ -3930,44 +3932,45 @@ export class AgentManager {
       pendingRun.stagedEvents.push(event);
       return;
     }
-    const previous = this.sessionEventTails.get(agentId) ?? Promise.resolve();
-    const next = previous
-      .catch(() => undefined)
-      .then(async () => {
-        const current = this.agents.get(agentId);
-        if (!current) {
-          return;
-        }
-        if (current.session == null) {
-          return;
-        }
-        this.logger.trace(
-          {
-            agentId,
-            provider: event.provider,
-            sessionId: current.persistence?.sessionId ?? undefined,
-            turnId: getAgentStreamEventTurnId(event),
-            event,
-          },
-          "agent.manager.dequeue",
-        );
-        await this.dispatchSessionEvent(current, event);
+    void this.runSessionOperation(agentId, async () => {
+      const current = this.agents.get(agentId);
+      if (!current) {
         return;
-      })
-      .catch((err) => {
-        this.logger.error(
-          { err, agentId, eventType: event.type },
-          "Failed to process session event",
-        );
-      });
-
-    this.sessionEventTails.set(agentId, next);
-    this.trackBackgroundTask(next);
-    void next.finally(() => {
-      if (this.sessionEventTails.get(agentId) === next) {
-        this.sessionEventTails.delete(agentId);
       }
+      if (current.session == null) {
+        return;
+      }
+      this.logger.trace(
+        {
+          agentId,
+          provider: event.provider,
+          sessionId: current.persistence?.sessionId ?? undefined,
+          turnId: getAgentStreamEventTurnId(event),
+          event,
+        },
+        "agent.manager.dequeue",
+      );
+      await this.dispatchSessionEvent(current, event);
+      return;
+    }).catch((err) => {
+      this.logger.error({ err, agentId, eventType: event.type }, "Failed to process session event");
     });
+  }
+
+  private runSessionOperation(agentId: string, operation: () => Promise<void>): Promise<void> {
+    const previous = this.sessionEventTails.get(agentId) ?? Promise.resolve();
+    const result = previous.then(operation);
+    const settled = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.sessionEventTails.set(agentId, settled);
+    this.trackBackgroundTask(settled);
+    void settled.then(() => {
+      if (this.sessionEventTails.get(agentId) === settled) this.sessionEventTails.delete(agentId);
+      return undefined;
+    });
+    return result;
   }
 
   /**
@@ -4167,40 +4170,43 @@ export class AgentManager {
     broadcast: boolean,
     broadcastTimeline: boolean,
   ): Promise<void> {
-    const history = await AgentHistoryReplay.create(
-      projectHistoryReplay(agent.session.streamHistory()),
-    );
-    try {
-      this.agentStreamCoalescer.flushAndDiscard(agent.id);
-      await this.deleteCommittedTimeline(agent.id);
-      this.timelineStore.delete(agent.id);
-      this.timelineStore.initialize(agent.id, { timestamp: new Date().toISOString() });
-      agent.historyPrimed = true;
-      for (const event of this.providerSubagents.deleteParent(agent.id)) {
-        if (broadcast) this.dispatch({ type: "provider_subagent", event });
+    return this.runSessionOperation(agent.id, async () => {
+      agent.historyPrimed = false;
+      const history = await AgentHistoryReplay.create(
+        projectHistoryReplay(agent.session.streamHistory()),
+      );
+      try {
+        this.agentStreamCoalescer.flushAndDiscard(agent.id);
+        await this.deleteCommittedTimeline(agent.id);
+        this.timelineStore.delete(agent.id);
+        this.timelineStore.initialize(agent.id, { timestamp: new Date().toISOString() });
+        for (const event of this.providerSubagents.deleteParent(agent.id)) {
+          if (broadcast) this.dispatch({ type: "provider_subagent", event });
+        }
+        for await (const event of history.events()) {
+          if (event.type !== "provider_subagent") continue;
+          const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
+          if (broadcast) this.dispatch({ type: "provider_subagent", event: update });
+        }
+        for await (const batch of historyTimelineBatches(history)) {
+          const rows = this.recordTimelineBatch(agent.id, batch);
+          if (broadcastTimeline)
+            for (let index = 0; index < batch.length; index++) {
+              const row = rows[index];
+              this.dispatchStream(agent.id, batch[index], {
+                seq: row.seq,
+                epoch: this.timelineStore.getEpoch(agent.id),
+                timestamp: row.timestamp,
+              });
+            }
+        }
+        agent.historyPrimed = true;
+        this.touchUpdatedAt(agent);
+        this.emitState(agent);
+      } finally {
+        await history.close();
       }
-      for (const event of history.eventsSync()) {
-        if (event.type !== "provider_subagent") continue;
-        const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
-        if (broadcast) this.dispatch({ type: "provider_subagent", event: update });
-      }
-      for (const batch of historyTimelineBatches(history)) {
-        const rows = this.recordTimelineBatch(agent.id, batch);
-        if (broadcastTimeline)
-          for (let index = 0; index < batch.length; index++) {
-            const row = rows[index];
-            this.dispatchStream(agent.id, batch[index], {
-              seq: row.seq,
-              epoch: this.timelineStore.getEpoch(agent.id),
-              timestamp: row.timestamp,
-            });
-          }
-      }
-      this.touchUpdatedAt(agent);
-      this.emitState(agent);
-    } finally {
-      await history.close();
-    }
+    });
   }
 
   private async primeTimelineFromLegacyProviderHistory(
@@ -4211,58 +4217,61 @@ export class AgentManager {
       | Iterable<AgentStreamEvent>
       | AgentHistoryReplay<HistoryReplayEvent> = agent.session.streamHistory(),
   ): Promise<void> {
-    agent.historyPrimed = false;
-    let history: AgentHistoryReplay<HistoryReplayEvent>;
-    try {
-      history =
-        source instanceof AgentHistoryReplay
-          ? source
-          : await AgentHistoryReplay.create(projectHistoryReplay(source));
-    } catch (error) {
-      this.logger.warn({ err: error, agentId: agent.id }, "Failed to hydrate provider history");
-      throw error;
-    }
-    try {
-      await this.deleteCommittedTimeline(agent.id);
-      const deferredBroadcast = typeof broadcast === "function";
-      // These descriptors are also retained by ProviderSubagentStore. Timeline
-      // payloads stay in the staged file, including during deferred publication.
-      const providerSubagentEvents: AgentManagerEvent[] = [];
-      for (const event of history.eventsSync()) {
-        if (event.type !== "provider_subagent") continue;
-        const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
-        const managerEvent: AgentManagerEvent = { type: "provider_subagent", event: update };
-        if (deferredBroadcast) providerSubagentEvents.push(managerEvent);
-        else if (broadcast) this.dispatch(managerEvent);
+    return this.runSessionOperation(agent.id, async () => {
+      if (agent.historyPrimed) return;
+      agent.historyPrimed = false;
+      let history: AgentHistoryReplay<HistoryReplayEvent>;
+      try {
+        history =
+          source instanceof AgentHistoryReplay
+            ? source
+            : await AgentHistoryReplay.create(projectHistoryReplay(source));
+      } catch (error) {
+        this.logger.warn({ err: error, agentId: agent.id }, "Failed to hydrate provider history");
+        throw error;
       }
-      const startSeq = this.timelineStore.getNextSeq(agent.id);
-      for (const batch of historyTimelineBatches(history)) {
-        const rows = this.recordTimelineBatch(agent.id, batch);
-        if (!deferredBroadcast && broadcast)
-          for (let index = 0; index < batch.length; index++) {
-            const row = rows[index];
-            this.dispatchStream(agent.id, batch[index], {
-              seq: row.seq,
-              epoch: this.timelineStore.getEpoch(agent.id),
-              timestamp: row.timestamp,
-            });
-          }
+      try {
+        await this.deleteCommittedTimeline(agent.id);
+        const deferredBroadcast = typeof broadcast === "function";
+        // These descriptors are also retained by ProviderSubagentStore. Timeline
+        // payloads stay in the staged file, including during deferred publication.
+        const providerSubagentEvents: AgentManagerEvent[] = [];
+        for await (const event of history.events()) {
+          if (event.type !== "provider_subagent") continue;
+          const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
+          const managerEvent: AgentManagerEvent = { type: "provider_subagent", event: update };
+          if (deferredBroadcast) providerSubagentEvents.push(managerEvent);
+          else if (broadcast) this.dispatch(managerEvent);
+        }
+        const startSeq = this.timelineStore.getNextSeq(agent.id);
+        for await (const batch of historyTimelineBatches(history)) {
+          const rows = this.recordTimelineBatch(agent.id, batch);
+          if (!deferredBroadcast && broadcast)
+            for (let index = 0; index < batch.length; index++) {
+              const row = rows[index];
+              this.dispatchStream(agent.id, batch[index], {
+                seq: row.seq,
+                epoch: this.timelineStore.getEpoch(agent.id),
+                timestamp: row.timestamp,
+              });
+            }
+        }
+        agent.historyPrimed = true;
+        if (typeof broadcast !== "function" || !broadcast()) return;
+        for (const event of providerSubagentEvents) this.dispatch(event);
+        let seq = startSeq;
+        for await (const event of history.events()) {
+          if (event.type !== "timeline") continue;
+          this.dispatchStream(agent.id, event, {
+            seq: seq++,
+            epoch: this.timelineStore.getEpoch(agent.id),
+            timestamp: event.timestamp!,
+          });
+        }
+      } finally {
+        if (!(source instanceof AgentHistoryReplay)) await history.close();
       }
-      agent.historyPrimed = true;
-      if (typeof broadcast !== "function" || !broadcast()) return;
-      for (const event of providerSubagentEvents) this.dispatch(event);
-      let seq = startSeq;
-      for (const event of history.eventsSync()) {
-        if (event.type !== "timeline") continue;
-        this.dispatchStream(agent.id, event, {
-          seq: seq++,
-          epoch: this.timelineStore.getEpoch(agent.id),
-          timestamp: event.timestamp!,
-        });
-      }
-    } finally {
-      if (!(source instanceof AgentHistoryReplay)) await history.close();
-    }
+    });
   }
 
   private notifyForegroundTurnWaiters(agentId: string, event: AgentStreamEvent): void {
