@@ -1892,6 +1892,59 @@ describe("WorkspaceGitService checkout observation", () => {
     },
   );
 
+  test.each([REPO_CWD, GIT_DIR])(
+    "background recovery allows a healthy inventory beyond the initial deadline: %s",
+    async (failedDirectory) => {
+      const watcher = createWatcherHarness();
+      const subscribeNormally = watcher.subscribe.getMockImplementation()!;
+      const recoverySubscription = createDeferred<{
+        updateIgnore: (paths: string[]) => Promise<void>;
+        unsubscribe: () => Promise<void>;
+      }>();
+      let firstAttempt = true;
+      watcher.subscribe.mockImplementation(async (directory, callback, options) => {
+        if (directory !== failedDirectory) return subscribeNormally(directory, callback, options);
+        if (firstAttempt) {
+          firstAttempt = false;
+          throw new Error("initial watcher unavailable");
+        }
+        return recoverySubscription.promise;
+      });
+      const logger = createLogger();
+      const service = createService(
+        watcher,
+        { getWorkspaceGitSelfHealPhaseMs: () => 1_000_000 },
+        logger,
+      );
+      const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+      await vi.waitFor(() => {
+        expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
+        expect(getWatcherSubscribeCallCount(watcher, failedDirectory)).toBe(1);
+      });
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(getWatcherSubscribeCallCount(watcher, failedDirectory)).toBe(2);
+      await vi.advanceTimersByTimeAsync(15_000);
+
+      const recovery = watcher.subscribe.mock.calls.findLast(
+        ([directory]) => directory === failedDirectory,
+      )!;
+      const opened = await subscribeNormally(...recovery);
+      recoverySubscription.resolve(opened);
+      await vi.waitFor(() => {
+        expect(logger.info).toHaveBeenCalledWith(
+          expect.any(Object),
+          failedDirectory === GIT_DIR
+            ? "Repository metadata watcher recovered"
+            : "Working tree watcher recovered",
+        );
+      });
+      expect(opened.unsubscribe).not.toHaveBeenCalled();
+
+      subscription.unsubscribe();
+      service.dispose();
+    },
+  );
+
   test("setup-time watcher error defers recovery until subscribe settles", async () => {
     const watcher = createWatcherHarness();
     const openedSubscription = createDeferred<{

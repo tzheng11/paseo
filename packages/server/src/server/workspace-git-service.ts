@@ -116,6 +116,9 @@ const WORKING_TREE_KNOWN_DIRECTORIES_MAX = 50_000;
 export const WORKSPACE_GIT_REFRESH_CONCURRENCY = 4;
 export const WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY = 2;
 export const WORKSPACE_GIT_WATCHER_SUBSCRIBE_TIMEOUT_MS = 10_000;
+// Recovery runs in the background. A large inventory can need a minute under
+// load; reusing the initial RPC deadline would discard every healthy attempt.
+const WATCH_RECOVERY_SUBSCRIBE_TIMEOUT_MS = 120_000;
 const WATCH_RECOVERY_BASE_DELAY_MS = 30_000;
 // Giving up permanently leaves polling as the only behaviour until a daemon
 // restart, which kills running agents. Back off, but keep trying.
@@ -408,10 +411,8 @@ class WorkspaceGitServiceDisposedError extends Error {
 }
 
 class WorkspaceGitWatcherSubscriptionTimeoutError extends Error {
-  constructor(watchPath: string) {
-    super(
-      `Watcher subscription for ${watchPath} timed out after ${WORKSPACE_GIT_WATCHER_SUBSCRIBE_TIMEOUT_MS}ms`,
-    );
+  constructor(watchPath: string, timeoutMs: number) {
+    super(`Watcher subscription for ${watchPath} timed out after ${timeoutMs}ms`);
     this.name = "WorkspaceGitWatcherSubscriptionTimeoutError";
   }
 }
@@ -1384,6 +1385,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     callback: FileObserverCallback,
     options: FileObserverOptions,
     onSubscribeSettled: () => void,
+    timeoutMs = WORKSPACE_GIT_WATCHER_SUBSCRIBE_TIMEOUT_MS,
   ): Promise<FileObserverSubscription> {
     this.assertNotDisposed();
     const signal = this.disposeController.signal;
@@ -1413,8 +1415,8 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     const timeoutPromise = new Promise<never>((_resolve, reject) => {
       timeout = setTimeout(() => {
         outcome = "expired";
-        reject(new WorkspaceGitWatcherSubscriptionTimeoutError(watchPath));
-      }, WORKSPACE_GIT_WATCHER_SUBSCRIBE_TIMEOUT_MS);
+        reject(new WorkspaceGitWatcherSubscriptionTimeoutError(watchPath, timeoutMs));
+      }, timeoutMs);
     });
     const disposalPromise = new Promise<never>((_resolve, reject) => {
       const rejectForDisposal = () => {
@@ -1521,6 +1523,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
         },
         { ignore },
         markSubscribeSettled,
+        options?.replaceFallback ? WATCH_RECOVERY_SUBSCRIBE_TIMEOUT_MS : undefined,
       );
       if (watcherErrored) {
         await this.unsubscribeWatcherSubscription(subscription, target.watchPath);
@@ -2226,6 +2229,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
         },
         { ignore },
         markSubscribeSettled,
+        options?.replaceFallback ? WATCH_RECOVERY_SUBSCRIBE_TIMEOUT_MS : undefined,
       );
       openedSubscription = subscription;
       await canary.verify(this.disposeController.signal);
