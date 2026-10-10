@@ -1816,6 +1816,82 @@ describe("WorkspaceGitService checkout observation", () => {
     service.dispose();
   });
 
+  test.each([REPO_CWD, GIT_DIR])(
+    "initial watcher rejection recovers with backoff: %s",
+    async (failedDirectory) => {
+      const failedDirectories = new Set([failedDirectory]);
+      const watcher = createWatcherHarness({ failDirectories: failedDirectories });
+      const service = createService(watcher, {
+        getWorkspaceGitSelfHealPhaseMs: () => 1_000_000,
+      });
+      const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+      await vi.waitFor(() => {
+        expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
+        expect(getWatcherSubscribeCallCount(watcher, failedDirectory)).toBe(1);
+      });
+
+      failedDirectories.clear();
+      await vi.advanceTimersByTimeAsync(29_000);
+      expect(getWatcherSubscribeCallCount(watcher, failedDirectory)).toBe(1);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.waitFor(() => {
+        expect(getWatcherSubscribeCallCount(watcher, failedDirectory)).toBe(2);
+      });
+      expect(getWatcherRecordsForDirectory(watcher, failedDirectory)).toHaveLength(1);
+
+      subscription.unsubscribe();
+      service.dispose();
+    },
+  );
+
+  test.each([REPO_CWD, GIT_DIR])(
+    "initial watcher timeout waits for the expired attempt before recovery: %s",
+    async (failedDirectory) => {
+      const watcher = createWatcherHarness();
+      const subscribeNormally = watcher.subscribe.getMockImplementation()!;
+      const openedSubscription = createDeferred<{
+        updateIgnore: (paths: string[]) => Promise<void>;
+        unsubscribe: () => Promise<void>;
+      }>();
+      const expiredUnsubscribe = vi.fn(async () => {});
+      let firstAttempt = true;
+      watcher.subscribe.mockImplementation(async (directory, callback, options) => {
+        if (directory === failedDirectory && firstAttempt) {
+          firstAttempt = false;
+          return openedSubscription.promise;
+        }
+        return subscribeNormally(directory, callback, options);
+      });
+      const service = createService(watcher, {
+        getWorkspaceGitSelfHealPhaseMs: () => 1_000_000,
+      });
+      const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+      await vi.waitFor(() => {
+        expect(getWatcherSubscribeCallCount(watcher, failedDirectory)).toBe(1);
+      });
+      await vi.advanceTimersByTimeAsync(45_000);
+      expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
+      expect(getWatcherSubscribeCallCount(watcher, failedDirectory)).toBe(1);
+
+      openedSubscription.resolve({
+        updateIgnore: vi.fn(async () => {}),
+        unsubscribe: expiredUnsubscribe,
+      });
+      await vi.waitFor(() => {
+        expect(expiredUnsubscribe).toHaveBeenCalledTimes(1);
+      });
+      await vi.advanceTimersByTimeAsync(29_000);
+      expect(getWatcherSubscribeCallCount(watcher, failedDirectory)).toBe(1);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.waitFor(() => {
+        expect(getWatcherSubscribeCallCount(watcher, failedDirectory)).toBe(2);
+      });
+
+      subscription.unsubscribe();
+      service.dispose();
+    },
+  );
+
   test("setup-time watcher error defers recovery until subscribe settles", async () => {
     const watcher = createWatcherHarness();
     const openedSubscription = createDeferred<{

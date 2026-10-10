@@ -1561,8 +1561,15 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
         { err: error, cwd: target.cwd },
         "Failed to start working tree watcher; using degraded polling",
       );
+      // A deadline can expire while subscribe is still building its inventory.
+      // Retry initial failures too, but let markSubscribeSettled defer that retry
+      // until the expired attempt has finished instead of overlapping scans.
+      watcherErrored = true;
       if (!options?.replaceFallback) {
         this.startWorkingTreeWatchFallback(target, "watcher_setup_failed");
+      }
+      if (subscribeSettled) {
+        this.scheduleWorkingTreeWatchRecovery(target);
       }
       return false;
     }
@@ -1708,7 +1715,6 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     }
     const recovered = await this.startWorkingTreeSubscription(target, { replaceFallback: true });
     if (!recovered) {
-      this.scheduleWorkingTreeWatchRecovery(target);
       return;
     }
     this.logger.info({ cwd: target.cwd }, "Working tree watcher recovered");
@@ -2262,8 +2268,14 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
         { err: error, repoGitRoot: target.repoGitRoot },
         "Failed to start repository metadata watcher; using degraded polling",
       );
+      // Match working-tree recovery: startup failures must not leave polling
+      // permanent, and an expired subscribe must settle before a new attempt.
+      watcherErrored = true;
       if (!options?.replaceFallback) {
         this.startRepoMetadataFallback(target);
+      }
+      if (subscribeSettled) {
+        this.scheduleRepoMetadataWatchRecovery(target);
       }
       return false;
     }
@@ -2296,7 +2308,6 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     }
     const recovered = await this.startRepoMetadataObservation(target, { replaceFallback: true });
     if (!recovered) {
-      this.scheduleRepoMetadataWatchRecovery(target);
       return;
     }
     this.logger.info({ repoGitRoot: target.repoGitRoot }, "Repository metadata watcher recovered");
