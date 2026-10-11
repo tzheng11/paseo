@@ -518,15 +518,14 @@ test("startup waits for native coverage before a caller's first nested write", a
       },
     },
     paths,
-    (directory, listener, recursive = true) => {
+    async (directory, listener, recursive = true) => {
       registrations.push({ directory, listener, recursive });
-      // FSEvents registers asynchronously and drops pre-registration changes.
+      // The subscription promise is the native registration barrier.
+      await new Promise<void>((done) => setImmediate(done));
+      registered = true;
       return {
         close: () => {},
         on: () => {},
-        flushPendingWatches: () => {
-          registered = true;
-        },
       };
     },
   );
@@ -542,6 +541,111 @@ test("startup waits for native coverage before a caller's first nested write", a
       }
     }
     await expect.poll(() => events.map((event) => event.path)).toContain(observed);
+  } finally {
+    active = false;
+    await backend.close();
+    await observer.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("close waits for an asynchronous native subscription arriving after cancellation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "native-late-subscription-"));
+  const observer = createFileObserver();
+  const paths = createObserverPaths(process.platform);
+  const attaching = Promise.withResolvers<void>();
+  const attached = Promise.withResolvers<void>();
+  const detached = Promise.withResolvers<void>();
+  const detaching = Promise.withResolvers<void>();
+  let active = true;
+  const backend = createNativeRecursiveBackend(
+    {
+      root,
+      metrics: observer.getDiagnostics(),
+      isActive: () => active,
+      isIgnored: () => false,
+      isPathInside: paths.isInside,
+      queueEvent: () => {},
+      fail: (error) => {
+        throw error;
+      },
+    },
+    paths,
+    async () => {
+      attaching.resolve();
+      await attached.promise;
+      return {
+        on: () => {},
+        close: async () => {
+          detaching.resolve();
+          await detached.promise;
+        },
+      };
+    },
+  );
+  try {
+    const startup = backend.start();
+    await attaching.promise;
+    active = false;
+    const closing = backend.close();
+    attached.resolve();
+    await startup;
+    let closed = false;
+    void closing.then(() => {
+      closed = true;
+      return;
+    });
+    await detaching.promise;
+    expect(closed).toBe(false);
+    detached.resolve();
+    await closing;
+    expect(backend.getDiagnostics().nativeHandleCount).toBe(0);
+  } finally {
+    attached.resolve();
+    detached.resolve();
+    active = false;
+    await backend.close();
+    await observer.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a native overflow recovers changes outside the shallow root scan", async () => {
+  const root = await mkdtemp(join(tmpdir(), "native-overflow-"));
+  const directory = join(root, "nested", "deep");
+  await mkdir(directory, { recursive: true });
+  const file = join(directory, "lost.txt");
+  await writeFile(file, "before");
+  const observer = createFileObserver();
+  const paths = createObserverPaths(process.platform);
+  const changes: FileChange[] = [];
+  let notify!: (eventType: string, filename: string | null) => void;
+  let active = true;
+  const backend = createNativeRecursiveBackend(
+    {
+      root,
+      metrics: observer.getDiagnostics(),
+      isActive: () => active,
+      isIgnored: () => false,
+      isPathInside: paths.isInside,
+      queueEvent: (type, path) => changes.push({ type, path }),
+      fail: (error) => {
+        throw error;
+      },
+    },
+    paths,
+    (_root, listener) => {
+      notify = listener;
+      return { close: () => {}, on: () => {} };
+    },
+  );
+  try {
+    await backend.start();
+    await rm(file);
+    notify("overflow", null);
+    await expect
+      .poll(() => changes, { timeout: 3_000 })
+      .toContainEqual({ type: "delete", path: file });
   } finally {
     active = false;
     await backend.close();

@@ -22,30 +22,33 @@ afterEach(async () => {
   roots.clear();
 });
 
-test("observes nested files while pruning excluded directories", async () => {
-  const root = await createRoot();
-  const ignored = join(root, "ignored");
-  const observed = join(root, "nested");
-  await mkdir(ignored);
-  await mkdir(observed);
-  const events: FileChange[] = [];
-  const subscription = await subscribeToFileChanges(
-    root,
-    (error, batch) => {
-      expect(error).toBeNull();
-      events.push(...batch);
-    },
-    { ignore: [ignored] },
-  );
+test.each(["ignored", "[ignored]"])(
+  "observes nested files while pruning literal excluded directory %s",
+  async (name) => {
+    const root = await createRoot();
+    const ignored = join(root, name);
+    const observed = join(root, "nested");
+    await mkdir(ignored);
+    await mkdir(observed);
+    const events: FileChange[] = [];
+    const subscription = await subscribeToFileChanges(
+      root,
+      (error, batch) => {
+        expect(error).toBeNull();
+        events.push(...batch);
+      },
+      { ignore: [ignored] },
+    );
 
-  await writeFile(join(ignored, "ignored.txt"), "ignored");
-  const observedPath = join(observed, "observed.txt");
-  await writeFile(observedPath, "observed");
+    await writeFile(join(ignored, "ignored.txt"), "ignored");
+    const observedPath = join(observed, "observed.txt");
+    await writeFile(observedPath, "observed");
 
-  await expect.poll(() => events.map((event) => event.path)).toContain(observedPath);
-  expect(events.map((event) => event.path)).not.toContain(join(ignored, "ignored.txt"));
-  await subscription.unsubscribe();
-});
+    await expect.poll(() => events.map((event) => event.path)).toContain(observedPath);
+    expect(events.map((event) => event.path)).not.toContain(join(ignored, "ignored.txt"));
+    await subscription.unsubscribe();
+  },
+);
 
 test("an aborted startup is visible in diagnostics and releases its observation", async () => {
   const root = await createRoot();
@@ -398,3 +401,41 @@ function expectFileChanges(paths: string[], type?: FileChange["type"]) {
     },
   };
 }
+
+test.skipIf(process.platform !== "darwin")(
+  "macOS keeps full root coverage with many excluded package outputs and ignore changes",
+  async () => {
+    const observer = createObserver();
+    const directories = await Promise.all(Array.from({ length: 3 }, () => createRoot()));
+    const delivered = new Set<string>();
+    const subscriptions = await Promise.all(
+      directories.map(async (root) => {
+        const ignored = Array.from({ length: 40 }, (_, i) => join(root, `pkg-${i}`, "dist"));
+        await Promise.all(
+          ignored.map(async (directory) => {
+            await mkdir(directory, { recursive: true });
+            await mkdir(join(dirname(directory), "src"));
+          }),
+        );
+        const subscription = await observer.subscribe(
+          root,
+          (error, events) => {
+            expect(error).toBeNull();
+            for (const event of events) delivered.add(event.path);
+          },
+          { ignore: ignored },
+        );
+        // Adding an exclusion must replace one native stream, not fan out a
+        // libuv watch for every parent/sibling in a monorepo.
+        await subscription.updateIgnore([...ignored, join(root, "new-output")]);
+        return subscription;
+      }),
+    );
+    expect(observer.getDiagnostics().nativeHandleCount).toBe(directories.length);
+    const canaries = directories.map((root) => join(root, "pkg-39", "src", "canary.txt"));
+    await Promise.all(canaries.map((path) => writeFile(path, "covered")));
+    await expect.poll(() => canaries.filter((path) => !delivered.has(path))).toEqual([]);
+    await Promise.all(subscriptions.map((subscription) => subscription.unsubscribe()));
+    expect(observer.getDiagnostics().nativeHandleCount).toBe(0);
+  },
+);

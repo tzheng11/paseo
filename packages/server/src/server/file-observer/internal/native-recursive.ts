@@ -4,6 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import type { BackendDiagnostics, ObservationBackend, ObservationHost } from "./contracts.js";
 import type { ObserverPaths } from "./paths.js";
 import { isMissingPathError, toError } from "./paths.js";
+import { watchDarwinDirectory } from "./darwin.js";
 
 const MAX_TRACKED_ENTRIES = 250_000;
 const MAX_NATIVE_WATCHES = 5_000;
@@ -32,42 +33,36 @@ interface Inventory {
   files: Set<string>;
 }
 
-type WatchDirectory = (
+export interface NativeWatch {
+  close(): void | Promise<void>;
+  on(event: "error", listener: (error: Error) => void): unknown;
+}
+
+export type WatchDirectory = (
   root: string,
   listener: (eventType: string, filename: string | null) => void,
   recursive?: boolean,
-) => {
-  close(): void;
-  flushPendingWatches?(): void;
-  on(event: "error", listener: (error: Error) => void): unknown;
-};
+  ignored?: readonly string[],
+) => NativeWatch | Promise<NativeWatch>;
 
 const watchDirectory: WatchDirectory = (root, listener, recursive = true) => {
   const watcher = watch(root, { recursive }, listener);
   return {
     close: () => watcher.close(),
     on: (event, callback) => watcher.on(event, callback),
-    flushPendingWatches: () => {
-      if (process.platform !== "darwin") return;
-      // libuv attaches FSEvents asynchronously and recreates the shared stream
-      // from "now". A close waits for that reschedule; a temporary directory
-      // watch provides the barrier without writing a canary into user files.
-      // https://github.com/libuv/libuv/blob/v1.51.0/src/unix/fsevents.c#L811-L833
-      watch(root, { recursive: false }, () => {}).close();
-    },
   };
 };
 
 export function createNativeRecursiveBackend(
   host: ObservationHost,
   paths: ObserverPaths,
-  observe: WatchDirectory = watchDirectory,
+  observe: WatchDirectory = process.platform === "darwin" ? watchDarwinDirectory : watchDirectory,
 ): ObservationBackend {
   return new NativeRecursiveBackend(host, paths, observe);
 }
 
 class NativeRecursiveBackend implements ObservationBackend {
-  private readonly watchers = new Map<string, ReturnType<WatchDirectory>>();
+  private readonly watchers = new Map<string, NativeWatch>();
   private watchTopologyDirty = true;
   private files = new Set<string>();
   // Files classified before their parent directory has an entries bucket.
@@ -132,8 +127,6 @@ class NativeRecursiveBackend implements ObservationBackend {
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.cancelAudits();
-    for (const watcher of this.watchers.values()) watcher.close();
-    this.watchers.clear();
     this.closePromise = this.finishClose();
     return this.closePromise;
   }
@@ -156,31 +149,38 @@ class NativeRecursiveBackend implements ObservationBackend {
   }
 
   private async finishClose(): Promise<void> {
+    await this.closeWatches();
     await this.reconcileTail;
     this.classificationQueue.length = 0;
     await Promise.allSettled(this.classifications);
-    for (const watcher of this.watchers.values()) watcher.close();
-    this.watchers.clear();
+    await this.closeWatches();
     this.files.clear();
     this.orphanFiles.clear();
     this.directories.clear();
     this.entries.clear();
   }
 
-  // A recursive fs.watch has no exclude option: filtering its callbacks still
-  // delivers every build-output event to JS. Split coverage only along excluded
-  // paths, retaining recursive watches for all subtrees without exclusions.
+  private async closeWatches(): Promise<void> {
+    const watchers = [...this.watchers.values()];
+    this.watchers.clear();
+    await Promise.all(watchers.map((watcher) => watcher.close()));
+  }
+
+  // Windows needs split coverage to omit ignored subtrees. Darwin's backend
+  // filters in native code with one stream per root: thousands of libuv paths
+  // make its shared-stream reschedule and synchronous close stall the JS loop.
   private async syncWatchTopology(): Promise<void> {
     this.watchTopologyDirty = false;
     const ignored = this.host.ignoredRoots ?? [];
     const desired = new Set<string>();
-    let addedWatch: ReturnType<WatchDirectory> | undefined;
+    const nativeExclusions = this.observe === watchDarwinDirectory;
     const pending = [this.host.root];
     while (pending.length && this.host.isActive()) {
       const directory = pending.pop()!;
       if (this.host.isIgnored(directory)) continue;
-      const recursive = !ignored.some((root) => this.host.isPathInside(directory, root));
-      const key = `${recursive}:${directory}`;
+      const recursive =
+        nativeExclusions || !ignored.some((root) => this.host.isPathInside(directory, root));
+      const key = nativeExclusions ? JSON.stringify(ignored) : `${recursive}:${directory}`;
       desired.add(key);
       if (!this.watchers.has(key)) {
         if (this.watchers.size >= MAX_NATIVE_WATCHES) {
@@ -190,8 +190,7 @@ class NativeRecursiveBackend implements ObservationBackend {
           );
         }
         try {
-          this.watchDirectory(directory, recursive, key);
-          addedWatch = this.watchers.get(key);
+          await this.watchDirectory(directory, recursive, key);
         } catch (error) {
           if (directory !== this.host.root && this.paths.isExpectedWatchDisappearance(error))
             continue;
@@ -212,19 +211,19 @@ class NativeRecursiveBackend implements ObservationBackend {
     }
     for (const [key, watcher] of this.watchers) {
       if (desired.has(key)) continue;
-      watcher.close();
+      await watcher.close();
       this.watchers.delete(key);
     }
-    addedWatch?.flushPendingWatches?.();
   }
 
-  private watchDirectory(directory: string, recursive: boolean, key: string): void {
-    const watcher = this.observe(
+  private async watchDirectory(directory: string, recursive: boolean, key: string): Promise<void> {
+    const watcher = await this.observe(
       directory,
       (eventType, filename) => {
         if (!this.host.isActive()) return;
         this.host.metrics.nativeEventCount += 1;
         if (!filename) {
+          if (eventType === "overflow") this.fullAuditRequested = true;
           this.host.metrics.nativePathlessEventCount += 1;
           this.host.queueEvent("update", directory);
           this.watchTopologyDirty = true;
@@ -273,11 +272,12 @@ class NativeRecursiveBackend implements ObservationBackend {
         });
       },
       recursive,
+      this.host.ignoredRoots,
     );
     watcher.on("error", (error) => {
       if (!this.host.isActive()) return;
       if (directory !== this.host.root && this.paths.isExpectedWatchDisappearance(error)) {
-        watcher.close();
+        void this.closeDisappearedWatch(watcher);
         if (this.watchers.get(key) === watcher) this.watchers.delete(key);
         this.watchTopologyDirty = true;
         this.requestAudit(dirname(directory));
@@ -286,6 +286,14 @@ class NativeRecursiveBackend implements ObservationBackend {
       this.host.fail(toError(error));
     });
     this.watchers.set(key, watcher);
+  }
+
+  private async closeDisappearedWatch(watcher: NativeWatch): Promise<void> {
+    try {
+      await watcher.close();
+    } catch (error) {
+      this.host.fail(toError(error));
+    }
   }
 
   private enqueueAudit(emitDiff: boolean, generation: number): Promise<void> {
