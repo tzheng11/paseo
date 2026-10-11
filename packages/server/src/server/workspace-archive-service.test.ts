@@ -189,6 +189,53 @@ function assertArchiveResult(
 }
 
 describe("archiveByScope", () => {
+  test("bounds a stuck post-archive snapshot and handles its late rejection", async () => {
+    const { tempDir, repoDir } = createGitRepo();
+    const workspaceId = "ws-stuck-refresh";
+    const deps = createArchiveDeps({
+      paseoHome: path.join(tempDir, ".paseo"),
+      activeWorkspaces: [{ workspaceId, cwd: repoDir, kind: "directory", mainRepoRoot: repoDir }],
+    });
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let rejectSnapshot!: (error: Error) => void;
+    deps.workspaceGitService.getSnapshot = vi.fn(() => {
+      entered();
+      return new Promise((_, reject) => {
+        rejectSnapshot = reject;
+      });
+    });
+    vi.useFakeTimers();
+    try {
+      const archive = archiveByScope(deps, {
+        scope: { kind: "workspace", workspaceId },
+        requestId: "req-stuck-refresh",
+      });
+      await started;
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(await archive).toMatchObject({
+        archivedWorkspaceIds: [workspaceId],
+        removedDirectory: false,
+      });
+      expect(deps.clearWorkspaceArchiving).toHaveBeenCalledWith([workspaceId]);
+      expect(deps.sessionLogger?.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          err: expect.objectContaining({
+            message: expect.stringContaining("Timed out after 5000ms"),
+          }),
+        }),
+        "Failed to force-refresh workspace git snapshot after archiving",
+      );
+      rejectSnapshot(new Error("late refresh failure"));
+      await Promise.resolve();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("workspace scope archives the record and removes the directory on last reference", async () => {
     const { tempDir, repoDir } = createGitRepo();
     const paseoHome = path.join(tempDir, ".paseo");
