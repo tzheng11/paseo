@@ -206,7 +206,7 @@ async function runAllPollingAdmissionLoad(base: string, roots: string[]) {
     await until(
       () => service.getMetrics().workspaceRefreshInFlightCount === 0,
       "recovery refreshes drain",
-      30_000,
+      120_000,
     );
     const dirtyBeforeEdits = roots.filter((cwd) => service.peekSnapshot(cwd)?.git.isDirty);
     report({ phase: "all-polling-before-edits", dirtyBeforeEdits, observed: observed.size });
