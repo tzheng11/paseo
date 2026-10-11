@@ -52,9 +52,29 @@ function limitPlainText(item: AgentTimelineItem): AgentTimelineItem {
   };
 }
 
+function limitUnknownToolValue(value: unknown): unknown {
+  let changed = false;
+  // JSON's traversal handles nested provider results without adding a recursive
+  // JS walker. This clips the projection only; native tool arguments/results stay
+  // authoritative and permission requests never pass through this function.
+  const serialized = JSON.stringify(value, (_key, field: unknown) => {
+    if (typeof field !== "string" || field.length <= TOOL_CALL_CONTENT_MAX_LENGTH) return field;
+    changed = true;
+    const notice = "\n\n[Content truncated]";
+    return field.slice(0, TOOL_CALL_CONTENT_MAX_LENGTH - notice.length) + notice;
+  });
+  return changed && serialized !== undefined ? JSON.parse(serialized) : value;
+}
+
 export function limitAgentTimelineItemContent(item: AgentTimelineItem): AgentTimelineItem {
   item = limitFailedShellError(item);
   item = limitPlainText(item);
+  if (item.type === "tool_call" && item.detail.type === "unknown") {
+    const input = limitUnknownToolValue(item.detail.input);
+    const output = limitUnknownToolValue(item.detail.output);
+    if (input !== item.detail.input || output !== item.detail.output)
+      return { ...item, detail: { ...item.detail, input, output } };
+  }
   if (
     item.type !== "tool_call" ||
     item.detail.type !== "shell" ||

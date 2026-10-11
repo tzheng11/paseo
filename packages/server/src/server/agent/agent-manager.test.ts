@@ -20,6 +20,8 @@ import {
 } from "./agent-manager.js";
 import { AgentStorage } from "./agent-storage.js";
 import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
+import { DiskAgentTimelineStore } from "./disk-agent-timeline-store.js";
+import { AgentHistoryReplay } from "./agent-history-replay.js";
 import { toAgentPayload } from "./agent-projections.js";
 import { projectTimelineRows } from "./timeline-projection.js";
 import { getOpenAgentTabLabel, PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
@@ -752,6 +754,262 @@ test("refreshing an agent replaces the injected timeline store instead of append
     ]);
   } finally {
     if (agentId) await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("history replay yields to other requests and orders live events after the complete replay", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-cooperative-history-"));
+  const historyCount = 256;
+  const probe = deferred<number>();
+  const concurrentRead = deferred<AgentTimelineItem[]>();
+  let armed = false;
+  const session = new (class extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      for (let index = 0; index < historyCount; index++)
+        yield {
+          type: "timeline",
+          provider: "codex",
+          item: { type: "user_message", messageId: `history-${index}`, text: `row ${index}` },
+        };
+    }
+  })({ provider: "codex", cwd: workdir });
+  const store = new (class extends DiskAgentTimelineStore {
+    override appendBatch(
+      agentId: string,
+      entries: Parameters<InMemoryAgentTimelineStore["appendBatch"]>[1],
+    ): AgentTimelineRow[] {
+      const rows = super.appendBatch(agentId, entries);
+      if (armed) {
+        armed = false;
+        setImmediate(() => {
+          probe.resolve(this.getCount(agentId));
+          void manager
+            .hydrateTimelineFromProvider(agentId)
+            .then(
+              () => concurrentRead.resolve(manager.getTimeline(agentId)),
+              concurrentRead.reject,
+            );
+          session.pushEvent({
+            type: "timeline",
+            provider: "codex",
+            item: { type: "user_message", messageId: "live-after-snapshot", text: "new live work" },
+          });
+        });
+      }
+      return rows;
+    }
+  })({ directory: join(workdir, "projection-cache") });
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, timelineStore: store, logger });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  try {
+    armed = true;
+    await manager.hydrateTimelineFromProvider(agent.id, { force: true });
+    const countAtProbe = await probe.promise;
+    await manager.flush();
+    expect(countAtProbe).toBeGreaterThan(0);
+    expect(countAtProbe).toBeLessThan(historyCount);
+    expect((await concurrentRead.promise).length).toBeGreaterThanOrEqual(historyCount);
+    expect(
+      manager
+        .getTimeline(agent.id)
+        .map((item) => (item.type === "user_message" ? item.messageId : item.type)),
+    ).toEqual([
+      ...Array.from({ length: historyCount }, (_, index) => `history-${index}`),
+      "live-after-snapshot",
+    ]);
+  } finally {
+    await manager.closeAgent(agent.id);
+    await manager.flush();
+    store.close();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("concurrent history imports share an event-loop write budget", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-concurrent-replays-"));
+  const count = 4;
+  const ready = deferred<void>();
+  const probe = deferred<number>();
+  const passes = new WeakMap<object, number>();
+  const originalEvents = AgentHistoryReplay.prototype.events;
+  let waiting = 0;
+  const reader = vi
+    .spyOn(AgentHistoryReplay.prototype, "events")
+    .mockImplementation(async function* (this: AgentHistoryReplay<unknown>) {
+      const pass = (passes.get(this) ?? 0) + 1;
+      passes.set(this, pass);
+      if (pass !== 2) {
+        yield* originalEvents.call(this);
+        return;
+      }
+      // Stage from the real files, then release all four readers together to
+      // reproduce several tabs reopening their histories in the same turn.
+      const rows = [];
+      for await (const row of originalEvents.call(this)) rows.push(row);
+      if (++waiting === count) ready.resolve();
+      await ready.promise;
+      yield* rows;
+    });
+  let appended = 0;
+  let armed = true;
+  const store = new (class extends DiskAgentTimelineStore {
+    override appendBatch(
+      agentId: string,
+      entries: Parameters<InMemoryAgentTimelineStore["appendBatch"]>[1],
+    ): AgentTimelineRow[] {
+      const rows = super.appendBatch(agentId, entries);
+      appended += entries.length;
+      if (armed) {
+        armed = false;
+        setImmediate(() => probe.resolve(appended));
+      }
+      return rows;
+    }
+  })({ directory: join(workdir, "cache") });
+  const client = new (class extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new (class extends TestAgentSession {
+        override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+          for (let index = 0; index < 256; index++)
+            yield {
+              type: "timeline",
+              provider: "codex",
+              item: { type: "user_message", messageId: String(index), text: "reopen" },
+            };
+        }
+      })(config);
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, timelineStore: store, logger });
+  const agents = [];
+  try {
+    for (let index = 0; index < count; index++)
+      agents.push(
+        await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+          workspaceId: undefined,
+        }),
+      );
+    await Promise.all(
+      agents.map((agent) => manager.hydrateTimelineFromProvider(agent.id, { force: true })),
+    );
+    expect(await probe.promise).toBe(64);
+    for (const agent of agents) expect(manager.getTimelineCount(agent.id)).toBe(256);
+  } finally {
+    reader.mockRestore();
+    for (const agent of agents) await manager.closeAgent(agent.id);
+    await manager.flush();
+    store.close();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("large tool results yield before a full item-count batch blocks other requests", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-replay-bytes-"));
+  const probe = deferred<number>();
+  let armed = true;
+  const store = new (class extends DiskAgentTimelineStore {
+    override appendBatch(
+      agentId: string,
+      entries: Parameters<InMemoryAgentTimelineStore["appendBatch"]>[1],
+    ): AgentTimelineRow[] {
+      const rows = super.appendBatch(agentId, entries);
+      if (armed) {
+        armed = false;
+        setImmediate(() => probe.resolve(this.getCount(agentId)));
+      }
+      return rows;
+    }
+  })({ directory: join(workdir, "cache") });
+  const client = new (class extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new (class extends TestAgentSession {
+        override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+          for (let index = 0; index < 96; index++)
+            yield {
+              type: "timeline",
+              provider: "codex",
+              item: {
+                type: "tool_call",
+                callId: String(index),
+                name: "mcp",
+                status: "completed",
+                error: null,
+                detail: { type: "unknown", input: null, output: { text: "x".repeat(64 * 1024) } },
+              },
+            };
+        }
+      })(config);
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, timelineStore: store, logger });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  try {
+    await manager.hydrateTimelineFromProvider(agent.id, { force: true });
+    expect(await probe.promise).toBeGreaterThan(0);
+    expect(await probe.promise).toBeLessThan(64);
+    expect(manager.getTimelineCount(agent.id)).toBe(96);
+  } finally {
+    await manager.closeAgent(agent.id);
+    await manager.flush();
+    store.close();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("failed history staging preserves readable rows and releases queued live events", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-failed-queued-history-"));
+  const session = new (class extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      this.pushEvent({
+        type: "timeline",
+        provider: "codex",
+        item: { type: "user_message", messageId: "new-live", text: "keep working" },
+      });
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "user_message", messageId: "partial-import", text: "incomplete" },
+      };
+      throw new Error("provider replay interrupted");
+    }
+  })({ provider: "codex", cwd: workdir });
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, logger });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  try {
+    await manager.appendTimelineItem(agent.id, {
+      type: "user_message",
+      messageId: "previous",
+      text: "original instructions",
+    });
+    await expect(manager.hydrateTimelineFromProvider(agent.id, { force: true })).rejects.toThrow(
+      "provider replay interrupted",
+    );
+    await manager.flush();
+    expect(
+      manager
+        .getTimeline(agent.id)
+        .map((item) => (item.type === "user_message" ? item.messageId : item.type)),
+    ).toEqual(["previous", "new-live"]);
+  } finally {
+    await manager.closeAgent(agent.id);
+    await manager.flush();
     rmSync(workdir, { recursive: true, force: true });
   }
 });

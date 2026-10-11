@@ -8,7 +8,7 @@ function decoderHarness() {
     frames,
     problems,
     decoder: new JsonlFrameDecoder({
-      frame: (frame) => frames.push(frame),
+      frame: (decoded) => frames.push(decoded),
       problem: (problem) => problems.push(problem),
     }),
   };
@@ -28,6 +28,40 @@ function chunkFrames(frame: Record<string, unknown>, chunkSize: number) {
 }
 
 describe("JsonlFrameDecoder", () => {
+  it("rejects an oversized unterminated frame before retaining more bytes", () => {
+    const frames: Record<string, unknown>[] = [];
+    const problems: JsonlFrameProblem[] = [];
+    const decoder = new JsonlFrameDecoder({
+      maxFrameBytes: 8,
+      frame: (decoded) => frames.push(decoded),
+      problem: (problem) => problems.push(problem),
+    });
+    decoder.write('{"x":1}\n');
+    decoder.write("12345678");
+    decoder.write("9");
+    decoder.write('{"x":2}\n');
+    expect(frames).toEqual([{ x: 1 }]);
+    expect(problems).toEqual(["frame-too-large"]);
+  });
+
+  it("counts UTF-8 bytes per frame and preserves characters split between buffers", () => {
+    const frame = { text: "🧠🌍" };
+    const bytes = Buffer.from(JSON.stringify(frame));
+    const frames: Record<string, unknown>[] = [];
+    const problems: JsonlFrameProblem[] = [];
+    const decoder = new JsonlFrameDecoder({
+      maxFrameBytes: bytes.length,
+      frame: (decoded) => frames.push(decoded),
+      problem: (problem) => problems.push(problem),
+    });
+    for (const byte of Buffer.concat([bytes, Buffer.from("\n"), bytes])) {
+      decoder.write(Buffer.from([byte]));
+    }
+    decoder.end();
+    expect(frames).toEqual([frame, frame]);
+    expect(problems).toEqual([]);
+  });
+
   it("publishes ordinary frames across arbitrary stream chunks", () => {
     const { decoder, frames, problems } = decoderHarness();
     decoder.write('{"type":"ready"');

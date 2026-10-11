@@ -1,4 +1,5 @@
 import { describe, expect, test, vi } from "vitest";
+import { z } from "zod";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { type Dirent, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -105,6 +106,7 @@ interface CollaborationModeRecord {
 }
 
 interface CodexSessionTestAccess {
+  pagedHistoryAvailable: boolean;
   codexUserMessageTurns(): {
     resolve(messageId: string): { index: number; turnId: string | null } | null;
     count(): number;
@@ -1845,6 +1847,81 @@ describe("Codex app-server provider", () => {
     expect(threadRequests).toEqual(["thread/read"]);
     await session.close();
     appServer.assertNoErrors();
+  });
+
+  test.each([
+    { version: "0.159.1", paged: false },
+    { version: "0.159.2", paged: true },
+    { version: "0.160.0", paged: true },
+    { version: "unknown", paged: false },
+  ])(
+    "gates metadata-only resume and history pages on Codex $version",
+    async ({ version, paged }) => {
+      const resumeParams: unknown[] = [];
+      const reads: unknown[] = [];
+      let turnPages = 0;
+      const appServer = createFakeCodexAppServer({
+        initialize: () => ({ userAgent: `paseo/${version}` }),
+        "thread/loaded/list": () => ({ data: [] }),
+        "thread/resume": (params) => {
+          resumeParams.push(params);
+          return { thread: { id: "archived-thread-id" } };
+        },
+        "thread/read": (params) => {
+          reads.push(params);
+          return { thread: { historyMode: "paginated", turns: [] } };
+        },
+        "thread/turns/list": () => {
+          turnPages += 1;
+          return { data: [], nextCursor: null };
+        },
+      });
+      const provider = createProviderWithFakeAppServer(appServer);
+      const session = await provider.resumeSession(archivedThreadHandle());
+      try {
+        expect(resumeParams).toEqual([
+          { threadId: "archived-thread-id", ...(paged ? { excludeTurns: true } : {}) },
+        ]);
+        expect(reads).toEqual([{ threadId: "archived-thread-id", includeTurns: !paged }]);
+        expect(turnPages).toBe(paged ? 1 : 0);
+        appServer.assertNoErrors();
+      } finally {
+        await session.close();
+      }
+    },
+  );
+
+  test("pages archived Codex history without resuming or unarchiving it", async () => {
+    const appServer = createFakeCodexAppServer({
+      initialize: () => ({ userAgent: "paseo/0.159.2" }),
+      "thread/resume": () => {
+        throw new Error("read-only history must not resume");
+      },
+      "thread/unarchive": () => {
+        throw new Error("read-only history must not unarchive");
+      },
+      "thread/read": () => ({ thread: { historyMode: "paginated" } }),
+      "thread/turns/list": () => ({ data: [{ id: "turn-a" }], nextCursor: null }),
+      "thread/items/list": () => ({
+        data: [
+          { turnId: "turn-a", item: { type: "agentMessage", id: "a", text: "archived history" } },
+        ],
+        nextCursor: null,
+      }),
+    });
+    const provider = createProviderWithFakeAppServer(appServer);
+    const session = await provider.resumeSession(archivedThreadHandle(), undefined, undefined, {
+      purpose: "history",
+    });
+    try {
+      const history: AgentStreamEvent[] = [];
+      for await (const event of session.streamHistory()) history.push(event);
+      expect(history).toHaveLength(1);
+      expect(history[0]).toMatchObject({ type: "timeline", item: { text: "archived history" } });
+      appServer.assertNoErrors();
+    } finally {
+      await session.close();
+    }
   });
 
   test("unarchives Codex when an active Paseo agent resumes an archived thread", async () => {
@@ -4614,6 +4691,178 @@ describe("Codex app-server provider", () => {
       },
     ]);
   });
+
+  test("loads paginated turns and item pages in order without a full-history response", async () => {
+    const session = createSession();
+    asInternals(session).pagedHistoryAvailable = true;
+    const requests: Array<{ method: string; params: unknown }> = [];
+    session.client = {
+      request: vi.fn(async (method: string, params: unknown) => {
+        requests.push({ method, params });
+        const record = z.record(z.string(), z.unknown()).parse(params);
+        if (method === "thread/read") return { thread: { historyMode: "paginated" } };
+        if (method === "thread/turns/list")
+          return record?.cursor
+            ? { data: [{ id: "turn-b", items: [] }], nextCursor: null }
+            : { data: [{ id: "turn-a", items: [] }], nextCursor: "turn-next" };
+        if (method === "thread/items/list") {
+          let name = record.cursor ? "a2" : "a1";
+          if (record.turnId === "turn-b") name = "b";
+          return {
+            data: [
+              {
+                turnId: record?.turnId,
+                item: { type: "agentMessage", id: name, text: name },
+                completedAtMs: 1777633200000,
+              },
+            ],
+            nextCursor: name === "a1" ? "item-next" : null,
+          };
+        }
+        throw new Error(`Unexpected method ${method}`);
+      }),
+    };
+    await asInternals(session).loadPersistedHistory(session.client);
+    const history: AgentStreamEvent[] = [];
+    for await (const event of session.streamHistory()) history.push(event);
+    expect(
+      history.map((event) =>
+        event.type === "timeline" && event.item.type === "assistant_message"
+          ? event.item.text
+          : event.type,
+      ),
+    ).toEqual(["a1", "a2", "b"]);
+    expect(
+      history.map((event) => (event.type === "timeline" ? event.timestamp : undefined)),
+    ).toEqual(Array(3).fill("2026-05-01T11:00:00.000Z"));
+    expect(requests).toEqual([
+      { method: "thread/read", params: { threadId: "test-thread", includeTurns: false } },
+      {
+        method: "thread/turns/list",
+        params: {
+          threadId: "test-thread",
+          limit: 32,
+          sortDirection: "asc",
+          itemsView: "notLoaded",
+        },
+      },
+      {
+        method: "thread/items/list",
+        params: { threadId: "test-thread", turnId: "turn-a", limit: 8, sortDirection: "asc" },
+      },
+      {
+        method: "thread/items/list",
+        params: {
+          threadId: "test-thread",
+          turnId: "turn-a",
+          limit: 8,
+          sortDirection: "asc",
+          cursor: "item-next",
+        },
+      },
+      {
+        method: "thread/turns/list",
+        params: {
+          threadId: "test-thread",
+          limit: 32,
+          sortDirection: "asc",
+          itemsView: "notLoaded",
+          cursor: "turn-next",
+        },
+      },
+      {
+        method: "thread/items/list",
+        params: { threadId: "test-thread", turnId: "turn-b", limit: 8, sortDirection: "asc" },
+      },
+    ]);
+  });
+
+  test("pages legacy turns without changing their history mode or native message ids", async () => {
+    const session = createSession();
+    asInternals(session).pagedHistoryAvailable = true;
+    const request = vi.fn(async (method: string, params: unknown) => {
+      const record = z.record(z.string(), z.unknown()).parse(params);
+      if (method === "thread/read") return { thread: { historyMode: "legacy" } };
+      if (method !== "thread/turns/list") throw new Error(`Unexpected method ${method}`);
+      return {
+        data: [
+          {
+            id: record.cursor ? "turn-b" : "turn-a",
+            startedAt: 1777633200,
+            items: [
+              {
+                type: "userMessage",
+                id: record.cursor ? "b" : "a",
+                content: [{ type: "text", text: "keep working" }],
+              },
+            ],
+          },
+        ],
+        nextCursor: record.cursor ? null : "next-turn",
+      };
+    });
+    session.client = { request };
+    await asInternals(session).loadPersistedHistory(session.client);
+    expect(asInternals(session).codexUserMessageTurns().resolve("b")).toEqual({
+      index: 1,
+      turnId: "turn-b",
+    });
+    const history: AgentStreamEvent[] = [];
+    for await (const event of session.streamHistory()) history.push(event);
+    expect(history).toHaveLength(2);
+    expect(history[0]).toMatchObject({ type: "timeline", timestamp: "2026-05-01T11:00:00.000Z" });
+    expect(request.mock.calls).toEqual([
+      ["thread/read", { threadId: "test-thread", includeTurns: false }],
+      [
+        "thread/turns/list",
+        { threadId: "test-thread", limit: 1, sortDirection: "asc", itemsView: "full" },
+      ],
+      [
+        "thread/turns/list",
+        {
+          threadId: "test-thread",
+          limit: 1,
+          sortDirection: "asc",
+          itemsView: "full",
+          cursor: "next-turn",
+        },
+      ],
+    ]);
+  });
+
+  test.each(["repeated cursor", "failed page"])(
+    "preserves readable history after a %s",
+    async (failure) => {
+      const session = createSession();
+      session.client = {
+        request: vi.fn(async () => ({
+          thread: {
+            turns: [{ items: [{ type: "agentMessage", id: "old", text: "previous history" }] }],
+          },
+        })),
+      };
+      await asInternals(session).loadPersistedHistory(session.client);
+      asInternals(session).pagedHistoryAvailable = true;
+      session.client = {
+        request: vi.fn(async (method: string, params: unknown) => {
+          if (method === "thread/read") return { thread: { historyMode: "legacy" } };
+          const record = z.record(z.string(), z.unknown()).parse(params);
+          if (record.cursor && failure === "failed page") throw new Error("history page failed");
+          return {
+            data: [{ items: [{ type: "agentMessage", id: "new", text: "partial history" }] }],
+            nextCursor: "same-cursor",
+          };
+        }),
+      };
+      await expect(asInternals(session).loadPersistedHistory(session.client)).rejects.toThrow(
+        failure === "failed page" ? "history page failed" : "repeated a history cursor",
+      );
+      const history: AgentStreamEvent[] = [];
+      for await (const event of session.streamHistory()) history.push(event);
+      expect(history).toHaveLength(1);
+      expect(history[0]).toMatchObject({ type: "timeline", item: { text: "previous history" } });
+    },
+  );
 
   test("retains native turn ids from persisted user messages", async () => {
     const session = createSession();

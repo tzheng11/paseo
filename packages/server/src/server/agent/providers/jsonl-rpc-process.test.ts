@@ -114,6 +114,32 @@ function nextExit(transport: JsonlRpcProcess): Promise<JsonlRpcExit> {
 }
 
 describe("JsonlRpcProcess", () => {
+  test("terminates an oversized real subprocess while another provider keeps responding", async () => {
+    const transport = startProcess({
+      source: `
+      process.stdin.once("data", () => {
+        const block = Buffer.alloc(1024 * 1024, "x");
+        for (let index = 0; index < 65; index++) process.stdout.write(block);
+      });
+      setInterval(() => {}, 1000);
+    `,
+    });
+    const healthy = startProcess();
+    const exited = nextExit(transport);
+    try {
+      await expect(transport.request({ type: "read-history" })).rejects.toThrow(
+        "JSONL frame exceeded",
+      );
+      await exited;
+      await expect(healthy.request({ type: "echo", value: "still alive" })).resolves.toMatchObject({
+        value: "still alive",
+      });
+    } finally {
+      await transport.close();
+      await healthy.close();
+    }
+  });
+
   test("spawns a resolved command and correlates concurrent requests", async () => {
     const transport = startProcess();
 
