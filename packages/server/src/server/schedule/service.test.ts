@@ -42,6 +42,7 @@ import type { ScheduleExecutionResult, StoredSchedule } from "@getpaseo/protocol
 
 interface ScheduleServiceInternals {
   executeSchedule(schedule: StoredSchedule, runId: string): Promise<ScheduleExecutionResult>;
+  runSchedule(schedule: StoredSchedule, now: Date): Promise<void>;
 }
 
 const SCHEDULE_TEST_CAPABILITIES: AgentCapabilityFlags = {
@@ -344,6 +345,51 @@ describe("ScheduleService", () => {
     });
     expect(inspected.nextRunAt).toBe("2026-01-01T00:02:00.000Z");
   });
+
+  test.each([
+    {
+      name: "hourly interval",
+      cadence: { type: "every", everyMs: 3_600_000 } as const,
+      followingPeriod: "2026-01-01T02:00:00.000Z",
+    },
+    {
+      name: "daily cron",
+      cadence: { type: "cron", expression: "0 0 * * *", timezone: "UTC" } as const,
+      followingPeriod: "2026-01-03T00:00:00.000Z",
+    },
+  ])(
+    "advances one period when the same $name slot fires three times",
+    async ({ cadence, followingPeriod }) => {
+      const service = createScheduleService({
+        paseoHome: tempDir,
+        logger: createTestLogger(),
+        agentManager: new AgentManager({ logger: createTestLogger() }),
+        agentStorage,
+        providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+        now: () => now,
+        runner: async () => ({ agentId: null, output: "ok" }),
+      });
+      const due = await service.create({
+        prompt: "check the recurring slot",
+        cadence,
+        runOnCreate: false,
+        target: { type: "new-agent", config: { provider: "claude", cwd: tempDir } },
+      });
+      now = new Date(due.nextRunAt!);
+
+      // Replay the same captured due slot, as duplicate fires do. Normal tick
+      // admission would read the advanced schedule and suppress these duplicates.
+      for (let fire = 0; fire < 3; fire++) {
+        await (service as unknown as ScheduleServiceInternals).runSchedule(due, now);
+        const inspected = await service.inspect(due.id);
+        expect(inspected.runs).toHaveLength(fire + 1);
+        expect(inspected.runs.every((run) => run.scheduledFor === due.nextRunAt)).toBe(true);
+        expect(inspected.runs.every((run) => run.status === "succeeded")).toBe(true);
+        expect(inspected.nextRunAt).toBe(followingPeriod);
+        now = new Date(now.getTime() + 1_000);
+      }
+    },
+  );
 
   test("pause and resume update persisted schedule state", async () => {
     const service = createScheduleService({
