@@ -14,6 +14,7 @@ const MAX_NATIVE_WATCHES = 5_000;
 // same paths at a fraction of the cost.
 const MAX_CONCURRENT_CLASSIFICATIONS = 32;
 const MAX_QUEUED_CLASSIFICATIONS = 2_048;
+const MAX_CONCURRENT_INVENTORY_READS = 16;
 const AUDIT_QUIET_MS = 500;
 const AUDIT_MAX_DIRTY_MS = 5_000;
 const OPTIONAL_AUDIT_QUIET_MS = 8_000;
@@ -328,6 +329,7 @@ class NativeRecursiveBackend implements ObservationBackend {
     try {
       if (this.watchTopologyDirty) await this.syncWatchTopology();
       if (!this.canCommit(generation)) return;
+      this.host.onInventoryProgress?.();
       if (fullAudit) {
         const next = await this.scanTree(this.host.root);
         if (!this.canCommit(generation)) return;
@@ -366,34 +368,42 @@ class NativeRecursiveBackend implements ObservationBackend {
     const entries = new Map<string, DirectoryEntry>();
     const pending = [root];
     while (pending.length > 0 && this.host.isActive()) {
-      const directory = pending.pop();
-      if (!directory) continue;
-      let children: Dirent[];
-      try {
-        children = await readdir(directory, { withFileTypes: true });
-      } catch (error) {
-        if (isMissingPathError(error) && !this.host.isActive()) {
-          return { directories, entries, files };
-        }
-        if (!isMissingPathError(error) || directory === this.host.root) throw error;
-        continue;
-      }
-      directories.add(directory);
-      this.assertWithinLimit(files.size + directories.size);
-      const entry: DirectoryEntry = { directories: new Set(), files: new Set() };
-      for (const child of children) {
-        const path = join(directory, child.name);
-        if (this.host.isIgnored(path)) continue;
-        if (child.isDirectory()) {
-          entry.directories.add(path);
-          pending.push(path);
-        } else {
-          entry.files.add(path);
-          files.add(path);
+      // Serial readdir multiplies filesystem/loop latency by every directory
+      // in a monorepo, cancelling otherwise healthy native subscriptions.
+      // Batches bound descriptor pressure and leave cancellation a barrier.
+      const batch = pending.splice(-MAX_CONCURRENT_INVENTORY_READS);
+      const results = await Promise.allSettled(
+        batch.map(async (directory) => {
+          let children: Dirent[];
+          try {
+            children = await readdir(directory, { withFileTypes: true });
+          } catch (error) {
+            if (isMissingPathError(error) && !this.host.isActive()) return;
+            if (!isMissingPathError(error) || directory === this.host.root) throw error;
+            return;
+          }
+          if (!this.host.isActive()) return;
+          directories.add(directory);
           this.assertWithinLimit(files.size + directories.size);
-        }
-      }
-      entries.set(directory, entry);
+          const entry: DirectoryEntry = { directories: new Set(), files: new Set() };
+          for (const child of children) {
+            const path = join(directory, child.name);
+            if (this.host.isIgnored(path)) continue;
+            if (child.isDirectory()) {
+              entry.directories.add(path);
+              pending.push(path);
+            } else {
+              entry.files.add(path);
+              files.add(path);
+              this.assertWithinLimit(files.size + directories.size);
+            }
+          }
+          entries.set(directory, entry);
+        }),
+      );
+      const failed = results.find((result) => result.status === "rejected");
+      if (failed?.status === "rejected") throw failed.reason;
+      this.host.onInventoryProgress?.();
     }
     return { directories, entries, files };
   }

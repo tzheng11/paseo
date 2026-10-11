@@ -33,6 +33,7 @@ export interface ObservationHost {
   isActive(): boolean;
   isIgnored(path: string): boolean;
   isPathInside(root: string, path: string): boolean;
+  onInventoryProgress?(): void;
   queueEvent(type: FileChangeType, path: string): void;
   fail(error: Error): void;
 }

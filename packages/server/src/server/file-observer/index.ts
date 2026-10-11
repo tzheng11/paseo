@@ -15,6 +15,7 @@ export interface FileChange {
 export interface FileObserverOptions {
   ignore?: string[];
   signal?: AbortSignal;
+  onInventoryProgress?: () => void;
 }
 
 export type FileObserverCallback = (error: Error | null, events: FileChange[]) => void;

@@ -41,6 +41,7 @@ class Observation implements ManagedObservation, ObservationHost {
   readonly root: string;
   readonly metrics: ObserverMetrics;
   ignoredRoots: string[];
+  private ignoredMatcher: (path: string) => boolean;
   private status: "open" | "failed" | "closed" = "open";
   private readonly backend: ObservationBackend;
   private readonly pendingEvents = new Map<string, FileChange>();
@@ -61,6 +62,7 @@ class Observation implements ManagedObservation, ObservationHost {
     this.root = input.root;
     this.metrics = input.metrics;
     this.ignoredRoots = input.paths.normalizeIgnoredRoots(input.root, input.options.ignore ?? []);
+    this.ignoredMatcher = input.paths.ignoredMatcher(this.ignoredRoots);
     this.backend = input.createBackend(this);
   }
 
@@ -89,6 +91,7 @@ class Observation implements ManagedObservation, ObservationHost {
     const next = this.input.paths.normalizeIgnoredRoots(this.root, paths);
     if (samePaths(this.ignoredRoots, next)) return;
     this.ignoredRoots = next;
+    this.ignoredMatcher = this.input.paths.ignoredMatcher(next);
     for (const path of this.pendingEvents.keys()) {
       if (this.isIgnored(path)) this.pendingEvents.delete(path);
     }
@@ -120,11 +123,15 @@ class Observation implements ManagedObservation, ObservationHost {
   }
 
   isIgnored(path: string): boolean {
-    return this.ignoredRoots.some((root) => this.input.paths.isInside(root, path));
+    return this.ignoredMatcher(path);
   }
 
   isPathInside(root: string, path: string): boolean {
     return this.input.paths.isInside(root, path);
+  }
+
+  onInventoryProgress(): void {
+    if (this.isActive()) this.input.options.onInventoryProgress?.();
   }
 
   queueEvent(type: FileChangeType, path: string): void {
