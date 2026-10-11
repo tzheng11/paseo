@@ -2803,6 +2803,11 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
           reensureObservation,
           WORKSPACE_GIT_OBSERVATION_REENSURE_INTERVAL_MS,
         );
+        // Observation discovery can now recover without a snapshot. Retry a
+        // failed cold read separately so a healthy watcher cannot strand it.
+        if (!target.latestSnapshot) {
+          this.scheduleInitialWorkspaceRefresh(target);
+        }
         this.scheduleWorkspaceObservationSetup(target);
       };
       target.observationReensureTimer = setTimeout(

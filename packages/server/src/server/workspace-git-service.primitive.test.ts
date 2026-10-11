@@ -956,10 +956,13 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
 
   test("observation re-ensure retries setup even when the git snapshot is still recent", async () => {
     let nowMs = 0;
-    const getCheckoutSnapshotFacts = vi
-      .fn<(cwd: string) => Promise<CheckoutSnapshotFacts>>()
-      .mockRejectedValueOnce(new Error("git facts temporarily unavailable"))
-      .mockImplementation(async (cwd: string) => createCheckoutFacts(cwd, { remoteUrl: null }));
+    let factsAvailable = false;
+    const getCheckoutSnapshotFacts = vi.fn(async (cwd: string) => {
+      if (!factsAvailable) {
+        throw new Error("git facts temporarily unavailable");
+      }
+      return createCheckoutFacts(cwd, { remoteUrl: null });
+    });
     const getCheckoutStatus = vi.fn(async (cwd: string) =>
       createCheckoutStatus(cwd, { remoteUrl: null }),
     );
@@ -981,6 +984,7 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     expect(getCheckoutSnapshotFacts).toHaveBeenCalled();
     expect(subscribe).not.toHaveBeenCalled();
 
+    factsAvailable = true;
     nowMs = 30_000;
     await service.getSnapshot(REPO_CWD, { force: true, reason: "recovered-git-read" });
     expect(getCheckoutStatus).toHaveBeenCalledTimes(1);
@@ -1001,26 +1005,32 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
   });
 
   test("observation re-ensure retries failed cold facts through initial admission", async () => {
-    const getCheckoutSnapshotFacts = vi
-      .fn<(cwd: string) => Promise<CheckoutSnapshotFacts>>()
-      .mockRejectedValueOnce(new Error("temporarily unavailable"))
-      .mockImplementation(async (cwd) => createCheckoutFacts(cwd, { remoteUrl: null }));
+    let factsAvailable = false;
+    const getCheckoutSnapshotFacts = vi.fn(async (cwd: string) => {
+      if (!factsAvailable) {
+        throw new Error("temporarily unavailable");
+      }
+      return createCheckoutFacts(cwd, { remoteUrl: null });
+    });
     const subscribe = vi.fn(async () => createAsyncSubscription());
     const service = createService({ getCheckoutSnapshotFacts, subscribe });
     const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
     try {
       await vi.waitFor(() => {
-        expect(getCheckoutSnapshotFacts).toHaveBeenCalledTimes(1);
+        expect(getCheckoutSnapshotFacts).toHaveBeenCalled();
         expect(service.getMetrics().workspaceInitialRefreshActiveCount).toBe(0);
+        expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
       });
       expect(service.peekSnapshot(REPO_CWD)).toBeNull();
       expect(subscribe).not.toHaveBeenCalled();
+      const failedFactsCalls = getCheckoutSnapshotFacts.mock.calls.length;
+      factsAvailable = true;
       await vi.advanceTimersByTimeAsync(60_000);
       await vi.waitFor(() => {
         expect(service.peekSnapshot(REPO_CWD)).not.toBeNull();
         expect(subscribe).toHaveBeenCalledTimes(2);
       });
-      expect(getCheckoutSnapshotFacts).toHaveBeenCalledTimes(2);
+      expect(getCheckoutSnapshotFacts.mock.calls.length).toBeGreaterThan(failedFactsCalls);
     } finally {
       subscription.unsubscribe();
       service.dispose();
@@ -2177,6 +2187,7 @@ describe("WorkspaceGitServiceImpl D2 read methods", () => {
       expect(subscribe).toHaveBeenCalledWith(repoDir, expect.any(Function), {
         ignore: [join(repoDir, ".git"), ignoredRoot],
         signal: expect.any(AbortSignal),
+        onInventoryProgress: expect.any(Function),
       });
 
       subscription.unsubscribe();
