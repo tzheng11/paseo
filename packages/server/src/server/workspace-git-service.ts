@@ -1275,11 +1275,16 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
 
   private scheduleWorkspaceObservationSetup(target: WorkspaceGitTarget): void {
     if (
-      !target.latestFacts ||
       target.observationSetupComplete ||
       target.observationSetupPromise ||
       !this.isActiveObservedWorkspaceTarget(target)
     ) {
+      return;
+    }
+
+    if (!target.latestFacts) {
+      // Retry failed discovery through cold admission, including re-ensure ticks.
+      this.scheduleInitialWorkspaceRefresh(target);
       return;
     }
 

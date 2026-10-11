@@ -694,7 +694,7 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
 
     nowMs += 3_000;
     const refresh = service.refresh(REPO_CWD);
-    await flushPromises();
+    await vi.waitFor(() => expect(getCheckoutStatus).toHaveBeenCalledTimes(2));
     const directRead = service.getSnapshot(REPO_CWD);
 
     expect(getCheckoutStatus).toHaveBeenCalledTimes(2);
@@ -984,7 +984,10 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     nowMs = 30_000;
     await service.getSnapshot(REPO_CWD, { force: true, reason: "recovered-git-read" });
     expect(getCheckoutStatus).toHaveBeenCalledTimes(1);
-    expect(subscribe).not.toHaveBeenCalled();
+    await vi.waitFor(() => {
+      expect(subscribe).toHaveBeenCalledTimes(2);
+      expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
+    });
 
     nowMs = 60_000;
     await vi.advanceTimersByTimeAsync(60_000);
@@ -995,6 +998,33 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
 
     subscription.unsubscribe();
     service.dispose();
+  });
+
+  test("observation re-ensure retries failed cold facts through initial admission", async () => {
+    const getCheckoutSnapshotFacts = vi
+      .fn<(cwd: string) => Promise<CheckoutSnapshotFacts>>()
+      .mockRejectedValueOnce(new Error("temporarily unavailable"))
+      .mockImplementation(async (cwd) => createCheckoutFacts(cwd, { remoteUrl: null }));
+    const subscribe = vi.fn(async () => createAsyncSubscription());
+    const service = createService({ getCheckoutSnapshotFacts, subscribe });
+    const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    try {
+      await vi.waitFor(() => {
+        expect(getCheckoutSnapshotFacts).toHaveBeenCalledTimes(1);
+        expect(service.getMetrics().workspaceInitialRefreshActiveCount).toBe(0);
+      });
+      expect(service.peekSnapshot(REPO_CWD)).toBeNull();
+      expect(subscribe).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(60_000);
+      await vi.waitFor(() => {
+        expect(service.peekSnapshot(REPO_CWD)).not.toBeNull();
+        expect(subscribe).toHaveBeenCalledTimes(2);
+      });
+      expect(getCheckoutSnapshotFacts).toHaveBeenCalledTimes(2);
+    } finally {
+      subscription.unsubscribe();
+      service.dispose();
+    }
   });
 
   test("stale workspace watcher callbacks do not refresh after unsubscribe", async () => {
@@ -2146,6 +2176,7 @@ describe("WorkspaceGitServiceImpl D2 read methods", () => {
       expect(subscribe).toHaveBeenCalledTimes(1);
       expect(subscribe).toHaveBeenCalledWith(repoDir, expect.any(Function), {
         ignore: [join(repoDir, ".git"), ignoredRoot],
+        signal: expect.any(AbortSignal),
       });
 
       subscription.unsubscribe();
