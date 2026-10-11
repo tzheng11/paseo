@@ -8,16 +8,246 @@ import { monitorEventLoopDelay } from "node:perf_hooks";
 import pino from "pino";
 import pLimit from "p-limit";
 import { createFileObserver, type FileObserver } from "../src/server/file-observer/index.js";
-import { WorkspaceGitServiceImpl } from "../src/server/workspace-git-service.js";
+import {
+  WorkspaceGitServiceImpl,
+  WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY,
+} from "../src/server/workspace-git-service.js";
 import { createTestPaseoDaemon } from "../src/server/test-utils/paseo-daemon.js";
 import { DaemonClient } from "../src/server/test-utils/daemon-client.js";
 import { summarizeWatchLoadEventLoop } from "./watch-load-metrics.js";
+import {
+  getCheckoutSnapshotFacts,
+  getCheckoutShortstat,
+  getCheckoutStatus,
+  getCheckoutWorktreeState,
+} from "../src/utils/checkout-git.js";
+import {
+  configureGitProcessPolicy,
+  runGitCommand,
+  snapshotGitCommandRuntimeMetrics,
+} from "../src/utils/run-git-command.js";
+
+// Inject at the dependency boundaries, rather than hanging native code or
+// changing a serving daemon. Real checkout commands and recovery use real Git
+// and FSEvents; the injected fault models the reported non-settling work.
+async function runAllPollingAdmissionLoad(base: string, roots: string[]) {
+  const entry = process.env.PASEO_WATCH_LOAD_GIT_SERVICE_ENTRY;
+  const Service: typeof WorkspaceGitServiceImpl = entry
+    ? (await import(entry)).WorkspaceGitServiceImpl
+    : WorkspaceGitServiceImpl;
+  const expectStarvation = process.env.PASEO_WATCH_LOAD_EXPECT_STARVATION === "1";
+  configureGitProcessPolicy({ maxProcessConcurrency: 4, maxProcessesPerSecond: 64 });
+  const probe = join(base, "polling-probe");
+  await mkdir(probe, { recursive: true });
+  await exec("git", ["init", "--quiet", "--initial-branch=main", probe]);
+  const home = await mkdtemp(join(base, "polling-home-"));
+  const observer = createFileObserver();
+  const polling = new Set<string>();
+  const observed = new Set<string>();
+  const covered = new Set<string>();
+  const blocked = new Set<string>();
+  const warnings: object[] = [];
+  const logger = pino(
+    { level: "warn" },
+    {
+      write(line: string) {
+        const value = JSON.parse(line);
+        warnings.push(value);
+        if (value.msg === "Working tree watcher unavailable; using bounded polling fallback")
+          polling.add(value.cwd);
+      },
+    },
+  );
+  let rejectWatchers = true;
+  let holdRefreshes = false;
+  let measureCoverage = false;
+  let release!: () => void;
+  const gate = new Promise<void>((done) => {
+    release = done;
+  });
+  const hold = async (cwd: string) => {
+    if (holdRefreshes && cwd !== probe) {
+      blocked.add(cwd);
+      await gate;
+    }
+  };
+  const service = new Service({
+    paseoHome: home,
+    logger,
+    fileObserver: observer,
+    deps: {
+      subscribe: async (directory, callback, options) => {
+        if (rejectWatchers)
+          throw Object.assign(new Error("load-test watcher admission EMFILE"), { code: "EMFILE" });
+        const subscription = await observer.subscribe(directory, callback, options);
+        if (roots.includes(directory)) observed.add(directory);
+        return subscription;
+      },
+      // Share one real Git scheduler across the preserved and current service.
+      runGitCommand,
+      getCheckoutSnapshotFacts: (cwd, context) =>
+        getCheckoutSnapshotFacts(cwd, { ...context, runGitCommand }),
+      getCheckoutShortstat: (cwd, context, options) =>
+        getCheckoutShortstat(cwd, { ...context, runGitCommand }, options),
+      getCheckoutStatus: async (cwd, context) => {
+        await hold(cwd);
+        return getCheckoutStatus(cwd, { ...context, runGitCommand });
+      },
+      getCheckoutWorktreeState: async (cwd, context) => {
+        await hold(cwd);
+        return getCheckoutWorktreeState(cwd, { ...context, runGitCommand });
+      },
+    },
+  });
+  const subscriptions: ReturnType<WorkspaceGitServiceImpl["registerWorkspace"]>[] = [];
+  let read: Promise<void> | undefined;
+  let step = "warming";
+  const progress = setInterval(
+    () =>
+      report({
+        phase: "all-polling-progress",
+        step,
+        polling: polling.size,
+        blocked: blocked.size,
+        observed: observed.size,
+        covered: covered.size,
+        dirtySnapshots: roots.filter((cwd) => service.peekSnapshot(cwd)?.git.isDirty).length,
+        git: snapshotGitCommandRuntimeMetrics(),
+        snapshots: roots.filter((cwd) => service.peekSnapshot(cwd)).length,
+        metrics: service.getMetrics(),
+      }),
+    5_000,
+  );
+  try {
+    const warm = pLimit(2);
+    await Promise.all(
+      roots.map((cwd) => warm(() => service.getSnapshot(cwd, { includeForge: false }))),
+    );
+    // Keep the fault comparison separate from the cold-start protocol phase:
+    // first warm real Git facts, then admit watcher failures for the whole fleet.
+    holdRefreshes = true;
+    subscriptions.push(
+      ...roots.map((cwd) =>
+        service.registerWorkspace({ cwd }, (snapshot) => {
+          if (measureCoverage && snapshot.git.isGit && snapshot.git.isDirty) covered.add(cwd);
+        }),
+      ),
+    );
+    step = "degrading-watchers";
+    await until(
+      () =>
+        polling.size === roots.length &&
+        service.getMetrics().workspaceObservationSetupInFlightCount === 0,
+      "all workspaces degraded to polling",
+      120_000,
+    );
+    step = "holding-polling-refreshes";
+    holdRefreshes = true;
+    await until(() => blocked.size >= 3, "polling occupies refresh admission", 30_000);
+    if (expectStarvation) {
+      await until(
+        () => service.getMetrics().workspaceRefreshAdmissionPendingCount >= roots.length - 4,
+        "baseline full polling backlog",
+        65_000,
+      );
+    }
+    const samples = [];
+    for (let i = 0; i < 3; i++) {
+      samples.push(service.getMetrics());
+      await sleep(1_000);
+    }
+    step = "demand-read";
+    const uncached = service.peekSnapshot(probe) === null;
+    const started = performance.now();
+    let latencyMs: number | null = null;
+    let readError: string | null = null;
+    read = service
+      .getSnapshot(probe, { force: true, reason: "polling-load-live-read", includeForge: false })
+      .then((snapshot) => {
+        if (!snapshot.git.isGit) throw new Error("live probe is not a Git checkout");
+        latencyMs = performance.now() - started;
+        return undefined;
+      })
+      .catch((error: unknown) => {
+        readError = String(error);
+      });
+    await Promise.race([read, sleep(10_000)]);
+    const starvation = latencyMs === null;
+    const during = service.getMetrics();
+    report({
+      phase: "all-polling-admission",
+      entry: entry ?? "source",
+      injectedFault: true,
+      polling: polling.size,
+      total: roots.length,
+      nativeObservedDuringFault: observed.size,
+      heldRefreshes: blocked.size,
+      samples,
+      during,
+      uncached,
+      latencyMs,
+      readError,
+      starvation,
+    });
+    if (!uncached || readError || starvation !== expectStarvation)
+      throw new Error("all-polling live admission regression");
+    holdRefreshes = false;
+    release();
+    step = "native-recovery";
+    // Enable watcher recovery before waiting for a quiescent fleet: continuing
+    // all-polling work can keep a busy fleet non-idle even after the gate opens.
+    rejectWatchers = false;
+    await read;
+    await until(
+      () => observed.size === roots.length,
+      "all native working-tree watches recover",
+      90_000,
+    );
+    await until(
+      () => service.getMetrics().workspaceRefreshInFlightCount === 0,
+      "recovery refreshes drain",
+      30_000,
+    );
+    const dirtyBeforeEdits = roots.filter((cwd) => service.peekSnapshot(cwd)?.git.isDirty);
+    report({ phase: "all-polling-before-edits", dirtyBeforeEdits, observed: observed.size });
+    if (dirtyBeforeEdits.length)
+      throw new Error("polling coverage requires clean starting snapshots");
+    measureCoverage = true;
+    await Promise.all(
+      roots.map((root) =>
+        writeFile(
+          join(root, "packages/pkg-0/src/index.ts"),
+          "export const pollingRecovered = true;\nexport const coverage = 1;\n",
+        ),
+      ),
+    );
+    await until(() => covered.size === roots.length, "recovered native edit round trips", 30_000);
+    report({
+      phase: "all-polling-recovered",
+      registered: observed.size,
+      roundTrips: covered.size,
+      total: roots.length,
+      latencyMs,
+      expectedBaselineStarvation: expectStarvation,
+      metrics: service.getMetrics(),
+      warningCount: warnings.length,
+    });
+  } finally {
+    clearInterval(progress);
+    holdRefreshes = false;
+    release();
+    await read;
+    for (const subscription of subscriptions) subscription.unsubscribe();
+    await service.dispose();
+    await observer.close();
+  }
+}
 
 const exec = promisify(execFile);
 const count = Number(process.env.PASEO_WATCH_LOAD_WORKSPACES ?? 85);
 const packages = Number(process.env.PASEO_WATCH_LOAD_PACKAGES ?? 160);
 const fdLimit = Number(process.env.PASEO_WATCH_LOAD_FD_LIMIT ?? 256);
-const timeoutMs = Number(process.env.PASEO_WATCH_LOAD_TIMEOUT_MS ?? 300_000);
+const timeoutMs = Number(process.env.PASEO_WATCH_LOAD_TIMEOUT_MS ?? 600_000);
 const sleep = (ms: number) => new Promise<void>((done) => setTimeout(done, ms));
 function report(value: object) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -141,38 +371,48 @@ async function runChild() {
     const observer: FileObserver = createObserver();
     const errors: string[] = [];
     const edits = new Set<string>();
+    // Match the production observation-setup admission bound. Launching 85
+    // inventory walks simultaneously changes the load and can expire a healthy
+    // subscription before the Git service would have admitted it.
+    const observe = pLimit(WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY);
     const subscriptions = await Promise.allSettled(
-      roots.map(async (root) => {
-        const controller = new AbortController();
-        const timeout = setTimeout(
-          () => controller.abort(new Error("subscription deadline")),
-          10_000,
-        );
-        const ignore = [
-          join(root, ".git"),
-          join(root, ".next"),
-          join(root, "node_modules"),
-          ...Array.from({ length: packages }, (_, i) =>
-            ["dist", "node_modules"].map((p) => join(root, "packages", `pkg-${i}`, p)),
-          ).flat(),
-        ];
-        try {
-          return await observer.subscribe(
-            root,
-            (error, events) => {
-              if (error) errors.push(error.message);
-              for (const event of events) edits.add(event.path);
-            },
-            { ignore, signal: controller.signal },
+      roots.map((root) =>
+        observe(async () => {
+          const controller = new AbortController();
+          const timeout = setTimeout(
+            () => controller.abort(new Error("subscription deadline")),
+            10_000,
           );
-        } finally {
-          clearTimeout(timeout);
-        }
-      }),
+          const ignore = [
+            join(root, ".git"),
+            join(root, ".next"),
+            join(root, "node_modules"),
+            ...Array.from({ length: packages }, (_, i) =>
+              join(root, "packages", `pkg-${i}`, "dist"),
+            ),
+            ...Array.from({ length: packages }, (_, i) =>
+              join(root, "packages", `pkg-${i}`, "node_modules"),
+            ),
+          ];
+          try {
+            return await observer.subscribe(
+              root,
+              (error, events) => {
+                if (error) errors.push(error.message);
+                for (const event of events) edits.add(event.path);
+              },
+              { ignore, signal: controller.signal },
+            );
+          } finally {
+            clearTimeout(timeout);
+          }
+        }),
+      ),
     );
     const registered = subscriptions.filter((s) => s.status === "fulfilled").length;
     report({
       phase: "native-admitted",
+      setupConcurrency: WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY,
       registered,
       errors,
       failures: subscriptions.filter((s) => s.status === "rejected").map((s) => String(s.reason)),
@@ -266,6 +506,22 @@ async function runChild() {
           );
         }),
       ),
+    );
+    phase = "all-polling-admission";
+    await runAllPollingAdmissionLoad(base, roots);
+    if (process.env.PASEO_WATCH_LOAD_POLLING_ONLY === "1") {
+      report({
+        phase: "polling-verdict",
+        functionalPassed: true,
+        eventLoop: eventLoopEvidence(),
+        base,
+      });
+      return;
+    }
+    // The failure/recovery phase dirties every checkout. Restore clean status
+    // before measuring actual protocol transitions in the fresh daemon.
+    await Promise.all(
+      roots.map((root) => clean(() => exec("git", ["checkout", "--", "."], { cwd: root }))),
     );
     phase = "daemon-cold-refresh";
     // Seed only scratch registry records. Production bootstrap and protocol

@@ -690,6 +690,57 @@ describe("WorkspaceGitServiceImpl", () => {
     }
   });
 
+  test("all-polling refreshes leave admission for an uncached live read", async () => {
+    const cwds = Array.from({ length: 86 }, (_, i) => path.resolve(`/tmp/all-polling-${i}`));
+    const live = path.resolve("/tmp/all-polling-live");
+    const gate = createDeferred<void>();
+    const blocked = new Set<string>();
+    let hold = false;
+    const service = createService({
+      subscribe: vi.fn(async () => {
+        throw Object.assign(new Error("watcher admission EMFILE"), { code: "EMFILE" });
+      }),
+      runGitCommand: vi.fn(async (_args: string[], options: { cwd: string }) => ({
+        stdout: `${options.cwd}\n`,
+        stderr: "",
+        truncated: false,
+        exitCode: 0,
+        signal: null,
+      })),
+      getCheckoutStatus: vi.fn(async (cwd: string) => {
+        if (hold && cwd !== live) {
+          blocked.add(cwd);
+          await gate.promise;
+        }
+        return createCheckoutStatus(cwd);
+      }),
+    });
+    const subscriptions = cwds.map((cwd) => service.registerWorkspace({ cwd }, vi.fn()));
+    let read: Promise<WorkspaceGitRuntimeSnapshot> | undefined;
+    try {
+      await Promise.all(cwds.map((cwd) => service.getSnapshot(cwd)));
+      await vi.waitFor(() =>
+        expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0),
+      );
+      expect(service.getMetrics().workingTreeWatchTargetCount).toBe(cwds.length);
+      hold = true;
+      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.waitFor(() => expect(blocked.size).toBe(WORKSPACE_GIT_REFRESH_CONCURRENCY - 1));
+      expect(service.peekSnapshot(live)).toBeNull();
+      read = service.getSnapshot(live, { force: true, reason: "all-polling-live-read" });
+      await expect(read).resolves.toMatchObject({ cwd: live });
+      expect(blocked.size).toBe(WORKSPACE_GIT_REFRESH_CONCURRENCY - 1);
+      gate.resolve();
+      await vi.waitFor(() => expect(service.getMetrics().workspaceRefreshInFlightCount).toBe(0));
+    } finally {
+      hold = false;
+      gate.resolve();
+      await read;
+      for (const subscription of subscriptions) subscription.unsubscribe();
+      await service.dispose();
+    }
+  });
+
   test("bounds workspace observation setup pipelines", async () => {
     const cwds = Array.from(
       { length: WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY + 2 },
