@@ -409,6 +409,41 @@ describe("runGitCommand", () => {
     ]);
   });
 
+  it("a cold workspace live read overtakes already queued background Git commands", async () => {
+    const { runGitCommand } = await loadRunGitCommand(1);
+    const [{ WorkspaceGitServiceImpl }, { default: pino }] = await Promise.all([
+      import("../server/workspace-git-service.js"),
+      import("pino"),
+    ]);
+    enqueueSpawnBehaviors(
+      { delayMs: 100, stdoutData: "active" },
+      { stdoutData: "live" },
+      { stdoutData: "background" },
+    );
+    const active = runGitCommand(["status"], { cwd: process.cwd() });
+    await vi.waitFor(() => expect(fakeSpawnController.processes).toHaveLength(1));
+    const background = runGitCommand(["rev-parse", "background"], { cwd: process.cwd() });
+    let factsOutput: string | undefined;
+    const service = new WorkspaceGitServiceImpl({
+      logger: pino({ level: "silent" }),
+      paseoHome: process.cwd(),
+      deps: {
+        getCheckoutSnapshotFacts: async (cwd, context) => {
+          const result = await context.runGitCommand!(["rev-parse", "live"], { cwd });
+          factsOutput = result.stdout;
+          return { isGit: false };
+        },
+      },
+    });
+    try {
+      await service.getSnapshot(process.cwd(), { includeForge: false });
+      expect(factsOutput).toBe("live");
+    } finally {
+      service.dispose();
+      await Promise.allSettled([active, background]);
+    }
+  });
+
   it("binds queue provenance to a Git command runner", async () => {
     const { createRunGitCommand, snapshotGitCommandRuntimeMetrics } = await loadRunGitCommand(1);
     enqueueSpawnBehaviors({ stdoutData: "ok" });

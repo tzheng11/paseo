@@ -52,6 +52,7 @@ import {
 import {
   createRunGitCommand,
   runGitCommand,
+  runWithGitCommandPriority,
   type RunGitCommand,
 } from "../utils/run-git-command.js";
 import { branchNameFromRef } from "../utils/worktree-metadata.js";
@@ -602,6 +603,23 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   // refresh any queued workspace immediately and the cold pass can reuse it.
   private readonly workspaceInitialRefreshLimit = pLimit({ concurrency: 1, rejectOnClear: true });
   private readonly initialRefreshScheduled = new Set<WorkspaceGitTarget>();
+  private readonly pendingColdRefreshes = new WeakMap<
+    WorkspaceGitTarget,
+    WorkspaceGitRefreshRequest
+  >();
+  // Watch/poll refreshes must leave a slot for an uncached explicit read.
+  private readonly backgroundRefreshLimit = pLimit({
+    concurrency: WORKSPACE_GIT_REFRESH_CONCURRENCY - 1,
+    rejectOnClear: true,
+  });
+  private readonly backgroundRefreshes = new Map<
+    WorkspaceGitTarget,
+    {
+      request: WorkspaceGitRefreshRequest;
+      started: boolean;
+      promise: Promise<void>;
+    }
+  >();
   private readonly workspaceObservationSetupLimit = pLimit({
     concurrency: WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY,
     rejectOnClear: true,
@@ -763,7 +781,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       return target.latestSnapshot;
     }
 
-    return this.requestWorkspaceSnapshot(target, request);
+    return runWithGitCommandPriority("high", () => this.requestWorkspaceSnapshot(target, request));
   }
 
   async getCheckout(cwd: string): Promise<ProjectCheckoutLitePayload> {
@@ -809,7 +827,12 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     const normalizedOptions = this.normalizeCheckoutDiffOptions(options);
     // Initial inventory events cover the watcher setup gap. Process them before
     // starting a cold diff, rather than invalidating that build halfway through.
-    await this.workspaceTargets.get(normalizedCwd)?.observationSetupPromise;
+    const target = this.workspaceTargets.get(normalizedCwd);
+    if (target && !target.observationSetupComplete) {
+      await runWithGitCommandPriority("high", () => this.getFactsForObservation(target));
+      this.scheduleWorkspaceObservationSetup(target);
+      await target.observationSetupPromise;
+    }
     this.assertNotDisposed();
     return this.checkoutDiffCache.read({
       cwd: normalizedCwd,
@@ -1031,6 +1054,8 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     this.disposeController.abort(new WorkspaceGitServiceDisposedError());
     this.workspaceRefreshLimit.clearQueue();
     this.workspaceInitialRefreshLimit.clearQueue();
+    this.backgroundRefreshLimit.clearQueue();
+    this.backgroundRefreshes.clear();
     this.workspaceObservationSetupLimit.clearQueue();
 
     for (const target of this.workspaceTargets.values()) {
@@ -1250,6 +1275,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
 
   private scheduleWorkspaceObservationSetup(target: WorkspaceGitTarget): void {
     if (
+      !target.latestFacts ||
       target.observationSetupComplete ||
       target.observationSetupPromise ||
       !this.isActiveObservedWorkspaceTarget(target)
@@ -1336,6 +1362,10 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       .getCheckoutSnapshotFacts(target.cwd, context)
       .then((facts) => {
         target.latestFacts = facts;
+        // Reuse the admitted snapshot's facts. Starting full checkout discovery
+        // for every cold watcher defeats initial-refresh admission and labels
+        // those Git commands as unrelated background work.
+        this.scheduleWorkspaceObservationSetup(target);
         return facts;
       })
       .finally(() => {
@@ -1407,6 +1437,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   ): Promise<FileObserverSubscription> {
     this.assertNotDisposed();
     const signal = this.disposeController.signal;
+    const subscriptionController = new AbortController();
     let outcome: "pending" | "accepted" | "expired" = "pending";
     let timeout: NodeJS.Timeout | null = null;
     let removeAbortListener = () => {};
@@ -1414,7 +1445,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     let subscriptionPromise: Promise<FileObserverSubscription>;
     try {
       subscriptionPromise = this.deps
-        .subscribe(watchPath, callback, options)
+        .subscribe(watchPath, callback, { ...options, signal: subscriptionController.signal })
         .finally(onSubscribeSettled);
     } catch (error) {
       onSubscribeSettled();
@@ -1433,12 +1464,15 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     const timeoutPromise = new Promise<never>((_resolve, reject) => {
       timeout = setTimeout(() => {
         outcome = "expired";
-        reject(new WorkspaceGitWatcherSubscriptionTimeoutError(watchPath, timeoutMs));
+        const error = new WorkspaceGitWatcherSubscriptionTimeoutError(watchPath, timeoutMs);
+        subscriptionController.abort(error);
+        reject(error);
       }, timeoutMs);
     });
     const disposalPromise = new Promise<never>((_resolve, reject) => {
       const rejectForDisposal = () => {
         outcome = "expired";
+        subscriptionController.abort(signal.reason);
         reject(signal.reason);
       };
       if (signal.aborted) {
@@ -3002,7 +3036,30 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       return;
     }
     try {
-      await this.requestWorkspaceSnapshot(target, request);
+      if (!target.latestSnapshot && request.reason !== "initial") {
+        this.pendingColdRefreshes.set(
+          target,
+          this.mergeRefreshRequests(this.pendingColdRefreshes.get(target) ?? null, request),
+        );
+        this.scheduleInitialWorkspaceRefresh(target);
+        return;
+      }
+      const existing = this.backgroundRefreshes.get(target);
+      if (existing) {
+        if (existing.started) await this.requestWorkspaceSnapshot(target, request);
+        else existing.request = this.mergeRefreshRequests(existing.request, request);
+        await existing.promise;
+        return;
+      }
+      const entry = { request, started: false, promise: Promise.resolve() };
+      entry.promise = this.backgroundRefreshLimit(async () => {
+        entry.started = true;
+        await this.requestWorkspaceSnapshot(target, entry.request);
+      }).finally(() => {
+        if (this.backgroundRefreshes.get(target) === entry) this.backgroundRefreshes.delete(target);
+      });
+      this.backgroundRefreshes.set(target, entry);
+      await entry.promise;
     } catch (error) {
       if (this.disposed || target.closed) {
         return;
@@ -3482,6 +3539,18 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     options?: { forceEmit?: boolean; notify?: boolean },
   ): void {
     target.latestSnapshot = snapshot;
+    const pendingCold = this.pendingColdRefreshes.get(target);
+    if (pendingCold) {
+      this.pendingColdRefreshes.delete(target);
+      // Preserve events during the first read, but release its admission and
+      // callers before draining follow-up work on a continuously changing repo.
+      const settled =
+        target.refreshState.status === "in-flight"
+          ? target.refreshState.promise
+          : Promise.resolve();
+      const requeue = () => this.refreshWorkspaceTarget(target, pendingCold);
+      void settled.then(requeue, requeue);
+    }
     if (target.listeners.size > 0) {
       this.updateForgePrStatusPollForTarget(target);
     }

@@ -47,6 +47,22 @@ test("observes nested files while pruning excluded directories", async () => {
   await subscription.unsubscribe();
 });
 
+test("an aborted startup is visible in diagnostics and releases its observation", async () => {
+  const root = await createRoot();
+  const observer = createFileObserver();
+  observers.add(observer);
+  const controller = new AbortController();
+  const reason = new Error("subscription deadline");
+  const pending = observer.subscribe(root, () => {}, { signal: controller.signal });
+  expect(observer.getDiagnostics().activeObservationCount).toBe(1);
+  controller.abort(reason);
+  await expect(pending).rejects.toBe(reason);
+  expect(observer.getDiagnostics()).toMatchObject({
+    activeObservationCount: 0,
+    nativeHandleCount: 0,
+  });
+});
+
 test("covers files populated immediately inside a newly created directory", async () => {
   const root = await createRoot();
   const events: FileChange[] = [];

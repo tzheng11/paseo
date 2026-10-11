@@ -14,6 +14,7 @@ export interface FileChange {
 
 export interface FileObserverOptions {
   ignore?: string[];
+  signal?: AbortSignal;
 }
 
 export type FileObserverCallback = (error: Error | null, events: FileChange[]) => void;
@@ -94,6 +95,7 @@ class FileObserverService implements FileObserver {
     options: FileObserverOptions = {},
   ): Promise<FileObserverSubscription> {
     if (this.state.status === "closed") throw new Error("File observer is closed");
+    options.signal?.throwIfAborted();
     const state = this.state;
     let observation!: ManagedObservation;
     observation = createManagedObservation({
@@ -103,15 +105,30 @@ class FileObserverService implements FileObserver {
       paths: this.paths,
       metrics: state.metrics,
       createBackend: this.createBackend,
-      onClosed: () => state.observations.delete(observation),
+      onClosed: () => {
+        options.signal?.removeEventListener("abort", abort);
+        state.observations.delete(observation);
+      },
     });
-    await observation.start();
-    if (this.closePromise) {
-      await observation.close();
-      throw new Error("File observer is closed");
-    }
+    // A pending inventory already owns native watches. Include it in diagnostics
+    // and teardown, rather than hiding it until subscribe() resolves.
     state.observations.add(observation);
-    return observation.subscription();
+    let abortClose: Promise<void> | null = null;
+    const abort = () => {
+      abortClose = observation.close();
+      void abortClose.catch(() => undefined); // Awaited by the subscribing caller below.
+    };
+    options.signal?.addEventListener("abort", abort, { once: true });
+    try {
+      await observation.start();
+      if (abortClose) await abortClose;
+      options.signal?.throwIfAborted();
+      if (this.closePromise) throw new Error("File observer is closed");
+      return observation.subscription();
+    } catch (error) {
+      await observation.close();
+      throw error;
+    }
   }
 
   getDiagnostics(): FileObserverDiagnostics {

@@ -29,6 +29,7 @@ export interface ObservationBackend {
 export interface ObservationHost {
   root: string;
   metrics: ObserverMetrics;
+  readonly ignoredRoots?: readonly string[];
   isActive(): boolean;
   isIgnored(path: string): boolean;
   isPathInside(root: string, path: string): boolean;

@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import { writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { expect, test, vi } from "vitest";
 import { createFileObserver, type FileChange } from "../index.js";
 import { createNativeRecursiveBackend } from "./native-recursive.js";
@@ -480,6 +480,68 @@ test("a file classified with no parent bucket yet still gets its delete emitted"
       })
       .toBe(true);
     expect(backend.getDiagnostics().nativeTrackedFileCount).toBe(0);
+  } finally {
+    active = false;
+    await backend.close();
+    await observer.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("startup waits for native coverage before a caller's first nested write", async () => {
+  const root = await mkdtemp(join(tmpdir(), "native-registration-"));
+  const ignored = join(root, "ignored");
+  const observed = join(root, "nested", "first.txt");
+  await mkdir(ignored);
+  await mkdir(dirname(observed));
+  const paths = createObserverPaths(process.platform);
+  const events: FileChange[] = [];
+  const registrations: Array<{
+    directory: string;
+    recursive: boolean;
+    listener: (event: string, path: string) => void;
+  }> = [];
+  let registered = false;
+  let active = true;
+  const observer = createFileObserver();
+  const backend = createNativeRecursiveBackend(
+    {
+      root,
+      ignoredRoots: [ignored],
+      metrics: observer.getDiagnostics(),
+      isActive: () => active,
+      isIgnored: (path) => paths.isInside(ignored, path),
+      isPathInside: paths.isInside,
+      queueEvent: (type, path) => events.push({ type, path }),
+      fail: (error) => {
+        throw error;
+      },
+    },
+    paths,
+    (directory, listener, recursive = true) => {
+      registrations.push({ directory, listener, recursive });
+      // FSEvents registers asynchronously and drops pre-registration changes.
+      return {
+        close: () => {},
+        on: () => {},
+        flushPendingWatches: () => {
+          registered = true;
+        },
+      };
+    },
+  );
+  try {
+    await backend.start();
+    await writeFile(observed, "first write immediately after subscribe");
+    if (registered) {
+      for (const registration of registrations) {
+        const covers = registration.recursive
+          ? paths.isInside(registration.directory, observed)
+          : dirname(observed) === registration.directory;
+        if (covers) registration.listener("rename", relative(registration.directory, observed));
+      }
+    }
+    await expect.poll(() => events.map((event) => event.path)).toContain(observed);
   } finally {
     active = false;
     await backend.close();

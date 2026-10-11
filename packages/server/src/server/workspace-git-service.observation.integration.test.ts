@@ -415,7 +415,7 @@ test("recursive observation updates tracked state and prunes ignored storms", as
   expect(service.getMetrics().workspaceRefreshQueuedCount).toBe(0);
 }, 30_000);
 
-test.each([".next", ".turbo", "node_modules", "dist", "coverage"])(
+test.each([".next", ".turbo", "node_modules", "dist", "coverage", "apps/web/.next"])(
   "a late Git-ignored %s tree is pruned while tracked changes still notify consumers",
   async (ignoredName) => {
     const tempDir = realpathSync(mkdtempSync(path.join(tmpdir(), "paseo-real-ignore-")));
@@ -425,9 +425,11 @@ test.each([".next", ".turbo", "node_modules", "dist", "coverage"])(
       execFileSync("git", args, { cwd: repoDir, encoding: "utf8" }).trim();
     git("init", "-q");
     writeFileSync(path.join(repoDir, ".gitignore"), `${ignoredName}/\n`);
-    const trackedPath = path.join(repoDir, "tracked.txt");
+    const trackedRelativePath = path.join(path.dirname(ignoredName), "tracked.txt");
+    const trackedPath = path.join(repoDir, trackedRelativePath);
+    mkdirSync(path.dirname(trackedPath), { recursive: true });
     writeFileSync(trackedPath, "before\n");
-    git("add", ".gitignore", "tracked.txt");
+    git("add", ".gitignore", trackedRelativePath);
     git("-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-qm", "fixture");
 
     const observer = createFileObserver();
@@ -498,6 +500,14 @@ test.each([".next", ".turbo", "node_modules", "dist", "coverage"])(
       expect(
         afterTrackedEdit.nativeClassificationCount - atIgnoreBoundary.nativeClassificationCount,
       ).toBeLessThanOrEqual(1);
+      // Inventory pruning alone leaves a recursive native handle covering build
+      // output. Count raw callbacks too, after the updated ignore barrier.
+      if (process.platform === "darwin") {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(
+          observer.getDiagnostics().nativeEventCount - atIgnoreBoundary.nativeEventCount,
+        ).toBeLessThanOrEqual(4);
+      }
     } finally {
       subscription?.unsubscribe();
       await service.dispose();

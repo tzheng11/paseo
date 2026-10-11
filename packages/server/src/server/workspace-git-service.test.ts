@@ -612,6 +612,84 @@ describe("WorkspaceGitServiceImpl", () => {
     await service.dispose();
   });
 
+  test("cold metadata and polling refreshes cannot bypass initial admission", async () => {
+    const cwds = Array.from({ length: 12 }, (_, i) => path.resolve(`/tmp/cold-trigger-${i}`));
+    const gate = createDeferred<void>();
+    const started: string[] = [];
+    const live = cwds.at(-1)!;
+    const service = createService({
+      getCheckoutStatus: vi.fn(async (cwd: string) => {
+        started.push(cwd);
+        if (cwd !== live) await gate.promise;
+        return createCheckoutStatus(cwd);
+      }),
+    });
+    const subscriptions = cwds.map((cwd) => service.registerWorkspace({ cwd }, vi.fn()));
+    let read: Promise<unknown> | undefined;
+    try {
+      await vi.waitFor(() => expect(started).toEqual([cwds[0]]));
+      for (const cwd of cwds.slice(0, -1)) service.onWorkspaceStateMayHaveChanged(cwd);
+      await vi.advanceTimersByTimeAsync(1_000);
+      let snapshot: WorkspaceGitRuntimeSnapshot | undefined;
+      read = service.getSnapshot(live).then((value) => {
+        snapshot = value;
+        return value;
+      });
+      await flushPromises();
+      await flushPromises();
+      expect(started).toEqual([cwds[0], live]);
+      gate.resolve();
+      await read;
+      expect(snapshot?.cwd).toBe(live);
+      const startsForFirst = () => started.filter((cwd) => cwd === cwds[0]);
+      await vi.waitFor(() => expect(startsForFirst()).toHaveLength(2));
+    } finally {
+      gate.resolve();
+      await read?.catch(() => undefined);
+      for (const subscription of subscriptions) subscription.unsubscribe();
+      await service.dispose();
+    }
+  });
+
+  test("warm background refreshes reserve admission for a cold live read", async () => {
+    const cwds = Array.from({ length: 8 }, (_, i) => path.resolve(`/tmp/warm-trigger-${i}`));
+    const live = path.resolve("/tmp/cold-live");
+    const gate = createDeferred<void>();
+    let block = false;
+    const started: string[] = [];
+    const service = createService({
+      getCheckoutStatus: vi.fn(async (cwd: string) => {
+        if (block) {
+          started.push(cwd);
+          if (cwd !== live) await gate.promise;
+        }
+        return createCheckoutStatus(cwd);
+      }),
+    });
+    const subscriptions = cwds.map((cwd) => service.registerWorkspace({ cwd }, vi.fn()));
+    let read: Promise<unknown> | undefined;
+    try {
+      await Promise.all(cwds.map((cwd) => service.getSnapshot(cwd)));
+      block = true;
+      for (const cwd of cwds) service.onWorkspaceStateMayHaveChanged(cwd);
+      await vi.advanceTimersByTimeAsync(1_000);
+      read = service.getSnapshot(live);
+      await flushPromises();
+      await flushPromises();
+      expect(started).toContain(live);
+      expect(started.filter((cwd) => cwd !== live)).toHaveLength(
+        WORKSPACE_GIT_REFRESH_CONCURRENCY - 1,
+      );
+      gate.resolve();
+      await read;
+    } finally {
+      gate.resolve();
+      await read?.catch(() => undefined);
+      for (const subscription of subscriptions) subscription.unsubscribe();
+      await service.dispose();
+    }
+  });
+
   test("bounds workspace observation setup pipelines", async () => {
     const cwds = Array.from(
       { length: WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY + 2 },
@@ -742,7 +820,7 @@ describe("WorkspaceGitServiceImpl", () => {
         workspaceRefreshAdmissionPendingCount: 1,
         workspaceObservationSetupAdmissionActiveCount: WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY,
         workspaceObservationSetupAdmissionPendingCount:
-          cwds.length - WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY,
+          WORKSPACE_GIT_REFRESH_CONCURRENCY - WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY,
       });
       expect(subscribe).toHaveBeenCalledTimes(WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY);
     });
@@ -1308,6 +1386,7 @@ describe("WorkspaceGitServiceImpl", () => {
     expect(subscribe).toHaveBeenCalledTimes(1);
     expect(subscribe).toHaveBeenCalledWith(REPO_CWD, expect.any(Function), {
       ignore: [join(REPO_CWD, ".git")],
+      signal: expect.any(AbortSignal),
     });
 
     subscription.unsubscribe();
@@ -1379,6 +1458,7 @@ describe("WorkspaceGitServiceImpl", () => {
     expect(subscription.repoRoot).toBeNull();
     expect(subscribe).toHaveBeenCalledWith(plainCwd, expect.any(Function), {
       ignore: [join(plainCwd, ".git")],
+      signal: expect.any(AbortSignal),
     });
     expect(vi.getTimerCount()).toBe(1);
 

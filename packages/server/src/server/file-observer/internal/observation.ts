@@ -40,7 +40,7 @@ export function createManagedObservation(input: {
 class Observation implements ManagedObservation, ObservationHost {
   readonly root: string;
   readonly metrics: ObserverMetrics;
-  private ignoredRoots: string[];
+  ignoredRoots: string[];
   private status: "open" | "failed" | "closed" = "open";
   private readonly backend: ObservationBackend;
   private readonly pendingEvents = new Map<string, FileChange>();
