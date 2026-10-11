@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { expect, test, vi } from "vitest";
 import { createFileObserver } from "../index.js";
 import { createNativeRecursiveBackend } from "./native-recursive.js";
@@ -8,6 +8,7 @@ import { createObserverPaths } from "./paths.js";
 
 const scan = vi.hoisted(() => ({
   root: "",
+  prefix: "",
   children: new Set<string>(),
   gate: Promise.resolve(),
   active: 0,
@@ -21,7 +22,7 @@ vi.mock("node:fs/promises", async (original) => {
     ...fs,
     readdir: async (...args: Parameters<typeof fs.readdir>) => {
       const path = String(args[0]);
-      if (path !== scan.root && path.startsWith(`${scan.root}/`)) {
+      if (scan.root && path !== scan.root && path.startsWith(scan.prefix)) {
         const first = scan.children.size === 0;
         scan.children.add(path);
         if (scan.failSibling && scan.children.size === 2) {
@@ -46,6 +47,7 @@ test.each([false, true])(
   async (failSibling) => {
     const root = await mkdtemp(join(tmpdir(), "native-startup-inventory-"));
     scan.root = root;
+    scan.prefix = root + sep;
     scan.children.clear();
     scan.active = 0;
     scan.peak = 0;
