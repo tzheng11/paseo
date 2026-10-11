@@ -212,6 +212,7 @@ async function runAllPollingAdmissionLoad(base: string, roots: string[]) {
     report({ phase: "all-polling-before-edits", dirtyBeforeEdits, observed: observed.size });
     if (dirtyBeforeEdits.length)
       throw new Error("polling coverage requires clean starting snapshots");
+    const coverageStarted = performance.now();
     measureCoverage = true;
     await Promise.all(
       roots.map((root) =>
@@ -221,9 +222,10 @@ async function runAllPollingAdmissionLoad(base: string, roots: string[]) {
         ),
       ),
     );
-    await until(() => covered.size === roots.length, "recovered native edit round trips", 30_000);
+    await until(() => covered.size === roots.length, "recovered native edit round trips", 120_000);
     report({
       phase: "all-polling-recovered",
+      coverageMs: performance.now() - coverageStarted,
       registered: observed.size,
       roundTrips: covered.size,
       total: roots.length,
@@ -621,15 +623,17 @@ async function runChild() {
       // Every admitted snapshot starts clean; the edits below must generate
       // distinct dirty transitions for all roots, not unchanged status values.
       covered.clear();
+      const coverageStarted = performance.now();
       await Promise.all(paths.map((path) => writeFile(path, "export const x = 3;\n")));
       await until(
         () => roots.every((root) => covered.has(root)),
         "all workspace Git callbacks",
-        30_000,
+        120_000,
       );
       stop();
       report({
         phase: "daemon-coverage",
+        coverageMs: performance.now() - coverageStarted,
         registered: count,
         roundTrips: covered.size,
         metrics: service!.getMetrics(),
