@@ -5218,7 +5218,9 @@ export class AgentManager {
         this.pluginLifecycle,
         describeHookAgent({ ...agent, title: agent.config.title }),
         event,
-        this.timelineStore.getItems(agentId),
+        // Only turn-ended hooks consume history. Usage updates can arrive per token;
+        // materializing a disk-backed timeline here blocks every daemon request.
+        isTurnTerminalEvent(event) ? this.timelineStore.getItems(agentId) : [],
       );
     }
   }
