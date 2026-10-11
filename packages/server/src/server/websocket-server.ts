@@ -274,6 +274,8 @@ function createFallbackWorkspaceGitService(): WorkspaceGitService {
       workspaceRefreshQueuedCount: 0,
       workspaceRefreshAdmissionActiveCount: 0,
       workspaceRefreshAdmissionPendingCount: 0,
+      workspaceInitialRefreshActiveCount: 0,
+      workspaceInitialRefreshPendingCount: 0,
       workspaceObservationSetupAdmissionActiveCount: 0,
       workspaceObservationSetupAdmissionPendingCount: 0,
       fetchInFlightCount: 0,

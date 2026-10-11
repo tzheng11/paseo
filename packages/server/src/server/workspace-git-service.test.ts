@@ -583,6 +583,35 @@ describe("WorkspaceGitServiceImpl", () => {
     service.dispose();
   });
 
+  test("staggered cold inventory lets an explicit read bypass all queued workspaces", async () => {
+    const cwds = Array.from({ length: 83 }, (_, index) => path.resolve(`/tmp/cold-repo-${index}`));
+    const firstRead = createDeferred<CheckoutStatusGit>();
+    const startedReads: string[] = [];
+    const getCheckoutStatus = vi.fn(async (cwd: string) => {
+      startedReads.push(cwd);
+      return cwd === cwds[0] ? firstRead.promise : createCheckoutStatus(cwd);
+    });
+    const service = createService({ getCheckoutStatus });
+    const subscriptions = cwds.map((cwd) => service.registerWorkspace({ cwd }, vi.fn()));
+    await vi.waitFor(() => expect(startedReads).toEqual([cwds[0]]));
+    expect(service.getMetrics()).toMatchObject({
+      workspaceInitialRefreshActiveCount: 1,
+      workspaceInitialRefreshPendingCount: cwds.length - 1,
+    });
+
+    const liveCwd = cwds.at(-1)!;
+    await expect(service.getSnapshot(liveCwd)).resolves.toMatchObject({ cwd: liveCwd });
+    expect(startedReads).toEqual([cwds[0], liveCwd]);
+    expect(service.getMetrics().workspaceRefreshAdmissionPendingCount).toBe(0);
+
+    firstRead.resolve(createCheckoutStatus(cwds[0]!));
+    await vi.waitFor(() => expect(service.peekSnapshot(cwds.at(-2)!)).not.toBeNull());
+    expect(startedReads).toHaveLength(cwds.length);
+    expect(new Set(startedReads).size).toBe(cwds.length);
+    for (const subscription of subscriptions) subscription.unsubscribe();
+    await service.dispose();
+  });
+
   test("bounds workspace observation setup pipelines", async () => {
     const cwds = Array.from(
       { length: WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY + 2 },
@@ -703,6 +732,9 @@ describe("WorkspaceGitServiceImpl", () => {
     }));
     const service = createService({ getCheckoutStatus, subscribe, runGitCommand });
 
+    // Explicit demand still fills the shared pool; cold inventory has its own
+    // staggered queue and must also be harmless when disposal clears it.
+    const refreshes = Promise.allSettled(cwds.map((cwd) => service.getSnapshot(cwd)));
     cwds.forEach((cwd) => service.registerWorkspace({ cwd }, vi.fn()));
     await vi.waitFor(() => {
       expect(service.getMetrics()).toMatchObject({
@@ -712,6 +744,7 @@ describe("WorkspaceGitServiceImpl", () => {
         workspaceObservationSetupAdmissionPendingCount:
           cwds.length - WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY,
       });
+      expect(subscribe).toHaveBeenCalledTimes(WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY);
     });
     const queuedRefreshSettlement = service.getSnapshot(cwds.at(-1)!).then(
       () => ({ status: "fulfilled" as const, error: null }),
@@ -741,6 +774,7 @@ describe("WorkspaceGitServiceImpl", () => {
       }
       expect(service.getMetrics().workspaceRefreshAdmissionActiveCount).toBe(0);
     });
+    await refreshes;
   });
 
   test("cleans a watcher subscription that resolves after its deadline", async () => {
@@ -884,6 +918,10 @@ describe("WorkspaceGitServiceImpl", () => {
       runGitFetch,
     });
 
+    await Promise.all([
+      service.getSnapshot(REPO_CWD),
+      service.getSnapshot(join(REPO_CWD, "packages", "server")),
+    ]);
     const first = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
     const second = service.registerWorkspace(
       { cwd: join(REPO_CWD, "packages", "server") },
@@ -943,6 +981,10 @@ describe("WorkspaceGitServiceImpl", () => {
       hasOriginRemote: vi.fn(async () => true),
       runGitFetch,
     });
+    await Promise.all([
+      service.getSnapshot(REPO_CWD),
+      service.getSnapshot(join(REPO_CWD, "packages", "server")),
+    ]);
     const first = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
     const second = service.registerWorkspace(
       { cwd: join(REPO_CWD, "packages", "server") },
@@ -1006,6 +1048,10 @@ describe("WorkspaceGitServiceImpl", () => {
         return result;
       }),
     });
+    await Promise.all([
+      service.getSnapshot(REPO_CWD),
+      service.getSnapshot(join(REPO_CWD, "packages", "server")),
+    ]);
     const first = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
     const second = service.registerWorkspace(
       { cwd: join(REPO_CWD, "packages", "server") },

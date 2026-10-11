@@ -1945,6 +1945,55 @@ describe("WorkspaceGitService checkout observation", () => {
     },
   );
 
+  test.each([
+    [REPO_CWD, false],
+    [GIT_DIR, false],
+    [REPO_CWD, true],
+    [GIT_DIR, true],
+  ] as const)(
+    "closing during background watcher recovery contains its rejection: %s, dispose=%s",
+    async (failedDirectory, dispose) => {
+      const watcher = createWatcherHarness();
+      const subscribeNormally = watcher.subscribe.getMockImplementation()!;
+      const recoverySubscription = createDeferred<{
+        updateIgnore: (paths: string[]) => Promise<void>;
+        unsubscribe: () => Promise<void>;
+      }>();
+      let attempts = 0;
+      watcher.subscribe.mockImplementation(async (directory, callback, options) => {
+        if (directory !== failedDirectory) return subscribeNormally(directory, callback, options);
+        if (++attempts === 1) throw new Error("initial watcher unavailable");
+        return recoverySubscription.promise;
+      });
+      const service = createService(watcher, {
+        getWorkspaceGitSelfHealPhaseMs: () => 1_000_000,
+      });
+      const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+      await vi.waitFor(() => {
+        expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
+        expect(attempts).toBe(1);
+      });
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(attempts).toBe(2);
+
+      subscription.unsubscribe();
+      if (dispose) await service.dispose();
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(attempts).toBe(2);
+      expect(service.getMetrics().workingTreeWatchTargetCount).toBe(0);
+      expect(service.getMetrics().repositoryTargetCount).toBe(0);
+
+      const lateUnsubscribe = vi.fn(async () => {});
+      recoverySubscription.resolve({
+        updateIgnore: async () => {},
+        unsubscribe: lateUnsubscribe,
+      });
+      await vi.waitFor(() => expect(lateUnsubscribe).toHaveBeenCalledTimes(1));
+      await service.dispose();
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
+
   test("setup-time watcher error defers recovery until subscribe settles", async () => {
     const watcher = createWatcherHarness();
     const openedSubscription = createDeferred<{

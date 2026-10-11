@@ -273,6 +273,8 @@ export interface WorkspaceGitServiceMetrics {
   workspaceRefreshQueuedCount: number;
   workspaceRefreshAdmissionActiveCount: number;
   workspaceRefreshAdmissionPendingCount: number;
+  workspaceInitialRefreshActiveCount: number;
+  workspaceInitialRefreshPendingCount: number;
   workspaceObservationSetupAdmissionActiveCount: number;
   workspaceObservationSetupAdmissionPendingCount: number;
   fetchInFlightCount: number;
@@ -595,6 +597,11 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     concurrency: WORKSPACE_GIT_REFRESH_CONCURRENCY,
     rejectOnClear: true,
   });
+  // Cold sidebar inventory must not reserve the shared refresh pool ahead of
+  // explicit reads. Keep targets idle until admitted so a live request can
+  // refresh any queued workspace immediately and the cold pass can reuse it.
+  private readonly workspaceInitialRefreshLimit = pLimit({ concurrency: 1, rejectOnClear: true });
+  private readonly initialRefreshScheduled = new Set<WorkspaceGitTarget>();
   private readonly workspaceObservationSetupLimit = pLimit({
     concurrency: WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY,
     rejectOnClear: true,
@@ -731,6 +738,8 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       workspaceRefreshQueuedCount,
       workspaceRefreshAdmissionActiveCount: this.workspaceRefreshLimit.activeCount,
       workspaceRefreshAdmissionPendingCount: this.workspaceRefreshLimit.pendingCount,
+      workspaceInitialRefreshActiveCount: this.workspaceInitialRefreshLimit.activeCount,
+      workspaceInitialRefreshPendingCount: this.workspaceInitialRefreshLimit.pendingCount,
       workspaceObservationSetupAdmissionActiveCount:
         this.workspaceObservationSetupLimit.activeCount,
       workspaceObservationSetupAdmissionPendingCount:
@@ -1021,6 +1030,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     this.disposed = true;
     this.disposeController.abort(new WorkspaceGitServiceDisposedError());
     this.workspaceRefreshLimit.clearQueue();
+    this.workspaceInitialRefreshLimit.clearQueue();
     this.workspaceObservationSetupLimit.clearQueue();
 
     for (const target of this.workspaceTargets.values()) {
@@ -1213,20 +1223,28 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   }
 
   private scheduleInitialWorkspaceRefresh(target: WorkspaceGitTarget): void {
+    if (this.initialRefreshScheduled.has(target)) return;
+    this.initialRefreshScheduled.add(target);
     queueMicrotask(() => {
-      if (!this.isActiveObservedWorkspaceTarget(target) || target.latestSnapshot) {
-        return;
-      }
-      void this.refreshWorkspaceTarget(target, {
-        force: false,
-        refreshStructure: true,
-        refreshWorktree: true,
-        includeForge: true,
-        reason: "initial",
-        notify: true,
-        queueIfBusy: false,
-        movedRemoteRefs: new Set(),
-      });
+      void this.workspaceInitialRefreshLimit(async () => {
+        if (!this.isActiveObservedWorkspaceTarget(target) || target.latestSnapshot) return;
+        await this.refreshWorkspaceTarget(target, {
+          force: false,
+          refreshStructure: true,
+          refreshWorktree: true,
+          includeForge: true,
+          reason: "initial",
+          notify: true,
+          queueIfBusy: false,
+          movedRemoteRefs: new Set(),
+        });
+      })
+        .catch((error) => {
+          if (!this.disposed) {
+            this.logger.warn({ err: error, cwd: target.cwd }, "Failed initial workspace refresh");
+          }
+        })
+        .finally(() => this.initialRefreshScheduled.delete(target));
     });
   }
 
@@ -1558,7 +1576,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
         return false;
       }
       if (this.disposed || target.closed) {
-        throw error;
+        // Background recovery can outlive its last listener. Its deadline or
+        // disposal rejection belongs to the closed target, not the process.
+        return false;
       }
       this.logger.warn(
         { err: error, cwd: target.cwd },
@@ -2266,7 +2286,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
         return false;
       }
       if (this.disposed || target.closed) {
-        throw error;
+        return false;
       }
       this.logger.warn(
         { err: error, repoGitRoot: target.repoGitRoot },
