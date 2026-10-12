@@ -1641,7 +1641,7 @@ describe("WorkspaceReconciliationService", () => {
       createPersistedProjectRecord({
         projectId: "pending",
         rootPath,
-        kind: "directory",
+        kind: "non_git",
         displayName: "pending",
         createdAt: timestamp,
         updatedAt: timestamp,
