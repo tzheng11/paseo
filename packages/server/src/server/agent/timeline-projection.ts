@@ -323,6 +323,46 @@ export class TimelineProjection {
     this.rows.push({ ...entry, seq: entry.seqEnd });
   }
 
+  getItemCount(): number {
+    return this.rows.length;
+  }
+
+  getFirstSeq(): number {
+    return this.rows[0]?.seqStart ?? 0;
+  }
+
+  getItems(): AgentTimelineItem[] {
+    return this.rows.map((row) => row.item);
+  }
+
+  getSubmittedUserMessage(clientMessageId: string): ProjectedTimelineRow | null {
+    const row = this.rows.find(
+      (candidate) =>
+        candidate.item.type === "user_message" &&
+        candidate.item.clientMessageId === clientMessageId,
+    );
+    return row ? { ...row } : null;
+  }
+
+  getLastItem(seq: number): AgentTimelineItem | null {
+    return this.rows.find((row) => row.seqEnd === seq)?.item ?? null;
+  }
+
+  getLastAssistantMessage(): string | null {
+    const row = this.rows.findLast((candidate) => candidate.item.type === "assistant_message");
+    return row?.item.type === "assistant_message" ? row.item.text : null;
+  }
+
+  selectPage(input: {
+    bounds: { minSeq: number; maxSeq: number };
+    direction: TimelineLimitDirection;
+    cursorSeq?: number;
+    limit: number;
+  }): ProjectedTimelinePageSelection {
+    // Retained rows are already projected. Only the selected response is copied.
+    return selectProjectedEntriesPage({ ...input, entries: this.rows });
+  }
+
   getRows(): ProjectedTimelineRow[] {
     return this.rows.map((row) => ({ ...row }));
   }
@@ -537,7 +577,7 @@ function selectProjectedEntriesBefore(input: {
 }
 
 function selectProjectedEntriesTail(
-  projectedAll: TimelineProjectionEntry[],
+  projectedAll: readonly TimelineProjectionEntry[],
   limit: number,
   bounds: { minSeq: number; maxSeq: number },
 ): ProjectedTimelinePageSelection {
@@ -566,7 +606,23 @@ export function selectProjectedTimelinePage(input: {
 }): ProjectedTimelinePageSelection {
   const limit = input.limit === undefined ? 0 : Math.max(0, Math.floor(input.limit));
   const bounds = input.bounds ?? getTimelineBounds(input.rows);
-  const projectedAll = projectTimelineRows({ rows: input.rows, mode: "projected" });
+  return selectProjectedEntriesPage({
+    ...input,
+    limit,
+    bounds,
+    entries: projectTimelineRows({ rows: input.rows, mode: "projected" }),
+  });
+}
+
+function selectProjectedEntriesPage(input: {
+  entries: readonly TimelineProjectionEntry[];
+  bounds: { minSeq: number; maxSeq: number } | null;
+  direction: TimelineLimitDirection;
+  cursorSeq?: number;
+  limit: number;
+}): ProjectedTimelinePageSelection {
+  const { entries: projectedAll, bounds } = input;
+  const limit = Math.max(0, Math.floor(input.limit));
   if (!bounds) {
     return {
       entries: [],

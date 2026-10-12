@@ -211,3 +211,48 @@ it("includes transitive tool updates in a contiguous projected tail", () => {
   expect(tail.rows.map((row) => row.seqStart)).toEqual([1, 2, 3, 5]);
   expect(tail).toMatchObject({ startSeq: 1, endSeq: 6, hasOlder: false });
 });
+
+describe("timeline read allocation budget", () => {
+  it("counts retained items without reading historical payloads", () => {
+    const store = new InMemoryAgentTimelineStore();
+    store.initialize("a");
+    let payloadReads = 0;
+    for (let i = 0; i < 1000; i++) {
+      store.append("a", {
+        get type() {
+          payloadReads++;
+          return "user_message" as const;
+        },
+        text: `message ${i}`,
+      });
+    }
+    payloadReads = 0;
+    expect(store.getItemCount("a")).toBe(1000);
+    expect(payloadReads).toBe(0);
+  });
+
+  it("pages an already projected history without inspecting unselected payloads", () => {
+    const store = new InMemoryAgentTimelineStore();
+    store.initialize("a");
+    let payloadReads = 0;
+    for (let i = 0; i < 1000; i++) {
+      store.append("a", {
+        get type() {
+          payloadReads++;
+          return "user_message" as const;
+        },
+        text: `message ${i}`,
+      });
+    }
+    payloadReads = 0;
+    const result = store.fetch("a", { limit: 10 });
+    expect(payloadReads).toBe(0);
+    expect(result.rows.map((row) => row.item)).toEqual(
+      Array.from({ length: 10 }, (_, i) => ({ type: "user_message", text: `message ${990 + i}` })),
+    );
+    expect(result).toMatchObject({ startSeq: 991, endSeq: 1000, hasOlder: true });
+    // A caller must not be able to overwrite the retained row metadata.
+    result.rows[0].seqStart = -1;
+    expect(store.fetch("a", { limit: 10 }).rows[0].seqStart).toBe(991);
+  });
+});

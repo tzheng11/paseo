@@ -11857,3 +11857,27 @@ test.each([false, true])(
     }
   },
 );
+
+test("metrics count projected history without materializing timeline arrays", async () => {
+  const manager = new AgentManager({ clients: { codex: new TestAgentClient() }, logger });
+  const agent = await manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
+    workspaceId: undefined,
+  });
+  await manager.appendTimelineItem(agent.id, { type: "assistant_message", text: "A" });
+  await manager.appendTimelineItem(agent.id, { type: "assistant_message", text: "B" });
+  await manager.appendTimelineItem(agent.id, { type: "user_message", text: "next" });
+  const snapshotSpy = vi
+    .spyOn(InMemoryAgentTimelineStore.prototype, "getItems")
+    .mockImplementation(() => {
+      throw new Error("metrics must not materialize history");
+    });
+  try {
+    expect(manager.getMetricsSnapshot().timelineStats).toEqual({
+      totalItems: 2,
+      maxItemsPerAgent: 2,
+    });
+  } finally {
+    snapshotSpy.mockRestore();
+    await manager.closeAgent(agent.id);
+  }
+});

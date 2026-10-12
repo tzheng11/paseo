@@ -10,6 +10,10 @@ then replaces the previous tool state or merges into the current text item. Inte
 are never retained for history or catch-up. Provider history is the durable transcript authority
 and rebuilds the projection when an agent resumes.
 
+Runtime metrics count the retained projection directly. Timeline reads select from that projection
+and copy only the returned row metadata; they do not clone and re-project the complete history
+for each bounded page. Full history and source-sequence cursor coverage remain available.
+
 The invariants are:
 
 > A continuously subscribed client applies every committed row in order. Opening or resuming an
