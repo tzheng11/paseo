@@ -126,12 +126,17 @@ test("host exit reports failure to every observation and releases close barriers
 
 test("failed child spawn without an exit event releases every close barrier", async () => {
   const child = new ChildProcess();
+  child.send = () => true;
+  child.kill = () => false;
   const host = new NativeWatchHost({ fork: () => child });
   // Node can return a ChildProcess with no pid when spawn fails with EMFILE.
-  // Sending then fails because no IPC channel was created; no exit event follows.
+  // No native process exists to kill and no exit event follows the error.
   const watch = host.watch({ root: "/not-spawned", kind: "directory" }, () => undefined);
   watches.push(watch);
-  await expect(watch.ready).rejects.toThrow();
+  queueMicrotask(() =>
+    child.emit("error", Object.assign(new Error("spawn EMFILE"), { code: "EMFILE" })),
+  );
+  await expect(watch.ready).rejects.toThrow("spawn EMFILE");
   await watch.close();
   expect(child.pid).toBeUndefined();
 });
