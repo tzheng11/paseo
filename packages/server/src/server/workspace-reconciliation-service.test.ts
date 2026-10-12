@@ -1631,4 +1631,55 @@ describe("WorkspaceReconciliationService", () => {
       mainRepoRoot: "/tmp/main-repo",
     });
   });
+
+  test("project registration is awaited and a late watch closes after disposal", async () => {
+    const rootPath = mkdtempSync(path.join(tmpdir(), "reconcile-pending-watch-"));
+    tempDirs.push(rootPath);
+    const { projects, projectRegistry, workspaceRegistry } = createTestRegistries();
+    projects.set(
+      "pending",
+      createPersistedProjectRecord({
+        projectId: "pending",
+        rootPath,
+        kind: "directory",
+        displayName: "pending",
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      }),
+    );
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let closes = 0;
+    const service = new WorkspaceReconciliationService({
+      projectRegistry,
+      workspaceRegistry,
+      logger: createTestLogger(),
+      watchProjectRoot: async () => {
+        entered();
+        await gate;
+        return {
+          close() {
+            closes++;
+          },
+        };
+      },
+    });
+    let ready = false;
+    const start = service.start().then(() => {
+      ready = true;
+      return undefined;
+    });
+    await started;
+    expect(ready).toBe(false);
+    service.dispose();
+    release();
+    await start;
+    expect(closes).toBe(1);
+  });
 });

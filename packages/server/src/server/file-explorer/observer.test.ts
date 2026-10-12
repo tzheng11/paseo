@@ -56,6 +56,22 @@ async function workspace() {
 }
 
 describe("FileObserver", () => {
+  test("native registration finishes before the first post-subscribe edit", async () => {
+    const root = await workspace();
+    const observer = new FileObserver();
+    const sizes: number[] = [];
+    const subscription = await observer.subscribe({ cwd: root, path: "file.txt" }, (version) => {
+      if (version.status === "ready") sizes.push(version.size!);
+    });
+    try {
+      await writeFile(path.join(root, "file.txt"), "after registration");
+      await expect.poll(() => sizes).toContain(18);
+    } finally {
+      subscription.unsubscribe();
+      observer.dispose();
+    }
+  });
+
   test("shares one parent watcher and publishes each real version once", async () => {
     const root = await workspace();
     const controls = new ObservationControls();
