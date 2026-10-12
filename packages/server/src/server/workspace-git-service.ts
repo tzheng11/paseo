@@ -276,6 +276,8 @@ export interface WorkspaceGitServiceMetrics {
   workspaceRefreshAdmissionPendingCount: number;
   workspaceInitialRefreshActiveCount: number;
   workspaceInitialRefreshPendingCount: number;
+  workspaceForgeRefreshAdmissionActiveCount?: number;
+  workspaceForgeRefreshAdmissionPendingCount?: number;
   workspaceObservationSetupAdmissionActiveCount: number;
   workspaceObservationSetupAdmissionPendingCount: number;
   fetchInFlightCount: number;
@@ -603,6 +605,13 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   // refresh any queued workspace immediately and the cold pass can reuse it.
   private readonly workspaceInitialRefreshLimit = pLimit({ concurrency: 1, rejectOnClear: true });
   private readonly initialRefreshScheduled = new Set<WorkspaceGitTarget>();
+  // Remote authentication/PR discovery is enrichment, not cold Git admission.
+  // Bound it separately so slow forge calls cannot own every refresh slot.
+  private readonly workspaceForgeRefreshLimit = pLimit({ concurrency: 2, rejectOnClear: true });
+  private readonly forgeRefreshPendingTargets = new Map<
+    WorkspaceGitTarget,
+    { pollKey: string | null }
+  >();
   private readonly initialSnapshotReady = new WeakMap<WorkspaceGitTarget, () => void>();
   private readonly factsLoadedAtMs = new WeakMap<WorkspaceGitTarget, number>();
   private readonly pendingColdRefreshes = new WeakMap<
@@ -760,6 +769,8 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       workspaceRefreshAdmissionPendingCount: this.workspaceRefreshLimit.pendingCount,
       workspaceInitialRefreshActiveCount: this.workspaceInitialRefreshLimit.activeCount,
       workspaceInitialRefreshPendingCount: this.workspaceInitialRefreshLimit.pendingCount,
+      workspaceForgeRefreshAdmissionActiveCount: this.workspaceForgeRefreshLimit.activeCount,
+      workspaceForgeRefreshAdmissionPendingCount: this.workspaceForgeRefreshLimit.pendingCount,
       workspaceObservationSetupAdmissionActiveCount:
         this.workspaceObservationSetupLimit.activeCount,
       workspaceObservationSetupAdmissionPendingCount:
@@ -1056,6 +1067,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     this.disposeController.abort(new WorkspaceGitServiceDisposedError());
     this.workspaceRefreshLimit.clearQueue();
     this.workspaceInitialRefreshLimit.clearQueue();
+    this.workspaceForgeRefreshLimit.clearQueue();
     this.backgroundRefreshLimit.clearQueue();
     this.backgroundRefreshes.clear();
     this.workspaceObservationSetupLimit.clearQueue();
@@ -2825,6 +2837,17 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       return;
     }
 
+    // Arming a poll also discovers its host/slug through Git. Admit that work
+    // with initial enrichment instead of fanning out one poll per cold target.
+    if (
+      this.initialSnapshotReady.has(target) ||
+      (this.forgeRefreshPendingTargets.has(target) &&
+        this.forgeRefreshPendingTargets.get(target)?.pollKey ===
+          this.getForgePrStatusPollKey(target))
+    ) {
+      return;
+    }
+
     const git = target.latestGit;
     if (!git?.remoteUrl) {
       this.stopForgePrStatusPollForTarget(target);
@@ -3276,6 +3299,21 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
           break;
         }
         snapshot = admittedSnapshot;
+        if (request.includeForge) {
+          const enrichment = this.enrichWorkspaceSnapshot(
+            target,
+            snapshot,
+            request,
+            runRefreshGitCommand,
+          );
+          if (request.reason === "initial") {
+            // Initial remote work must not own the target's Git refresh loop:
+            // edits can arrive while authentication or PR lookup is pending.
+            this.publishInitialForgeEnrichment(target, enrichment, request.notify);
+          } else {
+            snapshot = await enrichment;
+          }
+        }
         this.rememberSnapshot(target, snapshot, {
           notify: request.notify,
           forceEmit:
@@ -3304,6 +3342,68 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       throw failure.error;
     }
     return snapshot;
+  }
+
+  private publishInitialForgeEnrichment(
+    target: WorkspaceGitTarget,
+    enrichment: Promise<WorkspaceGitRuntimeSnapshot>,
+    notify: boolean,
+  ): void {
+    void enrichment
+      .then(() => {
+        if (this.isActiveObservedWorkspaceTarget(target)) {
+          this.rememberSnapshot(target, this.combineSnapshot(target), { notify });
+        }
+        return undefined;
+      })
+      .catch((error) => {
+        if (this.isActiveObservedWorkspaceTarget(target)) {
+          this.logger.warn({ err: error, cwd: target.cwd }, "Failed initial forge enrichment");
+        }
+      });
+  }
+
+  private async enrichWorkspaceSnapshot(
+    target: WorkspaceGitTarget,
+    snapshot: WorkspaceGitRuntimeSnapshot,
+    request: WorkspaceGitRefreshRequest,
+    runRefreshGitCommand: RunGitCommand,
+  ): Promise<WorkspaceGitRuntimeSnapshot> {
+    const pending = { pollKey: this.getForgePrStatusPollKey(target) };
+    this.forgeRefreshPendingTargets.set(target, pending);
+    try {
+      // The first Git snapshot releases cold admission immediately.
+      // Forge I/O owns neither the Git refresh nor background lane.
+      if (!target.latestSnapshot) {
+        this.rememberSnapshot(target, snapshot, { notify: request.notify });
+      }
+      await this.workspaceForgeRefreshLimit(async () => {
+        if (target.closed || this.workspaceTargets.get(target.cwd) !== target) return;
+        const facts = target.latestFacts;
+        if (!facts) return;
+        pending.pollKey = this.getForgePrStatusPollKey(target);
+        const forge = await this.loadWorkspaceForgeSnapshot(
+          target,
+          request,
+          facts,
+          runRefreshGitCommand,
+        );
+        if (
+          this.forgeRefreshPendingTargets.get(target) === pending &&
+          pending.pollKey === this.getForgePrStatusPollKey(target)
+        ) {
+          target.latestForge = forge;
+          target.latestForgeLoadedAtMs = this.deps.now().getTime();
+        }
+      });
+      return this.combineSnapshot(target);
+    } finally {
+      if (this.forgeRefreshPendingTargets.get(target) === pending) {
+        this.forgeRefreshPendingTargets.delete(target);
+      }
+      if (this.isActiveObservedWorkspaceTarget(target))
+        this.updateForgePrStatusPollForTarget(target);
+    }
   }
 
   private async refreshSnapshot(
@@ -3348,10 +3448,6 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     if (!facts) {
       facts = await this.refreshGitSnapshot(target, request, runRefreshGitCommand);
     }
-    if (request.includeForge) {
-      await this.refreshForgeSnapshot(target, request, facts, runRefreshGitCommand);
-    }
-
     const snapshot = this.combineSnapshot(target);
     target.latestSnapshotLoadedAtMs = this.deps.now().getTime();
     return snapshot;
@@ -3492,12 +3588,12 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     return facts;
   }
 
-  private async refreshForgeSnapshot(
+  private async loadWorkspaceForgeSnapshot(
     target: WorkspaceGitTarget,
     request: WorkspaceGitRefreshRequest,
     facts: CheckoutSnapshotFacts,
     runRefreshGitCommand: RunGitCommand,
-  ): Promise<void> {
+  ): Promise<WorkspaceGitRuntimeSnapshot["forge"]> {
     const remoteUrl = target.latestGit?.remoteUrl ?? null;
     const resolution = await this.forgeResolver.resolveFromRemoteUrlAsync(remoteUrl);
     // Every forge gates on the resolver alone: a cloud host matches synchronously
@@ -3505,9 +3601,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     // this async resolution populates), so GitHub Enterprise is no longer gated
     // out by a cloud-only identity check.
     if (!resolution) {
-      target.latestForge = buildUnresolvedRemoteForgeSnapshot(remoteUrl);
-      target.latestForgeLoadedAtMs = this.deps.now().getTime();
-      return;
+      return buildUnresolvedRemoteForgeSnapshot(remoteUrl);
     }
     const forgeService: ForgeService = resolution.service;
     const forceForge = request.force && request.includeForge;
@@ -3527,8 +3621,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     });
     // Carry the resolved forge (probe-aware) so the wire projection labels
     // self-managed GitLab hosts correctly instead of falling back to "github".
-    target.latestForge = { ...forgeSnapshot, forge: resolution.forge };
-    target.latestForgeLoadedAtMs = this.deps.now().getTime();
+    return { ...forgeSnapshot, forge: resolution.forge };
   }
 
   private combineSnapshot(target: WorkspaceGitTarget): WorkspaceGitRuntimeSnapshot {

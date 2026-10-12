@@ -612,6 +612,128 @@ describe("WorkspaceGitServiceImpl", () => {
     await service.dispose();
   });
 
+  test.each(["authentication", "pull-request"])(
+    "92 initial snapshots finish while forge %s is blocked",
+    async (phase) => {
+      const cwds = Array.from({ length: 92 }, (_, i) => path.resolve(`/tmp/forge-startup-${i}`));
+      const gate = createDeferred<void>();
+      const entered = vi.fn();
+      const github = createGitHubServiceStub();
+      github.isAuthenticated = vi.fn(async () => {
+        if (phase === "authentication") {
+          entered();
+          await gate.promise;
+        }
+        return true;
+      });
+      const getPullRequestStatus = vi.fn(async () => {
+        if (phase === "pull-request") {
+          entered();
+          await gate.promise;
+        }
+        return createPullRequestStatusResult();
+      });
+      const service = new WorkspaceGitServiceImpl({
+        logger: createLogger() as unknown as pino.Logger,
+        paseoHome: "/tmp/paseo-test",
+        deps: {
+          ...buildDefaultTestServiceDeps(),
+          forgeOverrides: { github },
+          getPullRequestStatus,
+        },
+      });
+      const subscriptions = cwds.map((cwd) => service.registerWorkspace({ cwd }, vi.fn()));
+      try {
+        await vi.waitFor(() => expect(entered).toHaveBeenCalled());
+        await vi.waitFor(() => {
+          expect(service.getMetrics()).toMatchObject({
+            workspaceInitialRefreshActiveCount: 0,
+            workspaceInitialRefreshPendingCount: 0,
+          });
+          for (const cwd of cwds) expect(service.peekSnapshot(cwd)?.git.isGit).toBe(true);
+        });
+        const snapshot = await service.getSnapshot(cwds.at(-1)!, { includeForge: false });
+        expect(snapshot.git.currentBranch).toBe("main");
+        gate.resolve();
+        await vi.waitFor(() =>
+          expect(service.peekSnapshot(cwds.at(-1)!)?.forge.pullRequest?.url).toBe(
+            "https://github.com/acme/repo/pull/123",
+          ),
+        );
+      } finally {
+        gate.resolve();
+        for (const subscription of subscriptions) subscription.unsubscribe();
+        await service.dispose();
+      }
+    },
+  );
+
+  test("Git updates finish while initial forge enrichment is still pending", async () => {
+    const gate = createDeferred<PullRequestStatusResult>();
+    const getPullRequestStatus = vi.fn(() => gate.promise);
+    let dirty = false;
+    const getCheckoutStatus = vi.fn(async (cwd: string) =>
+      createCheckoutStatus(cwd, { isDirty: dirty }),
+    );
+    const service = createService({ getCheckoutStatus, getPullRequestStatus });
+    const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    try {
+      await vi.waitFor(() => expect(getPullRequestStatus).toHaveBeenCalled());
+      expect(service.peekSnapshot(REPO_CWD)?.git.isDirty).toBe(false);
+      dirty = true;
+      const refresh = service.getSnapshot(REPO_CWD, {
+        force: true,
+        includeForge: false,
+        reason: "edit-during-initial-forge",
+      });
+      await vi.waitFor(() => expect(getCheckoutStatus).toHaveBeenCalledTimes(2));
+      await expect(refresh).resolves.toMatchObject({ git: { isDirty: true } });
+    } finally {
+      gate.resolve(createPullRequestStatusResult());
+      subscription.unsubscribe();
+      await service.dispose();
+    }
+  });
+
+  test("late initial PR lookup cannot publish over a changed branch", async () => {
+    const gate = createDeferred<PullRequestStatusResult>();
+    const getPullRequestStatus = vi.fn(() => gate.promise);
+    let branch = "main";
+    const service = createService({
+      getPullRequestStatus,
+      getCheckoutSnapshotFacts: vi.fn(async (cwd: string) => ({
+        ...createCheckoutSnapshotFacts(cwd),
+        currentBranch: branch,
+        pullRequestLookupTarget: { headRef: branch },
+      })),
+      getCheckoutStatus: vi.fn(async (cwd: string) =>
+        createCheckoutStatus(cwd, { currentBranch: branch }),
+      ),
+    });
+    const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    try {
+      await vi.waitFor(() => expect(getPullRequestStatus).toHaveBeenCalled());
+      branch = "feature";
+      await service.getSnapshot(REPO_CWD, {
+        force: true,
+        includeForge: false,
+        reason: "branch-change-during-initial-forge",
+      });
+      gate.resolve(createPullRequestStatusResult());
+      await vi.waitFor(() =>
+        expect(service.getMetrics().workspaceForgeRefreshAdmissionActiveCount).toBe(0),
+      );
+      expect(service.peekSnapshot(REPO_CWD)).toMatchObject({
+        git: { currentBranch: "feature" },
+        forge: { pullRequest: null },
+      });
+    } finally {
+      gate.resolve(createPullRequestStatusResult());
+      subscription.unsubscribe();
+      await service.dispose();
+    }
+  });
+
   test("a hot workspace successor cannot hold cold discovery and watcher registration", async () => {
     const hot = path.resolve("/tmp/hot-startup");
     const cold = path.resolve("/tmp/cold-startup");
