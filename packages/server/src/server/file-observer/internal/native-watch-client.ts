@@ -11,6 +11,12 @@ export interface HostedNativeWatch extends NativeWatch {
   close(): Promise<void>;
 }
 
+interface NativeWatchHostOptions {
+  entry?: URL;
+  timeoutMs?: number;
+  fork?: typeof fork;
+}
+
 interface Subscription {
   listener: (event: string, filename: string | null) => void;
   onError?: (error: Error) => void;
@@ -30,13 +36,20 @@ export class NativeWatchHost {
   private readonly subscriptions = new Map<number, Subscription>();
   private nextId = 0;
 
-  constructor(
-    private readonly entry = new URL(
-      import.meta.url.endsWith(".ts") ? "./native-watch-host.ts" : "./native-watch-host.js",
-      import.meta.url,
-    ),
-    private readonly timeoutMs = 30_000,
-  ) {}
+  private readonly entry: URL;
+  private readonly timeoutMs: number;
+  private readonly forkHost: typeof fork;
+
+  constructor(options: NativeWatchHostOptions = {}) {
+    this.entry =
+      options.entry ??
+      new URL(
+        import.meta.url.endsWith(".ts") ? "./native-watch-host.ts" : "./native-watch-host.js",
+        import.meta.url,
+      );
+    this.timeoutMs = options.timeoutMs ?? 30_000;
+    this.forkHost = options.fork ?? fork;
+  }
 
   watch(input: NativeWatchInput, listener: Subscription["listener"]): HostedNativeWatch {
     const id = ++this.nextId;
@@ -97,7 +110,7 @@ export class NativeWatchHost {
   private send(command: WatchHostCommand): void {
     try {
       if (!this.child) {
-        const child = fork(this.entry, [], {
+        const child = this.forkHost(this.entry, [], {
           execArgv: this.entry.pathname.endsWith(".ts")
             ? ["--import", import.meta.resolve("tsx")]
             : [],
@@ -167,7 +180,7 @@ export class NativeWatchHost {
     const closed = () => {
       for (const subscription of subscriptions) subscription.resolveClose();
     };
-    if (child && child.exitCode === null && child.signalCode === null) {
+    if (child?.pid !== undefined && child.exitCode === null && child.signalCode === null) {
       child.once("exit", closed);
       child.kill("SIGKILL");
     } else closed();

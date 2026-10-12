@@ -1,3 +1,4 @@
+import { ChildProcess } from "node:child_process";
 import { mkdtemp, writeFile, access, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -42,7 +43,7 @@ async function fixture(mode: string, timeout = 5000) {
     process.on('disconnect', () => process.exit(0));
   `,
   );
-  return { root, host: new NativeWatchHost(pathToFileURL(entry), timeout) };
+  return { root, host: new NativeWatchHost({ entry: pathToFileURL(entry), timeoutMs: timeout }) };
 }
 
 async function entered(root: string) {
@@ -121,4 +122,16 @@ test("host exit reports failure to every observation and releases close barriers
   watches.push(watch);
   await expect(watch.ready).rejects.toThrow("exited (17)");
   await watch.close();
+});
+
+test("failed child spawn without an exit event releases every close barrier", async () => {
+  const child = new ChildProcess();
+  const host = new NativeWatchHost({ fork: () => child });
+  // Node can return a ChildProcess with no pid when spawn fails with EMFILE.
+  // Sending then fails because no IPC channel was created; no exit event follows.
+  const watch = host.watch({ root: "/not-spawned", kind: "directory" }, () => undefined);
+  watches.push(watch);
+  await expect(watch.ready).rejects.toThrow();
+  await watch.close();
+  expect(child.pid).toBeUndefined();
 });
