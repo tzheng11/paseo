@@ -36,9 +36,10 @@ frame closes only that provider process and rejects its pending requests. Provid
 remain unchanged; the transport does not discard a response and keep pretending the session is healthy.
 The cache requires Node 22.13 or later, or Electron's bundled Node with `node:sqlite` support.
 
-Runtime metrics count the retained projection directly. Timeline reads select from that projection
-and copy only the returned row metadata; they do not clone and re-project the complete history
-for each bounded page. Full history and source-sequence cursor coverage remain available.
+Runtime metrics count the complete projection, including rows on disk; `timelineStats.totalItems`
+is not a count of resident JavaScript objects. Metadata stream events do not load the transcript
+for plugin hooks. Turn-end hooks still receive the complete timeline, which is an explicit
+full-history allocation outside the row-cache budget.
 
 The invariants are:
 

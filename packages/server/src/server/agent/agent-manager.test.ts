@@ -12139,3 +12139,39 @@ test("metrics count projected history without materializing timeline arrays", as
     await manager.closeAgent(agent.id);
   }
 });
+
+test("provider metadata reaches clients without materializing plugin timeline history", async () => {
+  const client = new SessionRecordingAgentClient();
+  const store = new InMemoryAgentTimelineStore();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    logger,
+    timelineStore: store,
+    pluginLifecycle: { emit: vi.fn(), before: async (_name, request) => request },
+  });
+  const agent = await manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
+    workspaceId: undefined,
+  });
+  const snapshots = vi.spyOn(store, "getItems");
+  const events: AgentManagerEvent[] = [];
+  const unsubscribe = manager.subscribe((event) => events.push(event));
+  try {
+    client.sessions[0].pushEvent({
+      type: "thinking_option_changed",
+      provider: "codex",
+      thinkingOptionId: null,
+    });
+    await manager.flush();
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "agent_stream",
+        agentId: agent.id,
+        event: { type: "thinking_option_changed", provider: "codex", thinkingOptionId: null },
+      }),
+    );
+    expect(snapshots).not.toHaveBeenCalled();
+  } finally {
+    unsubscribe();
+    await manager.closeAgent(agent.id);
+  }
+});

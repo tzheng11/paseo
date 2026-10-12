@@ -1,8 +1,8 @@
 /** Staging only: bounded timeline replay, no providers, watchers, or CPU burners. */
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, writeFile, mkdtemp, rm } from "node:fs/promises";
 import { resolve, dirname } from "node:path";
 import { pathToFileURL } from "node:url";
-import { loadavg } from "node:os";
+import { loadavg, tmpdir } from "node:os";
 import { monitorEventLoopDelay, PerformanceObserver, performance } from "node:perf_hooks";
 import { parseArgs } from "node:util";
 
@@ -29,6 +29,11 @@ if (!Number.isInteger(payloadBytes) || payloadBytes < 128 || payloadBytes > 1638
 const { AgentManager } = await import(
   pathToFileURL(resolve(values.runtime, "server/agent/agent-manager.js")).href
 );
+const { DiskAgentTimelineStore } = await import(
+  pathToFileURL(resolve(values.runtime, "server/agent/disk-agent-timeline-store.js")).href
+);
+const cacheDirectory = await mkdtemp(resolve(tmpdir(), "paseo-gc-replay-"));
+const diskStore = new DiskAgentTimelineStore({ directory: cacheDirectory });
 const logger = {
   child() {
     return this;
@@ -39,7 +44,11 @@ const logger = {
   warn() {},
   error() {},
 };
-const manager = new AgentManager({ logger });
+const manager = new AgentManager({
+  logger,
+  timelineStore: diskStore,
+  pluginLifecycle: { emit() {} },
+});
 // Fixture holders exercise the real manager/store read paths without launching agents.
 const store = manager.timelineStore,
   agentIds = [],
@@ -53,6 +62,11 @@ for (let a = 0; a < agentCount; a++) {
   agentIds.push(id);
   manager.agents.set(id, {
     id,
+    provider: "codex",
+    cwd: "/fixture",
+    config: {},
+    labels: {},
+    internal: false,
     lifecycle: a < runningCount ? "running" : "idle",
     activeForegroundTurnId: a < runningCount ? `turn-${a}` : null,
   });
@@ -64,6 +78,7 @@ for (let a = 0; a < agentCount; a++) {
       : Math.floor((totalItems - 64000) / (agentCount - 4)) +
         (a - 4 < (totalItems - 64000) % (agentCount - 4) ? 1 : 0);
   counts.set(id, count);
+  let batch = [];
   for (let i = 0; i < count; i++) {
     const text = Buffer.alloc(payloadBytes, 97 + (i % 26)).toString();
     let item;
@@ -81,7 +96,11 @@ for (let a = 0; a < agentCount; a++) {
         detail: { type: "plain_text", label: "fixture", text },
       };
     }
-    store.append(id, item);
+    batch.push({ item });
+    if (batch.length === 64 || i === count - 1) {
+      store.appendBatch(id, batch);
+      batch = [];
+    }
     if (i % 500 === 0) await new Promise((done) => setImmediate(done));
   }
 }
@@ -101,7 +120,17 @@ const observer = new PerformanceObserver((list) => {
 observer.observe({ entryTypes: ["gc"] });
 const loop = monitorEventLoopDelay({ resolution: 10 });
 loop.enable();
+await new Promise((done) => setTimeout(done, 30));
 const begin = performance.now();
+let nextMetadataAt = begin,
+  metadataEvents = 0,
+  lastBeat = begin,
+  beatMaxMs = 0;
+const heartbeat = setInterval(() => {
+  const now = performance.now();
+  beatMaxMs = Math.max(beatMaxMs, now - lastBeat - 10);
+  lastBeat = now;
+}, 10);
 let peakHeap = retained.heapUsed,
   operations = 0,
   responseRows = 0,
@@ -114,9 +143,10 @@ const sample = setInterval(() => {
     load: loadavg(),
     heapUsed: m.heapUsed,
     p99Ms: loop.percentile(99) / 1e6,
-    maxMs: loop.max / 1e6,
+    maxMs: Math.max(loop.max / 1e6, beatMaxMs),
   });
   loop.reset();
+  beatMaxMs = 0;
 }, 1000);
 while (performance.now() - begin < seconds * 1000) {
   const tick = performance.now();
@@ -127,9 +157,20 @@ while (performance.now() - begin < seconds * 1000) {
     if (metrics.timelineStats.totalItems < totalItems) throw new Error("Fixture lost history");
     metricMs.push(performance.now() - t);
   }
+  const metadataDue = tick >= nextMetadataAt;
+  if (metadataDue) nextMetadataAt += 10000;
   for (let a = 0; a < runningCount; a++) {
     const id = agentIds[a];
     store.append(id, { type: "user_message", text: Buffer.alloc(1024, 120).toString() });
+    // Metadata events at two per second overall; history is needed only at turn end.
+    if (metadataDue) {
+      metadataEvents++;
+      manager.dispatchStream(id, {
+        type: "thinking_option_changed",
+        provider: "codex",
+        thinkingOptionId: null,
+      });
+    }
     const t = performance.now();
     const fetched = manager.fetchTimeline(id, { limit: 200 });
     requestMs.push(performance.now() - t);
@@ -142,6 +183,7 @@ while (performance.now() - begin < seconds * 1000) {
   await new Promise((done) => setTimeout(done, Math.max(0, 1000 - (performance.now() - tick))));
 }
 clearInterval(sample);
+clearInterval(heartbeat);
 loop.disable();
 observer.disconnect();
 const percentile = (xs, p) => [...xs].sort((a, b) => a - b)[Math.floor((xs.length - 1) * p)] ?? 0;
@@ -155,6 +197,9 @@ const result = {
     runningCount,
     totalItems,
     payloadBytes,
+    backend: "disk",
+    metadataEventsPerSecond: 2,
+    metadataEvents,
     seconds,
     operations,
     responseRows,
@@ -202,3 +247,6 @@ console.log(
     windows: undefined,
   }),
 );
+
+diskStore.close();
+await rm(cacheDirectory, { recursive: true, force: true });
