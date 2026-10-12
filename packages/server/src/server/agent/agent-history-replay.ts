@@ -1,11 +1,9 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { pruneAbandonedHistoryCaches } from "./agent-history-cache-directory.js";
 import { closeSync, createReadStream, openSync, readSync } from "node:fs";
-import { StringDecoder } from "node:string_decoder";
 import { chmod, copyFile, mkdtemp, open, rm, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { createInterface } from "node:readline";
 
 export interface AgentHistoryReadMetrics {
   historyEventsRead: number;
@@ -81,21 +79,31 @@ export class AgentHistoryReplay<T> {
     private file: FileHandle | null,
   ) {}
 
-  static async create<T>(events: AsyncIterable<T> | Iterable<T>): Promise<AgentHistoryReplay<T>> {
+  static async create<T>(
+    events: AsyncIterable<T> | Iterable<T>,
+    options?: { key?: (event: T) => string | null; measureSource?: boolean },
+  ): Promise<AgentHistoryReplay<T>> {
     if (!prunedAbandonedReplays) {
       pruneAbandonedHistoryCaches(tmpdir(), "paseo-history-");
       prunedAbandonedReplays = true;
     }
     const directory = await mkdtemp(path.join(tmpdir(), `paseo-history-${process.pid}-`));
     const replay = new AgentHistoryReplay<T>(directory, null);
-    const metrics = requestHistoryReads.getStore();
+    const metrics = options?.measureSource === false ? undefined : requestHistoryReads.getStore();
+    const indicesByKey = new Map<string, number>();
     if (metrics) metrics.historyReplayCount++;
     try {
       replay.file = await open(path.join(directory, "events.jsonl"), "wx", 0o600);
       for await (const event of events) {
         const line = JSON.stringify(event) + "\n";
         const bytes = Buffer.byteLength(line, "utf8");
-        replay.records.push({ offset: replay.bytes, bytes });
+        const key = options?.key?.(event);
+        const existingIndex = key ? indicesByKey.get(key) : undefined;
+        const record = { offset: replay.bytes, bytes };
+        if (existingIndex === undefined) {
+          if (key) indicesByKey.set(key, replay.records.length);
+          replay.records.push(record);
+        } else replay.records[existingIndex] = record;
         replay.bytes += bytes;
         if (metrics) {
           metrics.historyEventsRead++;
@@ -194,14 +202,13 @@ export class AgentHistoryReplay<T> {
                 startIndex: headEnd,
                 endIndex: tailStart - 1,
                 count: tailStart - headEnd,
-                bytes:
-                  this.records[tailStart - 1].offset +
-                  this.records[tailStart - 1].bytes -
-                  this.records[headEnd].offset,
+                bytes: this.records
+                  .slice(headEnd, tailStart)
+                  .reduce((sum, record) => sum + record.bytes, 0),
               }
             : null,
         totalEvents: this.records.length,
-        totalBytes: this.bytes,
+        totalBytes: this.records.reduce((sum, record) => sum + record.bytes, 0),
       };
     } finally {
       await file.close();
@@ -272,41 +279,38 @@ export class AgentHistoryReplay<T> {
 
   /** Full-history consumers must opt into this streamed path explicitly. */
   async *streamAll(): AsyncGenerator<T> {
-    yield* this.events();
+    const file = await open(path.join(this.directory, "events.jsonl"), "r");
+    try {
+      for (let index = 0; index < this.records.length; index++)
+        yield (await this.readRecord(file, index)).value;
+    } finally {
+      await file.close();
+    }
   }
 
   async *events(): AsyncGenerator<T> {
-    const stream = createReadStream(path.join(this.directory, "events.jsonl"), {
-      encoding: "utf8",
-      highWaterMark: 64 * 1024,
-    });
-    const reader = createInterface({ input: stream, crlfDelay: Infinity });
-    try {
-      for await (const line of reader) yield JSON.parse(line) as T;
-    } finally {
-      reader.close();
-      stream.destroy();
-    }
+    yield* this.streamAll();
   }
 
   *eventsSync(): Generator<T> {
     const descriptor = openSync(path.join(this.directory, "events.jsonl"), "r");
-    const buffer = Buffer.allocUnsafe(64 * 1024);
-    const decoder = new StringDecoder("utf8");
-    let pending = "";
     try {
-      let bytes: number;
-      while ((bytes = readSync(descriptor, buffer, 0, buffer.length, null)) > 0) {
-        pending += decoder.write(buffer.subarray(0, bytes));
-        let newline: number;
-        while ((newline = pending.indexOf("\n")) >= 0) {
-          const line = pending.slice(0, newline);
-          pending = pending.slice(newline + 1);
-          yield JSON.parse(line) as T;
+      for (const record of this.records) {
+        const buffer = Buffer.allocUnsafe(record.bytes);
+        let read = 0;
+        while (read < record.bytes) {
+          const bytes = readSync(
+            descriptor,
+            buffer,
+            read,
+            record.bytes - read,
+            record.offset + read,
+          );
+          if (!bytes) throw new Error("History source was truncated during streamed read");
+          read += bytes;
         }
+        yield JSON.parse(buffer.toString("utf8")) as T;
       }
-      pending += decoder.end();
-      if (pending) yield JSON.parse(pending) as T;
     } finally {
       closeSync(descriptor);
     }

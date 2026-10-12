@@ -31,9 +31,13 @@ tails expanded by interleaved lifecycle updates can still allocate large respons
 The row-cache budget excludes those responses and provider-owned history-loading buffers. On
 Codex 0.159.2+, resume omits turns and history loads through paged endpoints: paginated threads
 use metadata-only turn pages and bounded item pages; legacy threads load one full turn at a time.
-Their persisted history mode is preserved. Older Codex binaries and Claude's transcript reader
-still materialize provider history before yielding it. Projected provider items can also accumulate
-before replay; these bounds do not cover every provider's peak allocation.
+Their persisted history mode is preserved. Codex writes normalized parent and child replay payloads
+to an indexed disk file, keeping routing and rewind identifiers in memory. Its window reader limits
+both event count and UTF-8 bytes before decoding and reports the omitted middle's count and size.
+Middle pages leave an oversized record unread, report its size and advance the cursor; explicit
+full replay streams those records. Reload still builds the index from all provider pages before
+hydration. Older Codex binaries, legacy turns and other provider readers can still materialize
+large native responses; these bounds do not cover every provider's peak allocation.
 Codex and JSONL RPC transports bound each stdout frame to 64 MiB before decoding it. An oversized
 frame closes only that provider process and rejects its pending requests. Provider transcripts
 remain unchanged; the transport does not discard a response and keep pretending the session is healthy.

@@ -4692,6 +4692,77 @@ describe("Codex app-server provider", () => {
     ]);
   });
 
+  test("reads bounded history edges and middle pages without another provider request", async () => {
+    const session = createSession();
+    asInternals(session).pagedHistoryAvailable = true;
+    const request = vi.fn(async (method: string, raw: unknown) => {
+      const params = z.record(z.string(), z.unknown()).parse(raw);
+      if (method === "thread/read") return { thread: { historyMode: "paginated" } };
+      if (method === "thread/turns/list")
+        return { data: [{ id: "turn", items: [] }], nextCursor: null };
+      if (method !== "thread/items/list") throw new Error("Unexpected request " + method);
+      const start = Number(params.cursor ?? 0);
+      const end = Math.min(start + 8, 300);
+      const data = [];
+      for (let index = start; index < end; index++)
+        data.push({
+          turnId: "turn",
+          item: {
+            type: "agentMessage",
+            id: String(index),
+            text: "x".repeat(index === 150 ? 2 * 1024 * 1024 : 4096),
+          },
+          completedAtMs: 1777633200000,
+        });
+      return {
+        data,
+        nextCursor: end < 300 ? String(end) : null,
+      };
+    });
+    session.client = { request };
+    try {
+      await asInternals(session).loadPersistedHistory(session.client);
+      request.mockClear();
+      const window = await session.readHistoryWindows!({
+        head: { events: 2, bytes: 10000 },
+        tail: { events: 3, bytes: 14000 },
+      });
+      expect(window.totalEvents).toBe(300);
+      expect(window.head.map((entry) => entry.index)).toEqual([0, 1]);
+      expect(window.tail.map((entry) => entry.index)).toEqual([297, 298, 299]);
+      expect(window.gap).toEqual({
+        startIndex: 2,
+        endIndex: 296,
+        count: 295,
+        bytes:
+          window.totalBytes -
+          [...window.head, ...window.tail].reduce((sum, entry) => sum + entry.bytes, 0),
+      });
+      expect(window.head.reduce((sum, entry) => sum + entry.bytes, 0)).toBeLessThanOrEqual(10000);
+      expect(window.tail.reduce((sum, entry) => sum + entry.bytes, 0)).toBeLessThanOrEqual(14000);
+      const middle = await session.readHistoryPage!({
+        cursor: 150,
+        direction: "after",
+        limit: { events: 1, bytes: 16000 },
+      });
+      expect(middle.entries).toEqual([]);
+      expect(middle.oversized).toEqual([{ index: 150, bytes: expect.any(Number) }]);
+      expect(middle.nextCursor).toBe(151);
+      for (let pass = 0; pass < 2; pass++) {
+        let count = 0;
+        for await (const event of session.streamAllHistory!()) {
+          expect(event.type).toBe("timeline");
+          count++;
+        }
+        expect(count).toBe(300);
+      }
+      expect(request).not.toHaveBeenCalled();
+    } finally {
+      session.client = null;
+      await session.close();
+    }
+  });
+
   test("loads paginated turns and item pages in order without a full-history response", async () => {
     const session = createSession();
     asInternals(session).pagedHistoryAvailable = true;

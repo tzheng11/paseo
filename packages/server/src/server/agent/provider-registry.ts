@@ -459,6 +459,37 @@ export function wrapSessionProvider(provider: AgentProvider, inner: AgentSession
         yield mapStreamEvent(provider, event);
       }
     },
+    readHistoryWindows: inner.readHistoryWindows
+      ? async (limits) => {
+          const windows = await inner.readHistoryWindows!(limits);
+          return {
+            ...windows,
+            head: windows.head.map((entry) =>
+              Object.assign({}, entry, { value: mapStreamEvent(provider, entry.value) }),
+            ),
+            tail: windows.tail.map((entry) =>
+              Object.assign({}, entry, { value: mapStreamEvent(provider, entry.value) }),
+            ),
+          };
+        }
+      : undefined,
+    readHistoryPage: inner.readHistoryPage
+      ? async (options) => {
+          const page = await inner.readHistoryPage!(options);
+          return {
+            ...page,
+            entries: page.entries.map((entry) =>
+              Object.assign({}, entry, { value: mapStreamEvent(provider, entry.value) }),
+            ),
+          };
+        }
+      : undefined,
+    streamAllHistory: inner.streamAllHistory
+      ? async function* () {
+          for await (const event of inner.streamAllHistory!())
+            yield mapStreamEvent(provider, event);
+        }
+      : undefined,
     getRuntimeInfo: async () => mapRuntimeInfo(provider, await inner.getRuntimeInfo()),
     getAvailableModes: () => inner.getAvailableModes(),
     getCurrentMode: () => inner.getCurrentMode(),

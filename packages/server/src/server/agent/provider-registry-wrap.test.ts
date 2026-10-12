@@ -30,6 +30,9 @@ const OPTIONAL_AGENT_SESSION_METHOD_NAMES = [
   "revertFiles",
   "revertBoth",
   "tryHandleOutOfBand",
+  "readHistoryWindows",
+  "readHistoryPage",
+  "streamAllHistory",
 ] as const satisfies readonly OptionalAgentSessionMethodName[];
 
 type MissingOptionalAgentSessionMethod = Exclude<
@@ -185,6 +188,55 @@ async function* emptyHistory(): AsyncGenerator<AgentStreamEvent> {
 }
 
 describe("wrapSessionProvider", () => {
+  test("forwards window, page and explicit full-stream reads with the configured provider", async () => {
+    const session: AgentSession = new FakeSession();
+    const value: AgentStreamEvent = {
+      type: "timeline",
+      provider: "claude",
+      item: { type: "user_message", text: "context" },
+    };
+    session.readHistoryWindows = async () => ({
+      head: [{ index: 0, bytes: 100, value }],
+      tail: [],
+      gap: { startIndex: 1, endIndex: 9, count: 9, bytes: 900 },
+      totalEvents: 10,
+      totalBytes: 1000,
+    });
+    session.readHistoryPage = async () => ({
+      entries: [{ index: 1, bytes: 100, value }],
+      oversized: [],
+      nextCursor: 2,
+    });
+    session.streamAllHistory = async function* () {
+      yield value;
+    };
+    const wrapped = wrapSessionProvider("custom-claude", session);
+    const windows = await wrapped.readHistoryWindows!({
+      head: { events: 1, bytes: 100 },
+      tail: { events: 1, bytes: 100 },
+    });
+    expect(windows.head[0].value.provider).toBe("custom-claude");
+    expect(windows.gap).toEqual({ startIndex: 1, endIndex: 9, count: 9, bytes: 900 });
+    expect(
+      (
+        await wrapped.readHistoryPage!({
+          cursor: 1,
+          direction: "after",
+          limit: { events: 1, bytes: 100 },
+        })
+      ).entries[0].value.provider,
+    ).toBe("custom-claude");
+    const values: AgentStreamEvent[] = [];
+    for await (const event of wrapped.streamAllHistory!()) values.push(event);
+    expect(values).toEqual([{ ...value, provider: "custom-claude" }]);
+    session.readHistoryWindows = undefined;
+    session.readHistoryPage = undefined;
+    session.streamAllHistory = undefined;
+    const unsupported = wrapSessionProvider("custom-claude", session);
+    expect(unsupported.readHistoryWindows).toBeUndefined();
+    expect(unsupported.readHistoryPage).toBeUndefined();
+    expect(unsupported.streamAllHistory).toBeUndefined();
+  });
   test("forwards every optional AgentSession method", async () => {
     const session = new FakeSession();
     const wrapped = wrapSessionProvider("custom-claude", session);

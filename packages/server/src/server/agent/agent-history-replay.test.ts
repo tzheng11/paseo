@@ -9,6 +9,35 @@ import {
 } from "./agent-history-replay.js";
 
 describe("AgentHistoryReplay", () => {
+  it("replaces keyed payloads on disk without moving their original history position", async () => {
+    const replay = await AgentHistoryReplay.create(
+      [
+        { id: "tool", state: "running" },
+        { id: "message", state: "answer" },
+        { id: "tool", state: "completed" },
+      ],
+      { key: (value) => value.id },
+    );
+    try {
+      const values: Array<{ id: string; state: string }> = [];
+      for await (const value of replay.streamAll()) values.push(value);
+      expect(values).toEqual([
+        { id: "tool", state: "completed" },
+        { id: "message", state: "answer" },
+      ]);
+      expect([...replay.eventsSync()]).toEqual(values);
+      const windows = await replay.readWindows({
+        head: { events: 1, bytes: 100 },
+        tail: { events: 1, bytes: 100 },
+      });
+      expect(windows.gap).toBeNull();
+      expect(windows.totalBytes).toBe(
+        values.reduce((sum, value) => sum + Buffer.byteLength(JSON.stringify(value) + "\n"), 0),
+      );
+    } finally {
+      await replay.close();
+    }
+  });
   it("indexes a frozen file without decoding its omitted middle", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "history-window-test-"));
     const file = path.join(directory, "source.jsonl");

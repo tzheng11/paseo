@@ -40,6 +40,12 @@ import {
   type ResolveAgentDefaultModeInput,
 } from "../agent-sdk-types.js";
 import { importSessionFromPersistence } from "../provider-session-import.js";
+import {
+  AgentHistoryReplay,
+  type HistoryReadLimit,
+  type HistoryPage,
+  type HistoryWindows,
+} from "../agent-history-replay.js";
 import { runProviderRefreshActivity } from "../provider-refresh-deadline.js";
 import type { Logger } from "pino";
 
@@ -498,6 +504,8 @@ interface CodexConfiguredDefaults {
 }
 
 interface PersistedTimelineEntry {
+  type: "timeline";
+  provider: typeof CODEX_PROVIDER;
   item: AgentTimelineItem;
   timestamp?: string;
   providerTurnId?: string;
@@ -509,8 +517,10 @@ interface PersistedSubAgentRoute {
 }
 
 interface CodexThreadHistoryProjection {
-  timeline: PersistedTimelineEntry[];
+  timeline: AgentHistoryReplay<PersistedTimelineEntry>;
   subAgentRoutes: PersistedSubAgentRoute[];
+  userMessages: Array<{ messageId: string | undefined; turnId: string | undefined }>;
+  asyncQuestionIds: Set<string>;
 }
 
 function mergeCodexConfiguredDefaults(
@@ -1880,24 +1890,17 @@ function settleHistoricalSubAgentActivity(
 }
 
 function updateHistoricalSubAgentActivity(
-  timeline: PersistedTimelineEntry[],
-  index: number,
+  existing: PersistedTimelineEntry,
   kind: CodexSubAgentActivity["kind"],
   subAgentType?: string,
-): void {
-  const existing = timeline[index];
-  if (existing?.item.type !== "tool_call") {
-    return;
-  }
+): PersistedTimelineEntry {
+  if (existing.item.type !== "tool_call") throw new Error("Expected a subagent tool call");
   const settledItem = settleHistoricalSubAgentActivity(existing.item, kind);
-  timeline[index] = {
+  return {
     ...existing,
     item:
       subAgentType && settledItem.detail.type === "sub_agent"
-        ? {
-            ...settledItem,
-            detail: { ...settledItem.detail, subAgentType },
-          }
+        ? { ...settledItem, detail: { ...settledItem.detail, subAgentType } }
         : settledItem,
   };
 }
@@ -2181,58 +2184,66 @@ async function loadCodexThreadHistoryTimeline(params: {
   client: CodexAppServerClientLike;
   pagedHistoryAvailable: boolean;
 }): Promise<CodexThreadHistoryProjection> {
-  const timeline: PersistedTimelineEntry[] = [];
-  const subAgentTimelineIndexByThreadId = new Map<string, number>();
-  for await (const turn of readCodexHistoryTurns(params)) {
-    for (const item of turn.items) {
-      const historicalSubAgentActivity = readCodexSubAgentActivity(item);
-      if (historicalSubAgentActivity) {
-        const existingIndex = subAgentTimelineIndexByThreadId.get(
-          historicalSubAgentActivity.agentThreadId,
-        );
-        if (existingIndex !== undefined) {
-          const activityTimelineItem = threadItemToTimeline(item, { cwd: params.cwd });
-          updateHistoricalSubAgentActivity(
-            timeline,
-            existingIndex,
-            historicalSubAgentActivity.kind,
-            activityTimelineItem?.type === "tool_call" &&
-              activityTimelineItem.detail.type === "sub_agent"
-              ? activityTimelineItem.detail.subAgentType
+  // Keep only child-routing state in memory; payloads are replayed from disk.
+  const subAgents = new Map<string, PersistedTimelineEntry>();
+  const userMessages: CodexThreadHistoryProjection["userMessages"] = [];
+  const asyncQuestionIds = new Set<string>();
+  async function* entries(): AsyncGenerator<PersistedTimelineEntry> {
+    for await (const turn of readCodexHistoryTurns(params)) {
+      for (const item of turn.items) {
+        const activity = readCodexSubAgentActivity(item);
+        const existing = activity && subAgents.get(activity.agentThreadId);
+        if (activity && existing) {
+          const mapped = threadItemToTimeline(item, { cwd: params.cwd });
+          const updated = updateHistoricalSubAgentActivity(
+            existing,
+            activity.kind,
+            mapped?.type === "tool_call" && mapped.detail.type === "sub_agent"
+              ? mapped.detail.subAgentType
               : undefined,
           );
+          subAgents.set(activity.agentThreadId, updated);
+          yield updated;
           continue;
         }
-      }
-      for (const timelineItem of threadItemToTimelineEntries(item, { cwd: params.cwd })) {
-        const timestamp =
-          readCodexHistoryTimestamp(item) ?? readCodexTurnHistoryTimestamp(turn, timelineItem);
-        const settledTimelineItem =
-          historicalSubAgentActivity && timelineItem.type === "tool_call"
-            ? settleHistoricalSubAgentActivity(timelineItem, historicalSubAgentActivity.kind)
-            : timelineItem;
-        timeline.push({
-          item: settledTimelineItem,
-          timestamp: timestamp ?? undefined,
-          ...(timelineItem.type === "user_message" && typeof turn.id === "string"
-            ? { providerTurnId: turn.id }
-            : {}),
-        });
-        for (const childThreadId of readCodexHistoricalSubAgentThreadIds(item)) {
-          subAgentTimelineIndexByThreadId.set(childThreadId, timeline.length - 1);
+        for (const timelineItem of threadItemToTimelineEntries(item, { cwd: params.cwd })) {
+          const entry: PersistedTimelineEntry = {
+            type: "timeline",
+            provider: CODEX_PROVIDER,
+            item:
+              activity && timelineItem.type === "tool_call"
+                ? settleHistoricalSubAgentActivity(timelineItem, activity.kind)
+                : timelineItem,
+            timestamp:
+              readCodexHistoryTimestamp(item) ??
+              readCodexTurnHistoryTimestamp(turn, timelineItem) ??
+              undefined,
+            ...(timelineItem.type === "user_message" && typeof turn.id === "string"
+              ? { providerTurnId: turn.id }
+              : {}),
+          };
+          for (const id of readCodexHistoricalSubAgentThreadIds(item)) subAgents.set(id, entry);
+          if (entry.item.type === "user_message")
+            userMessages.push({ messageId: entry.item.messageId, turnId: entry.providerTurnId });
+          if (entry.item.type === "tool_call" && entry.item.name === "request_user_input_async")
+            asyncQuestionIds.add(entry.item.callId);
+          yield entry;
         }
       }
     }
   }
-  const subAgentRoutes = Array.from(subAgentTimelineIndexByThreadId.entries()).flatMap(
-    ([childThreadId, timelineIndex]): PersistedSubAgentRoute[] => {
-      const item = timeline[timelineIndex]?.item;
-      return item?.type === "tool_call" && item.detail.type === "sub_agent"
-        ? [{ childThreadId, toolCall: item }]
-        : [];
-    },
+  const timeline = await AgentHistoryReplay.create(entries(), {
+    measureSource: false,
+    key: ({ item }) =>
+      item.type === "tool_call" && item.detail.type === "sub_agent" ? item.callId : null,
+  });
+  const subAgentRoutes = Array.from(subAgents.entries()).flatMap(
+    ([childThreadId, entry]): PersistedSubAgentRoute[] =>
+      entry.item.type === "tool_call" && entry.item.detail.type === "sub_agent"
+        ? [{ childThreadId, toolCall: entry.item }]
+        : [],
   );
-  return { timeline, subAgentRoutes };
+  return { timeline, subAgentRoutes, userMessages, asyncQuestionIds };
 }
 
 export async function forkCodexThread(
@@ -3543,9 +3554,11 @@ export class CodexAppServerAgentSession implements AgentSession {
   private speedModels: CodexModel[] = [];
   private planModeEnabled = false;
   private historyPending = false;
-  private persistedHistory: PersistedTimelineEntry[] = [];
+  private persistedHistory: AgentHistoryReplay<PersistedTimelineEntry> | null = null;
+  private persistedAsyncQuestionIds = new Set<string>();
   private loadingPersistedHistory = false;
   private persistedProviderSubagentEvents: AgentStreamEvent[] = [];
+  private persistedSubagentHistory: AgentHistoryReplay<AgentStreamEvent> | null = null;
   private pendingPermissions = new Map<string, AgentPermissionRequest>();
   private mcpElicitationPermissionIds = new Map<number, string>();
   private pendingPermissionHandlers = new Map<string, CodexPendingPermissionHandler>();
@@ -4083,27 +4096,31 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.persistedProviderSubagentEvents = [];
     this.loadingPersistedHistory = true;
     try {
-      await this.loadPersistedSubAgentHistories(client, subAgentRoutes);
+      const subagents = await AgentHistoryReplay.create(
+        this.loadPersistedSubAgentHistories(client, subAgentRoutes),
+        { measureSource: false },
+      );
+      await this.persistedSubagentHistory?.close();
+      this.persistedSubagentHistory = subagents;
+    } catch (error) {
+      await timeline.close();
+      throw error;
     } finally {
       this.loadingPersistedHistory = false;
     }
     this.resetCodexUserMessageTurns();
-    for (const entry of timeline) {
-      if (entry.item.type === "tool_call" && entry.item.name === "request_user_input_async") {
-        entry.item = this.asyncQuestions.timeline(entry.item.callId) ?? entry.item;
-      }
-      if (entry.item.type === "user_message") {
-        this.rememberCodexUserMessageTurn(entry.item.messageId, entry.providerTurnId);
-      }
-    }
+    this.persistedAsyncQuestionIds = history.asyncQuestionIds;
+    for (const message of history.userMessages)
+      this.rememberCodexUserMessageTurn(message.messageId, message.turnId);
+    await this.persistedHistory?.close();
     this.persistedHistory = timeline;
-    this.historyPending = timeline.length > 0;
+    this.historyPending = true;
   }
 
-  private async loadPersistedSubAgentHistories(
+  private async *loadPersistedSubAgentHistories(
     client: CodexAppServerClientLike,
     rootRoutes: readonly PersistedSubAgentRoute[],
-  ): Promise<void> {
+  ): AsyncGenerator<AgentStreamEvent> {
     const queue = rootRoutes.map((route) => ({
       route,
       parentCallId: null as string | null,
@@ -4122,6 +4139,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         parentCallId: next.parentCallId,
         parentSubagentId: next.parentSubagentId,
       });
+      yield* this.persistedProviderSubagentEvents.splice(0);
       try {
         const childHistory = await loadCodexThreadHistoryTimeline({
           threadId: next.route.childThreadId,
@@ -4129,15 +4147,24 @@ export class CodexAppServerAgentSession implements AgentSession {
           client,
           pagedHistoryAvailable: this.pagedHistoryAvailable,
         });
-        for (const entry of childHistory.timeline) {
-          this.emitProviderSubagentTimeline(next.route.childThreadId, entry.item, entry.timestamp);
-        }
-        for (const route of childHistory.subAgentRoutes) {
-          queue.push({
-            route,
-            parentCallId: next.route.toolCall.callId,
-            parentSubagentId: next.route.childThreadId,
-          });
+        try {
+          for await (const entry of childHistory.timeline.streamAll()) {
+            this.emitProviderSubagentTimeline(
+              next.route.childThreadId,
+              entry.item,
+              entry.timestamp,
+            );
+            yield* this.persistedProviderSubagentEvents.splice(0);
+          }
+          for (const route of childHistory.subAgentRoutes) {
+            queue.push({
+              route,
+              parentCallId: next.route.toolCall.callId,
+              parentSubagentId: next.route.childThreadId,
+            });
+          }
+        } finally {
+          await childHistory.timeline.close();
         }
       } catch (error) {
         this.logger.trace(
@@ -4642,28 +4669,44 @@ export class CodexAppServerAgentSession implements AgentSession {
   }
 
   async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
-    if (
-      (!this.historyPending || this.persistedHistory.length === 0) &&
-      this.persistedProviderSubagentEvents.length === 0
-    ) {
-      return;
-    }
-    const history = this.persistedHistory;
+    if (!this.historyPending && this.persistedProviderSubagentEvents.length === 0) return;
     const providerSubagents = this.persistedProviderSubagentEvents;
-    this.persistedHistory = [];
     this.persistedProviderSubagentEvents = [];
     this.historyPending = false;
-    for (const event of providerSubagents) {
-      yield event;
+    yield* providerSubagents;
+    yield* this.streamAllHistory();
+  }
+
+  /** Full replay is explicit; window reads never consume this stream. */
+  async *streamAllHistory(): AsyncGenerator<AgentStreamEvent> {
+    const history = this.persistedHistory;
+    if (this.persistedSubagentHistory) yield* this.persistedSubagentHistory.streamAll();
+    if (!history) return;
+    for await (const entry of history.streamAll()) {
+      const item =
+        entry.item.type === "tool_call" && entry.item.name === "request_user_input_async"
+          ? (this.asyncQuestions.timeline(entry.item.callId) ?? entry.item)
+          : entry.item;
+      yield { type: "timeline", provider: CODEX_PROVIDER, item, timestamp: entry.timestamp };
     }
-    for (const entry of history) {
-      yield {
-        type: "timeline",
-        provider: CODEX_PROVIDER,
-        item: entry.item,
-        timestamp: entry.timestamp,
-      };
-    }
+  }
+
+  async readHistoryWindows(limits: {
+    head: HistoryReadLimit;
+    tail: HistoryReadLimit;
+  }): Promise<HistoryWindows<AgentStreamEvent>> {
+    if (!this.persistedHistory)
+      return { head: [], tail: [], gap: null, totalEvents: 0, totalBytes: 0 };
+    return this.persistedHistory.readWindows(limits);
+  }
+
+  async readHistoryPage(options: {
+    cursor: number;
+    direction: "before" | "after";
+    limit: HistoryReadLimit;
+  }): Promise<HistoryPage<AgentStreamEvent>> {
+    if (!this.persistedHistory) return { entries: [], oversized: [], nextCursor: null };
+    return this.persistedHistory.readPage(options);
   }
 
   async getRuntimeInfo(): Promise<AgentRuntimeInfo> {
@@ -5053,7 +5096,8 @@ export class CodexAppServerAgentSession implements AgentSession {
       setThreadId: async (threadId) => {
         this.currentThreadId = threadId;
         this.cachedRuntimeInfo = null;
-        this.persistedHistory = [];
+        await this.persistedHistory?.close();
+        this.persistedHistory = null;
         this.historyPending = false;
         await this.loadPersistedHistory(this.client);
         this.reconcileAsyncQuestionsAfterRewind();
@@ -5126,6 +5170,10 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.pendingForegroundTurnIdentification?.resolve(null);
     this.pendingForegroundTurnIdentification = null;
     await this.disposeClient();
+    await this.persistedHistory?.close();
+    this.persistedHistory = null;
+    await this.persistedSubagentHistory?.close();
+    this.persistedSubagentHistory = null;
     this.currentThreadId = null;
   }
 
@@ -6617,11 +6665,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   }
 
   private reconcileAsyncQuestionsAfterRewind(): void {
-    const retainedIds = new Set(
-      this.persistedHistory.flatMap(({ item }) =>
-        item.type === "tool_call" && item.name === "request_user_input_async" ? [item.callId] : [],
-      ),
-    );
+    const retainedIds = this.persistedAsyncQuestionIds;
     for (const requestId of this.asyncQuestions.retain(retainedIds)) {
       this.emitEvent({
         type: "permission_resolved",
