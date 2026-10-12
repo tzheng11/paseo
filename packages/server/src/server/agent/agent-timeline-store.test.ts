@@ -1,9 +1,31 @@
-import { describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { DiskAgentTimelineStore } from "./disk-agent-timeline-store.js";
+import { afterEach, describe, expect, it } from "vitest";
 import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 
-describe("InMemoryAgentTimelineStore", () => {
+function projectedStart(row: { seqStart: number }): number {
+  return row.seqStart;
+}
+
+describe.each(["memory", "disk"])("%s agent timeline store", (backend) => {
+  const cleanups: Array<() => void> = [];
+  afterEach(() => {
+    for (const cleanup of cleanups.splice(0).toReversed()) cleanup();
+  });
+  function createStore() {
+    if (backend === "memory") return new InMemoryAgentTimelineStore();
+    const directory = mkdtempSync(path.join(tmpdir(), "paseo-timeline-contract-"));
+    const store = new DiskAgentTimelineStore({ directory, cacheBytes: 1024 });
+    cleanups.push(
+      () => rmSync(directory, { recursive: true, force: true }),
+      () => store.close(),
+    );
+    return store;
+  }
   it("clamps an overshooting before cursor into the bounded tail window", () => {
-    const store = new InMemoryAgentTimelineStore();
+    const store = createStore();
     store.initialize("agent-1", {
       epoch: "epoch-1",
       nextSeq: 8,
@@ -57,7 +79,7 @@ describe("InMemoryAgentTimelineStore", () => {
   });
 
   it("returns a bounded reset window when an after cursor is behind retained history", () => {
-    const store = new InMemoryAgentTimelineStore();
+    const store = createStore();
     store.initialize("agent-1", {
       epoch: "epoch-1",
       nextSeq: 8,
@@ -104,112 +126,112 @@ describe("InMemoryAgentTimelineStore", () => {
       ],
     });
   });
-});
 
-describe("projected timeline retention", () => {
-  it("retains one full tool state while streaming every source update", () => {
-    const store = new InMemoryAgentTimelineStore();
-    store.initialize("agent");
-    for (let seq = 1; seq <= 2000; seq++) {
-      const item = {
-        type: "tool_call" as const,
-        callId: "child",
-        name: "task",
-        status: "running" as const,
-        error: null,
-        detail: { type: "plain_text" as const, label: "Child", text: "x".repeat(seq * 128) },
-      };
-      expect(store.append("agent", item)).toMatchObject({ seq, item });
-    }
-    const result = store.fetch("agent", { limit: 0 });
-    expect(result.rows).toHaveLength(1);
-    expect(JSON.stringify(result.rows).length).toBeLessThan(260_000);
-    expect(result.window.maxSeq).toBe(2000);
+  describe("projected timeline retention", () => {
+    it("retains one full tool state while streaming every source update", () => {
+      const store = createStore();
+      store.initialize("agent");
+      for (let seq = 1; seq <= 2000; seq++) {
+        const item = {
+          type: "tool_call" as const,
+          callId: "child",
+          name: "task",
+          status: "running" as const,
+          error: null,
+          detail: { type: "plain_text" as const, label: "Child", text: "x".repeat(seq * 128) },
+        };
+        expect(store.append("agent", item)).toMatchObject({ seq, item });
+      }
+      const result = store.fetch("agent", { limit: 0 });
+      expect(result.rows).toHaveLength(1);
+      expect(JSON.stringify(result.rows).length).toBeLessThan(260_000);
+      expect(result.window.maxSeq).toBe(2000);
+    });
+
+    it("catches up a mid-message cursor with the complete projected message", () => {
+      const store = createStore();
+      store.initialize("agent", { epoch: "e" });
+      store.append("agent", { type: "assistant_message", messageId: "m", text: "A" });
+      store.append("agent", { type: "assistant_message", messageId: "m", text: "B" });
+      expect(
+        store.fetch("agent", { direction: "after", cursor: { epoch: "e", seq: 1 } }).rows,
+      ).toMatchObject([
+        {
+          item: { text: "AB" },
+          seqStart: 1,
+          seqEnd: 2,
+          sourceSeqRanges: [{ startSeq: 1, endSeq: 2 }],
+        },
+      ]);
+    });
   });
 
-  it("catches up a mid-message cursor with the complete projected message", () => {
-    const store = new InMemoryAgentTimelineStore();
-    store.initialize("agent", { epoch: "e" });
-    store.append("agent", { type: "assistant_message", messageId: "m", text: "A" });
-    store.append("agent", { type: "assistant_message", messageId: "m", text: "B" });
-    expect(
-      store.fetch("agent", { direction: "after", cursor: { epoch: "e", seq: 1 } }).rows,
-    ).toMatchObject([
-      {
+  describe("projected sequence ownership", () => {
+    it("preserves fetched coverage when another source chunk arrives", () => {
+      const store = createStore();
+      store.initialize("a");
+      store.append("a", { type: "assistant_message", text: "A" });
+      const before = store.fetch("a");
+      store.append("a", { type: "assistant_message", text: "B" });
+      expect(before.rows[0]).toMatchObject({
+        item: { text: "A" },
+        seqEnd: 1,
+        sourceSeqRanges: [{ startSeq: 1, endSeq: 1 }],
+      });
+      expect(store.fetch("a").rows[0]).toMatchObject({
         item: { text: "AB" },
-        seqStart: 1,
         seqEnd: 2,
         sourceSeqRanges: [{ startSeq: 1, endSeq: 2 }],
-      },
-    ]);
-  });
-});
-
-describe("projected sequence ownership", () => {
-  it("preserves fetched coverage when another source chunk arrives", () => {
-    const store = new InMemoryAgentTimelineStore();
-    store.initialize("a");
-    store.append("a", { type: "assistant_message", text: "A" });
-    const before = store.fetch("a");
-    store.append("a", { type: "assistant_message", text: "B" });
-    expect(before.rows[0]).toMatchObject({
-      item: { text: "A" },
-      seqEnd: 1,
-      sourceSeqRanges: [{ startSeq: 1, endSeq: 1 }],
+      });
     });
-    expect(store.fetch("a").rows[0]).toMatchObject({
-      item: { text: "AB" },
-      seqEnd: 2,
-      sourceSeqRanges: [{ startSeq: 1, endSeq: 2 }],
+    it("preserves source positions when seeding a projected history whose last update is an earlier tool", () => {
+      const store = createStore();
+      store.initialize("a");
+      const tool = {
+        type: "tool_call" as const,
+        callId: "t",
+        name: "shell",
+        error: null,
+        detail: { type: "plain_text" as const, label: "work" },
+      };
+      store.append("a", { ...tool, status: "running" });
+      store.append("a", { type: "assistant_message", text: "Answer" });
+      store.append("a", { ...tool, status: "completed" });
+      store.initialize("b", { rows: store.getRows("a") });
+      expect(store.append("b", { type: "user_message", text: "next" }).seq).toBe(4);
+      expect(store.fetch("b").rows.map(projectedStart)).toEqual([1, 2, 4]);
+    });
+    it("returns the last projected assistant message without joining different messages", () => {
+      const store = createStore();
+      store.initialize("a");
+      store.append("a", { type: "assistant_message", messageId: "first", text: "First" });
+      store.append("a", { type: "assistant_message", messageId: "second", text: "Sec" });
+      store.append("a", { type: "assistant_message", messageId: "second", text: "ond" });
+      expect(store.getLastAssistantMessage("a")).toBe("Second");
+    });
+
+    it("includes transitive tool updates in a contiguous projected tail", () => {
+      const store = createStore();
+      store.initialize("a");
+      const tool = (callId: string, status: "running" | "completed") => ({
+        type: "tool_call" as const,
+        callId,
+        name: "shell",
+        status,
+        error: null,
+        detail: { type: "plain_text" as const, label: "work" },
+      });
+      store.append("a", tool("first", "running"));
+      store.append("a", tool("second", "running"));
+      store.append("a", { type: "user_message", text: "Continue" });
+      store.append("a", tool("first", "completed"));
+      store.append("a", { type: "assistant_message", text: "Answer" });
+      store.append("a", tool("second", "completed"));
+      const tail = store.fetch("a", { limit: 1 });
+      expect(tail.rows.map(projectedStart)).toEqual([1, 2, 3, 5]);
+      expect(tail).toMatchObject({ startSeq: 1, endSeq: 6, hasOlder: false });
     });
   });
-  it("preserves source positions when seeding a projected history whose last update is an earlier tool", () => {
-    const store = new InMemoryAgentTimelineStore();
-    store.initialize("a");
-    const tool = {
-      type: "tool_call" as const,
-      callId: "t",
-      name: "shell",
-      error: null,
-      detail: { type: "plain_text" as const, label: "work" },
-    };
-    store.append("a", { ...tool, status: "running" });
-    store.append("a", { type: "assistant_message", text: "Answer" });
-    store.append("a", { ...tool, status: "completed" });
-    store.initialize("b", { rows: store.getRows("a") });
-    expect(store.append("b", { type: "user_message", text: "next" }).seq).toBe(4);
-    expect(store.fetch("b").rows.map((row) => row.seqStart)).toEqual([1, 2, 4]);
-  });
-  it("returns the last projected assistant message without joining different messages", () => {
-    const store = new InMemoryAgentTimelineStore();
-    store.initialize("a");
-    store.append("a", { type: "assistant_message", messageId: "first", text: "First" });
-    store.append("a", { type: "assistant_message", messageId: "second", text: "Sec" });
-    store.append("a", { type: "assistant_message", messageId: "second", text: "ond" });
-    expect(store.getLastAssistantMessage("a")).toBe("Second");
-  });
-});
-
-it("includes transitive tool updates in a contiguous projected tail", () => {
-  const store = new InMemoryAgentTimelineStore();
-  store.initialize("a");
-  const tool = (callId: string, status: "running" | "completed") => ({
-    type: "tool_call" as const,
-    callId,
-    name: "shell",
-    status,
-    error: null,
-    detail: { type: "plain_text" as const, label: "work" },
-  });
-  store.append("a", tool("first", "running"));
-  store.append("a", tool("second", "running"));
-  store.append("a", { type: "user_message", text: "Continue" });
-  store.append("a", tool("first", "completed"));
-  store.append("a", { type: "assistant_message", text: "Answer" });
-  store.append("a", tool("second", "completed"));
-  const tail = store.fetch("a", { limit: 1 });
-  expect(tail.rows.map((row) => row.seqStart)).toEqual([1, 2, 3, 5]);
-  expect(tail).toMatchObject({ startSeq: 1, endSeq: 6, hasOlder: false });
 });
 
 describe("timeline read allocation budget", () => {
@@ -227,7 +249,7 @@ describe("timeline read allocation budget", () => {
       });
     }
     payloadReads = 0;
-    expect(store.getItemCount("a")).toBe(1000);
+    expect(store.getCount("a")).toBe(1000);
     expect(payloadReads).toBe(0);
   });
 

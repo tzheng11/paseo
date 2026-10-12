@@ -506,6 +506,27 @@ npm run build:app-deps     # highlight -> protocol -> client -> expo-two-way-aud
 
 Use `npm run build:server` whenever you have changed any daemon/server-facing package and need clean cross-package types or runtime behavior.
 
+For a personal daemon fork, use Node 22.13 or later and run the built supervisor against an isolated home:
+
+```bash
+npm ci
+npm run build:server
+PASEO_HOME="$PWD/.dev/fork-paseo-home" PASEO_LISTEN=127.0.0.1:6768 \
+  PASEO_NODE_ENV=production node packages/server/dist/scripts/supervisor-entrypoint.js --no-relay
+```
+
+Add `localhost:6768` as a host in the official desktop app to try the fork. Keep the test home
+separate until you have verified paging, reconnects, refresh, and reopen latency with your workload.
+The daemon's compatibility contract is in [Protocol compatibility](./protocol-compatibility.md).
+
+To package this machine's daemon and CLI dependencies, run `node scripts/trace-daemon.mjs` after
+building, then copy the listed paths while preserving their relative layout and workspace symlinks.
+Include the root `package.json` and `LICENSE`. The resulting directory requires a compatible Node
+runtime and contains native dependencies for the build machine's platform and architecture.
+Start its `packages/server/dist/scripts/supervisor-entrypoint.js` directly to run that checkout's
+server. An official CLI upgrade installs the official distribution; keep fork builds under your
+own install prefix.
+
 The app Metro config disables Watchman and uses Metro's node crawler for exports. Keep that invariant unless you have verified production app exports on machines with and without Watchman installed; distro Watchman builds can differ in capabilities and change Metro's crawl behavior.
 
 For tighter loops, you can rebuild a single workspace:

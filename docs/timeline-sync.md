@@ -5,10 +5,36 @@ Agent chat delivery has two paths:
 1. **Live stream** — `agent_stream` WebSocket messages for immediacy. These may be delta-shaped lifecycle updates.
 2. **Authoritative history** — `fetch_agent_timeline_request` for correctness. This always returns full projected timeline items, never lifecycle deltas.
 
-The daemon retains projected items in memory. Each source event advances the stream sequence,
-then replaces the previous tool state or merges into the current text item. Intermediate payloads
-are never retained for history or catch-up. Provider history is the durable transcript authority
-and rebuilds the projection when an agent resumes.
+The daemon keeps projected items in a disposable SQLite cache under
+`$PASEO_HOME/runtime/timeline-cache/`. A 32 MiB serialized-row cache is shared across all loaded
+agents; SQLite's page cache has a 4 MiB target. Provider history remains the durable transcript
+authority and rebuilds the projection when an agent resumes. You can remove abandoned caches
+while the daemon is stopped. Normal shutdown removes its cache; startup removes caches owned
+by processes that have exited.
+
+Each source event advances the stream sequence, then replaces the previous tool state or merges
+into the current text item. Intermediate payloads are never retained for history or catch-up.
+History imports stage events on disk before changing the readable timeline, then commit batches
+of at most 64 events and 512 KiB. A shared replay write queue yields before each batch, so many
+tabs reopening together cannot each consume a full write budget in the same event-loop turn.
+A single larger item is processed alone. Replay uses the same per-agent queue
+as live events, so new events wait behind the complete import while other agents and connections
+remain responsive. History requests wait for that queue until the agent's history is primed.
+A failed provider stream leaves the previous timeline readable. Deferred publication
+replays the staged file instead of retaining another full timeline array.
+
+Ordinary pages read only selected rows from disk. Explicit full-history reads (`limit: 0`, exports,
+and forks) and tails expanded by interleaved lifecycle updates can still allocate large responses.
+The row-cache budget excludes those responses and provider-owned history-loading buffers. On
+Codex 0.159.2+, resume omits turns and history loads through paged endpoints: paginated threads
+use metadata-only turn pages and bounded item pages; legacy threads load one full turn at a time.
+Their persisted history mode is preserved. Older Codex binaries and Claude's transcript reader
+still materialize provider history before yielding it. Projected provider items can also accumulate
+before replay; these bounds do not cover every provider's peak allocation.
+Codex and JSONL RPC transports bound each stdout frame to 64 MiB before decoding it. An oversized
+frame closes only that provider process and rejects its pending requests. Provider transcripts
+remain unchanged; the transport does not discard a response and keep pretending the session is healthy.
+The cache requires Node 22.13 or later, or Electron's bundled Node with `node:sqlite` support.
 
 Runtime metrics count the retained projection directly. Timeline reads select from that projection
 and copy only the returned row metadata; they do not clone and re-project the complete history
@@ -21,7 +47,9 @@ The invariants are:
 > through backward pagination.
 
 Tool output is bounded before it enters either delivery path. Canonical shell tool output is sliced
-to 64 KiB, and the same bounded item is used for runtime timeline rows and live stream events.
+to 64 KiB. Plain-text content and string values nested in unknown structured tool inputs/results
+have the same display limit with a truncation notice. The same bounded item is used for runtime
+timeline rows and live stream events; native provider transcripts and permission requests are unchanged.
 Provider history hydration applies the same rule so reopening an agent cannot restore an oversized
 tool payload.
 

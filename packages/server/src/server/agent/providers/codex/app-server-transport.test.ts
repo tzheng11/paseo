@@ -8,6 +8,47 @@ import {
 import { CodexAppServerClient } from "./app-server-transport.js";
 
 describe("Codex app-server transport", () => {
+  test("oversized provider output rejects all pending requests and leaves another client usable", async () => {
+    const child = createCodexAppServerChildProcess();
+    const client = new CodexAppServerClient(child, createTestLogger());
+    const terminated = vi.fn();
+    client.setUnexpectedTerminationHandler(terminated);
+    const first = expect(client.request("thread/read", {})).rejects.toThrow("JSONL frame exceeded");
+    const second = expect(client.request("model/list", {})).rejects.toThrow("JSONL frame exceeded");
+    const block = Buffer.alloc(1024 * 1024, "x");
+    for (let index = 0; index < 64; index++) child.stdout.write(block);
+    child.stdout.write("x");
+    await first;
+    await second;
+    expect(terminated).toHaveBeenCalledTimes(1);
+    await expect(client.request("model/list", {})).rejects.toThrow("client is closed");
+    await client.dispose();
+    expect(terminated).toHaveBeenCalledTimes(1);
+
+    const otherChild = createCodexAppServerChildProcess();
+    const other = new CodexAppServerClient(otherChild, createTestLogger());
+    const healthy = other.request("model/list", {});
+    otherChild.stdout.write('{"id":1,"result":{"data":[]}}\n');
+    await expect(healthy).resolves.toEqual({ data: [] });
+    await other.dispose();
+    child.stdout.end();
+    child.stderr.end();
+    otherChild.stdout.end();
+    otherChild.stderr.end();
+  });
+
+  test("preserves fragmented Unicode and a final response without a newline", async () => {
+    const child = createCodexAppServerChildProcess();
+    const client = new CodexAppServerClient(child, createTestLogger());
+    const request = client.request("model/list", {});
+    for (const byte of Buffer.from('{"id":1,"result":{"name":"🧠"}}'))
+      child.stdout.write(Buffer.from([byte]));
+    child.stdout.end();
+    await expect(request).resolves.toEqual({ name: "🧠" });
+    await client.dispose();
+    child.stderr.end();
+  });
+
   test("ignores non-JSON stdout lines without dropping pending requests", async () => {
     const child = createCodexAppServerChildProcess();
     const client = new CodexAppServerClient(child, createTestLogger());

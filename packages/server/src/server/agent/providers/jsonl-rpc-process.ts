@@ -3,7 +3,7 @@ import type { Logger } from "pino";
 
 import { spawnProcess } from "../../../utils/spawn.js";
 import { terminateWithTreeKill } from "../../../utils/tree-kill.js";
-import { JsonlFrameDecoder } from "./jsonl-frame-decoder.js";
+import { JsonlFrameDecoder, JsonlFrameSizeError } from "./jsonl-frame-decoder.js";
 export { supportsJsonlRpcProtocolV2 } from "./jsonl-frame-decoder.js";
 
 /** Default wall-clock timeout for control-plane / short RPC calls. */
@@ -90,6 +90,10 @@ export class JsonlRpcProcess {
     this.frameDecoder = new JsonlFrameDecoder({
       frame: (message) => this.dispatchFrame(message),
       problem: (problem, detail) => {
+        if (detail instanceof JsonlFrameSizeError) {
+          void this.close(detail);
+          return;
+        }
         this.options.logger.warn(
           { problem, detail },
           `Ignoring invalid ${this.diagnosticName} frame`,
@@ -98,7 +102,7 @@ export class JsonlRpcProcess {
     });
     this.child = (options.spawn ?? spawnJsonlRpcProcess)(options.launch);
     this.child.stdout.on("data", (chunk) => {
-      this.handleStdoutChunk(chunk.toString());
+      this.frameDecoder.write(chunk);
     });
     this.child.stderr.on("data", (chunk) => {
       this.stderrBuffer += chunk.toString();
@@ -254,10 +258,6 @@ export class JsonlRpcProcess {
     }
   }
 
-  private handleStdoutChunk(chunk: string): void {
-    this.frameDecoder.write(chunk);
-  }
-
   /** Route a complete logical frame to its consumer (pending request or subscriber). */
   private dispatchFrame(message: Record<string, unknown>): void {
     const pending =
@@ -308,6 +308,7 @@ export class JsonlRpcProcess {
       return;
     }
     this.disposed = true;
+    this.frameDecoder.close();
     for (const pending of this.pending.values()) {
       if (pending.timer) {
         clearTimeout(pending.timer);

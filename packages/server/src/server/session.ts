@@ -4497,7 +4497,7 @@ export class Session {
       await unarchiveAgentState(this.agentStorage, this.agentManager, snapshot.id);
       await this.agentManager.hydrateTimelineFromProvider(snapshot.id);
       await this.agentUpdates.forwardLiveAgent(snapshot);
-      const timelineSize = this.agentManager.getTimeline(snapshot.id).length;
+      const timelineSize = this.agentManager.getTimelineCount(snapshot.id);
       if (requestId) {
         const agentPayload = await this.buildAgentPayload(snapshot);
         this.emit({
@@ -4646,7 +4646,7 @@ export class Session {
       }
       await this.agentManager.hydrateTimelineFromProvider(agentId, { broadcast: true });
       await this.agentUpdates.forwardLiveAgent(snapshot);
-      const timelineSize = this.agentManager.getTimeline(agentId).length;
+      const timelineSize = this.agentManager.getTimelineCount(agentId);
       if (requestId) {
         this.emit({
           type: "status",

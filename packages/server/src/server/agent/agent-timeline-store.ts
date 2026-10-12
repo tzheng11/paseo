@@ -44,7 +44,7 @@ export class InMemoryAgentTimelineStore {
     this.states.set(agentId, {
       epoch: options?.epoch ?? randomUUID(),
       projection,
-      minSeq: projection.getFirstSeq(),
+      minSeq: projection.firstSeq,
       nextSeq,
     });
   }
@@ -53,12 +53,22 @@ export class InMemoryAgentTimelineStore {
     this.states.delete(agentId);
   }
 
-  getItems(agentId: string): AgentTimelineItem[] {
-    return this.requireState(agentId).projection.getItems();
+  getNextSeq(agentId: string): number {
+    return this.requireState(agentId).nextSeq;
   }
 
-  getItemCount(agentId: string): number {
-    return this.requireState(agentId).projection.getItemCount();
+  getCount(agentId: string): number {
+    return this.requireState(agentId).projection.count;
+  }
+
+  getRecentItems(agentId: string, limit: number): AgentTimelineItem[] {
+    return this.requireState(agentId).projection.getRecentItems(limit);
+  }
+
+  getItems(agentId: string): AgentTimelineItem[] {
+    return this.requireState(agentId)
+      .projection.getRows()
+      .map((row) => row.item);
   }
 
   getRows(agentId: string): ProjectedTimelineRow[] {
@@ -66,7 +76,12 @@ export class InMemoryAgentTimelineStore {
   }
 
   getSubmittedUserMessage(agentId: string, clientMessageId: string): AgentTimelineRow | null {
-    return this.requireState(agentId).projection.getSubmittedUserMessage(clientMessageId);
+    const row = this.requireState(agentId).projection.findRow(
+      (candidate) =>
+        candidate.item.type === "user_message" &&
+        candidate.item.clientMessageId === clientMessageId,
+    );
+    return row ? cloneRow(row) : null;
   }
 
   enrichSubmittedUserMessage(
@@ -94,7 +109,7 @@ export class InMemoryAgentTimelineStore {
       !staleCursor &&
       direction === "after" &&
       cursor !== undefined &&
-      state.projection.getItemCount() > 0 &&
+      state.projection.count > 0 &&
       cursor.seq < state.minSeq - 1;
     const reset = staleCursor || gap;
     const page = state.projection.selectPage({
@@ -137,13 +152,27 @@ export class InMemoryAgentTimelineStore {
     return cloneRow(row);
   }
 
+  appendBatch(
+    agentId: string,
+    entries: readonly { item: AgentTimelineItem; timestamp?: string }[],
+  ): AgentTimelineRow[] {
+    return entries.map(({ item, timestamp }) => this.append(agentId, item, { timestamp }));
+  }
+
   getLastItem(agentId: string): AgentTimelineItem | null {
     const state = this.requireState(agentId);
-    return state.projection.getLastItem(state.nextSeq - 1);
+    return state.projection.findRow((row) => row.seqEnd === state.nextSeq - 1)?.item ?? null;
+  }
+
+  getLastAssistantMessageSegment(agentId: string): string | null {
+    return this.requireState(agentId).projection.getLastAssistantMessageSegment();
   }
 
   getLastAssistantMessage(agentId: string): string | null {
-    return this.requireState(agentId).projection.getLastAssistantMessage();
+    const row = this.requireState(agentId).projection.findLastRow(
+      (candidate) => candidate.item.type === "assistant_message",
+    );
+    return row?.item.type === "assistant_message" ? row.item.text : null;
   }
 
   private requireState(agentId: string): AgentTimelineState {
@@ -171,3 +200,8 @@ export class InMemoryAgentTimelineStore {
     });
   }
 }
+
+export type AgentRuntimeTimelineStore = Pick<
+  InMemoryAgentTimelineStore,
+  keyof InMemoryAgentTimelineStore
+>;

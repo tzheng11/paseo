@@ -296,6 +296,23 @@ function mergeAssistantChunks(entries: readonly WorkingEntry[]): WorkingEntry[] 
 export type ProjectedTimelineRow = AgentTimelineRow & TimelineProjectionEntry;
 
 /** Owns projected state; source events are consumed, never retained. */
+/** Reuse the same projection rules for memory and disk-backed rows. */
+export function mergeProjectedTimelineRow(
+  existing: TimelineProjectionEntry | undefined,
+  incoming: TimelineProjectionEntry,
+  mode: "identity" | "adjacent",
+): ProjectedTimelineRow | null {
+  if (!existing) return null;
+  const merged =
+    mode === "identity"
+      ? mergeIdentityEntries(existing, incoming)
+      : mergeReasoningChunks(mergeAssistantChunks([existing, incoming]));
+  let entry: TimelineProjectionEntry | null;
+  if (Array.isArray(merged)) entry = merged.length === 1 ? merged[0] : null;
+  else entry = merged;
+  return entry ? { ...entry, seq: entry.seqEnd } : null;
+}
+
 export class TimelineProjection {
   private readonly rows: ProjectedTimelineRow[] = [];
   private readonly identities = new Map<string, number>();
@@ -305,62 +322,59 @@ export class TimelineProjection {
     const identity = timelineItemIdentity(row.item);
     const index = identity === null ? undefined : this.identities.get(identity);
     const existing = index === undefined ? undefined : this.rows[index];
-    const merged = existing ? mergeIdentityEntries(existing, entry) : null;
+    const merged = mergeProjectedTimelineRow(existing, entry, "identity");
     if (merged && index !== undefined) {
-      this.rows[index] = { ...merged, seq: merged.seqEnd };
+      this.rows[index] = merged;
       return;
     }
-    const previous = this.rows.at(-1);
-    const adjacent = previous
-      ? mergeReasoningChunks(mergeAssistantChunks([previous, entry]))
-      : [entry];
-    if (previous && adjacent.length === 1) {
-      const mergedText = adjacent[0];
-      this.rows[this.rows.length - 1] = { ...mergedText, seq: mergedText.seqEnd };
+    const mergedText = mergeProjectedTimelineRow(this.rows.at(-1), entry, "adjacent");
+    if (mergedText) {
+      this.rows[this.rows.length - 1] = mergedText;
       return;
     }
     if (identity !== null) this.identities.set(identity, this.rows.length);
     this.rows.push({ ...entry, seq: entry.seqEnd });
   }
 
-  getItemCount(): number {
+  get count(): number {
     return this.rows.length;
   }
 
-  getFirstSeq(): number {
+  get firstSeq(): number {
     return this.rows[0]?.seqStart ?? 0;
   }
 
-  getItems(): AgentTimelineItem[] {
-    return this.rows.map((row) => row.item);
-  }
-
-  getSubmittedUserMessage(clientMessageId: string): ProjectedTimelineRow | null {
-    const row = this.rows.find(
-      (candidate) =>
-        candidate.item.type === "user_message" &&
-        candidate.item.clientMessageId === clientMessageId,
-    );
+  findRow(predicate: (row: ProjectedTimelineRow) => boolean): ProjectedTimelineRow | null {
+    const row = this.rows.find(predicate);
     return row ? { ...row } : null;
   }
 
-  getLastItem(seq: number): AgentTimelineItem | null {
-    return this.rows.find((row) => row.seqEnd === seq)?.item ?? null;
+  findLastRow(predicate: (row: ProjectedTimelineRow) => boolean): ProjectedTimelineRow | null {
+    const row = this.rows.findLast(predicate);
+    return row ? { ...row } : null;
   }
 
-  getLastAssistantMessage(): string | null {
-    const row = this.rows.findLast((candidate) => candidate.item.type === "assistant_message");
-    return row?.item.type === "assistant_message" ? row.item.text : null;
+  getLastAssistantMessageSegment(): string | null {
+    const chunks: string[] = [];
+    for (let index = this.rows.length - 1; index >= 0; index--) {
+      const item = this.rows[index].item;
+      if (item.type !== "assistant_message") {
+        if (chunks.length) break;
+        continue;
+      }
+      chunks.push(item.text);
+    }
+    return chunks.length ? chunks.toReversed().join("") : null;
   }
 
-  selectPage(input: {
-    bounds: { minSeq: number; maxSeq: number };
-    direction: TimelineLimitDirection;
-    cursorSeq?: number;
-    limit: number;
-  }): ProjectedTimelinePageSelection {
-    // Retained rows are already projected. Only the selected response is copied.
+  selectPage(input: Omit<Parameters<typeof selectProjectedEntriesPage>[0], "entries">) {
     return selectProjectedEntriesPage({ ...input, entries: this.rows });
+  }
+
+  getRecentItems(limit: number): AgentTimelineItem[] {
+    const count = Math.max(0, Math.floor(limit));
+    const rows = count === 0 ? this.rows : this.rows.slice(-count);
+    return rows.map((row) => row.item);
   }
 
   getRows(): ProjectedTimelineRow[] {
@@ -604,25 +618,23 @@ export function selectProjectedTimelinePage(input: {
   cursorSeq?: number;
   limit?: number;
 }): ProjectedTimelinePageSelection {
-  const limit = input.limit === undefined ? 0 : Math.max(0, Math.floor(input.limit));
-  const bounds = input.bounds ?? getTimelineBounds(input.rows);
   return selectProjectedEntriesPage({
     ...input,
-    limit,
-    bounds,
+    bounds: input.bounds ?? getTimelineBounds(input.rows),
     entries: projectTimelineRows({ rows: input.rows, mode: "projected" }),
   });
 }
 
-function selectProjectedEntriesPage(input: {
+export function selectProjectedEntriesPage(input: {
   entries: readonly TimelineProjectionEntry[];
   bounds: { minSeq: number; maxSeq: number } | null;
   direction: TimelineLimitDirection;
   cursorSeq?: number;
-  limit: number;
+  limit?: number;
 }): ProjectedTimelinePageSelection {
-  const { entries: projectedAll, bounds } = input;
-  const limit = Math.max(0, Math.floor(input.limit));
+  const limit = input.limit === undefined ? 0 : Math.max(0, Math.floor(input.limit));
+  const bounds = input.bounds;
+  const projectedAll = input.entries;
   if (!bounds) {
     return {
       entries: [],
