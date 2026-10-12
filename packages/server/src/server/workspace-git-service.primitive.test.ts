@@ -577,8 +577,12 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
 
     checkoutStatusDeferred.resolve(createCheckoutStatus(REPO_CWD));
 
-    await expect(service.getSnapshot(REPO_CWD)).resolves.toEqual(createSnapshot(REPO_CWD));
-    expect(service.peekSnapshot(REPO_CWD)).toEqual(createSnapshot(REPO_CWD));
+    await expect(service.getSnapshot(REPO_CWD)).resolves.toMatchObject({
+      git: createSnapshot(REPO_CWD).git,
+    });
+    await vi.waitFor(() => {
+      expect(service.peekSnapshot(REPO_CWD)).toEqual(createSnapshot(REPO_CWD));
+    });
 
     subscription.unsubscribe();
     service.dispose();

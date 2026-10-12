@@ -6,6 +6,8 @@ export interface GitCommandDurationStats {
 }
 
 export interface GitCommandRuntimeMetricsSnapshot {
+  /** Background ignore inventories have independent admission and statistics. */
+  inventory?: GitCommandRuntimeMetricsSnapshot;
   concurrencyLimit: number;
   maxProcessesPerSecond: number;
   active: number;

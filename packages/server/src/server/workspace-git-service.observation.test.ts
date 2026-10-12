@@ -243,6 +243,8 @@ function createService(
         filterEvents: (events) => events,
         verify: vi.fn(async () => {}),
       })),
+      // Most observation cases test filtering/recovery rather than rate limits.
+      getWorkingTreeIgnoreRefreshIntervalMs: () => 0,
       ...overrides,
     } as never,
   });
@@ -2422,6 +2424,76 @@ describe("WorkspaceGitService checkout observation", () => {
     service.dispose();
   });
 
+  test("updates to tracked files in unseen parents never re-inventory ignored directories", async () => {
+    const watcher = createWatcherHarness();
+    const runGitCommand = vi.fn(async (args: string[]) => ({
+      stdout: args[0] === "rev-parse" ? `${REPO_CWD}\n` : "",
+      stderr: "",
+      truncated: false,
+      exitCode: 0,
+      signal: null,
+    }));
+    const service = createService(watcher, { runGitCommand });
+    const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    await vi.waitFor(() =>
+      expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0),
+    );
+    const [checkoutWatcher] = getWatcherRecordsForDirectory(watcher, REPO_CWD);
+    const before = runGitCommand.mock.calls.filter(([args]) => args[0] === "ls-files").length;
+    for (let index = 0; index < 100; index += 1) {
+      checkoutWatcher.callback(null, [
+        { path: path.join(REPO_CWD, `src-${index}`, "tracked.ts"), type: "update" },
+      ]);
+      await vi.advanceTimersByTimeAsync(3_000);
+    }
+    expect(runGitCommand.mock.calls.filter(([args]) => args[0] === "ls-files")).toHaveLength(
+      before,
+    );
+    subscription.unsubscribe();
+    service.dispose();
+  });
+
+  test("topology and ignore-rule bursts coalesce into one inventory per interval with a trailing refresh", async () => {
+    const watcher = createWatcherHarness();
+    const runGitCommand = vi.fn(async (args: string[]) => ({
+      stdout: args[0] === "rev-parse" ? `${REPO_CWD}\n` : "",
+      stderr: "",
+      truncated: false,
+      exitCode: 0,
+      signal: null,
+    }));
+    const service = createService(watcher, {
+      runGitCommand,
+      getWorkingTreeIgnoreRefreshIntervalMs: () => 30_000,
+    });
+    const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    await vi.waitFor(() =>
+      expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0),
+    );
+    const [checkoutWatcher] = getWatcherRecordsForDirectory(watcher, REPO_CWD);
+    const count = () => runGitCommand.mock.calls.filter(([args]) => args[0] === "ls-files").length;
+    const before = count();
+    for (let index = 0; index < 20; index += 1) {
+      checkoutWatcher.callback(null, [
+        { path: path.join(REPO_CWD, `new-${index}`, "file.ts"), type: "create" },
+      ]);
+      checkoutWatcher.callback(null, [{ path: path.join(REPO_CWD, ".gitignore"), type: "update" }]);
+      await vi.advanceTimersByTimeAsync(1_000);
+    }
+    expect(count()).toBe(before);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(count()).toBe(before + 1);
+    checkoutWatcher.callback(null, [
+      { path: path.join(REPO_CWD, "later", "file.ts"), type: "create" },
+    ]);
+    await vi.advanceTimersByTimeAsync(29_000);
+    expect(count()).toBe(before + 1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(count()).toBe(before + 2);
+    subscription.unsubscribe();
+    service.dispose();
+  });
+
   test("a failed ignore refresh does not permanently mark a directory known", async () => {
     // Regression for the failure path reintroducing the original #4558 bug:
     // `noteWorkingTreeDirectories` marks a newly seen directory known and
@@ -2894,7 +2966,9 @@ describe("WorkspaceGitService checkout observation", () => {
     });
 
     await vi.waitFor(() => expect(lsFilesCallCount).toBe(3));
-    expect(checkoutWatcher?.ignore).toContain(path.join(REPO_CWD, "build"));
+    await vi.waitFor(() => {
+      expect(checkoutWatcher?.ignore).toContain(path.join(REPO_CWD, "build"));
+    });
 
     subscription.unsubscribe();
     service.dispose();

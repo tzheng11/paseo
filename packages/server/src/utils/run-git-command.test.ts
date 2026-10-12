@@ -234,6 +234,42 @@ describe("runGitCommand", () => {
     vi.unstubAllEnvs();
   });
 
+  it("keeps ignored-directory inventories outside read admission and labels their queue", async () => {
+    const { runGitCommand, snapshotGitCommandRuntimeMetrics } = await loadRunGitCommand(1);
+    enqueueSpawnBehaviors({ delayMs: 60_000 });
+    const args = ["ls-files", "-o", "-i", "--directory", "--exclude-standard"];
+    const inventories = Array.from({ length: 5 }, () =>
+      runGitCommand(args, { cwd: process.cwd() }),
+    );
+    await vi.waitFor(() => expect(fakeSpawnController.processes).toHaveLength(1));
+
+    await expect(
+      runGitCommand(["status", "--short"], { cwd: process.cwd() }),
+    ).resolves.toMatchObject({ exitCode: 0 });
+    expect(fakeSpawnController.processes[0]?.exited).toBe(false);
+    expect(snapshotGitCommandRuntimeMetrics()).toMatchObject({
+      active: 0,
+      pending: 0,
+      inventory: {
+        concurrencyLimit: 1,
+        active: 1,
+        pending: 4,
+        activeProvenanceTop: [["git-ignore-inventory", 1]],
+        pendingProvenanceTop: [["git-ignore-inventory", 4]],
+      },
+    });
+
+    const first = fakeSpawnController.processes[0]!;
+    first.dispose();
+    first.emit("exit", 0, null);
+    first.emit("close", 0, null);
+    await Promise.all(inventories);
+    expect(snapshotGitCommandRuntimeMetrics().inventory).toMatchObject({
+      peakActive: 1,
+      pending: 0,
+    });
+  });
+
   it("throttles concurrent git commands to the configured limit", async () => {
     const { runGitCommand } = await loadRunGitCommand(2);
 

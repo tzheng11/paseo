@@ -26,6 +26,15 @@ const DEFAULT_STDERR_LIMIT = 2048;
 
 let gitProcessScheduler = new GitProcessScheduler(resolveGitProcessPolicy({ env: process.env }));
 let gitRuntimeMetrics = createGitCommandRuntimeMetricsWindow(gitProcessScheduler.policy);
+// Full-tree ignore inventories must not occupy read/refresh process slots.
+// One background process and a low start rate bound their extra host load.
+const inventoryProcessScheduler = new GitProcessScheduler({
+  maxProcessConcurrency: 1,
+  maxProcessesPerSecond: 2,
+});
+const inventoryRuntimeMetrics = createGitCommandRuntimeMetricsWindow(
+  inventoryProcessScheduler.policy,
+);
 const gitCommandPriority = new AsyncLocalStorage<GitProcessPriority>();
 
 export function runWithGitCommandPriority<T>(priority: GitProcessPriority, operation: () => T): T {
@@ -204,10 +213,16 @@ function snapshotGitCommandMetricsState(state: GitCommandMetricsState): GitComma
 }
 
 export function snapshotGitCommandRuntimeMetrics(): GitCommandRuntimeMetricsSnapshot {
-  return gitRuntimeMetrics.snapshotAndReset({
-    active: gitProcessScheduler.activeCount,
-    pending: gitProcessScheduler.pendingCount,
-  });
+  return {
+    ...gitRuntimeMetrics.snapshotAndReset({
+      active: gitProcessScheduler.activeCount,
+      pending: gitProcessScheduler.pendingCount,
+    }),
+    inventory: inventoryRuntimeMetrics.snapshotAndReset({
+      active: inventoryProcessScheduler.activeCount,
+      pending: inventoryProcessScheduler.pendingCount,
+    }),
+  };
 }
 
 function submitGitCommandMetric(args: string[], cwd: string): GitCommandMetricsState | null {
@@ -281,12 +296,20 @@ function executeGitCommand<Output>(
   decode: (output: Buffer) => Output,
   provenance?: string,
 ): Promise<GitCommandResult<Output>> {
+  const isInventory =
+    getGitOperation(args) === "ls-files" &&
+    ["-o", "-i", "--directory", "--exclude-standard"].every((flag) => args.includes(flag));
+  const scheduler = isInventory ? inventoryProcessScheduler : gitProcessScheduler;
+  const runtimeMetrics = isInventory ? inventoryRuntimeMetrics : gitRuntimeMetrics;
+  const commandProvenance = isInventory
+    ? `git-ignore-inventory${provenance ? `:${provenance}` : ""}`
+    : provenance;
   const metricsState = submitGitCommandMetric(args, options.cwd);
   const commandTrace = submitGitCommandTrace(args, options.cwd, {
-    active: gitProcessScheduler.activeCount,
-    pending: gitProcessScheduler.pendingCount,
+    active: scheduler.activeCount,
+    pending: scheduler.pendingCount,
   });
-  const runtimeMetric = gitRuntimeMetrics.submit(getGitOperation(args), provenance);
+  const runtimeMetric = runtimeMetrics.submit(getGitOperation(args), commandProvenance);
   const startCommand = () => {
     let releaseProcessSlot!: () => void;
     const exited = new Promise<void>((resolve) => {
@@ -294,10 +317,10 @@ function executeGitCommand<Output>(
     });
     const resultPromise = new Promise<GitCommandResult<Output>>((resolve, reject) => {
       startGitCommandTrace(commandTrace, {
-        active: gitProcessScheduler.activeCount,
-        pending: gitProcessScheduler.pendingCount,
+        active: scheduler.activeCount,
+        pending: scheduler.pendingCount,
       });
-      gitRuntimeMetrics.start(runtimeMetric);
+      runtimeMetrics.start(runtimeMetric);
       const timeout = options.timeout ?? DEFAULT_TIMEOUT_MS;
       const maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
       const acceptExitCodes = options.acceptExitCodes ?? [0];
@@ -346,7 +369,7 @@ function executeGitCommand<Output>(
         if (metricFinished) return;
         metricFinished = true;
         finishGitCommandMetric(metricsState, metric);
-        gitRuntimeMetrics.finish(runtimeMetric, { success: metric.success, timedOut });
+        runtimeMetrics.finish(runtimeMetric, { success: metric.success, timedOut });
       };
 
       const settleTimeoutTrace = (exitCode: number | null, signal: NodeJS.Signals | null) => {
@@ -396,9 +419,11 @@ function executeGitCommand<Output>(
         // `core.quotepath=false` makes git emit raw UTF-8 paths instead of
         // octal-escaping non-ASCII bytes (e.g. `测试文件.txt` vs `"\346\265\213..."`).
         // `core.fsmonitor=false` prevents repository config from launching a command.
+        const gitArgs = ["-c", "core.quotepath=false", "-c", "core.fsmonitor=false", ...args];
+        const lowerPriority = isInventory && process.platform !== "win32";
         child = spawnProcess(
-          "git",
-          ["-c", "core.quotepath=false", "-c", "core.fsmonitor=false", ...args],
+          lowerPriority ? "nice" : "git",
+          lowerPriority ? ["-n", "10", "git", ...gitArgs] : gitArgs,
           {
             cwd: options.cwd,
             envOverlay,
@@ -560,13 +585,10 @@ function executeGitCommand<Output>(
     });
     return { result: resultPromise, exited };
   };
-  const promise = gitProcessScheduler.run(startCommand, {
-    priority: gitCommandPriority.getStore() ?? "normal",
+  const promise = scheduler.run(startCommand, {
+    priority: isInventory ? "normal" : (gitCommandPriority.getStore() ?? "normal"),
   });
-  gitRuntimeMetrics.observeLimiter(
-    gitProcessScheduler.activeCount,
-    gitProcessScheduler.pendingCount,
-  );
+  runtimeMetrics.observeLimiter(scheduler.activeCount, scheduler.pendingCount);
   return promise;
 }
 

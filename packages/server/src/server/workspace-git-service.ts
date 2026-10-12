@@ -98,6 +98,7 @@ const DEGRADED_GIT_POLL_MAX_INTERVAL_MS = 60_000;
 // a couple of `git ls-files` runs rather than one per event.
 const WORKING_TREE_IGNORE_REFRESH_QUIET_MS = 300;
 const WORKING_TREE_IGNORE_REFRESH_MAX_DELAY_MS = 2_000;
+const WORKING_TREE_IGNORE_REFRESH_INTERVAL_MS = 30_000;
 // `knownDirectories` is a memoisation of the fast path in
 // `noteWorkingTreeDirectories`, not authoritative state — every entry is
 // rediscoverable from a later watcher event under the same path. Deletion
@@ -396,6 +397,7 @@ interface WorkspaceGitServiceDependencies {
   ) => Promise<WorkspaceGitFetchResult>;
   runGitCommand: typeof runGitCommand;
   getWorkspaceGitSelfHealPhaseMs: typeof getWorkspaceGitObservationReensurePhaseMs;
+  getWorkingTreeIgnoreRefreshIntervalMs: () => number;
   createWatcherLivenessCanary: typeof createWatcherLivenessCanary;
   now: () => Date;
 }
@@ -491,6 +493,7 @@ interface WorkingTreeWatchTarget {
   appliedIgnoreList: string[];
   ignoredDirectoriesRefreshPromise: Promise<void> | null;
   ignoredDirectoriesRefreshRequested: boolean;
+  ignoredDirectoriesRefreshedAtMs: number | null;
   // Bounded two ways so a long-lived daemon over a churning tree cannot grow
   // this without limit: `removeDeletedKnownDirectories` drops an entry (and
   // anything nested under it) once its own path is reported deleted, and
@@ -575,10 +578,11 @@ function buildDefaultWorkspaceGitServiceDeps(
     resolveAbsoluteGitDir,
     hasOriginRemote,
     runGitFetch: fetchWorkspaceGitRemote,
-    runGitCommand,
+    runGitCommand: createRunGitCommand("workspace-watch"),
     getWorkspaceGitSelfHealPhaseMs: getWorkspaceGitObservationReensurePhaseMs,
     createWatcherLivenessCanary,
     now: () => new Date(),
+    getWorkingTreeIgnoreRefreshIntervalMs: () => WORKING_TREE_IGNORE_REFRESH_INTERVAL_MS,
   };
 }
 
@@ -1428,6 +1432,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       appliedIgnoreList: [],
       ignoredDirectoriesRefreshPromise: null,
       ignoredDirectoriesRefreshRequested: false,
+      ignoredDirectoriesRefreshedAtMs: repoRoot ? this.deps.now().getTime() : null,
       knownDirectories: new Set(),
       pendingKnownDirectories: new Set(),
       ignoreRefreshTimer: null,
@@ -1843,8 +1848,8 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
    * `git ls-files` reports ignored directories only once they exist, so the
    * ignore set must be re-read when new directory topology appears — not only
    * when the rules change. Keyed on `dirname` because FSEvents coalescing makes
-   * the directory's own creation event unreliable; a file inside it proves it
-   * exists either way.
+   * the directory's own creation event unreliable; a newly created file inside
+   * it proves it exists. Updates to existing files do not change topology.
    */
   private noteWorkingTreeDirectories(
     target: WorkingTreeWatchTarget,
@@ -1862,6 +1867,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     // ignored directory that exists by then. Stop before a large event batch
     // multiplies containment checks across all its new directories.
     for (const event of events) {
+      if (event.type !== "create") {
+        continue;
+      }
       const directory = dirname(event.path);
       if (target.knownDirectories.has(directory) || !isRelevantDirectory(directory)) {
         continue;
@@ -1944,6 +1952,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     }
     const delayMs = Math.max(
       0,
+      this.workingTreeIgnoreRefreshDelay(target),
       Math.min(WORKING_TREE_IGNORE_REFRESH_QUIET_MS, target.ignoreRefreshDeadlineMs - now),
     );
     target.ignoreRefreshTimer = setTimeout(() => {
@@ -2039,26 +2048,45 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     if (target.ignoredDirectoriesRefreshPromise) {
       return target.ignoredDirectoriesRefreshPromise;
     }
+    if (this.workingTreeIgnoreRefreshDelay(target) > 0) {
+      this.scheduleWorkingTreeIgnoreRefresh(target);
+      return Promise.resolve();
+    }
 
     const refreshPromise = (async () => {
-      while (!target.closed && target.ignoredDirectoriesRefreshRequested) {
-        target.ignoredDirectoriesRefreshRequested = false;
-        try {
-          await this.replaceWorkingTreeIgnoredDirectories(target);
-        } catch (error) {
-          this.logger.warn(
-            { err: error, cwd: target.cwd },
-            "Failed to refresh working tree watcher ignore paths",
-          );
-        }
+      target.ignoredDirectoriesRefreshRequested = false;
+      try {
+        await this.replaceWorkingTreeIgnoredDirectories(target);
+      } catch (error) {
+        this.logger.warn(
+          { err: error, cwd: target.cwd },
+          "Failed to refresh working tree watcher ignore paths",
+        );
       }
     })().finally(() => {
+      // Completion, rather than submission, also bounds retries after a long
+      // background queue wait or a failed inventory.
+      target.ignoredDirectoriesRefreshedAtMs = this.deps.now().getTime();
       if (target.ignoredDirectoriesRefreshPromise === refreshPromise) {
         target.ignoredDirectoriesRefreshPromise = null;
+      }
+      if (target.ignoredDirectoriesRefreshRequested && !target.closed) {
+        this.scheduleWorkingTreeIgnoreRefresh(target);
       }
     });
     target.ignoredDirectoriesRefreshPromise = refreshPromise;
     return refreshPromise;
+  }
+
+  private workingTreeIgnoreRefreshDelay(target: WorkingTreeWatchTarget): number {
+    return target.ignoredDirectoriesRefreshedAtMs === null
+      ? 0
+      : Math.max(
+          0,
+          target.ignoredDirectoriesRefreshedAtMs +
+            this.deps.getWorkingTreeIgnoreRefreshIntervalMs() -
+            this.deps.now().getTime(),
+        );
   }
 
   private async replaceWorkingTreeIgnoredDirectories(
