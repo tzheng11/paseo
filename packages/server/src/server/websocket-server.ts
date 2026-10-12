@@ -1,3 +1,7 @@
+import {
+  withAgentHistoryReadMetrics,
+  type AgentHistoryReadMetrics,
+} from "./agent/agent-history-replay.js";
 import { stat } from "node:fs/promises";
 import type { CreationSnapshot } from "@getpaseo/protocol/messages";
 import { CreationService } from "./creation/index.js";
@@ -2395,8 +2399,23 @@ export class VoiceAssistantWebSocketServer {
         "ws_control_rpc_received",
       );
     }
+    const refreshRequest =
+      message.message.type === "refresh_agent_request" ? message.message : null;
+    const historyReads: AgentHistoryReadMetrics | null = refreshRequest
+      ? {
+          historyEventsRead: 0,
+          historyBytesRead: 0,
+          historyReplayCount: 0,
+        }
+      : null;
     const startMs = performance.now();
-    await activeConnection.session.handleMessage(message.message, ws);
+    if (historyReads) {
+      await withAgentHistoryReadMetrics(historyReads, () =>
+        activeConnection.session.handleMessage(message.message, ws),
+      );
+    } else {
+      await activeConnection.session.handleMessage(message.message, ws);
+    }
     const durationMs = performance.now() - startMs;
     this.recordRequestLatency(message.message.type, durationMs);
 
@@ -2404,6 +2423,14 @@ export class VoiceAssistantWebSocketServer {
       activeConnection.connectionLogger.warn(
         {
           requestType: message.message.type,
+          ...(refreshRequest
+            ? {
+                agentId: refreshRequest.agentId,
+                requestId: refreshRequest.requestId,
+                ...historyReads,
+                historyReadMeasurement: "request-local-normalized-provider-events",
+              }
+            : {}),
           durationMs: Math.round(durationMs),
           inflightRequests: activeConnection.session.getRuntimeMetrics().inflightRequests,
         },

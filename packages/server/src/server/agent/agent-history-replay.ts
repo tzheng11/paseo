@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { pruneAbandonedHistoryCaches } from "./agent-history-cache-directory.js";
 import { closeSync, createReadStream, openSync, readSync } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
@@ -5,6 +6,22 @@ import { mkdtemp, open, rm, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
+
+export interface AgentHistoryReadMetrics {
+  historyEventsRead: number;
+  historyBytesRead: number;
+  historyReplayCount: number;
+}
+
+const requestHistoryReads = new AsyncLocalStorage<AgentHistoryReadMetrics>();
+
+/** Measure normalized source events once, not spool replay passes or provider file bytes. */
+export function withAgentHistoryReadMetrics<T>(
+  metrics: AgentHistoryReadMetrics,
+  operation: () => Promise<T>,
+): Promise<T> {
+  return requestHistoryReads.run(metrics, operation);
+}
 
 let prunedAbandonedReplays = false;
 
@@ -23,10 +40,16 @@ export class AgentHistoryReplay<T> {
     }
     const directory = await mkdtemp(path.join(tmpdir(), `paseo-history-${process.pid}-`));
     const replay = new AgentHistoryReplay<T>(directory, null);
+    const metrics = requestHistoryReads.getStore();
+    if (metrics) metrics.historyReplayCount++;
     try {
       replay.file = await open(path.join(directory, "events.jsonl"), "wx", 0o600);
       for await (const event of events) {
         const line = JSON.stringify(event) + "\n";
+        if (metrics) {
+          metrics.historyEventsRead++;
+          metrics.historyBytesRead += Buffer.byteLength(line, "utf8");
+        }
         if (replay.pending.length + line.length > 64 * 1024) await replay.flush();
         replay.pending += line;
       }

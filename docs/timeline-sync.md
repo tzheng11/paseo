@@ -41,6 +41,14 @@ is not a count of resident JavaScript objects. Metadata stream events do not loa
 for plugin hooks. Turn-end hooks still receive the complete timeline, which is an explicit
 full-history allocation outside the row-cache budget.
 
+`refresh_agent_request` deliberately reloads the provider session and rebuilds history, so its
+cost still scales with the transcript. The metadata-hook optimization does not bound provider
+history loading. Slow refresh logs include `agentId`, `requestId`, `historyEventsRead`,
+`historyBytesRead` and `historyReplayCount`. Those sizes count UTF-8 JSONL bytes and events
+normalized into the staged replay once; they exclude provider-owned raw buffers and repeated
+spool reads. Measurements are scoped to the request that performs the read, so a request
+waiting on another caller's existing load can report zero. No transcript contents are logged.
+
 The invariants are:
 
 > A continuously subscribed client applies every committed row in order. Opening or resuming an
