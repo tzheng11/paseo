@@ -12157,16 +12157,16 @@ test("provider metadata reaches clients without materializing plugin timeline hi
   const unsubscribe = manager.subscribe((event) => events.push(event));
   try {
     client.sessions[0].pushEvent({
-      type: "thinking_option_changed",
+      type: "usage_updated",
       provider: "codex",
-      thinkingOptionId: null,
+      usage: { inputTokens: 1 },
     });
     await manager.flush();
     expect(events).toContainEqual(
       expect.objectContaining({
         type: "agent_stream",
         agentId: agent.id,
-        event: { type: "thinking_option_changed", provider: "codex", thinkingOptionId: null },
+        event: { type: "usage_updated", provider: "codex", usage: { inputTokens: 1 } },
       }),
     );
     expect(snapshots).not.toHaveBeenCalled();

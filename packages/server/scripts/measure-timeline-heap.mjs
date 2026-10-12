@@ -166,9 +166,9 @@ while (performance.now() - begin < seconds * 1000) {
     if (metadataDue) {
       metadataEvents++;
       manager.dispatchStream(id, {
-        type: "thinking_option_changed",
+        type: "usage_updated",
         provider: "codex",
-        thinkingOptionId: null,
+        usage: { inputTokens: 1 },
       });
     }
     const t = performance.now();
