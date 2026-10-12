@@ -142,6 +142,7 @@ export class FileObserver {
   }
 
   private useFallback(target: string, observed: ObservedFile): void {
+    if (this.observed.get(target) !== observed) return;
     observed.watcher?.close();
     observed.watcher = null;
     if (observed.fallback) return;

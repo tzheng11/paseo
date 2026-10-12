@@ -152,4 +152,28 @@ describe("FileObserver", () => {
     expect(updates).toEqual(["missing"]);
     subscription.unsubscribe();
   });
+  test("late native failure after disposal does not recreate polling", async () => {
+    const root = await workspace();
+    const controls = new ObservationControls();
+    let fail!: () => void;
+    const original = controls.watchDirectory.bind(controls);
+    const dependencies: FileObserverDependencies = {
+      ...controls,
+      watchDirectory(directory, change, onError) {
+        fail = onError;
+        return original(directory, change);
+      },
+      setTimeout: controls.setTimeout.bind(controls),
+      clearTimeout: controls.clearTimeout.bind(controls),
+      setInterval() {
+        throw Error("polling resurrected after dispose");
+      },
+      clearInterval: controls.clearInterval.bind(controls),
+    };
+    const observer = new FileObserver(dependencies);
+    await observer.subscribe({ cwd: root, path: "file.txt" }, () => undefined);
+    observer.dispose();
+    expect(() => fail()).not.toThrow();
+    expect(controls.closes).toBe(1);
+  });
 });

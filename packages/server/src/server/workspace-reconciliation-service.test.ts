@@ -1682,4 +1682,38 @@ describe("WorkspaceReconciliationService", () => {
     await start;
     expect(closes).toBe(1);
   });
+  test("a project watcher that fails before registration returns is released", async () => {
+    const rootPath = mkdtempSync(path.join(tmpdir(), "reconcile-failed-watch-"));
+    tempDirs.push(rootPath);
+    const { projects, projectRegistry, workspaceRegistry } = createTestRegistries();
+    projects.set(
+      "failed",
+      createPersistedProjectRecord({
+        projectId: "failed",
+        rootPath,
+        kind: "non_git",
+        displayName: "failed",
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      }),
+    );
+    let closes = 0;
+    const service = new WorkspaceReconciliationService({
+      projectRegistry,
+      workspaceRegistry,
+      logger: createTestLogger(),
+      watchProjectRoot: async (_root, _options, _change, onError) => {
+        onError(new Error("native registration failed"));
+        return {
+          close() {
+            closes++;
+          },
+        };
+      },
+    });
+    await service.start();
+    expect(closes).toBe(1);
+    service.dispose();
+    expect(closes).toBe(1);
+  });
 });

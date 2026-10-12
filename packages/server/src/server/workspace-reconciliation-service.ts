@@ -458,7 +458,8 @@ export class WorkspaceReconciliationService {
       );
       if (alreadyWatching) continue;
       try {
-        let watcher: ProjectRootWatcher;
+        let watcher: ProjectRootWatcher | null = null;
+        let watchFailed = false;
         watcher = await this.watchProjectRoot(
           project.rootPath,
           { recursive: false },
@@ -468,7 +469,8 @@ export class WorkspaceReconciliationService {
             }
           },
           (error) => {
-            watcher.close();
+            watchFailed = true;
+            watcher?.close();
             const index = this.watchers.findIndex((target) => target.watcher === watcher);
             if (index >= 0) this.watchers.splice(index, 1);
             this.logger.warn(
@@ -480,6 +482,10 @@ export class WorkspaceReconciliationService {
         if (this.disposed) {
           watcher.close();
           return;
+        }
+        if (watchFailed) {
+          watcher.close();
+          continue;
         }
         this.watchers.push({ rootPath: project.rootPath, watcher });
       } catch (error) {
