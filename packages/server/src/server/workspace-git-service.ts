@@ -838,13 +838,24 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
         mainRepoRoot: null,
       });
     }
+    // Preserve getCheckoutStatus's identity contract: a main checkout's
+    // common-directory root is not a linked-worktree parent, and ownership
+    // requires the stored/resolved base that makes a Paseo worktree valid.
+    const isPaseoOwnedWorktree =
+      facts.paseoWorktree.isPaseoOwnedWorktree && Boolean(facts.resolvedBaseRef);
+    let mainRepoRoot = facts.mainRepoRoot;
+    if (isPaseoOwnedWorktree) {
+      mainRepoRoot ??= facts.worktreeRoot;
+    } else if (!mainRepoRoot || resolve(mainRepoRoot) === resolve(facts.worktreeRoot)) {
+      mainRepoRoot = null;
+    }
     return checkoutLiteFromGitSnapshot(normalizedCwd, {
       isGit: true,
       currentBranch: facts.currentBranch,
       remoteUrl: facts.remoteUrl,
       repoRoot: facts.worktreeRoot,
-      isPaseoOwnedWorktree: facts.paseoWorktree.isPaseoOwnedWorktree,
-      mainRepoRoot: facts.mainRepoRoot,
+      isPaseoOwnedWorktree,
+      mainRepoRoot,
     });
   }
 

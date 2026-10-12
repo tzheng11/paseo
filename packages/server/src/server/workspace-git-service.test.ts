@@ -389,6 +389,57 @@ describe("WorkspaceGitServiceImpl", () => {
     service.dispose();
   });
 
+  test.each([
+    {
+      name: "main checkout",
+      mainRepoRoot: REPO_CWD,
+      owned: false,
+      base: "main",
+      expectedMain: null,
+      expectedOwned: false,
+    },
+    {
+      name: "native linked checkout",
+      mainRepoRoot: path.resolve("/tmp/main-root"),
+      owned: false,
+      base: "main",
+      expectedMain: path.resolve("/tmp/main-root"),
+      expectedOwned: false,
+    },
+    {
+      name: "owned checkout with base",
+      mainRepoRoot: null,
+      owned: true,
+      base: "main",
+      expectedMain: REPO_CWD,
+      expectedOwned: true,
+    },
+    {
+      name: "owned checkout without base",
+      mainRepoRoot: REPO_CWD,
+      owned: true,
+      base: null,
+      expectedMain: null,
+      expectedOwned: false,
+    },
+  ])(
+    "checkout identity preserves the status projection for $name",
+    async ({ mainRepoRoot, owned, base, expectedMain, expectedOwned }) => {
+      const facts = {
+        ...createCheckoutSnapshotFacts(REPO_CWD),
+        mainRepoRoot,
+        paseoWorktree: { isPaseoOwnedWorktree: owned },
+        resolvedBaseRef: base,
+      };
+      const service = createService({ getCheckoutSnapshotFacts: vi.fn(async () => facts) });
+      await expect(service.getCheckout(REPO_CWD)).resolves.toMatchObject({
+        mainRepoRoot: expectedMain,
+        isPaseoOwnedWorktree: expectedOwned,
+      });
+      service.dispose();
+    },
+  );
+
   test("bulk checkout membership reads stay bounded and share a pending read for the same checkout", async () => {
     const gate = createDeferred<void>();
     const getCheckoutSnapshotFacts = vi.fn(async (cwd: string) => {
