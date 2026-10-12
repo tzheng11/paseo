@@ -624,9 +624,12 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   >();
   // Watch/poll refreshes must leave a slot for an uncached explicit read.
   private readonly backgroundRefreshLimit = pLimit({
-    concurrency: WORKSPACE_GIT_REFRESH_CONCURRENCY - 1,
+    // Two warm jobs, one independent cold job and one explicit read.
+    concurrency: WORKSPACE_GIT_REFRESH_CONCURRENCY - 2,
     rejectOnClear: true,
   });
+  private readonly checkoutMetadataLimit = pLimit({ concurrency: 2, rejectOnClear: true });
+  private readonly checkoutMetadataReads = new Map<string, Promise<ProjectCheckoutLitePayload>>();
   private readonly backgroundRefreshes = new Map<
     WorkspaceGitTarget,
     {
@@ -804,12 +807,28 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   async getCheckout(cwd: string): Promise<ProjectCheckoutLitePayload> {
     this.assertNotDisposed();
     const normalizedCwd = resolve(cwd);
-    const status = await this.deps.getCheckoutStatus(normalizedCwd, {
+    const existing = this.checkoutMetadataReads.get(normalizedCwd);
+    if (existing) return existing;
+    const read = this.checkoutMetadataLimit(() => this.readCheckoutMetadata(normalizedCwd)).finally(
+      () => {
+        if (this.checkoutMetadataReads.get(normalizedCwd) === read)
+          this.checkoutMetadataReads.delete(normalizedCwd);
+      },
+    );
+    this.checkoutMetadataReads.set(normalizedCwd, read);
+    return read;
+  }
+
+  private async readCheckoutMetadata(normalizedCwd: string): Promise<ProjectCheckoutLitePayload> {
+    this.assertNotDisposed();
+    // Membership/reconciliation needs identity, never a full dirty-tree scan.
+    const facts = await this.deps.getCheckoutSnapshotFacts(normalizedCwd, {
       paseoHome: this.paseoHome,
       worktreesRoot: this.worktreesRoot,
       logger: this.logger,
+      runGitCommand: createRunGitCommand("workspace-checkout-metadata"),
     });
-    if (!status.isGit) {
+    if (!facts.isGit) {
       return checkoutLiteFromGitSnapshot(normalizedCwd, {
         isGit: false,
         currentBranch: null,
@@ -821,11 +840,11 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     }
     return checkoutLiteFromGitSnapshot(normalizedCwd, {
       isGit: true,
-      currentBranch: status.currentBranch,
-      remoteUrl: status.remoteUrl,
-      repoRoot: status.repoRoot,
-      isPaseoOwnedWorktree: status.isPaseoOwnedWorktree,
-      mainRepoRoot: status.mainRepoRoot,
+      currentBranch: facts.currentBranch,
+      remoteUrl: facts.remoteUrl,
+      repoRoot: facts.worktreeRoot,
+      isPaseoOwnedWorktree: facts.paseoWorktree.isPaseoOwnedWorktree,
+      mainRepoRoot: facts.mainRepoRoot,
     });
   }
 
@@ -1073,6 +1092,8 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     this.workspaceInitialRefreshLimit.clearQueue();
     this.workspaceForgeRefreshLimit.clearQueue();
     this.backgroundRefreshLimit.clearQueue();
+    this.checkoutMetadataLimit.clearQueue();
+    this.checkoutMetadataReads.clear();
     this.backgroundRefreshes.clear();
     this.workspaceObservationSetupLimit.clearQueue();
 
@@ -1421,7 +1442,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     repoRoot: string | null,
   ): Promise<WorkingTreeWatchTarget> {
     const ignoredDirectories = repoRoot
-      ? (await this.loadIgnoredDirs(watchPath)).ignored
+      ? (await runWithGitCommandPriority("high", () => this.loadIgnoredDirs(watchPath))).ignored
       : new Set<string>();
     const target: WorkingTreeWatchTarget = {
       cwd,
@@ -3320,9 +3341,10 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
           });
         // Release background admission between generations as well as shared
         // admission. Otherwise three hot loops can starve cold discovery forever.
-        const admittedSnapshot = background
-          ? await this.backgroundRefreshLimit(refresh)
-          : await refresh();
+        const admittedSnapshot =
+          background && request.reason !== "initial"
+            ? await this.backgroundRefreshLimit(refresh)
+            : await refresh();
         if (!admittedSnapshot) {
           break;
         }

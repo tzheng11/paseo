@@ -270,6 +270,30 @@ describe("runGitCommand", () => {
     });
   });
 
+  it("initial watcher inventories pass warm re-inventories without adding another process", async () => {
+    const { runGitCommand, runWithGitCommandPriority } = await loadRunGitCommand(1);
+    const { spawn } = await import("node:child_process");
+    const args = ["ls-files", "-o", "-i", "--directory", "--exclude-standard"];
+    enqueueSpawnBehaviors({ delayMs: 60_000 });
+    const first = runGitCommand(args, { cwd: "/seed-held" });
+    const warm = runGitCommand(args, { cwd: "/warm-reinventory" });
+    const initial = runWithGitCommandPriority("high", () =>
+      runGitCommand(args, { cwd: "/new-watcher" }),
+    );
+    await vi.waitFor(() => expect(fakeSpawnController.processes).toHaveLength(1));
+    const held = fakeSpawnController.processes[0]!;
+    held.dispose();
+    held.emit("exit", 0, null);
+    held.emit("close", 0, null);
+    await Promise.all([first, warm, initial]);
+    const calls = vi.mocked(spawn).mock.calls;
+    const newWatcher = calls.findIndex(([, , options]) => options?.cwd === "/new-watcher");
+    const reinventory = calls.findIndex(([, , options]) => options?.cwd === "/warm-reinventory");
+    expect(newWatcher).toBeGreaterThanOrEqual(0);
+    expect(reinventory).toBeGreaterThan(newWatcher);
+    expect(fakeSpawnController.peakActiveCount).toBe(1);
+  });
+
   it("throttles concurrent git commands to the configured limit", async () => {
     const { runGitCommand } = await loadRunGitCommand(2);
 

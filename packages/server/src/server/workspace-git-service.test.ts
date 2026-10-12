@@ -324,6 +324,90 @@ function createService(options?: CreateServiceTestOptions) {
 }
 
 describe("WorkspaceGitServiceImpl", () => {
+  test("cold snapshots keep progressing while warm refresh generations are held", async () => {
+    const warm = Array.from({ length: 3 }, (_, i) => path.resolve(`/tmp/held-warm-${i}`));
+    const cold = Array.from({ length: 92 }, (_, i) => path.resolve(`/tmp/progress-cold-${i}`));
+    const callbacks = new Map<
+      string,
+      (error: Error | null, events: Array<{ path: string; type: "update" }>) => void
+    >();
+    const warmGate = createDeferred<{ isDirty: boolean; diffStat: null }>();
+    const getCheckoutStatus = vi.fn(async (cwd: string) => createCheckoutStatus(cwd));
+    const getCheckoutWorktreeState = vi.fn(() => warmGate.promise);
+    const subscribe = vi.fn(async (cwd, callback) => {
+      callbacks.set(cwd, callback);
+      return createAsyncSubscription();
+    });
+    const runGitCommand = vi.fn(async (_args: string[], options: { cwd: string }) => ({
+      stdout: `${options.cwd}\n`,
+      stderr: "",
+      truncated: false,
+      exitCode: 0,
+      signal: null,
+    }));
+    const service = createService({
+      subscribe,
+      getCheckoutStatus,
+      getCheckoutWorktreeState,
+      runGitCommand,
+    });
+    const subscriptions = warm.map((cwd) => service.registerWorkspace({ cwd }, vi.fn()));
+    await vi.waitFor(() => {
+      for (const cwd of warm) expect(service.peekSnapshot(cwd)?.git.isGit).toBe(true);
+    });
+    await vi.waitFor(() =>
+      expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0),
+    );
+    for (const cwd of warm)
+      callbacks.get(cwd)!(null, [{ path: join(cwd, "tracked.ts"), type: "update" }]);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.waitFor(() => expect(getCheckoutWorktreeState).toHaveBeenCalled());
+    subscriptions.push(...cold.map((cwd) => service.registerWorkspace({ cwd }, vi.fn())));
+    await vi.waitFor(() => {
+      for (const cwd of cold) expect(service.peekSnapshot(cwd)?.git.isGit).toBe(true);
+    });
+    expect(service.getMetrics().workspaceInitialRefreshPendingCount).toBe(0);
+    warmGate.resolve({ isDirty: true, diffStat: null });
+    for (const subscription of subscriptions) subscription.unsubscribe();
+    service.dispose();
+  });
+
+  test("checkout membership reads use Git facts without reading dirty worktree status", async () => {
+    const getCheckoutSnapshotFacts = vi.fn(async (cwd: string) => createCheckoutSnapshotFacts(cwd));
+    const getCheckoutStatus = vi.fn(async () => {
+      throw new Error("status scan must not run");
+    });
+    const service = createService({ getCheckoutSnapshotFacts, getCheckoutStatus });
+    await expect(service.getCheckout(REPO_CWD)).resolves.toMatchObject({
+      cwd: REPO_CWD,
+      isGit: true,
+      currentBranch: "main",
+      worktreeRoot: REPO_CWD,
+    });
+    expect(getCheckoutStatus).not.toHaveBeenCalled();
+    expect(getCheckoutSnapshotFacts).toHaveBeenCalledTimes(1);
+    service.dispose();
+  });
+
+  test("bulk checkout membership reads stay bounded and share a pending read for the same checkout", async () => {
+    const gate = createDeferred<void>();
+    const getCheckoutSnapshotFacts = vi.fn(async (cwd: string) => {
+      await gate.promise;
+      return createCheckoutSnapshotFacts(cwd);
+    });
+    const service = createService({ getCheckoutSnapshotFacts });
+    const roots = Array.from({ length: 92 }, (_, i) => path.resolve(`/tmp/membership-${i}`));
+    const reads = roots.map((cwd) => service.getCheckout(cwd));
+    const duplicate = service.getCheckout(roots[0]);
+    await vi.waitFor(() => expect(getCheckoutSnapshotFacts).toHaveBeenCalledTimes(2));
+    gate.resolve();
+    const result = await Promise.all(reads);
+    await expect(duplicate).resolves.toEqual(result[0]);
+    expect(getCheckoutSnapshotFacts).toHaveBeenCalledTimes(92);
+    await service.getCheckout(roots[0]);
+    expect(getCheckoutSnapshotFacts).toHaveBeenCalledTimes(93);
+    service.dispose();
+  });
   beforeEach(() => {
     vi.useFakeTimers();
   });
@@ -924,7 +1008,7 @@ describe("WorkspaceGitServiceImpl", () => {
       await flushPromises();
       expect(started).toContain(live);
       expect(started.filter((cwd) => cwd !== live)).toHaveLength(
-        WORKSPACE_GIT_REFRESH_CONCURRENCY - 1,
+        WORKSPACE_GIT_REFRESH_CONCURRENCY - 2,
       );
       gate.resolve();
       await read;
@@ -971,11 +1055,11 @@ describe("WorkspaceGitServiceImpl", () => {
       expect(service.getMetrics().workingTreeWatchTargetCount).toBe(cwds.length);
       hold = true;
       await vi.advanceTimersByTimeAsync(5_000);
-      await vi.waitFor(() => expect(blocked.size).toBe(WORKSPACE_GIT_REFRESH_CONCURRENCY - 1));
+      await vi.waitFor(() => expect(blocked.size).toBe(WORKSPACE_GIT_REFRESH_CONCURRENCY - 2));
       expect(service.peekSnapshot(live)).toBeNull();
       read = service.getSnapshot(live, { force: true, reason: "all-polling-live-read" });
       await expect(read).resolves.toMatchObject({ cwd: live });
-      expect(blocked.size).toBe(WORKSPACE_GIT_REFRESH_CONCURRENCY - 1);
+      expect(blocked.size).toBe(WORKSPACE_GIT_REFRESH_CONCURRENCY - 2);
       gate.resolve();
       await vi.waitFor(() => expect(service.getMetrics().workspaceRefreshInFlightCount).toBe(0));
     } finally {

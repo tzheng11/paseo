@@ -586,7 +586,9 @@ function executeGitCommand<Output>(
     return { result: resultPromise, exited };
   };
   const promise = scheduler.run(startCommand, {
-    priority: isInventory ? "normal" : (gitCommandPriority.getStore() ?? "normal"),
+    // Initial watcher seeds can pass warm re-inventories within this lane;
+    // neither class takes a shared Git process slot.
+    priority: gitCommandPriority.getStore() ?? "normal",
   });
   runtimeMetrics.observeLimiter(scheduler.activeCount, scheduler.pendingCount);
   return promise;
