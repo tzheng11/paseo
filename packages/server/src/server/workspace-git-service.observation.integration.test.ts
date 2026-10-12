@@ -175,6 +175,9 @@ test("recursive observation updates tracked state and prunes ignored storms", as
     paseoHome: path.join(tempDir, "paseo-home"),
     fileObserver,
     deps: {
+      // The production interval has deterministic coverage; this contract
+      // exercises real pruning without a 30-second wall-clock wait.
+      getWorkingTreeIgnoreRefreshIntervalMs: () => 300,
       getCheckoutSnapshotFacts,
       getCheckoutStatus,
       getCheckoutShortstat,
@@ -467,6 +470,7 @@ test.each([".next", ".turbo", "node_modules", "dist", "coverage", "apps/web/.nex
       logger: pino({ enabled: false }),
       paseoHome: path.join(tempDir, "home"),
       fileObserver,
+      deps: { getWorkingTreeIgnoreRefreshIntervalMs: () => 300 },
     });
     let subscription: Awaited<ReturnType<typeof service.requestWorkingTreeWatch>> | undefined;
     try {
