@@ -75,6 +75,18 @@ export class InMemoryAgentTimelineStore {
     return this.requireState(agentId).projection.getRows();
   }
 
+  async *streamRows(agentId: string): AsyncGenerator<ProjectedTimelineRow> {
+    // This store is for tests and small provider-subagent projections. The
+    // production disk store decodes one row at a time without collecting it.
+    const state = this.requireState(agentId);
+    const nextSeq = state.nextSeq;
+    for (const row of state.projection.getRows()) {
+      if (this.states.get(agentId) !== state || state.nextSeq !== nextSeq)
+        throw new Error("History changed during streamed read");
+      yield cloneRow(row);
+    }
+  }
+
   getSubmittedUserMessage(agentId: string, clientMessageId: string): AgentTimelineRow | null {
     const row = this.requireState(agentId).projection.findRow(
       (candidate) =>

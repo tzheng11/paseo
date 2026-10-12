@@ -6028,6 +6028,40 @@ test("getTimelineRows falls back to the in-memory timeline when no durable store
   ]);
 });
 
+test("streamTimelineRows yields projected history without calling the full-array reader", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-stream-timeline-"));
+  const timelineStore = new InMemoryAgentTimelineStore();
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    timelineStore,
+    logger,
+  });
+  let agentId: string | undefined;
+  try {
+    const snapshot = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = snapshot.id;
+    await manager.appendTimelineItem(snapshot.id, { type: "assistant_message", text: "first" });
+    await manager.appendTimelineItem(snapshot.id, { type: "assistant_message", text: " second" });
+    const fullReader = vi.spyOn(timelineStore, "getRows").mockImplementation(() => {
+      throw new Error("full materialization");
+    });
+    const result: AgentTimelineRow[] = [];
+    for await (const row of manager.streamTimelineRows(snapshot.id)) result.push(row);
+    expect(result).toEqual([
+      expect.objectContaining({
+        seq: 2,
+        item: { type: "assistant_message", text: "first second" },
+      }),
+    ]);
+    expect(fullReader).not.toHaveBeenCalled();
+  } finally {
+    if (agentId) await manager.closeAgent(agentId);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("getAgent does not expose committed history internals once manager owns the seam", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-timeline-boundary-"));
   const storagePath = join(workdir, "agents");

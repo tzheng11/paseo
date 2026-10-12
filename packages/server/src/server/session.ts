@@ -101,7 +101,7 @@ import {
 } from "./workspace-labels/index.js";
 
 import { AgentManager, AgentRunCancellationError } from "./agent/agent-manager.js";
-import { buildTimelinePromptIndex } from "./agent/timeline-prompt-index.js";
+import { streamTimelinePromptIndex } from "./agent/timeline-prompt-index.js";
 import { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import type {
   AgentManagerEvent,
@@ -7875,7 +7875,7 @@ export class Session {
         agentStorage: this.agentStorage,
         logger: this.sessionLogger,
       });
-      const rows = await this.agentManager.getTimelineRows(msg.agentId);
+      const rows = this.agentManager.streamTimelineRows(msg.agentId);
       const { epoch } = this.agentManager.fetchTimeline(msg.agentId, {
         direction: "tail",
         limit: 1,
@@ -7928,12 +7928,12 @@ export class Session {
         agentStorage: this.agentStorage,
         logger: this.sessionLogger,
       });
-      const rows = await this.agentManager.getTimelineRows(msg.agentId);
+      const rows = this.agentManager.streamTimelineRows(msg.agentId);
       const timeline = this.agentManager.fetchTimeline(msg.agentId, {
         direction: "tail",
         limit: 1,
       });
-      const index = buildTimelinePromptIndex(timeline.epoch, rows);
+      const index = await streamTimelinePromptIndex(timeline.epoch, rows);
       this.emitForSource(
         {
           type: "agent.timeline.list_prompts.response",

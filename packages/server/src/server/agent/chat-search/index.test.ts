@@ -6,6 +6,35 @@ function rows(items: AgentTimelineItem[]) {
   return items.map((item, index) => ({ item, seq: index + 1, timestamp: "2026-09-12T00:00:00Z" }));
 }
 
+it("searches a streamed history and closes it when the result page fills", async () => {
+  let read = 0,
+    closed = false;
+  async function* source() {
+    try {
+      for (let index = 1; index <= 1000; index++) {
+        read++;
+        yield {
+          item: { type: "user_message" as const, text: "target" },
+          seq: index,
+          timestamp: "now",
+        };
+      }
+    } finally {
+      closed = true;
+    }
+  }
+  expect(await searchTimeline({ rows: source(), query: "target" })).toEqual({
+    locations: Array.from({ length: 200 }, (_, index) => ({
+      seq: index + 1,
+      role: "user",
+      count: 1,
+    })),
+    nextCursor: 200,
+  });
+  expect(read).toBe(201);
+  expect(closed).toBe(true);
+});
+
 it("returns source locations for formatted assistant text and literal user text", async () => {
   const result = await searchTimeline({
     rows: rows([

@@ -11,7 +11,7 @@ interface SearchLocation {
   count: number;
 }
 interface SearchInput {
-  rows: readonly AgentTimelineRow[];
+  rows: readonly AgentTimelineRow[] | AsyncIterable<AgentTimelineRow>;
   query: string;
   cursor?: number;
 }
@@ -61,8 +61,10 @@ export async function searchTimeline({ rows, query, cursor = 0 }: SearchInput) {
   if (!query.trim()) return { locations, nextCursor: null };
   const pattern = searchPattern(query);
   let lastYield = performance.now();
-  for (const entry of projectTimelineRows({ rows, mode: "projected" })) {
-    if (entry.seqEnd <= cursor) continue;
+  const projected = Array.isArray(rows) ? projectTimelineRows({ rows, mode: "projected" }) : rows;
+  for await (const entry of projected) {
+    const seq = "seqEnd" in entry ? Number(entry.seqEnd) : entry.seq;
+    if (seq <= cursor) continue;
     const item = entry.item;
     if (item.type !== "user_message" && item.type !== "assistant_message") continue;
     const raw = item.text.replace(/\r/g, "");
@@ -73,7 +75,7 @@ export async function searchTimeline({ rows, query, cursor = 0 }: SearchInput) {
         return { locations, nextCursor: locations[PAGE_SIZE - 1]!.seq };
       }
       locations.push({
-        seq: entry.seqEnd,
+        seq,
         role: item.type === "user_message" ? "user" : "assistant",
         count,
       });

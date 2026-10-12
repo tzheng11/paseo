@@ -40,3 +40,16 @@ export function buildTimelinePromptIndex(
     ),
   };
 }
+
+/** Retain prompt metadata, never assistant/tool payloads or full user bodies. */
+export async function streamTimelinePromptIndex(
+  epoch: string,
+  rows: AsyncIterable<AgentTimelineRow>,
+): Promise<TimelinePromptIndex> {
+  const prompts: TimelinePromptIndexEntry[] = [];
+  for await (const row of rows) {
+    if (row.item.type !== "user_message") continue;
+    prompts.push({ seq: row.seq, timestamp: row.timestamp, preview: promptPreview(row.item.text) });
+  }
+  return { epoch, prompts };
+}

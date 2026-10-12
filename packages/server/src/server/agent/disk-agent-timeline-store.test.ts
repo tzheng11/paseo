@@ -29,6 +29,27 @@ const tool = (callId: string, status: "running" | "completed"): AgentTimelineIte
 });
 
 describe("DiskAgentTimelineStore", () => {
+  it("streams projected history without collecting payloads and rejects a changing epoch", async () => {
+    const store = createStore();
+    store.initialize("stream", { epoch: "before" });
+    for (let index = 0; index < 1000; index++)
+      store.append("stream", {
+        type: "user_message",
+        text: "x".repeat(4096),
+        messageId: String(index),
+      });
+    let count = 0;
+    for await (const row of store.streamRows("stream")) {
+      expect(row.seq).toBe(++count);
+      expect(row.item.type).toBe("user_message");
+    }
+    expect(count).toBe(1000);
+    expect(store.cachedBytes).toBeLessThanOrEqual(1024);
+    const iterator = store.streamRows("stream");
+    expect((await iterator.next()).done).toBe(false);
+    store.initialize("stream", { epoch: "after" });
+    await expect(iterator.next()).rejects.toThrow("History changed");
+  });
   it("cleans caches left by a dead process without touching live or unrelated directories", () => {
     const directory = mkdtempSync(path.join(tmpdir(), "paseo-timeline-owner-test-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));

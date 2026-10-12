@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 import { LRUCache } from "lru-cache";
+import { setImmediate } from "node:timers/promises";
 import { timelineItemIdentity } from "@getpaseo/protocol/timeline-identity";
 import type { AgentTimelineItem } from "./agent-sdk-types.js";
 import type {
@@ -150,6 +151,23 @@ export class DiskAgentTimelineStore implements AgentRuntimeTimelineStore {
   getRows(agentId: string): ProjectedTimelineRow[] {
     const state = this.requireState(agentId);
     return this.readRows(state, 0);
+  }
+
+  /** Explicit full-history access without an array of decoded payloads. */
+  async *streamRows(agentId: string): AsyncGenerator<ProjectedTimelineRow> {
+    const state = this.requireState(agentId);
+    const count = state.count,
+      nextSeq = state.nextSeq;
+    let lastYield = performance.now();
+    for (let pos = 0; pos < count; pos++) {
+      if (this.states.get(agentId) !== state || state.nextSeq !== nextSeq)
+        throw new Error("History changed during streamed read");
+      yield this.readRow(state, pos);
+      if (performance.now() - lastYield >= 4) {
+        await setImmediate();
+        lastYield = performance.now();
+      }
+    }
   }
 
   getSubmittedUserMessage(agentId: string, clientMessageId: string): AgentTimelineRow | null {

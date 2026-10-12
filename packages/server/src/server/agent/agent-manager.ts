@@ -1282,6 +1282,30 @@ export class AgentManager {
     return this.timelineStore.getRows(id);
   }
 
+  /** Search, export and hooks must consume rows incrementally. */
+  async *streamTimelineRows(id: string): AsyncGenerator<AgentTimelineRow> {
+    this.requireAgent(id);
+    if (this.durableTimelineStore) {
+      const initial = await this.durableTimelineStore.fetchCommitted(id, { limit: 1 });
+      let seq = initial.window.minSeq - 1;
+      while (seq < initial.window.maxSeq) {
+        const page = await this.durableTimelineStore.fetchCommitted(id, {
+          direction: "after",
+          cursor: { epoch: initial.epoch, seq },
+          limit: 128,
+        });
+        if (page.epoch !== initial.epoch || page.window.maxSeq !== initial.window.maxSeq)
+          throw new Error("History changed during streamed read");
+        for (const row of page.rows) yield row;
+        if (page.endSeq === null || page.endSeq <= seq)
+          throw new Error("Streamed history page did not advance");
+        seq = page.endSeq;
+      }
+      return;
+    }
+    yield* this.timelineStore.streamRows(id);
+  }
+
   fetchTimeline(id: string, options?: AgentTimelineFetchOptions): AgentTimelineFetchResult {
     this.requireAgent(id);
     return this.timelineStore.fetch(id, options);
@@ -3303,14 +3327,11 @@ export class AgentManager {
 
   async rewind(agentId: string, messageId: string, mode: RewindMode): Promise<void> {
     const agent = this.requireSessionAgent(agentId);
-    const submittedRow = this.timelineStore
-      .getRows(agentId)
-      .find(
-        (row) =>
-          row.item.type === "user_message" &&
-          row.item.messageId === messageId &&
-          row.item.clientMessageId === messageId,
-      );
+    const candidate = this.timelineStore.getSubmittedUserMessage(agentId, messageId);
+    const submittedRow =
+      candidate?.item.type === "user_message" && candidate.item.messageId === messageId
+        ? candidate
+        : null;
     if (submittedRow && !submittedRow.providerMessageId) {
       throw new Error("Cannot rewind before the provider acknowledges the submitted prompt");
     }

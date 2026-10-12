@@ -23,8 +23,11 @@ remain responsive. History requests wait for that queue until the agent's histor
 A failed provider stream leaves the previous timeline readable. Deferred publication
 replays the staged file instead of retaining another full timeline array.
 
-Ordinary pages read only selected rows from disk. Explicit full-history reads (`limit: 0`, exports,
-and forks) and tails expanded by interleaved lifecycle updates can still allocate large responses.
+Ordinary pages read only selected rows from disk. Search and prompt indexing stream projected
+rows, yielding between disk reads, and retain only their result metadata. A changed history aborts
+the stream instead of returning results from mixed epochs. Rewind looks up its submitted prompt
+without loading the transcript. Explicit full-history reads (`limit: 0`, exports, and forks) and
+tails expanded by interleaved lifecycle updates can still allocate large responses.
 The row-cache budget excludes those responses and provider-owned history-loading buffers. On
 Codex 0.159.2+, resume omits turns and history loads through paged endpoints: paginated threads
 use metadata-only turn pages and bounded item pages; legacy threads load one full turn at a time.
