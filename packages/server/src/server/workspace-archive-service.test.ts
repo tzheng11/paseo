@@ -1,4 +1,6 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, fork, type ChildProcess } from "node:child_process";
+import { monitorEventLoopDelay } from "node:perf_hooks";
+import { pathToFileURL } from "node:url";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -19,6 +21,7 @@ import {
   resolveWorkspaceIdAtPath,
 } from "./workspace-archive-service.js";
 import { WorkspaceAutomationBlockedError } from "./workspace-automation-gate.js";
+import { NativeWatchHost } from "./file-observer/internal/native-watch-client.js";
 
 const cleanupPaths: string[] = [];
 
@@ -189,6 +192,124 @@ function assertArchiveResult(
 }
 
 describe("archiveByScope", () => {
+  test("archives through a 120-second native unwatch hang and restarts the bounded child", async () => {
+    const { tempDir, repoDir } = createGitRepo();
+    const paseoHome = path.join(tempDir, "paseo-home");
+    const worktree = await createPaseoOwnedWorktree(repoDir, paseoHome, "hung-unwatch");
+    const entry = path.join(tempDir, "fault-host.mjs");
+    const entered = path.join(tempDir, "unwatch-entered");
+    // Model a native unsubscribe that cannot service IPC for 120 seconds. This
+    // sleeps in the child; it creates no synthetic CPU load on the daemon host.
+    writeFileSync(
+      entry,
+      `
+      import { writeFileSync } from 'node:fs';
+      const roots = new Map();
+      process.on('message', command => {
+        if (command.action === 'watch') {
+          roots.set(command.id, command.input.root);
+          process.send({action:'ready', id:command.id});
+        }
+        else {
+          if (roots.get(command.id) === ${JSON.stringify(worktree.worktreePath)}) {
+            writeFileSync(${JSON.stringify(entered)}, String(process.pid));
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 120000);
+          }
+          process.send({action:'closed', id:command.id});
+        }
+      });
+      process.on('disconnect', () => process.exit(0));
+    `,
+    );
+    const children: ChildProcess[] = [];
+    const host = new NativeWatchHost({
+      entry: pathToFileURL(entry),
+      fork: (...args) => {
+        const child = fork(...args);
+        children.push(child);
+        return child;
+      },
+      // Use the production 30-second bound, not a shortened test deadline.
+    });
+    const watch = host.watch({ root: worktree.worktreePath, kind: "parcel" }, () => {});
+    await watch.ready;
+    const child = children[0]!;
+    const deps = createArchiveDeps({
+      paseoHome,
+      activeWorkspaces: [
+        {
+          workspaceId: "ws-hung-unwatch",
+          cwd: worktree.worktreePath,
+          kind: "worktree",
+          worktreeRoot: worktree.worktreePath,
+          isPaseoOwnedWorktree: true,
+          mainRepoRoot: repoDir,
+        },
+      ],
+    });
+    const archiveRecord = deps.archiveWorkspaceRecord;
+    let closeMs = 0;
+    deps.archiveWorkspaceRecord = async (workspaceId) => {
+      const start = performance.now();
+      await watch.close();
+      closeMs = performance.now() - start;
+      await archiveRecord(workspaceId);
+    };
+    const histogram = monitorEventLoopDelay({ resolution: 10 });
+    histogram.enable();
+    let ticks = 0;
+    const heartbeat = setInterval(() => ticks++, 50);
+    const started = performance.now();
+    try {
+      const result = await archiveByScope(deps, {
+        scope: { kind: "workspace", workspaceId: "ws-hung-unwatch" },
+        requestId: "fault-unwatch",
+      });
+      const archiveMs = performance.now() - started;
+      expect(readFileSync(entered, "utf8")).toBe(String(child.pid));
+      expect(result.archivedWorkspaceIds).toEqual(["ws-hung-unwatch"]);
+      expect(result.removedDirectory).toBe(true);
+      expect(existsSync(worktree.worktreePath)).toBe(false);
+      expect(closeMs).toBeGreaterThanOrEqual(29_000);
+      expect(closeMs).toBeLessThan(35_000);
+      expect(archiveMs).toBeLessThan(45_000);
+      expect(child.signalCode).toBe("SIGKILL");
+      // Prove the same host can spawn and register after terminating its wedge.
+      const replacement = host.watch({ root: repoDir, kind: "parcel" }, () => {});
+      await replacement.ready;
+      expect(children).toHaveLength(2);
+      expect(children[1]!.pid).not.toBe(child.pid);
+      const maxDelayMs = histogram.max / 1e6;
+      expect(maxDelayMs).toBeLessThan(1_000);
+      expect(ticks).toBeGreaterThan(400);
+      process.stdout.write(
+        "native-close-fault-proof " +
+          JSON.stringify({
+            injectedHangMs: 120_000,
+            productionTimeoutMs: 30_000,
+            closeMs,
+            archiveMs,
+            maxDelayMs,
+            ticks,
+            killedPid: child.pid,
+            replacementPid: children[1]!.pid,
+            killedSignal: child.signalCode,
+            archiveCompleted: result.removedDirectory,
+          }) +
+          "\n",
+      );
+      await replacement.close();
+    } finally {
+      clearInterval(heartbeat);
+      histogram.disable();
+      for (const ownedChild of children) {
+        if (ownedChild.exitCode === null && ownedChild.signalCode === null)
+          ownedChild.kill("SIGKILL");
+      }
+      await watch.close();
+    }
+  }, 60_000);
+
   test("bounds a stuck post-archive snapshot and handles its late rejection", async () => {
     const { tempDir, repoDir } = createGitRepo();
     const workspaceId = "ws-stuck-refresh";
