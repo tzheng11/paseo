@@ -43,6 +43,17 @@ export interface HistoryPage<T> {
   entries: HistoryWindowEntry<T>[];
   oversized: HistoryOmission[];
   nextCursor: number | null;
+  coveredCount?: number;
+  coveredBytes?: number;
+}
+
+export interface HistoryWindowInfo {
+  headEvents: number;
+  tailEvents: number;
+  gap: HistoryWindows<unknown>["gap"];
+  totalEvents: number;
+  totalBytes: number;
+  unit: "events" | "provider_items";
 }
 
 export interface HistoryWindows<T> {
@@ -52,6 +63,11 @@ export interface HistoryWindows<T> {
   totalEvents: number;
   totalBytes: number;
 }
+
+export const DEFAULT_HISTORY_WINDOWS = {
+  head: { events: 64, bytes: 256 * 1024 },
+  tail: { events: 256, bytes: 2 * 1024 * 1024 },
+};
 
 interface HistoryRecord {
   offset: number;
@@ -259,6 +275,8 @@ export class AgentHistoryReplay<T> {
         entries,
         oversized,
         nextCursor,
+        coveredCount: visited,
+        coveredBytes: [...entries, ...oversized].reduce((sum, entry) => sum + entry.bytes, 0),
       };
     } finally {
       await file.close();

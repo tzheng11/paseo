@@ -10,7 +10,12 @@ import type {
 } from "@getpaseo/protocol/agent-types";
 import type { AgentAttachment } from "@getpaseo/protocol/messages";
 import type { PaseoToolCatalog } from "./tools/types.js";
-import type { HistoryReadLimit, HistoryPage, HistoryWindows } from "./agent-history-replay.js";
+import type {
+  HistoryReadLimit,
+  HistoryPage,
+  HistoryWindows,
+  HistoryWindowInfo,
+} from "./agent-history-replay.js";
 
 export type {
   AgentFeature,
@@ -676,6 +681,7 @@ export interface AgentSession {
   steerActiveTurn?(prompt: AgentPromptInput, options: SteerActiveTurnOptions): Promise<SteerResult>;
   subscribe(callback: (event: AgentStreamEvent) => void): () => void;
   streamHistory(): AsyncGenerator<AgentStreamEvent>;
+  readonly historyWindowInfo?: HistoryWindowInfo;
   /** Optional while provider adapters migrate. No caller may use full replay as
    * a silent fallback for a bounded window request. */
   readHistoryWindows?(limits: {

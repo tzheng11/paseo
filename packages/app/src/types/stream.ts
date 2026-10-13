@@ -788,6 +788,7 @@ export interface NotificationItem {
   timestamp: Date;
   level: NotificationLevel;
   message: string;
+  historyGap?: { cursor: number; count: number; bytes: number };
 }
 
 export interface CompactionItem {

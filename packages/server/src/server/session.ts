@@ -2661,6 +2661,8 @@ export class Session {
     switch (msg.type) {
       case "fetch_agent_timeline_request":
         return this.handleFetchAgentTimelineRequest(msg, source);
+      case "agent.timeline.history.request":
+        return this.handleTimelineHistoryRequest(msg, source);
       case "agent.timeline.append.request":
         return this.handleAgentTimelineAppendRequest(msg);
       case "agent.timeline.search.request":
@@ -7724,6 +7726,63 @@ export class Session {
     });
   }
 
+  private async handleTimelineHistoryRequest(
+    msg: Extract<SessionInboundMessage, { type: "agent.timeline.history.request" }>,
+    source?: object,
+  ): Promise<void> {
+    const convert = (
+      entries: import("./agent/agent-history-replay.js").HistoryWindowEntry<
+        import("./agent/agent-sdk-types.js").AgentStreamEvent
+      >[],
+    ) =>
+      entries.flatMap(({ index, bytes, value }) =>
+        value.type === "timeline" && this.supportsTimelineItem(value.item, source)
+          ? [
+              {
+                index,
+                bytes,
+                provider: value.provider,
+                item: value.item,
+                timestamp: value.timestamp,
+              },
+            ]
+          : [],
+      );
+    try {
+      await ensureAgentLoaded(msg.agentId, {
+        agentManager: this.agentManager,
+        agentStorage: this.agentStorage,
+        logger: this.sessionLogger,
+      });
+      const result = await this.agentManager.readTimelineHistory(msg.agentId, msg);
+      const payload =
+        "head" in result
+          ? { ...result, head: convert(result.head), tail: convert(result.tail) }
+          : { ...result, entries: convert(result.entries) };
+      this.emitForSource(
+        {
+          type: "agent.timeline.history.response",
+          payload: { ...payload, requestId: msg.requestId, agentId: msg.agentId, error: null },
+        },
+        source,
+      );
+    } catch (error) {
+      this.emitForSource(
+        {
+          type: "agent.timeline.history.response",
+          payload: {
+            requestId: msg.requestId,
+            agentId: msg.agentId,
+            epoch: "",
+            unit: "events",
+            error: getErrorMessage(error),
+          },
+        },
+        source,
+      );
+    }
+  }
+
   private async handleFetchAgentTimelineRequest(
     msg: Extract<SessionInboundMessage, { type: "fetch_agent_timeline_request" }>,
     source?: object,
@@ -7785,6 +7844,7 @@ export class Session {
             reset: fetchedControlTimeline.reset,
             staleCursor: fetchedControlTimeline.staleCursor,
             gap: fetchedControlTimeline.gap,
+            historyWindow: this.agentManager.getHistoryWindowInfo(msg.agentId),
             window: selectedTimeline.timeline.window,
             startCursor,
             endCursor,

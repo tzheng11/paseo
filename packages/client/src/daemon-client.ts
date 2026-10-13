@@ -3258,6 +3258,25 @@ export class DaemonClient {
     });
   }
 
+  async fetchAgentTimelineHistory(
+    input: Omit<
+      Extract<SessionInboundMessage, { type: "agent.timeline.history.request" }>,
+      "type" | "requestId"
+    >,
+  ) {
+    // COMPAT(boundedTimelineHistory): added in v0.11.2; remove after 2027-04-12.
+    if (this.lastServerInfoMessage?.features?.boundedTimelineHistory !== true)
+      throw new Error("Update the host to load bounded history pages.");
+    const requestId = this.createRequestId();
+    const payload = await this.sendCorrelatedSessionRequest({
+      requestId,
+      message: { type: "agent.timeline.history.request", requestId, ...input },
+      responseType: "agent.timeline.history.response",
+    });
+    if (payload.error) throw new Error(payload.error);
+    return payload;
+  }
+
   async fetchAgentTimeline(
     agentId: string,
     options: FetchAgentTimelineOptions = {},

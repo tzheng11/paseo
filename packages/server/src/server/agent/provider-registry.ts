@@ -443,6 +443,9 @@ export function wrapSessionProvider(provider: AgentProvider, inner: AgentSession
     get capabilities() {
       return inner.capabilities;
     },
+    get historyWindowInfo() {
+      return inner.historyWindowInfo;
+    },
     get initialTimeline() {
       return inner.initialTimeline;
     },

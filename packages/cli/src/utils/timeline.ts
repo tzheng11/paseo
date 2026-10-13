@@ -14,9 +14,30 @@ export async function fetchProjectedTimelineItems(
 ): Promise<AgentTimelineItem[]> {
   const timeline = await input.client.fetchAgentTimeline(input.agentId, {
     direction: "tail",
-    limit: 0,
+    limit: 200,
     projection: "projected",
     timeout: input.timeoutMs,
   });
-  return timeline.entries.map((entry) => entry.item);
+  const items = timeline.entries.map((entry) => entry.item);
+  const gap = timeline.historyWindow?.gap;
+  if (gap)
+    items.unshift({
+      type: "notification",
+      level: "info",
+      message: `History gap: ${gap.count.toLocaleString()} items (${gap.bytes.toLocaleString()} bytes). Fetch a bounded middle page to read earlier history.`,
+    });
+  return items;
+}
+
+export async function fetchProjectedHistoryPage(
+  input: FetchProjectedTimelineItemsInput & { cursor: number; epoch?: string },
+) {
+  return input.client.fetchAgentTimelineHistory({
+    agentId: input.agentId,
+    operation: "page",
+    cursor: input.cursor,
+    epoch: input.epoch,
+    direction: "after",
+    limit: { events: 128, bytes: 256 * 1024 },
+  });
 }
