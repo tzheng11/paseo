@@ -886,8 +886,10 @@ class NativeRecursiveBackend implements ObservationBackend {
         this.host.queueEvent("create", path);
         // Sliced commits own the inventory until they finish. A stat completing
         // in that interval must not splice a file into a bucket being removed.
-        if (this.auditRunning) this.requestAudit(dirname(path));
-        else onPresent(stats.isDirectory());
+        if (this.auditRunning) {
+          if (stats.isDirectory() && !this.directories.has(path)) this.watchTopologyDirty = true;
+          this.requestAudit(dirname(path));
+        } else onPresent(stats.isDirectory());
         return undefined;
       })
       .catch((error: unknown) => {

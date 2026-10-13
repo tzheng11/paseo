@@ -123,3 +123,74 @@ test("an ignore generation supersedes a scan at its yield and leaves a complete 
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("a directory classified during an audit still acquires split native coverage", async () => {
+  const root = await mkdtemp(join(tmpdir(), "native-split-during-audit-"));
+  const ignored = join(root, "ignored");
+  const created = join(root, "created");
+  const paths = createObserverPaths(process.platform);
+  const watched = new Set<string>();
+  let notifyRoot!: (event: string, filename: string | null) => void;
+  let armed = false;
+  let paused = false;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const metrics = createFileObserver().getDiagnostics();
+  const backend = createNativeRecursiveBackend(
+    {
+      root,
+      metrics,
+      ignoredRoots: [ignored],
+      isActive: () => true,
+      isIgnored: (path) => paths.isInside(ignored, path),
+      isPathInside: paths.isInside,
+      onInventoryProgress: () => {
+        if (!armed) return;
+        armed = false;
+        vi.spyOn(observationWork, "pause").mockImplementationOnce(() => {
+          paused = true;
+          return gate;
+        });
+      },
+      queueEvent: () => {},
+      fail: (error) => {
+        throw error;
+      },
+    },
+    paths,
+    (directory, listener) => {
+      watched.add(directory);
+      if (directory === root) notifyRoot = listener;
+      return {
+        close: () => {
+          watched.delete(directory);
+        },
+        on: () => {},
+      };
+    },
+  );
+  let audit: Promise<void> | undefined;
+  try {
+    await backend.start();
+    armed = true;
+    audit = backend.updateIgnore();
+    await expect.poll(() => paused).toBe(true);
+    await mkdir(created);
+    await writeFile(join(created, "tracked"), "new");
+    notifyRoot("rename", "created");
+    await expect.poll(() => metrics.nativeClassificationCount).toBe(1);
+    await expect.poll(() => backend.getDiagnostics().pendingClassificationCount).toBe(0);
+    release();
+    await audit;
+    await expect.poll(() => watched.has(created), { timeout: 2_000 }).toBe(true);
+    expect(backend.getDiagnostics().nativeTrackedFileCount).toBe(1);
+  } finally {
+    release();
+    await audit;
+    vi.restoreAllMocks();
+    await backend.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
