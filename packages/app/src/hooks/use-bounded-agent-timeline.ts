@@ -57,7 +57,15 @@ export function useBoundedAgentTimeline(input: {
   const loadMiddle = useCallback(async () => {
     if (!client || !current?.snapshot.gap || loading) return;
     const cursor = current.middle?.nextIndex ?? current.snapshot.gap.startIndex;
-    const events = Math.min(128, current.snapshot.gap.endIndex + 1 - cursor);
+    const folded = foldTarget(current.middle, cursor);
+    if (folded) {
+      setLoaded({ ...current, middle: folded });
+      return;
+    }
+    const events = Math.min(
+      128,
+      (current.middle?.target?.startIndex ?? current.snapshot.gap.endIndex + 1) - cursor,
+    );
     if (events < 1) return;
     const currentGeneration = generation.current;
     setLoading(true);
@@ -82,6 +90,7 @@ export function useBoundedAgentTimeline(input: {
                 nextIndex: next,
                 coveredBytes: (state.middle?.coveredBytes ?? 0) + (page.coveredBytes ?? 0),
                 oversized: [...(state.middle?.oversized ?? []), ...(page.oversized ?? [])],
+                target: state.middle?.target,
               },
             }
           : state,
@@ -93,6 +102,56 @@ export function useBoundedAgentTimeline(input: {
       if (generation.current === currentGeneration) setLoading(false);
     }
   }, [agentId, client, current, loading]);
+  const loadAt = useCallback(
+    async (index: number) => {
+      if (!client || !current) throw new Error("History windows are not ready");
+      const cursor = Math.max(
+        index,
+        current.middle?.nextIndex ?? current.snapshot.gap?.startIndex ?? 0,
+      );
+      const currentGeneration = generation.current;
+      const page = await client.fetchAgentTimelineHistory({
+        agentId,
+        operation: "page",
+        epoch: current.epoch,
+        cursor,
+        direction: "after",
+        limit: {
+          events: Math.min(32, (current.snapshot.gap?.endIndex ?? cursor + 31) + 1 - cursor),
+          bytes: 256 * 1024,
+        },
+      });
+      if (!page.entries?.some((entry) => entry.index === index))
+        throw new Error("History item exceeds the display page limit");
+      if (generation.current !== currentGeneration)
+        throw new Error("History changed while loading its page");
+      const end = Math.min(
+        page.nextCursor ?? current.snapshot.totalEvents ?? cursor,
+        current.snapshot.gap?.endIndex === undefined ? Infinity : current.snapshot.gap.endIndex + 1,
+      );
+      setLoaded((state) =>
+        state === current
+          ? {
+              ...state,
+              middle: {
+                entries: state.middle?.entries ?? [],
+                nextIndex: state.middle?.nextIndex ?? state.snapshot.gap?.startIndex ?? 0,
+                coveredBytes: state.middle?.coveredBytes ?? 0,
+                oversized: state.middle?.oversized ?? [],
+                target: {
+                  entries: page.entries ?? [],
+                  startIndex: cursor,
+                  endIndex: end,
+                  coveredBytes: page.coveredBytes ?? 0,
+                  oversized: page.oversized ?? [],
+                },
+              },
+            }
+          : state,
+      );
+    },
+    [agentId, client, current],
+  );
   const items = useMemo(
     () =>
       current
@@ -104,11 +163,25 @@ export function useBoundedAgentTimeline(input: {
         : live,
     [current, live],
   );
-  return { items, loading, error, loadMiddle };
+  return { items, loading, error, loadMiddle, loadAt: current?.snapshot.gap ? loadAt : undefined };
 }
 
 export function supportsBoundedAgentHistory(
   capabilities: AgentCapabilityFlags | undefined,
 ): boolean {
   return capabilities?.supportsBoundedHistory === true;
+}
+
+function foldTarget(
+  middle: LoadedHistoryMiddle | null,
+  cursor: number,
+): LoadedHistoryMiddle | null {
+  if (!middle?.target || middle.target.startIndex !== cursor) return null;
+  const target = middle.target;
+  return {
+    entries: [...middle.entries, ...target.entries],
+    nextIndex: target.endIndex,
+    coveredBytes: middle.coveredBytes + target.coveredBytes,
+    oversized: [...middle.oversized, ...target.oversized],
+  };
 }

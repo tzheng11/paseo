@@ -1921,12 +1921,14 @@ export const AgentTimelineSearchRequestMessageSchema = z.object({
   requestId: z.string(),
   query: z.string(),
   cursor: z.number().int().nonnegative().optional(),
+  includeProviderHistory: z.boolean().optional(),
 });
 
 export const AgentTimelineListPromptsRequestMessageSchema = z.object({
   type: z.literal("agent.timeline.list_prompts.request"),
   agentId: z.string(),
   requestId: z.string(),
+  includeProviderHistory: z.boolean().optional(),
 });
 
 export const ProviderSubagentListRequestMessageSchema = z.object({
@@ -4742,6 +4744,7 @@ export const AgentTimelineSearchResponseMessageSchema = z.object({
         // Estimated occurrences in the message; the client verifies against rendered text.
         // COMPAT(timelineSearchCount): added in v0.9.0, remove optional after 2027-09-22.
         count: z.number().int().positive().optional(),
+        historyIndex: z.number().int().nonnegative().optional(),
       }),
     ),
     nextCursor: z.number().int().nonnegative().nullable(),
@@ -4760,6 +4763,7 @@ export const AgentTimelineListPromptsResponseMessageSchema = z.object({
         seq: z.number().int().nonnegative(),
         timestamp: z.string(),
         preview: z.string(),
+        historyIndex: z.number().int().nonnegative().optional(),
       }),
     ),
     error: z.string().nullable(),

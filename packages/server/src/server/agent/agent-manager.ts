@@ -1317,6 +1317,30 @@ export class AgentManager {
     return this.requireAgent(id).session?.historyWindowInfo;
   }
 
+  /** Search and prompt indexing explicitly traverse the unloaded provider middle. */
+  async *streamFullHistoryMessages(id: string): AsyncGenerator<AgentTimelineRow> {
+    const agent = this.requireSessionAgent(id);
+    if (!agent.session.streamHistoryEntries)
+      throw new Error("Provider has no streamed history source");
+    const epoch = this.timelineStore.getEpoch(id);
+    for await (const entry of agent.session.streamHistoryEntries({ messagesOnly: true })) {
+      if (this.timelineStore.getEpoch(id) !== epoch)
+        throw new Error("History changed during streamed read");
+      const event = entry.value;
+      if (
+        event.type !== "timeline" ||
+        (event.item.type !== "user_message" && event.item.type !== "assistant_message")
+      )
+        continue;
+      yield {
+        seq: entry.index + 1,
+        historyIndex: entry.index,
+        timestamp: event.timestamp ?? "1970-01-01T00:00:00.000Z",
+        item: event.item,
+      };
+    }
+  }
+
   async readTimelineHistory(
     id: string,
     request: {

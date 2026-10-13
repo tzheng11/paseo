@@ -7,6 +7,45 @@ import { z } from "zod";
 import { CodexHistorySource } from "./history-source.js";
 import type { AgentStreamEvent } from "../../agent-sdk-types.js";
 
+test("streams full message history in provider pages while preserving positions of skipped tools", async () => {
+  const calls: unknown[] = [];
+  const request = vi.fn(async (method: string, params: unknown) => {
+    calls.push(params);
+    if (method === "thread/turns/list") return { data: [], nextCursor: null };
+    const second = z.object({ cursor: z.string().optional() }).parse(params).cursor;
+    return second
+      ? { data: [{ turnId: "t", item: { id: "last", type: "agentMessage" } }], nextCursor: null }
+      : {
+          data: [
+            { turnId: "t", item: { id: "first", type: "userMessage" } },
+            { turnId: "t", item: { id: "tool", type: "mcpToolCall" } },
+          ],
+          nextCursor: "next",
+        };
+  });
+  const source = new CodexHistorySource({
+    databasePath: "unused",
+    threadId: "thread",
+    mapItem: (entry) => [
+      {
+        type: "timeline",
+        provider: "codex",
+        item: {
+          type: "assistant_message",
+          text: z.object({ id: z.string() }).parse(entry.item).id,
+        },
+      },
+    ],
+  });
+  const stream = source.stream({ request }, { messagesOnly: true });
+  expect((await stream.next()).value?.index).toBe(0);
+  expect(request).toHaveBeenCalledTimes(2);
+  expect((await stream.next()).value?.index).toBe(2);
+  expect(calls[1]).toEqual({ threadId: "thread", limit: 8, sortDirection: "asc" });
+  expect(calls[2]).toEqual({ threadId: "thread", limit: 8, sortDirection: "asc", cursor: "next" });
+  expect((await stream.next()).done).toBe(true);
+});
+
 test("decodes only bounded references and preserves attachment order within a source item", async () => {
   const directory = mkdtempSync(path.join(tmpdir(), "codex-history-source-"));
   const databasePath = path.join(directory, "history.sqlite");

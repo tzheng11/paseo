@@ -2,6 +2,21 @@ import { expect, it } from "vitest";
 import type { AgentTimelineItem } from "@getpaseo/protocol/agent-types";
 import { searchTimeline } from "./index.js";
 
+it("keeps provider positions separate from compact stream sequences", async () => {
+  async function* source() {
+    yield {
+      seq: 101,
+      historyIndex: 100,
+      timestamp: "start",
+      item: { type: "user_message" as const, text: "middle target" },
+    };
+  }
+  expect(await searchTimeline({ rows: source(), query: "target" })).toEqual({
+    locations: [{ seq: 101, historyIndex: 100, role: "user", count: 1 }],
+    nextCursor: null,
+  });
+});
+
 function rows(items: AgentTimelineItem[]) {
   return items.map((item, index) => ({ item, seq: index + 1, timestamp: "2026-09-12T00:00:00Z" }));
 }

@@ -9,6 +9,7 @@ interface SearchLocation {
   seq: number;
   role: "user" | "assistant";
   count: number;
+  historyIndex?: number;
 }
 interface SearchInput {
   rows: readonly AgentTimelineRow[] | AsyncIterable<AgentTimelineRow>;
@@ -78,6 +79,9 @@ export async function searchTimeline({ rows, query, cursor = 0 }: SearchInput) {
         seq,
         role: item.type === "user_message" ? "user" : "assistant",
         count,
+        ...("historyIndex" in entry && entry.historyIndex !== undefined
+          ? { historyIndex: entry.historyIndex }
+          : {}),
       });
     }
     if (performance.now() - lastYield >= 8) {

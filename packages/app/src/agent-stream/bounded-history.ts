@@ -8,10 +8,17 @@ export interface LoadedHistoryMiddle {
   nextIndex: number;
   coveredBytes: number;
   oversized: NonNullable<TimelineHistoryPage["oversized"]>;
+  target?: {
+    entries: NonNullable<TimelineHistoryPage["entries"]>;
+    startIndex: number;
+    endIndex: number;
+    coveredBytes: number;
+    oversized: NonNullable<TimelineHistoryPage["oversized"]>;
+  };
 }
 
 function hydrate(entries: NonNullable<TimelineHistoryPage["entries"]>): StreamItem[] {
-  return hydrateStreamState(
+  const items = hydrateStreamState(
     entries.map((entry) => ({
       event: {
         type: "timeline",
@@ -23,6 +30,20 @@ function hydrate(entries: NonNullable<TimelineHistoryPage["entries"]>): StreamIt
     })),
     { source: "canonical" },
   );
+  const positions = new Map<string, number>();
+  for (const entry of entries) {
+    const item = entry.item;
+    if (item.type === "assistant_message" && item.messageId)
+      positions.set(`assistant:${item.messageId}`, entry.index);
+    if (item.type === "user_message")
+      positions.set(`user:${item.messageId ?? item.clientMessageId ?? ""}`, entry.index);
+  }
+  return items.map((item) => {
+    const key = identity(item);
+    return key && positions.has(key)
+      ? Object.assign({}, item, { providerHistoryIndex: positions.get(key) })
+      : item;
+  });
 }
 
 function identity(item: StreamItem): string | null {
@@ -42,34 +63,13 @@ export function buildBoundedHistoryPresentation(input: {
   if (!snapshot.gap) return live;
   const head = hydrate(snapshot.head ?? []),
     tail = hydrate(snapshot.tail ?? []);
-  const mid = hydrate(middle?.entries ?? []);
+  const mid = hydrate(
+    [...(middle?.entries ?? []), ...(middle?.target?.entries ?? [])].toSorted(
+      (a, b) => a.index - b.index,
+    ),
+  );
   const next = middle?.nextIndex ?? snapshot.gap.startIndex;
-  const count = Math.max(0, snapshot.gap.endIndex + 1 - next);
-  const gaps: StreamItem[] = count
-    ? [
-        {
-          kind: "notification",
-          sourceType: "notification",
-          id: `history-gap:${snapshot.epoch}:${next}`,
-          timestamp: new Date(0),
-          level: "info",
-          message: "Earlier history is available on demand",
-          historyGap: {
-            cursor: next,
-            count,
-            bytes: Math.max(0, snapshot.gap.bytes - (middle?.coveredBytes ?? 0)),
-          },
-        },
-      ]
-    : [];
-  const omissions: StreamItem[] = (middle?.oversized ?? []).map((entry) => ({
-    kind: "notification",
-    sourceType: "notification",
-    id: `history-oversized:${snapshot.epoch}:${entry.index}`,
-    timestamp: new Date(0),
-    level: "info",
-    message: `History item exceeds the page limit (${entry.bytes.toLocaleString()} bytes).`,
-  }));
+  const { gaps, omissions } = gapPresentation(snapshot, middle, next);
   const history = [...head, ...mid, ...omissions, ...gaps, ...tail];
   return mergeLiveHistory(
     history,
@@ -92,10 +92,54 @@ function mergeLiveHistory(
     const key = identity(item);
     const index = key ? identities.get(key) : undefined;
     if (index !== undefined) {
-      history[index] = item;
+      history[index] = { ...item, providerHistoryIndex: history[index].providerHistoryIndex };
       continue;
     }
     if (!item.timelineCursor || item.timelineCursor.seq > boundary) history.push(item);
   }
   return history;
+}
+
+function gapPresentation(
+  snapshot: TimelineHistoryPage,
+  middle: LoadedHistoryMiddle | null,
+  next: number,
+) {
+  if (!snapshot.gap) return { gaps: [], omissions: [] };
+  const targetCount = middle?.target ? middle.target.endIndex - middle.target.startIndex : 0;
+  const count = Math.max(0, snapshot.gap.endIndex + 1 - next - targetCount);
+  const gaps: StreamItem[] = count
+    ? [
+        {
+          kind: "notification",
+          sourceType: "notification",
+          id: `history-gap:${snapshot.epoch}:${next}`,
+          timestamp: new Date(0),
+          level: "info",
+          message: "Earlier history is available on demand",
+          historyGap: {
+            cursor: next,
+            count,
+            bytes: Math.max(
+              0,
+              snapshot.gap.bytes -
+                (middle?.coveredBytes ?? 0) -
+                (middle?.target?.coveredBytes ?? 0),
+            ),
+          },
+        },
+      ]
+    : [];
+  const omissions: StreamItem[] = [
+    ...(middle?.oversized ?? []),
+    ...(middle?.target?.oversized ?? []),
+  ].map((entry) => ({
+    kind: "notification",
+    sourceType: "notification",
+    id: `history-oversized:${snapshot.epoch}:${entry.index}`,
+    timestamp: new Date(0),
+    level: "info",
+    message: `History item exceeds the page limit (${entry.bytes.toLocaleString()} bytes).`,
+  }));
+  return { gaps, omissions };
 }

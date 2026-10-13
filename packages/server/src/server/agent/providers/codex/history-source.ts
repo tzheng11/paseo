@@ -53,6 +53,43 @@ export class CodexHistorySource {
   }
   constructor(private readonly options: CodexHistorySourceOptions) {}
 
+  /** Explicit full reads keep one provider page, never a complete turn. */
+  async *stream(
+    client: CodexHistoryReadClient,
+    options?: { messagesOnly?: boolean },
+  ): AsyncGenerator<HistoryWindowEntry<AgentStreamEvent>> {
+    await this.ensureProjection(client);
+    let cursor: string | null = null;
+    let index = 0;
+    const seen = new Set<string>();
+    do {
+      const page = itemPage.parse(
+        await client.request("thread/items/list", {
+          threadId: this.options.threadId,
+          limit: 8,
+          sortDirection: "asc",
+          ...(cursor === null ? {} : { cursor }),
+        }),
+      );
+      if (page.nextCursor !== null && seen.has(page.nextCursor))
+        throw new Error("Native history repeated a stream cursor");
+      if (page.nextCursor !== null) seen.add(page.nextCursor);
+      for (const entry of page.data) {
+        const item = entry.item;
+        const isMessage =
+          typeof item === "object" &&
+          item !== null &&
+          "type" in item &&
+          (item.type === "userMessage" || item.type === "agentMessage");
+        if (!options?.messagesOnly || isMessage)
+          for (const value of this.options.mapItem(entry))
+            yield { index, bytes: Buffer.byteLength(JSON.stringify(value), "utf8"), value };
+        index++;
+      }
+      cursor = page.nextCursor;
+    } while (cursor !== null);
+  }
+
   async windows(
     client: CodexHistoryReadClient,
     limits: { head: HistoryReadLimit; tail: HistoryReadLimit },

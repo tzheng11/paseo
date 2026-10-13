@@ -53,8 +53,25 @@ identifiers in memory. Their ordinary replay also selects bounded edges; buildin
 still traverses provider pages. Older binaries and other adapters can retain large provider-owned
 buffers. The projection row-cache budget does not cover explicit `limit: 0` responses.
 Turn-end hooks carry bounded projection edges, `timelineGap`, and `providerHistoryGap` when
-provider history is unloaded; they do not clone the complete timeline. Search and prompt indexing currently stream the readable projection; full-source
-consumers must opt into provider replay to include an unloaded middle.
+provider history is unloaded; they do not clone the complete timeline. Search and prompt indexing
+explicitly stream provider messages when the client supports middle pages. Results carry a
+provider index for loading their bounded window; that index never becomes a live stream cursor.
+Clients without middle-page support search their readable projection.
+
+Full-history consumers have distinct contracts:
+
+| Caller                                            | History contract                                                                                                                  |
+| ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| Codex provider replay/export (`streamAllHistory`) | Explicit eight-item provider pages on a separate read-only connection; no aggregate timeline array.                               |
+| Search / prompt outline                           | Explicit message stream with provider positions; retains only bounded matches or prompt previews.                                 |
+| Turn-end hooks                                    | Bounded edges with both projection and provider gap metadata. Plugins can request ordinary middle pages through the timeline SDK. |
+| Import / fork / archived read / refresh           | Ordinary bounded provider replay. Native rewind uses user-message identifiers, and modern forks exclude turn payloads.            |
+| CLI logs / attach                                 | Bounded tail and explicit bounded middle pages; oversized records are reported rather than silently dropped.                      |
+| SDK `timeline.refetch` / catch-up                 | Readable projection pages. `limit: 0` is an explicit complete projection request, not a provider-transcript export.               |
+
+Legacy Codex and other provider adapters still need native window support to remove their
+provider-owned full response buffers. This Codex native candidate does not establish that bound
+for those adapters.
 
 Codex and JSONL RPC transports bound each stdout frame to 64 MiB before decoding. An oversized
 frame closes that provider process and rejects pending requests. Provider transcripts stay intact.

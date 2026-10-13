@@ -22,6 +22,38 @@ function message(seq: number, text = "target"): StreamItem {
   };
 }
 
+it("reveals an unloaded middle result using its provider index rather than a live cursor", async () => {
+  let loaded: number | undefined;
+  const model = new ChatFindModel({
+    async search() {
+      return {
+        ...response([]),
+        locations: [{ seq: 501, historyIndex: 500, role: "assistant" as const, count: 1 }],
+      };
+    },
+    async load(_epoch, _seq, historyIndex) {
+      loaded = historyIndex;
+      model.updateHistory("epoch", [
+        { ...message(7), timelineCursor: undefined, providerHistoryIndex: 500 },
+      ]);
+    },
+    async reveal() {
+      return { count: 1, occurrence: 0 };
+    },
+    clear() {},
+  });
+  try {
+    model.updateHistory("epoch", []);
+    model.open();
+    model.setQuery("target");
+    await expect.poll(() => model.getSnapshot().phase).toBe("ready");
+    expect(loaded).toBe(500);
+    expect(model.getSnapshot().selectedItemId).toBe("row-7");
+  } finally {
+    model.close();
+  }
+});
+
 it("loads an older location and searches a response merged across suppressed tasks once", async () => {
   const source = [
     { type: "assistant_message" as const, text: "first **target** " },

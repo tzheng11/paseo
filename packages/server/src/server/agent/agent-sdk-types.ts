@@ -15,6 +15,7 @@ import type {
   HistoryPage,
   HistoryWindows,
   HistoryWindowInfo,
+  HistoryWindowEntry,
 } from "./agent-history-replay.js";
 
 export type {
@@ -694,6 +695,10 @@ export interface AgentSession {
     limit: HistoryReadLimit;
   }): Promise<HistoryPage<AgentStreamEvent>>;
   streamAllHistory?(): AsyncGenerator<AgentStreamEvent>;
+  /** Provider positions, separate from live stream sequences. Explicit full consumer. */
+  streamHistoryEntries?(options?: {
+    messagesOnly?: boolean;
+  }): AsyncGenerator<HistoryWindowEntry<AgentStreamEvent>>;
   getRuntimeInfo(): Promise<AgentRuntimeInfo>;
   getAvailableModes(): Promise<AgentMode[]>;
   getCurrentMode(): Promise<string | null>;

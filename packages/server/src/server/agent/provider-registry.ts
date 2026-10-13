@@ -493,6 +493,12 @@ export function wrapSessionProvider(provider: AgentProvider, inner: AgentSession
             yield mapStreamEvent(provider, event);
         }
       : undefined,
+    streamHistoryEntries: inner.streamHistoryEntries
+      ? async function* (options) {
+          for await (const entry of inner.streamHistoryEntries!(options))
+            yield { ...entry, value: mapStreamEvent(provider, entry.value) };
+        }
+      : undefined,
     getRuntimeInfo: async () => mapRuntimeInfo(provider, await inner.getRuntimeInfo()),
     getAvailableModes: () => inner.getAvailableModes(),
     getCurrentMode: () => inner.getCurrentMode(),

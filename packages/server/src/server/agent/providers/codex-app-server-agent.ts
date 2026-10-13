@@ -47,6 +47,7 @@ import {
   type HistoryPage,
   type HistoryWindows,
   type HistoryWindowInfo,
+  type HistoryWindowEntry,
 } from "../agent-history-replay.js";
 import { CodexHistorySource } from "./codex/history-source.js";
 import { runProviderRefreshActivity } from "../provider-refresh-deadline.js";
@@ -4788,24 +4789,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   /** Full replay is explicit; window reads never consume this stream. */
   async *streamAllHistory(): AsyncGenerator<AgentStreamEvent> {
     if (this.nativeHistorySource && this.currentThreadId) {
-      // Explicit exports/replay may traverse every item, but never collect them.
-      const owned = await this.createHistoryReader();
-      const client = owned;
-      try {
-        for await (const turn of readCodexHistoryTurns({
-          client,
-          threadId: this.currentThreadId,
-          pagedHistoryAvailable: true,
-          historyMode: "paginated",
-        })) {
-          if (typeof turn.id !== "string") throw new Error("Native history turn has no id");
-          const turnId = turn.id;
-          for (const item of turn.items)
-            yield* mapCodexHistoryItem({ turnId, item }, this.config.cwd ?? null);
-        }
-      } finally {
-        await owned?.dispose();
-      }
+      for await (const entry of this.streamHistoryEntries()) yield entry.value;
       return;
     }
     const history = this.persistedHistory;
@@ -4817,6 +4801,25 @@ export class CodexAppServerAgentSession implements AgentSession {
           ? (this.asyncQuestions.timeline(entry.item.callId) ?? entry.item)
           : entry.item;
       yield { type: "timeline", provider: CODEX_PROVIDER, item, timestamp: entry.timestamp };
+    }
+  }
+
+  async *streamHistoryEntries(options?: {
+    messagesOnly?: boolean;
+  }): AsyncGenerator<HistoryWindowEntry<AgentStreamEvent>> {
+    if (this.nativeHistorySource) {
+      const owned = await this.createHistoryReader();
+      try {
+        yield* this.nativeHistorySource.stream(owned, options);
+      } finally {
+        await owned.dispose();
+      }
+      return;
+    }
+    if (!this.persistedHistory) return;
+    let index = 0;
+    for await (const value of this.persistedHistory.streamAll()) {
+      yield { index: index++, bytes: Buffer.byteLength(JSON.stringify(value), "utf8"), value };
     }
   }
 

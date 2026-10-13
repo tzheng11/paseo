@@ -25,6 +25,29 @@ const snapshot: TimelineHistoryPage = {
   error: null,
 };
 
+test("renders a bounded jump page in source order without inventing live cursors", () => {
+  const items = buildBoundedHistoryPresentation({
+    snapshot,
+    live: [],
+    middle: {
+      entries: [],
+      nextIndex: 2,
+      coveredBytes: 0,
+      oversized: [],
+      target: { entries: [entry(5)], startIndex: 5, endIndex: 6, coveredBytes: 100, oversized: [] },
+    },
+  });
+  const target = items.find((item) => item.providerHistoryIndex === 5);
+  expect(target?.kind).toBe("assistant_message");
+  expect(target?.timelineCursor).toBeUndefined();
+  const gap = items.find((item) => item.kind === "notification" && item.historyGap);
+  expect(gap?.kind === "notification" && gap.historyGap).toEqual({
+    cursor: 2,
+    count: 5,
+    bytes: 500,
+  });
+});
+
 test("renders the conversation start, exact gap shape and recent work as separate segments", () => {
   const items = buildBoundedHistoryPresentation({ snapshot, middle: null, live: [] });
   expect(items.map((item) => item.kind)).toEqual([

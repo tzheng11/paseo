@@ -18,9 +18,10 @@ test("serves bounded head/tail and lazy middle pages without consuming a full hi
           {
             id: "turn",
             items: Array.from({ length: 1000 }, (_, index) => ({
-              type: "agentMessage",
+              type: index === 500 ? "userMessage" : "agentMessage",
               id: String(index),
               text: `Item ${index}`,
+              ...(index === 500 ? { content: [{ type: "text", text: "Middle prompt" }] } : {}),
               timestamp: "2026-10-12T00:00:00.000Z",
             })),
           },
@@ -72,6 +73,23 @@ test("serves bounded head/tail and lazy middle pages without consuming a full hi
     expect(page.entries?.map((entry) => entry.index)).toEqual([64, 65]);
     expect(page.coveredCount).toBe(2);
     expect(page.nextCursor).toBe(66);
+    const matches = await ctx.client.searchAgentTimeline({
+      agentId: agent.id,
+      query: "Middle prompt",
+      includeProviderHistory: true,
+    });
+    expect(matches.locations).toEqual([{ seq: 501, historyIndex: 500, role: "user", count: 1 }]);
+    const prompts = await ctx.client.listAgentTimelinePrompts(agent.id, {
+      includeProviderHistory: true,
+    });
+    expect(prompts.prompts).toEqual([
+      {
+        seq: 501,
+        historyIndex: 500,
+        timestamp: "2026-10-12T00:00:00.000Z",
+        preview: "Middle prompt",
+      },
+    ]);
     await expect(
       ctx.client.fetchAgentTimelineHistory({
         agentId: agent.id,

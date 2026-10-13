@@ -6,6 +6,7 @@ export interface TimelinePromptIndexEntry {
   seq: number;
   timestamp: string;
   preview: string;
+  historyIndex?: number;
 }
 
 export interface TimelinePromptIndex {
@@ -49,7 +50,12 @@ export async function streamTimelinePromptIndex(
   const prompts: TimelinePromptIndexEntry[] = [];
   for await (const row of rows) {
     if (row.item.type !== "user_message") continue;
-    prompts.push({ seq: row.seq, timestamp: row.timestamp, preview: promptPreview(row.item.text) });
+    prompts.push({
+      seq: row.seq,
+      timestamp: row.timestamp,
+      preview: promptPreview(row.item.text),
+      ...(row.historyIndex === undefined ? {} : { historyIndex: row.historyIndex }),
+    });
   }
   return { epoch, prompts };
 }

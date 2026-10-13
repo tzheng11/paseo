@@ -7935,7 +7935,9 @@ export class Session {
         agentStorage: this.agentStorage,
         logger: this.sessionLogger,
       });
-      const rows = this.agentManager.streamTimelineRows(msg.agentId);
+      const rows = msg.includeProviderHistory
+        ? this.agentManager.streamFullHistoryMessages(msg.agentId)
+        : this.agentManager.streamTimelineRows(msg.agentId);
       const { epoch } = this.agentManager.fetchTimeline(msg.agentId, {
         direction: "tail",
         limit: 1,
@@ -7988,7 +7990,9 @@ export class Session {
         agentStorage: this.agentStorage,
         logger: this.sessionLogger,
       });
-      const rows = this.agentManager.streamTimelineRows(msg.agentId);
+      const rows = msg.includeProviderHistory
+        ? this.agentManager.streamFullHistoryMessages(msg.agentId)
+        : this.agentManager.streamTimelineRows(msg.agentId);
       const timeline = this.agentManager.fetchTimeline(msg.agentId, {
         direction: "tail",
         limit: 1,
