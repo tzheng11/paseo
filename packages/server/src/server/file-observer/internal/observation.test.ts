@@ -1,11 +1,12 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { createFileObserver, type FileChange, type FileObserverCallback } from "../index.js";
 import type { ObservationHost } from "./contracts.js";
 import { createManagedObservation } from "./observation.js";
 import { createObserverPaths } from "./paths.js";
+import { observationWork } from "./work-slice.js";
 
 test("large coalesced delivery yields between bounded subscriber batches", async () => {
   const batches: FileChange[][] = [];
@@ -36,7 +37,7 @@ test("large coalesced delivery yields between bounded subscriber batches", async
   }
 });
 
-async function harness(callback: FileObserverCallback) {
+async function harness(callback: FileObserverCallback, onIgnore: () => void = () => {}) {
   const root = await mkdtemp(join(tmpdir(), "observation-delivery-"));
   let host!: ObservationHost;
   const observation = createManagedObservation({
@@ -48,7 +49,9 @@ async function harness(callback: FileObserverCallback) {
       host = input;
       return {
         start: async () => {},
-        updateIgnore: async () => {},
+        updateIgnore: async () => {
+          onIgnore();
+        },
         close: async () => {},
         getDiagnostics: () => ({
           nativeHandleCount: 0,
@@ -64,6 +67,37 @@ async function harness(callback: FileObserverCallback) {
   });
   return { root, host, observation };
 }
+
+test("ignore cancels the backend generation before yielding to prune a large delivery queue", async () => {
+  let cancelled = false;
+  const { root, host, observation } = await harness(
+    () => {},
+    () => {
+      cancelled = true;
+    },
+  );
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let updating: Promise<void> | undefined;
+  try {
+    await observation.start();
+    for (let i = 0; i < 600; i++) host.queueEvent("create", join(root, "generated", `file-${i}`));
+    vi.spyOn(observationWork, "pause").mockReturnValueOnce(gate);
+    updating = observation.subscription().updateIgnore([join(root, "generated")]);
+    expect(cancelled).toBe(true);
+    release();
+    await updating;
+    expect(observation.getDiagnostics().pendingEventCount).toBe(0);
+  } finally {
+    release();
+    await updating;
+    vi.restoreAllMocks();
+    await observation.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test.each(["close", "ignore"] as const)(
   "%s during sliced delivery suppresses the remaining excluded events",

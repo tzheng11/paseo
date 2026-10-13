@@ -95,17 +95,21 @@ class Observation implements ManagedObservation, ObservationHost {
     if (samePaths(this.ignoredRoots, next)) return;
     this.ignoredRoots = next;
     this.ignoredMatcher = this.input.paths.ignoredMatcher(next);
+    try {
+      // Cancel obsolete inventory work before pruning can yield. Attach both
+      // rejection handlers immediately, including while pruning is suspended.
+      await Promise.all([this.backend.updateIgnore(), this.pruneIgnoredEvents()]);
+    } catch (error) {
+      this.fail(toError(error));
+      throw error;
+    }
+  }
+
+  private async pruneIgnoredEvents(): Promise<void> {
     for (const path of this.pendingEvents.keys()) {
       const pause = observationWork.pause();
       if (pause) await pause;
       if (this.isIgnored(path)) this.pendingEvents.delete(path);
-    }
-    if (!this.isActive()) return;
-    try {
-      await this.backend.updateIgnore();
-    } catch (error) {
-      this.fail(toError(error));
-      throw error;
     }
   }
 
