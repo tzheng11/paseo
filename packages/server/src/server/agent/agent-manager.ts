@@ -3523,8 +3523,7 @@ export class AgentManager {
     if (!this.durableTimelineStore) {
       return this.timelineStore.getLastAssistantMessageSegment(agentId);
     }
-    const liveTimeline = this.timelineStore.getItems(agentId);
-    const liveSegment = this.getLastAssistantMessageSegmentFromTimeline(liveTimeline);
+    const liveSegment = this.timelineStore.getLastAssistantMessageSegmentInfo(agentId);
     if (!liveSegment) {
       return await this.durableTimelineStore.getLastAssistantMessage(agentId);
     }

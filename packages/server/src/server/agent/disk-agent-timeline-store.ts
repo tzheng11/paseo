@@ -308,18 +308,25 @@ export class DiskAgentTimelineStore implements AgentRuntimeTimelineStore {
   }
 
   getLastAssistantMessageSegment(agentId: string): string | null {
+    return this.getLastAssistantMessageSegmentInfo(agentId)?.text ?? null;
+  }
+
+  getLastAssistantMessageSegmentInfo(
+    agentId: string,
+  ): { text: string; startsAtBeginning: boolean } | null {
     const state = this.requireState(agentId);
     const found = this.statement(
       "SELECT pos FROM rows WHERE sid = ? AND item_type = 'assistant_message' ORDER BY pos DESC LIMIT 1",
     ).get(state.key);
     if (!found) return null;
     const chunks: string[] = [];
-    for (let pos = Number(found.pos); pos >= 0; pos--) {
+    let pos = Number(found.pos);
+    for (; pos >= 0; pos--) {
       const item = this.readRow(state, pos).item;
       if (item.type !== "assistant_message") break;
       chunks.push(item.text);
     }
-    return chunks.toReversed().join("");
+    return { text: chunks.toReversed().join(""), startsAtBeginning: pos < 0 };
   }
 
   fetch(agentId: string, options?: AgentTimelineFetchOptions): AgentTimelineFetchResult {

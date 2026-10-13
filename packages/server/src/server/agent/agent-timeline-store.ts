@@ -225,6 +225,27 @@ export class InMemoryAgentTimelineStore {
     return this.requireState(agentId).projection.getLastAssistantMessageSegment();
   }
 
+  getLastAssistantMessageSegmentInfo(
+    agentId: string,
+  ): { text: string; startsAtBeginning: boolean } | null {
+    // This small in-memory projection is used by tests/subagents; production reads
+    // only the final segment from SQLite metadata and payload rows.
+    const rows = this.requireState(agentId).projection.getRows();
+    const chunks: string[] = [];
+    let pos = rows.length - 1;
+    for (; pos >= 0; pos--) {
+      const item = rows[pos].item;
+      if (item.type !== "assistant_message") {
+        if (chunks.length) break;
+        continue;
+      }
+      chunks.push(item.text);
+    }
+    return chunks.length
+      ? { text: chunks.toReversed().join(""), startsAtBeginning: pos < 0 }
+      : null;
+  }
+
   getLastAssistantMessage(agentId: string): string | null {
     const row = this.requireState(agentId).projection.findLastRow(
       (candidate) => candidate.item.type === "assistant_message",

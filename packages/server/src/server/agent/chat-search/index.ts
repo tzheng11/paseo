@@ -80,7 +80,10 @@ export async function searchTimeline({ rows, query, cursor = 0 }: SearchInput) {
         seq,
         role: item.type === "user_message" ? "user" : "assistant",
         count,
-        ...("providerMessageId" in entry && entry.providerMessageId !== undefined
+        ...("historyIndex" in entry &&
+        entry.historyIndex !== undefined &&
+        "providerMessageId" in entry &&
+        entry.providerMessageId !== undefined
           ? { messageId: entry.providerMessageId }
           : {}),
         ...("historyIndex" in entry && entry.historyIndex !== undefined

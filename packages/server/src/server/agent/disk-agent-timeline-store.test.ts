@@ -29,6 +29,22 @@ const tool = (callId: string, status: "running" | "completed"): AgentTimelineIte
 });
 
 describe("DiskAgentTimelineStore", () => {
+  it("reads only the final assistant segment and identifies a durable-history join", () => {
+    const store = createStore();
+    store.initialize("segment");
+    store.append("segment", { type: "assistant_message", messageId: "first", text: "A" });
+    expect(store.getLastAssistantMessageSegmentInfo("segment")).toEqual({
+      text: "A",
+      startsAtBeginning: true,
+    });
+    store.append("segment", { type: "user_message", text: "Boundary" });
+    store.append("segment", { type: "assistant_message", messageId: "last", text: "B" });
+    expect(store.getLastAssistantMessageSegmentInfo("segment")).toEqual({
+      text: "B",
+      startsAtBeginning: false,
+    });
+    expect(store.getLastAssistantMessageSegment("segment")).toBe("B");
+  });
   it("streams projected history without collecting payloads and rejects a changing epoch", async () => {
     const store = createStore();
     store.initialize("stream", { epoch: "before" });
