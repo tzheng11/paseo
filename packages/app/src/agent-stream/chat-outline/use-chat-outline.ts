@@ -140,12 +140,8 @@ export function useChatOutline({
 
   useEffect(() => {
     if (pendingJump === null) return;
-    const position = prompts.find((prompt) => prompt.seq === pendingJump.seq)?.historyIndex;
-    const target = loadedItems.find((item) =>
-      position === undefined
-        ? item.timelineCursor?.seq === pendingJump.seq
-        : item.providerHistoryIndex === position,
-    );
+    const prompt = prompts.find((entry) => entry.seq === pendingJump.seq);
+    const target = loadedItems.find((item) => matchesPrompt(item, pendingJump.seq, prompt));
     if (target) {
       if (pendingJump.hasScrolled) return;
       if (visibleMessageIds?.has(target.id) === false) {
@@ -166,12 +162,9 @@ export function useChatOutline({
     (seq: number) => {
       nextJumpRequestIdRef.current += 1;
       setPendingJump(null);
-      const position = prompts.find((prompt) => prompt.seq === seq)?.historyIndex;
-      const loaded = loadedItems.find((item) =>
-        position === undefined
-          ? item.timelineCursor?.seq === seq
-          : item.providerHistoryIndex === position,
-      );
+      const prompt = prompts.find((entry) => entry.seq === seq);
+      const position = prompt?.historyIndex;
+      const loaded = loadedItems.find((item) => matchesPrompt(item, seq, prompt));
       if (loaded) {
         if (revealLoadedMessage?.(loaded.id)) {
           const requestId = nextJumpRequestIdRef.current;
@@ -218,4 +211,18 @@ export function useChatOutline({
   );
 
   return { prompts, activePrompt, jumpToPrompt, reportReadingPosition };
+}
+
+function matchesPrompt(
+  item: StreamItem,
+  seq: number,
+  prompt: ChatOutlinePrompt | undefined,
+): boolean {
+  if (prompt?.historyIndex === undefined) return item.timelineCursor?.seq === seq;
+  return (
+    item.providerHistoryIndex === prompt.historyIndex ||
+    (prompt.messageId !== undefined &&
+      item.kind === "user_message" &&
+      item.messageId === prompt.messageId)
+  );
 }

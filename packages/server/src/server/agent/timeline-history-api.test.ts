@@ -78,7 +78,9 @@ test("serves bounded head/tail and lazy middle pages without consuming a full hi
       query: "Middle prompt",
       includeProviderHistory: true,
     });
-    expect(matches.locations).toEqual([{ seq: 501, historyIndex: 500, role: "user", count: 1 }]);
+    expect(matches.locations).toEqual([
+      { seq: 501, historyIndex: 500, messageId: "500", role: "user", count: 1 },
+    ]);
     const prompts = await ctx.client.listAgentTimelinePrompts(agent.id, {
       includeProviderHistory: true,
     });
@@ -86,6 +88,7 @@ test("serves bounded head/tail and lazy middle pages without consuming a full hi
       {
         seq: 501,
         historyIndex: 500,
+        messageId: "500",
         timestamp: "2026-10-12T00:00:00.000Z",
         preview: "Middle prompt",
       },

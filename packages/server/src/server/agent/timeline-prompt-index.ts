@@ -7,6 +7,7 @@ export interface TimelinePromptIndexEntry {
   timestamp: string;
   preview: string;
   historyIndex?: number;
+  messageId?: string;
 }
 
 export interface TimelinePromptIndex {
@@ -54,6 +55,7 @@ export async function streamTimelinePromptIndex(
       seq: row.seq,
       timestamp: row.timestamp,
       preview: promptPreview(row.item.text),
+      ...(row.providerMessageId === undefined ? {} : { messageId: row.providerMessageId }),
       ...(row.historyIndex === undefined ? {} : { historyIndex: row.historyIndex }),
     });
   }

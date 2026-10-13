@@ -12,7 +12,7 @@ function response(locations: Array<{ seq: number; role: "user" | "assistant"; co
     error: null,
   };
 }
-function message(seq: number, text = "target"): StreamItem {
+function message(seq: number, text = "target"): Extract<StreamItem, { kind: "assistant_message" }> {
   return {
     id: `row-${seq}`,
     kind: "assistant_message",
@@ -49,6 +49,41 @@ it("reveals an unloaded middle result using its provider index rather than a liv
     await expect.poll(() => model.getSnapshot().phase).toBe("ready");
     expect(loaded).toBe(500);
     expect(model.getSnapshot().selectedItemId).toBe("row-7");
+  } finally {
+    model.close();
+  }
+});
+
+it("finds a live message appended after the bounded snapshot by its provider identity", async () => {
+  const model = new ChatFindModel({
+    async search() {
+      return {
+        ...response([]),
+        locations: [
+          {
+            seq: 12001,
+            historyIndex: 12000,
+            messageId: "native-id",
+            role: "assistant" as const,
+            count: 1,
+          },
+        ],
+      };
+    },
+    async load() {
+      throw new Error("An already visible message must not reload history");
+    },
+    async reveal() {
+      return { count: 1, occurrence: 0 };
+    },
+    clear() {},
+  });
+  try {
+    model.updateHistory("epoch", [{ ...message(321), messageId: "native-id" }]);
+    model.open();
+    model.setQuery("target");
+    await expect.poll(() => model.getSnapshot().phase).toBe("ready");
+    expect(model.getSnapshot().selectedItemId).toBe("row-321");
   } finally {
     model.close();
   }

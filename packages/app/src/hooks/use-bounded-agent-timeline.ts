@@ -64,7 +64,8 @@ export function useBoundedAgentTimeline(input: {
     }
     const events = Math.min(
       128,
-      (current.middle?.target?.startIndex ?? current.snapshot.gap.endIndex + 1) - cursor,
+      Math.min(current.middle?.target?.startIndex ?? Infinity, current.snapshot.gap.endIndex + 1) -
+        cursor,
     );
     if (events < 1) return;
     const currentGeneration = generation.current;
@@ -117,7 +118,10 @@ export function useBoundedAgentTimeline(input: {
         cursor,
         direction: "after",
         limit: {
-          events: Math.min(32, (current.snapshot.gap?.endIndex ?? cursor + 31) + 1 - cursor),
+          events:
+            cursor <= (current.snapshot.gap?.endIndex ?? -1)
+              ? Math.min(32, current.snapshot.gap!.endIndex + 1 - cursor)
+              : 32,
           bytes: 256 * 1024,
         },
       });
@@ -125,10 +129,7 @@ export function useBoundedAgentTimeline(input: {
         throw new Error("History item exceeds the display page limit");
       if (generation.current !== currentGeneration)
         throw new Error("History changed while loading its page");
-      const end = Math.min(
-        page.nextCursor ?? current.snapshot.totalEvents ?? cursor,
-        current.snapshot.gap?.endIndex === undefined ? Infinity : current.snapshot.gap.endIndex + 1,
-      );
+      const end = page.nextCursor ?? cursor + (page.coveredCount ?? 0);
       setLoaded((state) =>
         state === current
           ? {

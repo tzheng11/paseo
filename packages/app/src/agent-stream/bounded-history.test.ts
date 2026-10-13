@@ -48,6 +48,35 @@ test("renders a bounded jump page in source order without inventing live cursors
   });
 });
 
+test("places a newer source page after the original tail without subtracting it from the middle gap", () => {
+  const items = buildBoundedHistoryPresentation({
+    snapshot,
+    live: [],
+    middle: {
+      entries: [],
+      nextIndex: 2,
+      coveredBytes: 0,
+      oversized: [],
+      target: {
+        entries: [entry(12)],
+        startIndex: 12,
+        endIndex: 13,
+        coveredBytes: 100,
+        oversized: [],
+      },
+    },
+  });
+  expect(
+    items.filter((item) => item.kind === "assistant_message").map((item) => item.messageId),
+  ).toEqual(["0", "1", "8", "9", "12"]);
+  const gap = items.find((item) => item.kind === "notification" && item.historyGap);
+  expect(gap?.kind === "notification" && gap.historyGap).toEqual({
+    cursor: 2,
+    count: 6,
+    bytes: 600,
+  });
+});
+
 test("renders the conversation start, exact gap shape and recent work as separate segments", () => {
   const items = buildBoundedHistoryPresentation({ snapshot, middle: null, live: [] });
   expect(items.map((item) => item.kind)).toEqual([

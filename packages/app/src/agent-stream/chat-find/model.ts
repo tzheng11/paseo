@@ -158,6 +158,7 @@ export class ChatFindModel {
             seq: location.seq,
             role: location.role,
             historyIndex: location.historyIndex,
+            messageId: location.messageId,
             // COMPAT(timelineSearchCount): hosts before v0.9.0 send no count; remove after 2027-09-22.
             count: location.count ?? 1,
           })),
@@ -187,7 +188,10 @@ export class ChatFindModel {
     for (const item of this.items) {
       if (location.historyIndex !== undefined) {
         if (
-          item.providerHistoryIndex === location.historyIndex &&
+          (item.providerHistoryIndex === location.historyIndex ||
+            (location.messageId !== undefined &&
+              (item.kind === "user_message" || item.kind === "assistant_message") &&
+              item.messageId === location.messageId)) &&
           item.kind === `${location.role}_message`
         )
           return { id: item.id, seq: location.seq, before: location.seq - 1 };

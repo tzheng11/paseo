@@ -1335,6 +1335,7 @@ export class AgentManager {
       yield {
         seq: entry.index + 1,
         historyIndex: entry.index,
+        providerMessageId: event.item.messageId,
         timestamp: event.timestamp ?? "1970-01-01T00:00:00.000Z",
         item: event.item,
       };

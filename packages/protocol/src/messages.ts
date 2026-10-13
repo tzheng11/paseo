@@ -4745,6 +4745,7 @@ export const AgentTimelineSearchResponseMessageSchema = z.object({
         // COMPAT(timelineSearchCount): added in v0.9.0, remove optional after 2027-09-22.
         count: z.number().int().positive().optional(),
         historyIndex: z.number().int().nonnegative().optional(),
+        messageId: z.string().optional(),
       }),
     ),
     nextCursor: z.number().int().nonnegative().nullable(),
@@ -4764,6 +4765,7 @@ export const AgentTimelineListPromptsResponseMessageSchema = z.object({
         timestamp: z.string(),
         preview: z.string(),
         historyIndex: z.number().int().nonnegative().optional(),
+        messageId: z.string().optional(),
       }),
     ),
     error: z.string().nullable(),

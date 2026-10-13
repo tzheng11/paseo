@@ -63,14 +63,24 @@ export function buildBoundedHistoryPresentation(input: {
   if (!snapshot.gap) return live;
   const head = hydrate(snapshot.head ?? []),
     tail = hydrate(snapshot.tail ?? []);
+  const tailStart = snapshot.tail?.[0]?.index ?? snapshot.totalEvents ?? Infinity;
+  const targetEntries = middle?.target?.entries ?? [];
   const mid = hydrate(
-    [...(middle?.entries ?? []), ...(middle?.target?.entries ?? [])].toSorted(
-      (a, b) => a.index - b.index,
-    ),
+    [
+      ...(middle?.entries ?? []),
+      ...targetEntries.filter((entry) => entry.index < tailStart),
+    ].toSorted((a, b) => a.index - b.index),
   );
   const next = middle?.nextIndex ?? snapshot.gap.startIndex;
   const { gaps, omissions } = gapPresentation(snapshot, middle, next);
-  const history = [...head, ...mid, ...omissions, ...gaps, ...tail];
+  const history = [
+    ...head,
+    ...mid,
+    ...omissions,
+    ...gaps,
+    ...tail,
+    ...hydrate(targetEntries.filter((entry) => entry.index >= tailStart)),
+  ];
   return mergeLiveHistory(
     history,
     live,
@@ -106,7 +116,13 @@ function gapPresentation(
   next: number,
 ) {
   if (!snapshot.gap) return { gaps: [], omissions: [] };
-  const targetCount = middle?.target ? middle.target.endIndex - middle.target.startIndex : 0;
+  const targetCount = middle?.target
+    ? Math.max(
+        0,
+        Math.min(snapshot.gap.endIndex + 1, middle.target.endIndex) -
+          Math.max(next, middle.target.startIndex),
+      )
+    : 0;
   const count = Math.max(0, snapshot.gap.endIndex + 1 - next - targetCount);
   const gaps: StreamItem[] = count
     ? [
@@ -124,7 +140,7 @@ function gapPresentation(
               0,
               snapshot.gap.bytes -
                 (middle?.coveredBytes ?? 0) -
-                (middle?.target?.coveredBytes ?? 0),
+                (targetCount > 0 ? (middle?.target?.coveredBytes ?? 0) : 0),
             ),
           },
         },
