@@ -196,6 +196,11 @@ try {
     loadAtIssue: removalLoad,
     loadAtCompletion: loadavg(),
   });
+  if (performance.now() - scoringStart > seconds * 1_000) {
+    throw new Error(
+      "Workload exceeded fixed scoring window; discard this arm and use a longer window",
+    );
+  }
   await sleep(Math.max(0, seconds * 1_000 - (performance.now() - scoringStart)));
   const windowMs = performance.now() - scoringStart;
   clearInterval(ticker);
