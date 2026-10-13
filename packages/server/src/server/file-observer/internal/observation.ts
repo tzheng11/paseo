@@ -15,8 +15,10 @@ import type {
 } from "./contracts.js";
 import type { ObserverPaths } from "./paths.js";
 import { toError } from "./paths.js";
+import { observationWork } from "./work-slice.js";
 
 const EVENT_BATCH_DELAY_MS = 10;
+const MAX_DELIVERY_BATCH = 256;
 
 export interface ManagedObservation {
   start(): Promise<void>;
@@ -47,6 +49,7 @@ class Observation implements ManagedObservation, ObservationHost {
   private readonly pendingEvents = new Map<string, FileChange>();
   private flushTimer: NodeJS.Timeout | null = null;
   private closePromise: Promise<void> | null = null;
+  private deliveryPromise: Promise<void> | null = null;
 
   constructor(
     private readonly input: {
@@ -93,8 +96,11 @@ class Observation implements ManagedObservation, ObservationHost {
     this.ignoredRoots = next;
     this.ignoredMatcher = this.input.paths.ignoredMatcher(next);
     for (const path of this.pendingEvents.keys()) {
+      const pause = observationWork.pause();
+      if (pause) await pause;
       if (this.isIgnored(path)) this.pendingEvents.delete(path);
     }
+    if (!this.isActive()) return;
     try {
       await this.backend.updateIgnore();
     } catch (error) {
@@ -107,7 +113,7 @@ class Observation implements ManagedObservation, ObservationHost {
     if (this.closePromise) return this.closePromise;
     this.status = "closed";
     this.cancelDelivery();
-    this.closePromise = this.backend.close().finally(this.input.onClosed);
+    this.closePromise = this.finishClose();
     return this.closePromise;
   }
 
@@ -138,14 +144,37 @@ class Observation implements ManagedObservation, ObservationHost {
     if (!this.isActive() || this.isIgnored(path)) return;
     const previous = this.pendingEvents.get(path);
     this.pendingEvents.set(path, mergeChange(previous, { path, type }));
-    if (this.flushTimer) return;
+    this.scheduleDelivery();
+  }
+
+  private scheduleDelivery(): void {
+    if (!this.isActive() || !this.pendingEvents.size) return;
+    if (this.flushTimer || this.deliveryPromise) return;
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null;
-      if (!this.isActive() || this.pendingEvents.size === 0) return;
-      const events = [...this.pendingEvents.values()];
-      this.pendingEvents.clear();
-      this.input.callback(null, events);
+      this.deliveryPromise = this.flushEvents().finally(() => {
+        this.deliveryPromise = null;
+        this.scheduleDelivery();
+      });
+      void this.deliveryPromise.catch((error: unknown) => this.fail(toError(error)));
     }, EVENT_BATCH_DELAY_MS);
+  }
+
+  private async flushEvents(): Promise<void> {
+    while (this.isActive() && this.pendingEvents.size) {
+      const events: FileChange[] = [];
+      let visited = 0;
+      for (const [path, event] of this.pendingEvents) {
+        this.pendingEvents.delete(path);
+        if (!this.isIgnored(path)) events.push(event);
+        visited += 1;
+        if (visited === MAX_DELIVERY_BATCH) break;
+      }
+      if (events.length) this.input.callback(null, events);
+      // Subscriber work is synchronous. Even a cheap batch must give timers,
+      // IPC and close/ignore cancellation a turn before the next callback.
+      if (this.pendingEvents.size) await observationWork.pause(true);
+    }
   }
 
   fail(error: Error): void {
@@ -158,7 +187,17 @@ class Observation implements ManagedObservation, ObservationHost {
   }
 
   private beginFailureClose(): void {
-    this.closePromise = this.backend.close().finally(this.input.onClosed);
+    this.closePromise = this.finishClose();
+  }
+
+  private finishClose(): Promise<void> {
+    return Promise.all([this.backend.close(), this.deliveryPromise]).then(
+      () => this.input.onClosed(),
+      (error: unknown) => {
+        this.input.onClosed();
+        throw error;
+      },
+    );
   }
 
   private cancelDelivery(): void {
