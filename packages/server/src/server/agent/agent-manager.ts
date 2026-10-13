@@ -1319,25 +1319,39 @@ export class AgentManager {
 
   /** Search and prompt indexing explicitly traverse the unloaded provider middle. */
   async *streamFullHistoryMessages(id: string): AsyncGenerator<AgentTimelineRow> {
+    yield* this.streamFullHistoryRows(id, { messagesOnly: true });
+  }
+
+  async *streamFullHistoryRows(
+    id: string,
+    options?: { messagesOnly?: boolean },
+  ): AsyncGenerator<AgentTimelineRow> {
     const agent = this.requireSessionAgent(id);
     if (!agent.session.streamHistoryEntries)
       throw new Error("Provider has no streamed history source");
     const epoch = this.timelineStore.getEpoch(id);
-    for await (const entry of agent.session.streamHistoryEntries({ messagesOnly: true })) {
+    for await (const entry of agent.session.streamHistoryEntries(options)) {
       if (this.timelineStore.getEpoch(id) !== epoch)
         throw new Error("History changed during streamed read");
       const event = entry.value;
+      if (event.type !== "timeline") continue;
       if (
-        event.type !== "timeline" ||
-        (event.item.type !== "user_message" && event.item.type !== "assistant_message")
+        options?.messagesOnly &&
+        event.item.type !== "user_message" &&
+        event.item.type !== "assistant_message"
       )
         continue;
+      const item = projectAgentMessage(limitAgentTimelineItemContent(event.item));
+      if (!item) continue;
       yield {
         seq: entry.index + 1,
         historyIndex: entry.index,
-        providerMessageId: event.item.messageId,
+        providerMessageId:
+          item.type === "user_message" || item.type === "assistant_message"
+            ? item.messageId
+            : undefined,
         timestamp: event.timestamp ?? "1970-01-01T00:00:00.000Z",
-        item: event.item,
+        item,
       };
     }
   }

@@ -127,7 +127,7 @@ import {
 } from "./agent/timeline-append.js";
 import { assertPluginTimelineDataSize } from "./agent/agent-timeline-content.js";
 import { parsePluginClientId } from "./plugins/plugin-session-identity.js";
-import { buildAgentForkContextAttachment } from "./agent/activity-curator.js";
+import { streamAgentForkContextAttachment } from "./agent/activity-curator.js";
 import { buildAgentPrompt } from "./agent/prompt-attachments.js";
 import type { StructuredGenerationDaemonConfig } from "./agent/structured-generation-providers.js";
 import {
@@ -8174,17 +8174,40 @@ export class Session {
       const agentPayload = await this.buildAgentPayload(snapshot);
       const timeline = this.agentManager.fetchTimeline(msg.agentId, {
         direction: "tail",
-        limit: 0,
+        limit: 1,
       });
-      const forkContext = buildAgentForkContextAttachment({
-        rows: timeline.rows,
-        cursorBoundary: msg.boundaryCursor
-          ? { timelineEpoch: timeline.epoch, cursor: msg.boundaryCursor }
-          : null,
-        boundaryMessageId: msg.boundaryMessageId,
+      const fullSource = Boolean(this.agentManager.getHistoryWindowInfo(msg.agentId)?.gap);
+      let boundaryMessageId = msg.boundaryMessageId;
+      if (fullSource && msg.boundaryCursor) {
+        if (msg.boundaryCursor.epoch !== timeline.epoch)
+          throw new Error("Selected timeline position is no longer available.");
+        const row = this.agentManager.fetchTimeline(msg.agentId, {
+          direction: "before",
+          cursor: { ...msg.boundaryCursor, seq: msg.boundaryCursor.seq + 1 },
+          limit: 1,
+        }).rows[0];
+        if (
+          !row ||
+          row.seqEnd !== msg.boundaryCursor.seq ||
+          row.item.type !== "assistant_message" ||
+          !row.item.messageId
+        )
+          throw new Error("Selected timeline position is no longer available.");
+        boundaryMessageId = row.item.messageId;
+      }
+      const forkContext = await streamAgentForkContextAttachment({
+        rows: fullSource
+          ? this.agentManager.streamFullHistoryRows(msg.agentId)
+          : this.agentManager.streamTimelineRows(msg.agentId),
+        cursorBoundary:
+          msg.boundaryCursor && !fullSource
+            ? { timelineEpoch: timeline.epoch, cursor: msg.boundaryCursor }
+            : null,
+        boundaryMessageId,
         agentTitle: agentPayload.title,
         cwd: snapshot.cwd,
       });
+      if (fullSource) forkContext.boundaryCursor = msg.boundaryCursor ?? null;
 
       this.emit({
         type: "agent.fork_context.response",

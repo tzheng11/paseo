@@ -93,6 +93,13 @@ test("serves bounded head/tail and lazy middle pages without consuming a full hi
         preview: "Middle prompt",
       },
     ]);
+    const context = await ctx.client.buildAgentForkContext(agent.id, { boundaryMessageId: "501" });
+    expect(
+      context.attachment?.type === "text" && context.attachment.text.includes("Item 400"),
+    ).toBe(true);
+    expect(
+      context.attachment?.type === "text" && context.attachment.text.includes("Item 502"),
+    ).toBe(false);
     await expect(
       ctx.client.fetchAgentTimelineHistory({
         agentId: agent.id,

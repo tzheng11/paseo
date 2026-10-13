@@ -60,14 +60,15 @@ Clients without middle-page support search their readable projection.
 
 Full-history consumers have distinct contracts:
 
-| Caller                                            | History contract                                                                                                                  |
-| ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| Codex provider replay/export (`streamAllHistory`) | Explicit eight-item provider pages on a separate read-only connection; no aggregate timeline array.                               |
-| Search / prompt outline                           | Explicit message stream with provider positions; retains only bounded matches or prompt previews.                                 |
-| Turn-end hooks                                    | Bounded edges with both projection and provider gap metadata. Plugins can request ordinary middle pages through the timeline SDK. |
-| Import / fork / archived read / refresh           | Ordinary bounded provider replay. Native rewind uses user-message identifiers, and modern forks exclude turn payloads.            |
-| CLI logs / attach                                 | Bounded tail and explicit bounded middle pages; oversized records are reported rather than silently dropped.                      |
-| SDK `timeline.refetch` / catch-up                 | Readable projection pages. `limit: 0` is an explicit complete projection request, not a provider-transcript export.               |
+| Caller                                            | History contract                                                                                                                                                |
+| ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Codex provider replay/export (`streamAllHistory`) | Explicit eight-item provider pages on a separate read-only connection; no aggregate timeline array.                                                             |
+| Search / prompt outline                           | Explicit message stream with provider positions; retains only bounded matches or prompt previews.                                                               |
+| Turn-end hooks                                    | Bounded edges with both projection and provider gap metadata. Plugins can request ordinary middle pages through the timeline SDK.                               |
+| Fork-context attachment                           | Explicit stream to the chosen message, retaining at most 100,000 characters / 2,000 summary entries. Native provider positions stay separate from live cursors. |
+| Import / native fork / archived read / refresh    | Ordinary bounded provider replay. Native rewind uses user-message identifiers, and modern forks exclude turn payloads.                                          |
+| CLI logs / attach                                 | Bounded tail and explicit bounded middle pages; oversized records are reported rather than silently dropped.                                                    |
+| SDK `timeline.refetch` / catch-up                 | Readable projection pages. `limit: 0` is an explicit complete projection request, not a provider-transcript export.                                             |
 
 Legacy Codex and other provider adapters still need native window support to remove their
 provider-owned full response buffers. This Codex native candidate does not establish that bound

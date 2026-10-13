@@ -367,3 +367,84 @@ export function buildAgentForkContextAttachment(input: {
     boundaryMessageId: selected.boundaryMessageId,
   };
 }
+
+/** A context export scans explicitly, retaining at most 100k characters / 2k entries. */
+export async function streamAgentForkContextAttachment(input: {
+  rows: AsyncIterable<AgentTimelineRow>;
+  cursorBoundary?: ForkCursorBoundary | null;
+  boundaryMessageId?: string | null;
+  agentTitle?: string | null;
+  cwd?: string | null;
+}): Promise<ReturnType<typeof buildAgentForkContextAttachment>> {
+  if (
+    input.cursorBoundary &&
+    input.cursorBoundary.cursor.epoch !== input.cursorBoundary.timelineEpoch
+  )
+    throw new Error("Selected timeline position is no longer available.");
+  const metadata = { agentTitle: input.agentTitle, cwd: input.cwd };
+  const budget =
+    MAX_FORK_CONTEXT_CHARS -
+    buildForkContextText({ body: "", ...metadata }).length -
+    FORK_HISTORY_OMITTED.length;
+  const summary = { entries: [] as ActivityEntry[], chars: 0, omitted: false };
+  let itemCount = 0;
+  let found = !input.cursorBoundary && !input.boundaryMessageId;
+  for await (const row of input.rows) {
+    const end = "seqEnd" in row ? Number(row.seqEnd) : row.seq;
+    if (input.cursorBoundary && end > input.cursorBoundary.cursor.seq) break;
+    itemCount++;
+    appendForkContextSummary(summary, row.item, budget);
+    const atCursor = input.cursorBoundary && end === input.cursorBoundary.cursor.seq;
+    const atMessage =
+      input.boundaryMessageId &&
+      row.item.type === "assistant_message" &&
+      row.item.messageId === input.boundaryMessageId;
+    if (atCursor || atMessage) {
+      found = true;
+      break;
+    }
+  }
+  if (!found) throw new Error("Selected timeline position is no longer available.");
+  const body =
+    (summary.omitted ? FORK_HISTORY_OMITTED : "") +
+    (summary.entries.length
+      ? fitForkContextEntries(summary.entries, budget)
+      : "No chat history to display.");
+  return {
+    attachment: {
+      type: "text",
+      mimeType: "text/plain",
+      contextKind: "chat_history",
+      title: "Chat history",
+      text: buildForkContextText({ body, ...metadata }),
+    },
+    itemCount,
+    boundaryCursor: input.cursorBoundary?.cursor ?? null,
+    boundaryMessageId: input.boundaryMessageId ?? null,
+  };
+}
+
+function appendForkContextSummary(
+  summary: { entries: ActivityEntry[]; chars: number; omitted: boolean },
+  item: AgentTimelineItem,
+  budget: number,
+): void {
+  for (const entry of curateProjectedActivityEntries([item], {
+    maxItems: 0,
+    labelAssistantMessages: true,
+    includeKinds: ["user_message", "assistant_message", "tool_call"],
+    includeExternalToolInput: false,
+  })) {
+    const text =
+      entry.text.length + 1 > budget
+        ? fitForkContextEntries([entry], budget - 1).slice(FORK_HISTORY_OMITTED.length)
+        : entry.text;
+    summary.omitted ||= text.length < entry.text.length;
+    summary.entries.push({ text });
+    summary.chars += text.length + 1;
+    while (summary.chars > budget || summary.entries.length > 2000) {
+      summary.chars -= summary.entries.shift()!.text.length + 1;
+      summary.omitted = true;
+    }
+  }
+}
