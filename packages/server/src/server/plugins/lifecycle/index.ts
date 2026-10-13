@@ -95,6 +95,10 @@ export function publishAgentStream(
   agent: PluginHookAgent,
   event: AgentStreamEvent,
   getTimeline: () => readonly AgentTimelineItem[],
+  getHistoryGaps?: () => Pick<
+    import("@getpaseo/plugin/server").PluginLifecycleEvents["agent.turn_ended"],
+    "timelineGap" | "providerHistoryGap"
+  >,
 ): void {
   if (event.type === "turn_started") {
     lifecycle.emit("agent.turn_started", { agent, turnId: event.turnId ?? null });
@@ -103,6 +107,7 @@ export function publishAgentStream(
       agent,
       turnId: event.turnId ?? null,
       timeline: getTimeline(),
+      ...getHistoryGaps?.(),
       outcome: { kind: "completed" },
     });
   } else if (event.type === "turn_failed") {
@@ -110,6 +115,7 @@ export function publishAgentStream(
       agent,
       turnId: event.turnId ?? null,
       timeline: getTimeline(),
+      ...getHistoryGaps?.(),
       outcome: { kind: "failed", error: { message: event.error, code: event.code } },
     });
   } else if (event.type === "turn_canceled") {
@@ -117,6 +123,7 @@ export function publishAgentStream(
       agent,
       turnId: event.turnId ?? null,
       timeline: getTimeline(),
+      ...getHistoryGaps?.(),
       outcome: { kind: "canceled", reason: event.reason },
     });
   } else if (event.type === "permission_requested") {

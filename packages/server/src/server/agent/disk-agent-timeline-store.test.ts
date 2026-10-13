@@ -182,3 +182,32 @@ describe("DiskAgentTimelineStore", () => {
     expect(disk.append("a", { type: "user_message", text: "fresh" }).seq).toBe(1);
   });
 });
+
+it("decodes bounded projection edges and accounts for a huge unloaded middle", () => {
+  const store = createStore(1024);
+  store.initialize("windows");
+  for (let index = 0; index < 10; index++)
+    store.append("windows", {
+      type: "user_message",
+      messageId: String(index),
+      text: "x".repeat(index === 5 ? 1024 * 1024 : 100),
+    });
+  const windows = store.readWindows("windows", {
+    head: { events: 2, bytes: 4096 },
+    tail: { events: 3, bytes: 4096 },
+  });
+  expect(windows.head.map((entry) => entry.index)).toEqual([0, 1]);
+  expect(windows.tail.map((entry) => entry.index)).toEqual([7, 8, 9]);
+  expect(windows.gap).toMatchObject({ startIndex: 2, endIndex: 6, count: 5 });
+  expect(windows.gap!.bytes).toBeGreaterThan(1024 * 1024);
+  const before = windows.totalBytes;
+  store.append("windows", { type: "assistant_message", messageId: "a", text: "small" });
+  store.append("windows", { type: "assistant_message", messageId: "a", text: " suffix" });
+  const updated = store.readWindows("windows", {
+    head: { events: 1, bytes: 4096 },
+    tail: { events: 1, bytes: 4096 },
+  });
+  expect(updated.totalEvents).toBe(11);
+  expect(updated.totalBytes).toBeGreaterThan(before);
+  expect(updated.tail[0].value).toMatchObject({ type: "assistant_message", text: "small suffix" });
+});

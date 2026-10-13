@@ -1,3 +1,4 @@
+import type { HistoryReadLimit, HistoryWindows } from "./agent-history-replay.js";
 import { randomUUID } from "node:crypto";
 import { TimelineProjection, type ProjectedTimelineRow } from "./timeline-projection.js";
 import type { AgentTimelineItem } from "./agent-sdk-types.js";
@@ -63,6 +64,50 @@ export class InMemoryAgentTimelineStore {
 
   getRecentItems(agentId: string, limit: number): AgentTimelineItem[] {
     return this.requireState(agentId).projection.getRecentItems(limit);
+  }
+
+  readWindows(
+    agentId: string,
+    limits: { head: HistoryReadLimit; tail: HistoryReadLimit },
+  ): HistoryWindows<AgentTimelineItem> {
+    const rows = this.requireState(agentId).projection.getRows();
+    const records = rows.map((row, index) => ({
+      index,
+      bytes: Buffer.byteLength(JSON.stringify(row), "utf8"),
+      value: row.item,
+    }));
+    const head = [];
+    let bytes = 0;
+    for (const record of records.slice(0, limits.head.events)) {
+      if (bytes + record.bytes > limits.head.bytes) break;
+      head.push(record);
+      bytes += record.bytes;
+    }
+    const tail = [];
+    bytes = 0;
+    for (const record of records.slice(head.length).toReversed().slice(0, limits.tail.events)) {
+      if (bytes + record.bytes > limits.tail.bytes) break;
+      tail.push(record);
+      bytes += record.bytes;
+    }
+    tail.reverse();
+    const end = tail[0]?.index ?? records.length;
+    const totalBytes = records.reduce((sum, record) => sum + record.bytes, 0);
+    return {
+      head,
+      tail,
+      totalEvents: records.length,
+      totalBytes,
+      gap:
+        head.length < end
+          ? {
+              startIndex: head.length,
+              endIndex: end - 1,
+              count: end - head.length,
+              bytes: totalBytes - [...head, ...tail].reduce((sum, entry) => sum + entry.bytes, 0),
+            }
+          : null,
+    };
   }
 
   getItems(agentId: string): AgentTimelineItem[] {

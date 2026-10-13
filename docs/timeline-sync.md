@@ -51,8 +51,9 @@ report an omitted middle and `--history-cursor` reads its next bounded page.
 Legacy Codex threads stage normalized parent/child replay files, keeping routing and rewind
 identifiers in memory. Their ordinary replay also selects bounded edges; building those indexes
 still traverses provider pages. Older binaries and other adapters can retain large provider-owned
-buffers. The projection row-cache budget does not cover explicit `limit: 0` responses or turn-end
-hook arrays. Search and prompt indexing currently stream the readable projection; full-source
+buffers. The projection row-cache budget does not cover explicit `limit: 0` responses.
+Turn-end hooks carry bounded projection edges, `timelineGap`, and `providerHistoryGap` when
+provider history is unloaded; they do not clone the complete timeline. Search and prompt indexing currently stream the readable projection; full-source
 consumers must opt into provider replay to include an unloaded middle.
 
 Codex and JSONL RPC transports bound each stdout frame to 64 MiB before decoding. An oversized

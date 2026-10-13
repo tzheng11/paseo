@@ -51,3 +51,20 @@ describe("plugin stream timeline loading", () => {
     },
   );
 });
+
+it("marks the bounded hook timeline and provider middle explicitly", () => {
+  const emit = vi.fn();
+  const timelineGap = { startIndex: 64, endIndex: 700, count: 637, bytes: 1000000 };
+  const providerHistoryGap = { startIndex: 32, endIndex: 10000, count: 9969, bytes: 100000000 };
+  publishAgentStream(
+    { emit } as unknown as PluginLifecycle,
+    agent,
+    { type: "turn_completed", provider: "codex" },
+    () => [{ type: "assistant_message", text: "recent" }],
+    () => ({ timelineGap, providerHistoryGap }),
+  );
+  expect(emit).toHaveBeenCalledWith(
+    "agent.turn_ended",
+    expect.objectContaining({ timelineGap, providerHistoryGap }),
+  );
+});

@@ -2,6 +2,7 @@ import {
   AgentHistoryReplay,
   DEFAULT_HISTORY_WINDOWS,
   type HistoryWindowInfo,
+  type HistoryWindows,
   type HistoryReadLimit,
 } from "./agent-history-replay.js";
 import { projectTimelineRows } from "./timeline-projection.js";
@@ -1313,7 +1314,7 @@ export class AgentManager {
   }
 
   getHistoryWindowInfo(id: string): HistoryWindowInfo | undefined {
-    return this.requireSessionAgent(id).session.historyWindowInfo;
+    return this.requireAgent(id).session?.historyWindowInfo;
   }
 
   async readTimelineHistory(
@@ -5284,11 +5285,18 @@ export class AgentManager {
     );
     this.dispatch({ type: "agent_stream", agentId, event, ...metadata });
     if (this.pluginLifecycle && agent && !agent.internal && event.type !== "timeline") {
+      let window: HistoryWindows<AgentTimelineItem> | undefined;
+      const getWindow = () =>
+        (window ??= this.timelineStore.readWindows(agentId, DEFAULT_HISTORY_WINDOWS));
       publishAgentStream(
         this.pluginLifecycle,
         describeHookAgent({ ...agent, title: agent.config.title }),
         event,
-        () => this.timelineStore.getItems(agentId),
+        () => [...getWindow().head, ...getWindow().tail].map((entry) => entry.value),
+        () => ({
+          timelineGap: getWindow().gap,
+          providerHistoryGap: agent.session?.historyWindowInfo?.gap,
+        }),
       );
     }
   }
