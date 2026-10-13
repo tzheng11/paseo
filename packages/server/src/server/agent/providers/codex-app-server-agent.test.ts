@@ -4706,6 +4706,7 @@ describe("Codex app-server provider", () => {
       const insert = db.prepare(
         "INSERT INTO thread_items VALUES ('test-thread', 'turn', ?, ?, ?, ?, ?)",
       );
+      db.exec("BEGIN");
       for (let index = 0; index < 1000; index++)
         insert.run(
           String(index),
@@ -4714,6 +4715,7 @@ describe("Codex app-server provider", () => {
           index === 0 ? "userMessage" : "agentMessage",
           "invalid payload never parsed",
         );
+      db.exec("COMMIT");
       db.close();
       const readerApp = createFakeCodexAppServer();
       const session = new CodexAppServerAgentSession(
