@@ -74,7 +74,7 @@ async function command(executable, args, directory, label) {
   output({ phase: `${label}-start`, load: loadAtIssue });
   const result = await exec(executable, args, {
     cwd: directory,
-    timeout: Math.min(240_000, Math.max(1_000, deadline - performance.now() - 20_000)),
+    timeout: Math.floor(Math.min(240_000, Math.max(1_000, deadline - performance.now() - 20_000))),
     maxBuffer: 4 * 1024 * 1024,
     env: { ...process.env, NEXT_TELEMETRY_DISABLED: "1" },
   });
