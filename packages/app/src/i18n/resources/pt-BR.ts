@@ -1929,6 +1929,21 @@ export const ptBR: TranslationResources = {
     archiveFinishedRetry: "Tentar novamente ({{failed}}/{{total}})",
   },
   panels: {
+    info: {
+      label: "Info",
+      fields: "Campos",
+      empty: "Vazio",
+      unavailable: "Indisponível",
+      save: "Salvar",
+      saving: "Salvando…",
+      retry: "Tentar novamente",
+      cancel: "Cancelar",
+      loading: "Carregando campos…",
+      update: "Atualize este host para editar os campos.",
+      readOnly: "Você tem acesso somente de leitura.",
+      offline: "Host desconectado. O rascunho foi mantido. Reconecte e tente novamente.",
+      conflict: "Cancele e reabra o campo para editar o valor mais recente.",
+    },
     draft: {
       newAgent: "Novo Agente",
       creatingAgent: "Criando agente",

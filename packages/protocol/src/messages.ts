@@ -980,6 +980,15 @@ export const WorkspaceTitleSetRequestSchema = z.object({
   requestId: z.string(),
 });
 
+export const WorkspaceFieldValueSetRequestSchema = z.object({
+  type: z.literal("workspace.field.value.set.request"),
+  workspaceId: z.string(),
+  fieldKey: z.string(),
+  value: z.string(),
+  expectedValue: z.string(),
+  requestId: z.string(),
+});
+
 export const WorkspacePinSetRequestSchema = z.object({
   type: z.literal("workspace.pin.set.request"),
   workspaceId: z.string(),
@@ -2097,6 +2106,18 @@ export const WorkspaceTitleSetResponsePayloadSchema = z.object({
 export const WorkspaceTitleSetResponseSchema = z.object({
   type: z.literal("workspace.title.set.response"),
   payload: WorkspaceTitleSetResponsePayloadSchema,
+});
+
+export const WorkspaceFieldValueSetResponseSchema = z.object({
+  type: z.literal("workspace.field.value.set.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    accepted: z.boolean(),
+    value: z.string(),
+    error: z.string().nullable(),
+    errorCode: z.enum(["invalid_value", "unknown_field", "not_found", "conflict"]).nullable(),
+  }),
 });
 
 export const WorkspacePinSetResponsePayloadSchema = z.object({
@@ -3220,6 +3241,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   ProjectIconSetRequestSchema,
   ProjectRemoveRequestSchema,
   WorkspaceTitleSetRequestSchema,
+  WorkspaceFieldValueSetRequestSchema,
   WorkspacePinSetRequestSchema,
   WorkspaceLabelListRequestSchema,
   WorkspaceLabelAssignmentSetRequestSchema,
@@ -3561,6 +3583,8 @@ export const ServerInfoStatusPayloadSchema = z
   .object({
     status: z.literal("server_info"),
     protocolVersion: z.number().int().optional(),
+    // COMPAT(workspaceFields): added in v0.11.3; remove optional after 2027-04-14.
+    workspaceFieldCatalogVersion: z.number().int().positive().optional(),
     serverId: z.string().trim().min(1),
     hostname: ServerInfoHostnameSchema.optional(),
     version: ServerInfoVersionSchema.optional(),
@@ -3584,6 +3608,8 @@ export const ServerInfoStatusPayloadSchema = z
         // COMPAT(internalWorkspaces): added in v0.9.0; remove gate after 2027-03-17.
         internalWorkspaces: z.boolean().optional(),
         backgroundWorkspaces: z.boolean().optional(),
+        // COMPAT(workspaceFields): added in v0.11.3; remove gate after 2027-04-14.
+        workspaceFields: z.boolean().optional(),
         providersSnapshot: z.boolean().optional(),
         usageSources: z.boolean().optional(),
         // COMPAT(providersSnapshotCwd): added in v0.3.2, remove gate after 2027-02-10.
@@ -4047,6 +4073,8 @@ export const WorkspaceDescriptorPayloadSchema = z
     // is derived from the branch/directory.
     title: z.string().nullable().optional(),
     // COMPAT(workspacePinning): added in v0.1.107, remove optional after 2027-01-12.
+    // COMPAT(workspaceFields): added in v0.11.3; remove optional after 2027-04-14.
+    fieldValues: z.record(z.string(), z.string()).optional(),
     pinnedAt: z.string().nullable().optional(),
     // COMPAT(workspaceLabels): added in v0.5.0, remove optional after 2027-08-14.
     labels: z.array(z.string()).optional(),
@@ -6966,6 +6994,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   ProjectIconSetResponseSchema,
   ProjectRemoveResponseSchema,
   WorkspaceTitleSetResponseSchema,
+  WorkspaceFieldValueSetResponseSchema,
   WorkspacePinSetResponseSchema,
   WorkspaceRecoveryInspectResponseSchema,
   WorkspaceRecoveryRestoreResponseSchema,

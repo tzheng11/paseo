@@ -1944,6 +1944,21 @@ export const es: TranslationResources = {
     archiveFinishedRetry: "Reintentar ({{failed}}/{{total}})",
   },
   panels: {
+    info: {
+      label: "Info",
+      fields: "Campos",
+      empty: "Vacío",
+      unavailable: "No disponible",
+      save: "Guardar",
+      saving: "Guardando…",
+      retry: "Reintentar",
+      cancel: "Cancelar",
+      loading: "Cargando campos…",
+      update: "Actualiza este host para editar los campos.",
+      readOnly: "Tienes acceso de solo lectura.",
+      offline: "Host desconectado. El borrador se conserva. Reconecta y reintenta.",
+      conflict: "Cancela y vuelve a abrir el campo para editar el valor más reciente.",
+    },
     draft: {
       newAgent: "Nuevo agente",
       creatingAgent: "Agente creador",

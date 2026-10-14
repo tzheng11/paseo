@@ -1940,6 +1940,21 @@ export const fr: TranslationResources = {
     archiveFinishedRetry: "Réessayer ({{failed}}/{{total}})",
   },
   panels: {
+    info: {
+      label: "Info",
+      fields: "Champs",
+      empty: "Vide",
+      unavailable: "Indisponible",
+      save: "Enregistrer",
+      saving: "Enregistrement…",
+      retry: "Réessayer",
+      cancel: "Annuler",
+      loading: "Chargement des champs…",
+      update: "Mettez cet hôte à jour pour modifier les champs.",
+      readOnly: "Vous avez un accès en lecture seule.",
+      offline: "Hôte déconnecté. Le brouillon est conservé. Reconnectez-vous et réessayez.",
+      conflict: "Annulez puis rouvrez le champ pour modifier la dernière valeur.",
+    },
     draft: {
       newAgent: "Nouvel agent",
       creatingAgent: "Création de l’agent",

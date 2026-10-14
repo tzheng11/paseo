@@ -1,3 +1,5 @@
+import { WorkspaceFieldError } from "@getpaseo/protocol/workspace-fields";
+import { setWorkspaceFieldValue } from "./workspace-fields.js";
 import { AgentDirectory } from "./agent/directory.js";
 import { searchTimeline } from "./agent/chat-search/index.js";
 import type { BrowserToolsBroker } from "./browser-tools/broker.js";
@@ -2942,6 +2944,8 @@ export class Session {
         return this.handleArchiveWorkspaceRequest(msg);
       case "project.remove.request":
         return this.handleProjectRemoveRequest(msg);
+      case "workspace.field.value.set.request":
+        return this.handleWorkspaceFieldValueSetRequest(msg);
       case "workspace.title.set.request":
         return this.handleWorkspaceTitleSetRequest(msg.workspaceId, msg.title, msg.requestId);
       case "workspace.pin.set.request":
@@ -3703,6 +3707,40 @@ export class Session {
           accepted: false,
           removedWorkspaceIds: [],
           error: getErrorMessageOr(error, "Failed to remove project"),
+        },
+      });
+    }
+  }
+
+  private async handleWorkspaceFieldValueSetRequest(input: {
+    workspaceId: string;
+    fieldKey: string;
+    value: string;
+    expectedValue: string;
+    requestId: string;
+  }): Promise<void> {
+    const { requestId, workspaceId } = input;
+    try {
+      const value = await setWorkspaceFieldValue(this.workspaceRegistry, input);
+      this.emit({
+        type: "workspace.field.value.set.response",
+        payload: { requestId, workspaceId, accepted: true, value, error: null, errorCode: null },
+      });
+      await this.emitWorkspaceUpdatesForWorkspaceIds([workspaceId]);
+    } catch (error) {
+      this.sessionLogger.error(
+        { err: error, workspaceId, requestId },
+        "session: workspace.field.value.set.request failed",
+      );
+      this.emit({
+        type: "workspace.field.value.set.response",
+        payload: {
+          requestId,
+          workspaceId,
+          accepted: false,
+          value: "",
+          error: error instanceof Error ? error.message : "Unable to save workspace field.",
+          errorCode: error instanceof WorkspaceFieldError ? error.code : null,
         },
       });
     }
@@ -5608,6 +5646,7 @@ export class Session {
       name: resolveWorkspaceDisplayName(workspace),
       title: workspace.title,
       pinnedAt: workspace.pinnedAt,
+      fieldValues: workspace.fieldValues ?? {},
       ...(workspace.labels && workspace.labels.length > 0 ? { labels: workspace.labels } : {}),
       background: workspace.background,
       archivingAt: null,
