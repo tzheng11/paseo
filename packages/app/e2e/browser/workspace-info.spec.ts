@@ -1,3 +1,5 @@
+import type { ServerInfoStatusPayload } from "@getpaseo/protocol/messages";
+import { daemonWsRoutePattern } from "../support/helpers/daemon-port";
 import { test, expect } from "../support/fixtures";
 import { seedWorkspace } from "../support/helpers/seed-client";
 import { gotoWorkspace } from "../support/helpers/launcher";
@@ -294,3 +296,117 @@ test("legacy layouts gain permanent Info once, preserving Files selection; dark 
     await workspace.cleanup();
   }
 });
+
+test("a delayed save acknowledgement preserves a newer second-client value", async ({
+  page,
+}, testInfo) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const gate = await installDaemonWebSocketGate(page);
+  const workspace = await seedWorkspace({ repoPrefix: "workspace-info-delayed-" });
+  try {
+    await gotoWorkspace(page, workspace.workspaceId);
+    await ensureExplorerSidebar(page);
+    await page.getByTestId("workspace-tab-info").filter({ visible: true }).click();
+    await page
+      .getByTestId("workspace-info-field-notionProjectUrl")
+      .filter({ visible: true })
+      .click();
+    await page.getByTestId("workspace-info-input").filter({ visible: true }).fill("first-save");
+    gate.holdNextServerMessage("workspace.field.value.set.response");
+    await page.getByTestId("workspace-info-save").filter({ visible: true }).click();
+    await gate.waitForHeldServerMessage("workspace.field.value.set.response");
+    await workspace.client.setWorkspaceFieldValue({
+      workspaceId: workspace.workspaceId,
+      fieldKey: "notionProjectUrl",
+      expectedValue: "first-save",
+      value: "newer-second-client",
+    });
+    const value = page
+      .getByTestId("workspace-info-value-notionProjectUrl")
+      .filter({ visible: true });
+    await expect(value).toHaveText("newer-second-client");
+    gate.releaseHeldServerMessage("workspace.field.value.set.response");
+    await expect(page.getByTestId("workspace-info-input").filter({ visible: true })).toHaveCount(0);
+    await expect(value).toHaveText("newer-second-client");
+    expect(
+      (await workspace.client.fetchWorkspaces()).entries.find((w) => w.id === workspace.workspaceId)
+        ?.fieldValues?.notionProjectUrl,
+    ).toBe("newer-second-client");
+    const path = testInfo.outputPath("delayed-ack-latest-value.png");
+    await page.screenshot({ path });
+    await testInfo.attach("delayed-ack-latest-value", { path, contentType: "image/png" });
+  } finally {
+    gate.restore();
+    await workspace.cleanup();
+  }
+});
+
+for (const variant of ["v0.11.2-omitted-feature", "version-2", "read-only", "hub-only"] as const) {
+  test(`${variant} capability fixture shows fixed labels and prevents mutations`, async ({
+    page,
+  }, testInfo) => {
+    const workspace = await seedWorkspace({ repoPrefix: `workspace-info-${variant}-` });
+    let mutations = 0;
+    await page.routeWebSocket(daemonWsRoutePattern(), (browser) => {
+      const server = browser.connectToServer();
+      browser.onMessage((message) => {
+        const envelope = JSON.parse(message.toString());
+        if ((envelope.message ?? envelope).type === "workspace.field.value.set.request")
+          mutations++;
+        server.send(message);
+      });
+      server.onMessage((message) => {
+        const envelope = JSON.parse(message.toString());
+        const payload = (envelope.message ?? envelope).payload as
+          | ServerInfoStatusPayload
+          | undefined;
+        if (payload?.status === "server_info") {
+          if (variant === "v0.11.2-omitted-feature") {
+            if (payload.features) delete payload.features.workspaceFields;
+            delete payload.workspaceFieldCatalogVersion;
+          } else if (variant === "version-2") payload.workspaceFieldCatalogVersion = 2;
+          else payload.permissions = variant === "read-only" ? ["workspace.read"] : ["hub.execute"];
+        }
+        browser.send(JSON.stringify(envelope));
+      });
+    });
+    try {
+      await gotoWorkspace(page, workspace.workspaceId);
+      await ensureExplorerSidebar(page);
+      await page.getByTestId("workspace-tab-info").filter({ visible: true }).click();
+      const update = variant === "v0.11.2-omitted-feature" || variant === "version-2";
+      await expect(
+        page.getByTestId("workspace-info-availability").filter({ visible: true }),
+      ).toHaveText(
+        update
+          ? "Update this host to edit workspace fields."
+          : "You have read-only access to these fields.",
+      );
+      for (const [key, label] of [
+        ["notionProjectUrl", "Notion Project URL"],
+        ["notionIssueUrl", "Notion Issue URL"],
+      ]) {
+        const row = page.getByTestId(`workspace-info-field-${key}`).filter({ visible: true });
+        await expect(row).toContainText(label);
+        await expect(row).toBeDisabled();
+        await expect(
+          page.getByTestId(`workspace-info-value-${key}`).filter({ visible: true }),
+        ).toHaveText(update ? "Unavailable" : "Empty");
+      }
+      await expect(page.getByTestId("workspace-info-input").filter({ visible: true })).toHaveCount(
+        0,
+      );
+      expect(mutations).toBe(0);
+      expect(
+        (await workspace.client.fetchWorkspaces()).entries.find(
+          (w) => w.id === workspace.workspaceId,
+        )?.fieldValues,
+      ).toEqual({});
+      const path = testInfo.outputPath(`${variant}.png`);
+      await page.screenshot({ path });
+      await testInfo.attach(variant, { path, contentType: "image/png" });
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+}

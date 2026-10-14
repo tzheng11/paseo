@@ -2,6 +2,50 @@ import { expect, test } from "vitest";
 import { WorkspaceFieldsModel, workspaceFieldsAvailability } from "./model";
 import { WorkspaceFieldError } from "@getpaseo/protocol/workspace-fields";
 
+test.each(["newer-second-client", "old"])(
+  "a delayed acknowledgement preserves authoritative value %s",
+  async (latest) => {
+    let resolve!: (result: { value: string }) => void;
+    const model = new WorkspaceFieldsModel(
+      () =>
+        new Promise((r) => {
+          resolve = r;
+        }),
+    );
+    model.receive({ notionProjectUrl: "old" }, "ready");
+    model.edit("notionProjectUrl");
+    model.change("first-save");
+    const saving = model.save();
+    model.receive({ notionProjectUrl: "first-save" }, "ready");
+    model.receive({ notionProjectUrl: latest }, "ready");
+    resolve({ value: "first-save" });
+    await saving;
+    expect(model.snapshot().values.notionProjectUrl).toBe(latest);
+    expect(model.snapshot().editor).toBeNull();
+  },
+);
+
+test("a different-key snapshot still permits the successful save value to display", async () => {
+  let resolve!: (result: { value: string }) => void;
+  const model = new WorkspaceFieldsModel(
+    () =>
+      new Promise((r) => {
+        resolve = r;
+      }),
+  );
+  model.receive({ notionProjectUrl: "old", notionIssueUrl: "issue" }, "ready");
+  model.edit("notionProjectUrl");
+  model.change("first-save");
+  const saving = model.save();
+  model.receive({ notionProjectUrl: "old", notionIssueUrl: "new issue" }, "ready");
+  resolve({ value: "first-save" });
+  await saving;
+  expect(model.snapshot().values).toEqual({
+    notionProjectUrl: "first-save",
+    notionIssueUrl: "new issue",
+  });
+});
+
 test("v0.11.2 omitted-feature, version-2 and denied actors never dispatch a save", async () => {
   expect(
     workspaceFieldsAvailability({ features: {}, permissions: ["workspace.manage"] }, true),
@@ -58,7 +102,7 @@ test("pending prevents duplicate saves and background snapshots preserve the dra
   resolve({ value: "draft" });
   await save;
   expect(model.snapshot().editor).toBeNull();
-  expect(model.snapshot().values.notionProjectUrl).toBe("draft");
+  expect(model.snapshot().values.notionProjectUrl).toBe("background");
 });
 
 test("failure and lost acknowledgement keep draft/expected value for safe retry; conflict reopens latest", async () => {

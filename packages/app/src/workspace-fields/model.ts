@@ -35,6 +35,7 @@ export interface FieldsSnapshot {
   editor: FieldEditor | null;
 }
 export class WorkspaceFieldsModel {
+  private editedValueRevision = 0;
   private state: FieldsSnapshot = { values: {}, availability: "loading", editor: null };
   private listeners = new Set<() => void>();
   constructor(
@@ -54,6 +55,10 @@ export class WorkspaceFieldsModel {
     for (const listener of this.listeners) listener();
   }
   receive(values: Record<string, string>, availability: WorkspaceFieldsAvailability): void {
+    const key = this.state.editor?.key;
+    if (key && (values[key] ?? "") !== (this.state.values[key] ?? "")) {
+      this.editedValueRevision++;
+    }
     this.publish({ ...this.state, values, availability });
   }
   edit(key: WorkspaceFieldKey): void {
@@ -90,6 +95,7 @@ export class WorkspaceFieldsModel {
       });
       return;
     }
+    const valueRevision = this.editedValueRevision;
     this.publish({ ...this.state, editor: { ...editor, status: "saving", error: null } });
     try {
       const { value } = await this.commit({
@@ -99,7 +105,11 @@ export class WorkspaceFieldsModel {
       });
       this.publish({
         ...this.state,
-        values: { ...this.state.values, [editor.key]: value },
+        // A delayed acknowledgement must not replace a subsequent authoritative edit.
+        values:
+          valueRevision === this.editedValueRevision
+            ? { ...this.state.values, [editor.key]: value }
+            : this.state.values,
         editor: null,
       });
     } catch (error) {
