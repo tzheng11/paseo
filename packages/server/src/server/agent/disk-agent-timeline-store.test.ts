@@ -29,6 +29,34 @@ const tool = (callId: string, status: "running" | "completed"): AgentTimelineIte
 });
 
 describe("DiskAgentTimelineStore", () => {
+  it("rolls back a failed batch and keeps the prior projection and sequence", () => {
+    const store = createStore();
+    store.initialize("rollback", { epoch: "epoch" });
+    store.append("rollback", { type: "assistant_message", messageId: "reply", text: "before" });
+    const before = store.fetch("rollback");
+    const invalid = Object.defineProperty({ type: "user_message" }, "text", {
+      enumerable: true,
+      get() {
+        throw new Error("projection failed");
+      },
+    }) as AgentTimelineItem;
+    expect(() =>
+      store.appendBatch("rollback", [
+        {
+          item: { type: "assistant_message", messageId: "reply", text: "uncommitted" },
+          timestamp: "now",
+        },
+        { item: invalid, timestamp: "now" },
+      ]),
+    ).toThrow("projection failed");
+    expect(store.fetch("rollback")).toEqual(before);
+    expect(store.append("rollback", { type: "user_message", text: "after" }).seq).toBe(2);
+    expect(store.getItems("rollback")).toEqual([
+      { type: "assistant_message", messageId: "reply", text: "before" },
+      { type: "user_message", text: "after" },
+    ]);
+  });
+
   it("reads only the final assistant segment and identifies a durable-history join", () => {
     const store = createStore();
     store.initialize("segment");

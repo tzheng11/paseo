@@ -12,6 +12,11 @@ authority and rebuilds the projection when an agent resumes. You can remove aban
 while the daemon is stopped. Normal shutdown removes its cache; startup removes caches owned
 by processes that have exited.
 
+The disposable cache keeps its transaction rollback journal in memory. Live session operations
+share a processing budget of at most 32 starts or 4 ms before yielding to the event loop; each
+agent still processes its events in order. Async provider work does not hold the shared budget.
+This prevents a burst of live updates from starving health requests and relay heartbeats.
+
 Each source event advances the stream sequence, then replaces the previous tool state or merges
 into the current text item. Intermediate payloads are never retained for history or catch-up.
 History imports stage events on disk before changing the readable timeline, then commit batches
