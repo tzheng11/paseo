@@ -758,6 +758,10 @@ export class ScheduleService {
   }): Promise<void> {
     const updatedSchedule = await this.store.update(params.scheduleId, (schedule) => {
       const now = this.now();
+      const finishedRun = schedule.runs.find((run) => run.id === params.runId);
+      if (!finishedRun) {
+        throw new Error(`Schedule run not found: ${params.runId}`);
+      }
       const completedRuns = schedule.runs.map((run) =>
         run.id === params.runId
           ? {
@@ -794,7 +798,9 @@ export class ScheduleService {
           nextRunAt: null,
         };
       } else {
-        const after = new Date(schedule.nextRunAt ?? now.toISOString());
+        // Duplicate fires of one slot must share its cadence anchor even after
+        // an earlier completion has advanced the schedule's nextRunAt.
+        const after = new Date(finishedRun.scheduledFor);
         let nextRunAt = computeNextRunAt(updated.cadence, after);
         while (nextRunAt.getTime() <= now.getTime()) {
           nextRunAt = computeNextRunAt(updated.cadence, nextRunAt);

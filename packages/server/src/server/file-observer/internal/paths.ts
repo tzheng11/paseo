@@ -4,6 +4,7 @@ export interface ObserverPaths {
   isInside(root: string, path: string): boolean;
   normalizeIgnoredRoots(root: string, paths: string[]): string[];
   collapse(paths: string[]): string[];
+  ignoredMatcher(roots: readonly string[]): (path: string) => boolean;
   isExpectedWatchDisappearance(error: unknown): boolean;
 }
 
@@ -50,6 +51,19 @@ export function createObserverPaths(platform: NodeJS.Platform): ObserverPaths {
   return {
     isInside,
     collapse,
+    ignoredMatcher(roots) {
+      const indexed = new Set(roots.map(comparable));
+      return (path) => {
+        const candidate = comparable(path);
+        let end = candidate.length;
+        while (end >= 0) {
+          if (indexed.has(candidate.slice(0, end))) return true;
+          end = candidate.lastIndexOf(pathApi.sep, end - 1);
+          if (end === 0) return indexed.has(pathApi.sep);
+        }
+        return false;
+      };
+    },
     normalizeIgnoredRoots(root, paths) {
       const inside = paths
         .map((path) => pathApi.resolve(path))

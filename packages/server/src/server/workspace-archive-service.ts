@@ -21,6 +21,9 @@ import type {
 import { createRealpathAwarePathMatcher } from "../utils/path.js";
 import { runWithGitCommandPriority } from "../utils/run-git-command.js";
 import { WorkspaceAutomationBlockedError } from "./workspace-automation-gate.js";
+import { withTimeout } from "../utils/promise-timeout.js";
+
+const POST_ARCHIVE_SNAPSHOT_TIMEOUT_MS = 5_000;
 
 export type ActiveWorkspaceRef = Pick<
   PersistedWorkspaceRecord,
@@ -155,9 +158,15 @@ async function archiveByScopeWithPriority(
 
     if (target.backing?.mainRepoRoot) {
       try {
-        await dependencies.workspaceGitService.getSnapshot(target.backing.mainRepoRoot, {
-          force: true,
-          reason: "archive-worktree",
+        // Records are already archived. A stalled refresh must not hold cleanup
+        // or the scheduled runner's completion/admission release indefinitely.
+        await withTimeout({
+          promise: dependencies.workspaceGitService.getSnapshot(target.backing.mainRepoRoot, {
+            force: true,
+            reason: "archive-worktree",
+          }),
+          timeoutMs: POST_ARCHIVE_SNAPSHOT_TIMEOUT_MS,
+          label: "post-archive workspace git snapshot",
         });
       } catch (error) {
         dependencies.sessionLogger?.warn(

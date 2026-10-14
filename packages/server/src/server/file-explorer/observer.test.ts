@@ -56,6 +56,22 @@ async function workspace() {
 }
 
 describe("FileObserver", () => {
+  test("native registration finishes before the first post-subscribe edit", async () => {
+    const root = await workspace();
+    const observer = new FileObserver();
+    const sizes: number[] = [];
+    const subscription = await observer.subscribe({ cwd: root, path: "file.txt" }, (version) => {
+      if (version.status === "ready") sizes.push(version.size!);
+    });
+    try {
+      await writeFile(path.join(root, "file.txt"), "after registration");
+      await expect.poll(() => sizes).toContain(18);
+    } finally {
+      subscription.unsubscribe();
+      observer.dispose();
+    }
+  });
+
   test("shares one parent watcher and publishes each real version once", async () => {
     const root = await workspace();
     const controls = new ObservationControls();
@@ -135,5 +151,29 @@ describe("FileObserver", () => {
 
     expect(updates).toEqual(["missing"]);
     subscription.unsubscribe();
+  });
+  test("late native failure after disposal does not recreate polling", async () => {
+    const root = await workspace();
+    const controls = new ObservationControls();
+    let fail!: () => void;
+    const original = controls.watchDirectory.bind(controls);
+    const dependencies: FileObserverDependencies = {
+      ...controls,
+      watchDirectory(directory, change, onError) {
+        fail = onError;
+        return original(directory, change);
+      },
+      setTimeout: controls.setTimeout.bind(controls),
+      clearTimeout: controls.clearTimeout.bind(controls),
+      setInterval() {
+        throw Error("polling resurrected after dispose");
+      },
+      clearInterval: controls.clearInterval.bind(controls),
+    };
+    const observer = new FileObserver(dependencies);
+    await observer.subscribe({ cwd: root, path: "file.txt" }, () => undefined);
+    observer.dispose();
+    expect(() => fail()).not.toThrow();
+    expect(controls.closes).toBe(1);
   });
 });

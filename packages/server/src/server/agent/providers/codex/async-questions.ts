@@ -149,6 +149,10 @@ export class CodexAsyncQuestions {
     return removedPendingIds;
   }
 
+  historyItemIds(): string[] {
+    return Array.from(this.records.values(), (record) => record.item.id);
+  }
+
   serialize(): unknown {
     return Array.from(this.records.values());
   }

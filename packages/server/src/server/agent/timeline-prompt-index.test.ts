@@ -1,8 +1,35 @@
 import { describe, expect, it } from "vitest";
 import type { AgentTimelineRow } from "./agent-timeline-store-types.js";
-import { buildTimelinePromptIndex } from "./timeline-prompt-index.js";
+import { buildTimelinePromptIndex, streamTimelinePromptIndex } from "./timeline-prompt-index.js";
 
 describe("buildTimelinePromptIndex", () => {
+  it("retains only prompt previews from a streamed history", async () => {
+    async function* rows() {
+      yield {
+        seq: 1,
+        timestamp: "start",
+        item: { type: "user_message" as const, text: "x".repeat(100000) },
+      };
+      for (let seq = 2; seq < 1000; seq++)
+        yield {
+          seq,
+          timestamp: "middle",
+          item: { type: "assistant_message" as const, text: "unused".repeat(10000) },
+        };
+      yield {
+        seq: 1000,
+        timestamp: "end",
+        item: { type: "user_message" as const, text: "Final prompt" },
+      };
+    }
+    expect(await streamTimelinePromptIndex("epoch", rows())).toEqual({
+      epoch: "epoch",
+      prompts: [
+        { seq: 1, timestamp: "start", preview: "x".repeat(119) + "…" },
+        { seq: 1000, timestamp: "end", preview: "Final prompt" },
+      ],
+    });
+  });
   it("indexes every canonical user prompt with a stable timeline position", () => {
     const rows: AgentTimelineRow[] = [
       {

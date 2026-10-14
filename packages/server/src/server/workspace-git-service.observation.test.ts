@@ -243,6 +243,8 @@ function createService(
         filterEvents: (events) => events,
         verify: vi.fn(async () => {}),
       })),
+      // Most observation cases test filtering/recovery rather than rate limits.
+      getWorkingTreeIgnoreRefreshIntervalMs: () => 0,
       ...overrides,
     } as never,
   });
@@ -551,6 +553,8 @@ describe("WorkspaceGitService checkout observation", () => {
     const subscription = service.registerWorkspace({ cwd: REPO_CWD }, listener);
 
     await vi.waitFor(() => {
+      expect(service.peekSnapshot(REPO_CWD)).not.toBeNull();
+      expect(getWatcherRecordsForDirectory(watcher, GIT_DIR)).toHaveLength(1);
       expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
       expect(service.getMetrics().workspaceRefreshInFlightCount).toBe(0);
     });
@@ -1194,6 +1198,7 @@ describe("WorkspaceGitService checkout observation", () => {
     const service = createService(watcher, { getCheckoutSnapshotFacts, getCheckoutStatus });
     const listener = vi.fn();
     const subscription = service.registerWorkspace({ cwd: REPO_CWD }, listener);
+    await service.getSnapshot(REPO_CWD);
 
     await vi.waitFor(() => {
       expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
@@ -1604,6 +1609,7 @@ describe("WorkspaceGitService checkout observation", () => {
     const getCheckoutStatus = vi.fn(async (cwd: string) => createCheckoutStatus(cwd, { isDirty }));
     const service = createService(watcher, { getCheckoutStatus });
     const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    await service.getSnapshot(REPO_CWD);
 
     await vi.waitFor(() => {
       expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
@@ -1795,6 +1801,7 @@ describe("WorkspaceGitService checkout observation", () => {
       logger,
     );
     const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    await service.getSnapshot(REPO_CWD);
 
     await vi.waitFor(() => {
       expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
@@ -1815,6 +1822,184 @@ describe("WorkspaceGitService checkout observation", () => {
     subscription.unsubscribe();
     service.dispose();
   });
+
+  test.each([REPO_CWD, GIT_DIR])(
+    "initial watcher rejection recovers with backoff: %s",
+    async (failedDirectory) => {
+      const failedDirectories = new Set([failedDirectory]);
+      const watcher = createWatcherHarness({ failDirectories: failedDirectories });
+      const service = createService(watcher, {
+        getWorkspaceGitSelfHealPhaseMs: () => 1_000_000,
+      });
+      const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+      await vi.waitFor(() => {
+        expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
+        expect(getWatcherSubscribeCallCount(watcher, failedDirectory)).toBe(1);
+      });
+
+      failedDirectories.clear();
+      await vi.advanceTimersByTimeAsync(29_000);
+      expect(getWatcherSubscribeCallCount(watcher, failedDirectory)).toBe(1);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.waitFor(() => {
+        expect(getWatcherSubscribeCallCount(watcher, failedDirectory)).toBe(2);
+      });
+      expect(getWatcherRecordsForDirectory(watcher, failedDirectory)).toHaveLength(1);
+
+      subscription.unsubscribe();
+      service.dispose();
+    },
+  );
+
+  test.each([REPO_CWD, GIT_DIR])(
+    "initial watcher timeout waits for the expired attempt before recovery: %s",
+    async (failedDirectory) => {
+      const watcher = createWatcherHarness();
+      const subscribeNormally = watcher.subscribe.getMockImplementation()!;
+      const openedSubscription = createDeferred<{
+        updateIgnore: (paths: string[]) => Promise<void>;
+        unsubscribe: () => Promise<void>;
+      }>();
+      const expiredUnsubscribe = vi.fn(async () => {});
+      let firstAttempt = true;
+      watcher.subscribe.mockImplementation(async (directory, callback, options) => {
+        if (directory === failedDirectory && firstAttempt) {
+          firstAttempt = false;
+          return openedSubscription.promise;
+        }
+        return subscribeNormally(directory, callback, options);
+      });
+      const service = createService(watcher, {
+        getWorkspaceGitSelfHealPhaseMs: () => 1_000_000,
+      });
+      const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+      await vi.waitFor(() => {
+        expect(getWatcherSubscribeCallCount(watcher, failedDirectory)).toBe(1);
+      });
+      await vi.advanceTimersByTimeAsync(45_000);
+      expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
+      expect(getWatcherSubscribeCallCount(watcher, failedDirectory)).toBe(1);
+
+      openedSubscription.resolve({
+        updateIgnore: vi.fn(async () => {}),
+        unsubscribe: expiredUnsubscribe,
+      });
+      await vi.waitFor(() => {
+        expect(expiredUnsubscribe).toHaveBeenCalledTimes(1);
+      });
+      await vi.advanceTimersByTimeAsync(29_000);
+      expect(getWatcherSubscribeCallCount(watcher, failedDirectory)).toBe(1);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.waitFor(() => {
+        expect(getWatcherSubscribeCallCount(watcher, failedDirectory)).toBe(2);
+      });
+
+      subscription.unsubscribe();
+      service.dispose();
+    },
+  );
+
+  test.each([REPO_CWD, GIT_DIR])(
+    "background recovery allows a healthy inventory beyond the initial deadline: %s",
+    async (failedDirectory) => {
+      const watcher = createWatcherHarness();
+      const subscribeNormally = watcher.subscribe.getMockImplementation()!;
+      const recoverySubscription = createDeferred<{
+        updateIgnore: (paths: string[]) => Promise<void>;
+        unsubscribe: () => Promise<void>;
+      }>();
+      let firstAttempt = true;
+      watcher.subscribe.mockImplementation(async (directory, callback, options) => {
+        if (directory !== failedDirectory) return subscribeNormally(directory, callback, options);
+        if (firstAttempt) {
+          firstAttempt = false;
+          throw new Error("initial watcher unavailable");
+        }
+        return recoverySubscription.promise;
+      });
+      const logger = createLogger();
+      const service = createService(
+        watcher,
+        { getWorkspaceGitSelfHealPhaseMs: () => 1_000_000 },
+        logger,
+      );
+      const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+      await vi.waitFor(() => {
+        expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
+        expect(getWatcherSubscribeCallCount(watcher, failedDirectory)).toBe(1);
+      });
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(getWatcherSubscribeCallCount(watcher, failedDirectory)).toBe(2);
+      await vi.advanceTimersByTimeAsync(15_000);
+
+      const recovery = watcher.subscribe.mock.calls.findLast(
+        ([directory]) => directory === failedDirectory,
+      )!;
+      const opened = await subscribeNormally(...recovery);
+      recoverySubscription.resolve(opened);
+      await vi.waitFor(() => {
+        expect(logger.info).toHaveBeenCalledWith(
+          expect.any(Object),
+          failedDirectory === GIT_DIR
+            ? "Repository metadata watcher recovered"
+            : "Working tree watcher recovered",
+        );
+      });
+      expect(opened.unsubscribe).not.toHaveBeenCalled();
+
+      subscription.unsubscribe();
+      service.dispose();
+    },
+  );
+
+  test.each([
+    [REPO_CWD, false],
+    [GIT_DIR, false],
+    [REPO_CWD, true],
+    [GIT_DIR, true],
+  ] as const)(
+    "closing during background watcher recovery contains its rejection: %s, dispose=%s",
+    async (failedDirectory, dispose) => {
+      const watcher = createWatcherHarness();
+      const subscribeNormally = watcher.subscribe.getMockImplementation()!;
+      const recoverySubscription = createDeferred<{
+        updateIgnore: (paths: string[]) => Promise<void>;
+        unsubscribe: () => Promise<void>;
+      }>();
+      let attempts = 0;
+      watcher.subscribe.mockImplementation(async (directory, callback, options) => {
+        if (directory !== failedDirectory) return subscribeNormally(directory, callback, options);
+        if (++attempts === 1) throw new Error("initial watcher unavailable");
+        return recoverySubscription.promise;
+      });
+      const service = createService(watcher, {
+        getWorkspaceGitSelfHealPhaseMs: () => 1_000_000,
+      });
+      const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+      await vi.waitFor(() => {
+        expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
+        expect(attempts).toBe(1);
+      });
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(attempts).toBe(2);
+
+      subscription.unsubscribe();
+      if (dispose) await service.dispose();
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(attempts).toBe(2);
+      expect(service.getMetrics().workingTreeWatchTargetCount).toBe(0);
+      expect(service.getMetrics().repositoryTargetCount).toBe(0);
+
+      const lateUnsubscribe = vi.fn(async () => {});
+      recoverySubscription.resolve({
+        updateIgnore: async () => {},
+        unsubscribe: lateUnsubscribe,
+      });
+      await vi.waitFor(() => expect(lateUnsubscribe).toHaveBeenCalledTimes(1));
+      await service.dispose();
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
 
   test("setup-time watcher error defers recovery until subscribe settles", async () => {
     const watcher = createWatcherHarness();
@@ -1893,6 +2078,7 @@ describe("WorkspaceGitService checkout observation", () => {
       getWorkspaceGitSelfHealPhaseMs: () => 1_000_000,
     });
     const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    await service.getSnapshot(REPO_CWD);
 
     await vi.waitFor(() => {
       expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
@@ -1938,6 +2124,7 @@ describe("WorkspaceGitService checkout observation", () => {
       getWorkspaceGitSelfHealPhaseMs: () => 1_000_000,
     });
     const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    await service.getSnapshot(REPO_CWD);
 
     await vi.waitFor(() => {
       expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
@@ -1973,6 +2160,7 @@ describe("WorkspaceGitService checkout observation", () => {
       getWorkspaceGitSelfHealPhaseMs: () => 1_000_000,
     });
     const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    await service.getSnapshot(REPO_CWD);
 
     await vi.waitFor(() => {
       expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
@@ -2019,6 +2207,7 @@ describe("WorkspaceGitService checkout observation", () => {
       runGitCommand,
     });
     const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    await service.getSnapshot(REPO_CWD);
 
     await vi.waitFor(() => {
       expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
@@ -2097,6 +2286,45 @@ describe("WorkspaceGitService checkout observation", () => {
       expect(getCheckoutStatus).toHaveBeenCalledTimes(statusCallsAfterRefresh + 1);
     });
 
+    subscription.unsubscribe();
+    service.dispose();
+  });
+
+  test("a large ignored event burst stays quiet and a following tracked edit still refreshes", async () => {
+    const watcher = createWatcherHarness();
+    const ignoredRoots = Array.from({ length: 198 }, (_, index) => `ignored-${index}/`);
+    ignoredRoots.push("node_modules/");
+    const runGitCommand = vi.fn(async (args: string[]) => ({
+      stdout: args[0] === "rev-parse" ? `${REPO_CWD}\n` : ignoredRoots.join("\n"),
+      stderr: "",
+      truncated: false,
+      exitCode: 0,
+      signal: null,
+    }));
+    const getCheckoutStatus = vi.fn(async (cwd: string) => createCheckoutStatus(cwd));
+    const service = createService(watcher, { getCheckoutStatus, runGitCommand });
+    const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    await vi.waitFor(() => {
+      expect(getWatcherRecordsForDirectory(watcher, REPO_CWD)).toHaveLength(1);
+      expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
+      expect(service.getMetrics().workspaceRefreshInFlightCount).toBe(0);
+    });
+    const [checkoutWatcher] = getWatcherRecordsForDirectory(watcher, REPO_CWD);
+    const statusCalls = getCheckoutStatus.mock.calls.length;
+    const ignoreCalls = runGitCommand.mock.calls.length;
+    const events = Array.from({ length: 26_079 }, (_, index) => ({
+      path: path.join(REPO_CWD, "node_modules", ".pnpm", `pkg-${index}`, "file.js"),
+      type: "create" as const,
+    }));
+
+    checkoutWatcher.callback(null, events);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(getCheckoutStatus).toHaveBeenCalledTimes(statusCalls);
+    expect(runGitCommand).toHaveBeenCalledTimes(ignoreCalls);
+
+    checkoutWatcher.callback(null, [{ path: path.join(REPO_CWD, "tracked.txt"), type: "update" }]);
+    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.waitFor(() => expect(getCheckoutStatus).toHaveBeenCalledTimes(statusCalls + 1));
     subscription.unsubscribe();
     service.dispose();
   });
@@ -2192,6 +2420,76 @@ describe("WorkspaceGitService checkout observation", () => {
       );
     });
 
+    subscription.unsubscribe();
+    service.dispose();
+  });
+
+  test("updates to tracked files in unseen parents never re-inventory ignored directories", async () => {
+    const watcher = createWatcherHarness();
+    const runGitCommand = vi.fn(async (args: string[]) => ({
+      stdout: args[0] === "rev-parse" ? `${REPO_CWD}\n` : "",
+      stderr: "",
+      truncated: false,
+      exitCode: 0,
+      signal: null,
+    }));
+    const service = createService(watcher, { runGitCommand });
+    const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    await vi.waitFor(() =>
+      expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0),
+    );
+    const [checkoutWatcher] = getWatcherRecordsForDirectory(watcher, REPO_CWD);
+    const before = runGitCommand.mock.calls.filter(([args]) => args[0] === "ls-files").length;
+    for (let index = 0; index < 100; index += 1) {
+      checkoutWatcher.callback(null, [
+        { path: path.join(REPO_CWD, `src-${index}`, "tracked.ts"), type: "update" },
+      ]);
+      await vi.advanceTimersByTimeAsync(3_000);
+    }
+    expect(runGitCommand.mock.calls.filter(([args]) => args[0] === "ls-files")).toHaveLength(
+      before,
+    );
+    subscription.unsubscribe();
+    service.dispose();
+  });
+
+  test("topology and ignore-rule bursts coalesce into one inventory per interval with a trailing refresh", async () => {
+    const watcher = createWatcherHarness();
+    const runGitCommand = vi.fn(async (args: string[]) => ({
+      stdout: args[0] === "rev-parse" ? `${REPO_CWD}\n` : "",
+      stderr: "",
+      truncated: false,
+      exitCode: 0,
+      signal: null,
+    }));
+    const service = createService(watcher, {
+      runGitCommand,
+      getWorkingTreeIgnoreRefreshIntervalMs: () => 30_000,
+    });
+    const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    await vi.waitFor(() =>
+      expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0),
+    );
+    const [checkoutWatcher] = getWatcherRecordsForDirectory(watcher, REPO_CWD);
+    const count = () => runGitCommand.mock.calls.filter(([args]) => args[0] === "ls-files").length;
+    const before = count();
+    for (let index = 0; index < 20; index += 1) {
+      checkoutWatcher.callback(null, [
+        { path: path.join(REPO_CWD, `new-${index}`, "file.ts"), type: "create" },
+      ]);
+      checkoutWatcher.callback(null, [{ path: path.join(REPO_CWD, ".gitignore"), type: "update" }]);
+      await vi.advanceTimersByTimeAsync(1_000);
+    }
+    expect(count()).toBe(before);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(count()).toBe(before + 1);
+    checkoutWatcher.callback(null, [
+      { path: path.join(REPO_CWD, "later", "file.ts"), type: "create" },
+    ]);
+    await vi.advanceTimersByTimeAsync(29_000);
+    expect(count()).toBe(before + 1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(count()).toBe(before + 2);
     subscription.unsubscribe();
     service.dispose();
   });
@@ -2597,6 +2895,7 @@ describe("WorkspaceGitService checkout observation", () => {
     }));
     const service = createService(watcher, { runGitCommand });
     const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    await service.getSnapshot(REPO_CWD);
 
     await vi.waitFor(() => {
       expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
@@ -2649,6 +2948,7 @@ describe("WorkspaceGitService checkout observation", () => {
     });
     const service = createService(watcher, { runGitCommand });
     const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    await service.getSnapshot(REPO_CWD);
 
     await vi.waitFor(() => {
       expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
@@ -2666,7 +2966,9 @@ describe("WorkspaceGitService checkout observation", () => {
     });
 
     await vi.waitFor(() => expect(lsFilesCallCount).toBe(3));
-    expect(checkoutWatcher?.ignore).toContain(path.join(REPO_CWD, "build"));
+    await vi.waitFor(() => {
+      expect(checkoutWatcher?.ignore).toContain(path.join(REPO_CWD, "build"));
+    });
 
     subscription.unsubscribe();
     service.dispose();

@@ -324,6 +324,141 @@ function createService(options?: CreateServiceTestOptions) {
 }
 
 describe("WorkspaceGitServiceImpl", () => {
+  test("cold snapshots keep progressing while warm refresh generations are held", async () => {
+    const warm = Array.from({ length: 3 }, (_, i) => path.resolve(`/tmp/held-warm-${i}`));
+    const cold = Array.from({ length: 92 }, (_, i) => path.resolve(`/tmp/progress-cold-${i}`));
+    const callbacks = new Map<
+      string,
+      (error: Error | null, events: Array<{ path: string; type: "update" }>) => void
+    >();
+    const warmGate = createDeferred<{ isDirty: boolean; diffStat: null }>();
+    const getCheckoutStatus = vi.fn(async (cwd: string) => createCheckoutStatus(cwd));
+    const getCheckoutWorktreeState = vi.fn(() => warmGate.promise);
+    const subscribe = vi.fn(async (cwd, callback) => {
+      callbacks.set(cwd, callback);
+      return createAsyncSubscription();
+    });
+    const runGitCommand = vi.fn(async (_args: string[], options: { cwd: string }) => ({
+      stdout: `${options.cwd}\n`,
+      stderr: "",
+      truncated: false,
+      exitCode: 0,
+      signal: null,
+    }));
+    const service = createService({
+      subscribe,
+      getCheckoutStatus,
+      getCheckoutWorktreeState,
+      runGitCommand,
+    });
+    const subscriptions = warm.map((cwd) => service.registerWorkspace({ cwd }, vi.fn()));
+    await vi.waitFor(() => {
+      for (const cwd of warm) expect(service.peekSnapshot(cwd)?.git.isGit).toBe(true);
+    });
+    await vi.waitFor(() =>
+      expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0),
+    );
+    for (const cwd of warm)
+      callbacks.get(cwd)!(null, [{ path: join(cwd, "tracked.ts"), type: "update" }]);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.waitFor(() => expect(getCheckoutWorktreeState).toHaveBeenCalled());
+    subscriptions.push(...cold.map((cwd) => service.registerWorkspace({ cwd }, vi.fn())));
+    await vi.waitFor(() => {
+      for (const cwd of cold) expect(service.peekSnapshot(cwd)?.git.isGit).toBe(true);
+    });
+    expect(service.getMetrics().workspaceInitialRefreshPendingCount).toBe(0);
+    warmGate.resolve({ isDirty: true, diffStat: null });
+    for (const subscription of subscriptions) subscription.unsubscribe();
+    service.dispose();
+  });
+
+  test("checkout membership reads use Git facts without reading dirty worktree status", async () => {
+    const getCheckoutSnapshotFacts = vi.fn(async (cwd: string) => createCheckoutSnapshotFacts(cwd));
+    const getCheckoutStatus = vi.fn(async () => {
+      throw new Error("status scan must not run");
+    });
+    const service = createService({ getCheckoutSnapshotFacts, getCheckoutStatus });
+    await expect(service.getCheckout(REPO_CWD)).resolves.toMatchObject({
+      cwd: REPO_CWD,
+      isGit: true,
+      currentBranch: "main",
+      worktreeRoot: REPO_CWD,
+    });
+    expect(getCheckoutStatus).not.toHaveBeenCalled();
+    expect(getCheckoutSnapshotFacts).toHaveBeenCalledTimes(1);
+    service.dispose();
+  });
+
+  test.each([
+    {
+      name: "main checkout",
+      mainRepoRoot: REPO_CWD,
+      owned: false,
+      base: "main",
+      expectedMain: null,
+      expectedOwned: false,
+    },
+    {
+      name: "native linked checkout",
+      mainRepoRoot: path.resolve("/tmp/main-root"),
+      owned: false,
+      base: "main",
+      expectedMain: path.resolve("/tmp/main-root"),
+      expectedOwned: false,
+    },
+    {
+      name: "owned checkout with base",
+      mainRepoRoot: null,
+      owned: true,
+      base: "main",
+      expectedMain: REPO_CWD,
+      expectedOwned: true,
+    },
+    {
+      name: "owned checkout without base",
+      mainRepoRoot: REPO_CWD,
+      owned: true,
+      base: null,
+      expectedMain: null,
+      expectedOwned: false,
+    },
+  ])(
+    "checkout identity preserves the status projection for $name",
+    async ({ mainRepoRoot, owned, base, expectedMain, expectedOwned }) => {
+      const facts = {
+        ...createCheckoutSnapshotFacts(REPO_CWD),
+        mainRepoRoot,
+        paseoWorktree: { isPaseoOwnedWorktree: owned },
+        resolvedBaseRef: base,
+      };
+      const service = createService({ getCheckoutSnapshotFacts: vi.fn(async () => facts) });
+      await expect(service.getCheckout(REPO_CWD)).resolves.toMatchObject({
+        mainRepoRoot: expectedMain,
+        isPaseoOwnedWorktree: expectedOwned,
+      });
+      service.dispose();
+    },
+  );
+
+  test("bulk checkout membership reads stay bounded and share a pending read for the same checkout", async () => {
+    const gate = createDeferred<void>();
+    const getCheckoutSnapshotFacts = vi.fn(async (cwd: string) => {
+      await gate.promise;
+      return createCheckoutSnapshotFacts(cwd);
+    });
+    const service = createService({ getCheckoutSnapshotFacts });
+    const roots = Array.from({ length: 92 }, (_, i) => path.resolve(`/tmp/membership-${i}`));
+    const reads = roots.map((cwd) => service.getCheckout(cwd));
+    const duplicate = service.getCheckout(roots[0]);
+    await vi.waitFor(() => expect(getCheckoutSnapshotFacts).toHaveBeenCalledTimes(2));
+    gate.resolve();
+    const result = await Promise.all(reads);
+    await expect(duplicate).resolves.toEqual(result[0]);
+    expect(getCheckoutSnapshotFacts).toHaveBeenCalledTimes(92);
+    await service.getCheckout(roots[0]);
+    expect(getCheckoutSnapshotFacts).toHaveBeenCalledTimes(93);
+    service.dispose();
+  });
   beforeEach(() => {
     vi.useFakeTimers();
   });
@@ -583,6 +718,410 @@ describe("WorkspaceGitServiceImpl", () => {
     service.dispose();
   });
 
+  test("staggered cold inventory lets an explicit read bypass all queued workspaces", async () => {
+    const cwds = Array.from({ length: 83 }, (_, index) => path.resolve(`/tmp/cold-repo-${index}`));
+    const firstRead = createDeferred<CheckoutStatusGit>();
+    const startedReads: string[] = [];
+    const getCheckoutStatus = vi.fn(async (cwd: string) => {
+      startedReads.push(cwd);
+      return cwd === cwds[0] ? firstRead.promise : createCheckoutStatus(cwd);
+    });
+    const service = createService({ getCheckoutStatus });
+    const subscriptions = cwds.map((cwd) => service.registerWorkspace({ cwd }, vi.fn()));
+    await vi.waitFor(() => expect(startedReads).toEqual([cwds[0]]));
+    expect(service.getMetrics()).toMatchObject({
+      workspaceInitialRefreshActiveCount: 1,
+      workspaceInitialRefreshPendingCount: cwds.length - 1,
+    });
+
+    const liveCwd = cwds.at(-1)!;
+    await expect(service.getSnapshot(liveCwd)).resolves.toMatchObject({ cwd: liveCwd });
+    expect(startedReads).toEqual([cwds[0], liveCwd]);
+    expect(service.getMetrics().workspaceRefreshAdmissionPendingCount).toBe(0);
+
+    firstRead.resolve(createCheckoutStatus(cwds[0]!));
+    await vi.waitFor(() => expect(service.peekSnapshot(cwds.at(-2)!)).not.toBeNull());
+    expect(startedReads).toHaveLength(cwds.length);
+    expect(new Set(startedReads).size).toBe(cwds.length);
+    for (const subscription of subscriptions) subscription.unsubscribe();
+    await service.dispose();
+  });
+
+  test.each(["authentication", "pull-request"])(
+    "92 initial snapshots finish while forge %s is blocked",
+    async (phase) => {
+      const cwds = Array.from({ length: 92 }, (_, i) => path.resolve(`/tmp/forge-startup-${i}`));
+      const gate = createDeferred<void>();
+      const entered = vi.fn();
+      const github = createGitHubServiceStub();
+      github.isAuthenticated = vi.fn(async () => {
+        if (phase === "authentication") {
+          entered();
+          await gate.promise;
+        }
+        return true;
+      });
+      const getPullRequestStatus = vi.fn(async () => {
+        if (phase === "pull-request") {
+          entered();
+          await gate.promise;
+        }
+        return createPullRequestStatusResult();
+      });
+      const service = new WorkspaceGitServiceImpl({
+        logger: createLogger() as unknown as pino.Logger,
+        paseoHome: "/tmp/paseo-test",
+        deps: {
+          ...buildDefaultTestServiceDeps(),
+          forgeOverrides: { github },
+          getPullRequestStatus,
+        },
+      });
+      const subscriptions = cwds.map((cwd) => service.registerWorkspace({ cwd }, vi.fn()));
+      try {
+        await vi.waitFor(() => expect(entered).toHaveBeenCalled());
+        await vi.waitFor(() => {
+          expect(service.getMetrics()).toMatchObject({
+            workspaceInitialRefreshActiveCount: 0,
+            workspaceInitialRefreshPendingCount: 0,
+          });
+          for (const cwd of cwds) expect(service.peekSnapshot(cwd)?.git.isGit).toBe(true);
+        });
+        const snapshot = await service.getSnapshot(cwds.at(-1)!, { includeForge: false });
+        expect(snapshot.git.currentBranch).toBe("main");
+        gate.resolve();
+        await vi.waitFor(() =>
+          expect(service.peekSnapshot(cwds.at(-1)!)?.forge.pullRequest?.url).toBe(
+            "https://github.com/acme/repo/pull/123",
+          ),
+        );
+      } finally {
+        gate.resolve();
+        for (const subscription of subscriptions) subscription.unsubscribe();
+        await service.dispose();
+      }
+    },
+  );
+
+  test("Git updates finish while initial forge enrichment is still pending", async () => {
+    const gate = createDeferred<PullRequestStatusResult>();
+    const getPullRequestStatus = vi.fn(() => gate.promise);
+    let dirty = false;
+    const getCheckoutStatus = vi.fn(async (cwd: string) =>
+      createCheckoutStatus(cwd, { isDirty: dirty }),
+    );
+    const service = createService({ getCheckoutStatus, getPullRequestStatus });
+    const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    try {
+      await vi.waitFor(() => expect(getPullRequestStatus).toHaveBeenCalled());
+      expect(service.peekSnapshot(REPO_CWD)?.git.isDirty).toBe(false);
+      dirty = true;
+      const refresh = service.getSnapshot(REPO_CWD, {
+        force: true,
+        includeForge: false,
+        reason: "edit-during-initial-forge",
+      });
+      await vi.waitFor(() => expect(getCheckoutStatus).toHaveBeenCalledTimes(2));
+      await expect(refresh).resolves.toMatchObject({ git: { isDirty: true } });
+    } finally {
+      gate.resolve(createPullRequestStatusResult());
+      subscription.unsubscribe();
+      await service.dispose();
+    }
+  });
+
+  test("late initial PR lookup cannot publish over a changed branch", async () => {
+    const gate = createDeferred<PullRequestStatusResult>();
+    const getPullRequestStatus = vi.fn(() => gate.promise);
+    let branch = "main";
+    const service = createService({
+      getPullRequestStatus,
+      getCheckoutSnapshotFacts: vi.fn(async (cwd: string) => ({
+        ...createCheckoutSnapshotFacts(cwd),
+        currentBranch: branch,
+        pullRequestLookupTarget: { headRef: branch },
+      })),
+      getCheckoutStatus: vi.fn(async (cwd: string) =>
+        createCheckoutStatus(cwd, { currentBranch: branch }),
+      ),
+    });
+    const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    try {
+      await vi.waitFor(() => expect(getPullRequestStatus).toHaveBeenCalled());
+      branch = "feature";
+      await service.getSnapshot(REPO_CWD, {
+        force: true,
+        includeForge: false,
+        reason: "branch-change-during-initial-forge",
+      });
+      gate.resolve(createPullRequestStatusResult());
+      await vi.waitFor(() =>
+        expect(service.getMetrics().workspaceForgeRefreshAdmissionActiveCount).toBe(0),
+      );
+      expect(service.peekSnapshot(REPO_CWD)).toMatchObject({
+        git: { currentBranch: "feature" },
+        forge: { pullRequest: null },
+      });
+    } finally {
+      gate.resolve(createPullRequestStatusResult());
+      subscription.unsubscribe();
+      await service.dispose();
+    }
+  });
+
+  test("a hot workspace successor cannot hold cold discovery and watcher registration", async () => {
+    const hot = path.resolve("/tmp/hot-startup");
+    const cold = path.resolve("/tmp/cold-startup");
+    const initial = createDeferred<CheckoutStatusGit>();
+    const successor = createDeferred<CheckoutStatusGit>();
+    const started: string[] = [];
+    let hotReads = 0;
+    const subscribe = vi.fn(async () => createAsyncSubscription());
+    const service = createService({
+      subscribe,
+      runGitCommand: vi.fn(async (_args, options) => ({
+        stdout: `${options.cwd}\n`,
+        stderr: "",
+        truncated: false,
+        exitCode: 0,
+        signal: null,
+      })),
+      getCheckoutStatus: vi.fn(async (cwd: string) => {
+        started.push(cwd);
+        if (cwd !== hot) return createCheckoutStatus(cwd);
+        hotReads += 1;
+        return hotReads === 1 ? initial.promise : successor.promise;
+      }),
+    });
+    const subscriptions = [hot, cold].map((cwd) => service.registerWorkspace({ cwd }, vi.fn()));
+    let followup: Promise<unknown> | undefined;
+    try {
+      await vi.waitFor(() => expect(started).toEqual([hot]));
+      followup = service.getSnapshot(hot, {
+        force: true,
+        includeForge: false,
+        reason: "startup-successor",
+      });
+      initial.resolve(createCheckoutStatus(hot));
+      await vi.waitFor(() => expect(started).toContain(cold));
+      await vi.waitFor(() => expect(service.peekSnapshot(cold)).not.toBeNull());
+      await vi.waitFor(() =>
+        expect(subscribe).toHaveBeenCalledWith(cold, expect.any(Function), expect.any(Object)),
+      );
+      expect(service.getMetrics().workspaceInitialRefreshPendingCount).toBe(0);
+      expect(started.filter((cwd) => cwd === hot)).toHaveLength(2);
+    } finally {
+      initial.resolve(createCheckoutStatus(hot));
+      successor.resolve(createCheckoutStatus(hot));
+      await followup;
+      for (const subscription of subscriptions) subscription.unsubscribe();
+      await service.dispose();
+    }
+  });
+
+  test("95 linked workspaces register observation while the first cold snapshot is blocked", async () => {
+    const cwds = Array.from({ length: 95 }, (_, i) => path.resolve(`/tmp/linked-startup-${i}`));
+    const gate = createDeferred<void>();
+    const subscribe = vi.fn(async () => createAsyncSubscription());
+    const service = createService({
+      subscribe,
+      getCheckoutSnapshotFacts: vi.fn(async (cwd: string) => ({
+        ...createCheckoutSnapshotFacts(cwd),
+        gitCommonDir: path.resolve("/tmp/linked-common/.git"),
+      })),
+      getCheckoutStatus: vi.fn(async (cwd: string) => {
+        await gate.promise;
+        return createCheckoutStatus(cwd);
+      }),
+      runGitCommand: vi.fn(async (_args, options) => ({
+        stdout: `${options.cwd}\n`,
+        stderr: "",
+        truncated: false,
+        exitCode: 0,
+        signal: null,
+      })),
+    });
+    const subscriptions = cwds.map((cwd) => service.registerWorkspace({ cwd }, vi.fn()));
+    try {
+      await vi.waitFor(() => {
+        const observed = new Set<string>();
+        for (const [directory] of subscribe.mock.calls) observed.add(directory);
+        for (const cwd of cwds) expect(observed.has(cwd)).toBe(true);
+      });
+      expect(service.getMetrics()).toMatchObject({
+        repositoryTargetCount: 1,
+        repositoryWorkspaceLinkCount: 95,
+        workspaceRefreshAdmissionActiveCount: 1,
+        workspaceInitialRefreshPendingCount: 94,
+      });
+    } finally {
+      gate.resolve();
+      for (const subscription of subscriptions) subscription.unsubscribe();
+      await service.dispose();
+    }
+  });
+
+  test("delayed cold snapshots reload facts discovered before a branch change", async () => {
+    const hot = path.resolve("/tmp/blocked-initial-facts");
+    const cold = path.resolve("/tmp/delayed-initial-facts");
+    const gate = createDeferred<void>();
+    let nowMs = 0;
+    const facts = vi.fn(async (cwd: string) => ({
+      ...createCheckoutSnapshotFacts(cwd),
+      currentBranch: nowMs === 0 ? "before" : "after",
+    }));
+    const service = createService({
+      now: () => new Date(nowMs),
+      getCheckoutSnapshotFacts: facts,
+      getCheckoutStatus: vi.fn(async (cwd: string, context: { facts?: CheckoutSnapshotFacts }) => {
+        if (cwd === hot) await gate.promise;
+        return createCheckoutStatus(cwd, {
+          currentBranch: context.facts?.isGit ? context.facts.currentBranch : null,
+        });
+      }),
+    });
+    const subscriptions = [hot, cold].map((cwd) => service.registerWorkspace({ cwd }, vi.fn()));
+    try {
+      await vi.waitFor(() => expect(facts).toHaveBeenCalledWith(cold, expect.any(Object)));
+      nowMs = 10_000;
+      gate.resolve();
+      await vi.waitFor(() => expect(service.peekSnapshot(cold)?.git.currentBranch).toBe("after"));
+    } finally {
+      gate.resolve();
+      for (const subscription of subscriptions) subscription.unsubscribe();
+      await service.dispose();
+    }
+  });
+
+  test("cold metadata and polling refreshes cannot bypass initial admission", async () => {
+    const cwds = Array.from({ length: 12 }, (_, i) => path.resolve(`/tmp/cold-trigger-${i}`));
+    const gate = createDeferred<void>();
+    const started: string[] = [];
+    const live = cwds.at(-1)!;
+    const service = createService({
+      getCheckoutStatus: vi.fn(async (cwd: string) => {
+        started.push(cwd);
+        if (cwd !== live) await gate.promise;
+        return createCheckoutStatus(cwd);
+      }),
+    });
+    const subscriptions = cwds.map((cwd) => service.registerWorkspace({ cwd }, vi.fn()));
+    let read: Promise<unknown> | undefined;
+    try {
+      await vi.waitFor(() => expect(started).toEqual([cwds[0]]));
+      for (const cwd of cwds.slice(0, -1)) service.onWorkspaceStateMayHaveChanged(cwd);
+      await vi.advanceTimersByTimeAsync(1_000);
+      let snapshot: WorkspaceGitRuntimeSnapshot | undefined;
+      read = service.getSnapshot(live).then((value) => {
+        snapshot = value;
+        return value;
+      });
+      await flushPromises();
+      await flushPromises();
+      expect(started).toEqual([cwds[0], live]);
+      gate.resolve();
+      await read;
+      expect(snapshot?.cwd).toBe(live);
+      const startsForFirst = () => started.filter((cwd) => cwd === cwds[0]);
+      await vi.waitFor(() => expect(startsForFirst()).toHaveLength(2));
+    } finally {
+      gate.resolve();
+      await read?.catch(() => undefined);
+      for (const subscription of subscriptions) subscription.unsubscribe();
+      await service.dispose();
+    }
+  });
+
+  test("warm background refreshes reserve admission for a cold live read", async () => {
+    const cwds = Array.from({ length: 8 }, (_, i) => path.resolve(`/tmp/warm-trigger-${i}`));
+    const live = path.resolve("/tmp/cold-live");
+    const gate = createDeferred<void>();
+    let block = false;
+    const started: string[] = [];
+    const service = createService({
+      getCheckoutStatus: vi.fn(async (cwd: string) => {
+        if (block) {
+          started.push(cwd);
+          if (cwd !== live) await gate.promise;
+        }
+        return createCheckoutStatus(cwd);
+      }),
+    });
+    const subscriptions = cwds.map((cwd) => service.registerWorkspace({ cwd }, vi.fn()));
+    let read: Promise<unknown> | undefined;
+    try {
+      await Promise.all(cwds.map((cwd) => service.getSnapshot(cwd)));
+      block = true;
+      for (const cwd of cwds) service.onWorkspaceStateMayHaveChanged(cwd);
+      await vi.advanceTimersByTimeAsync(1_000);
+      read = service.getSnapshot(live);
+      await flushPromises();
+      await flushPromises();
+      expect(started).toContain(live);
+      expect(started.filter((cwd) => cwd !== live)).toHaveLength(
+        WORKSPACE_GIT_REFRESH_CONCURRENCY - 2,
+      );
+      gate.resolve();
+      await read;
+    } finally {
+      gate.resolve();
+      await read?.catch(() => undefined);
+      for (const subscription of subscriptions) subscription.unsubscribe();
+      await service.dispose();
+    }
+  });
+
+  test("all-polling refreshes leave admission for an uncached live read", async () => {
+    const cwds = Array.from({ length: 86 }, (_, i) => path.resolve(`/tmp/all-polling-${i}`));
+    const live = path.resolve("/tmp/all-polling-live");
+    const gate = createDeferred<void>();
+    const blocked = new Set<string>();
+    let hold = false;
+    const service = createService({
+      subscribe: vi.fn(async () => {
+        throw Object.assign(new Error("watcher admission EMFILE"), { code: "EMFILE" });
+      }),
+      runGitCommand: vi.fn(async (_args: string[], options: { cwd: string }) => ({
+        stdout: `${options.cwd}\n`,
+        stderr: "",
+        truncated: false,
+        exitCode: 0,
+        signal: null,
+      })),
+      getCheckoutStatus: vi.fn(async (cwd: string) => {
+        if (hold && cwd !== live) {
+          blocked.add(cwd);
+          await gate.promise;
+        }
+        return createCheckoutStatus(cwd);
+      }),
+    });
+    const subscriptions = cwds.map((cwd) => service.registerWorkspace({ cwd }, vi.fn()));
+    let read: Promise<WorkspaceGitRuntimeSnapshot> | undefined;
+    try {
+      await Promise.all(cwds.map((cwd) => service.getSnapshot(cwd)));
+      await vi.waitFor(() =>
+        expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0),
+      );
+      expect(service.getMetrics().workingTreeWatchTargetCount).toBe(cwds.length);
+      hold = true;
+      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.waitFor(() => expect(blocked.size).toBe(WORKSPACE_GIT_REFRESH_CONCURRENCY - 2));
+      expect(service.peekSnapshot(live)).toBeNull();
+      read = service.getSnapshot(live, { force: true, reason: "all-polling-live-read" });
+      await expect(read).resolves.toMatchObject({ cwd: live });
+      expect(blocked.size).toBe(WORKSPACE_GIT_REFRESH_CONCURRENCY - 2);
+      gate.resolve();
+      await vi.waitFor(() => expect(service.getMetrics().workspaceRefreshInFlightCount).toBe(0));
+    } finally {
+      hold = false;
+      gate.resolve();
+      await read;
+      for (const subscription of subscriptions) subscription.unsubscribe();
+      await service.dispose();
+    }
+  });
+
   test("bounds workspace observation setup pipelines", async () => {
     const cwds = Array.from(
       { length: WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY + 2 },
@@ -630,6 +1169,39 @@ describe("WorkspaceGitServiceImpl", () => {
     }
     service.dispose();
   });
+
+  test.each([24_000, 128_000])(
+    "inventory progress renews idle expiry but retains the absolute cap (%s ms)",
+    async (durationMs) => {
+      const starting = createDeferred<ReturnType<typeof createAsyncSubscription>>();
+      let options: { signal?: AbortSignal; onInventoryProgress?: () => void } | undefined;
+      const service = createService({
+        subscribe: vi.fn(async (directory, _callback, input) => {
+          if (directory === REPO_CWD) {
+            options = input;
+            return starting.promise;
+          }
+          return createAsyncSubscription();
+        }),
+      });
+      await service.getSnapshot(REPO_CWD, { includeForge: false });
+      const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+      try {
+        await vi.waitFor(() => expect(options).toBeDefined());
+        for (let elapsed = 0; elapsed < durationMs; elapsed += 8_000) {
+          await vi.advanceTimersByTimeAsync(8_000);
+          options?.onInventoryProgress?.();
+        }
+        expect(options?.signal?.aborted).toBe(durationMs > 120_000);
+        starting.resolve(createAsyncSubscription());
+        await vi.waitFor(() => expect(service.getMetrics().repositoryWorkspaceLinkCount).toBe(1));
+      } finally {
+        starting.resolve(createAsyncSubscription());
+        subscription.unsubscribe();
+        await service.dispose();
+      }
+    },
+  );
 
   test("watcher subscription deadlines release observation admission slots", async () => {
     const cwds = Array.from(
@@ -703,6 +1275,9 @@ describe("WorkspaceGitServiceImpl", () => {
     }));
     const service = createService({ getCheckoutStatus, subscribe, runGitCommand });
 
+    // Explicit demand still fills the shared pool; cold inventory has its own
+    // staggered queue and must also be harmless when disposal clears it.
+    const refreshes = Promise.allSettled(cwds.map((cwd) => service.getSnapshot(cwd)));
     cwds.forEach((cwd) => service.registerWorkspace({ cwd }, vi.fn()));
     await vi.waitFor(() => {
       expect(service.getMetrics()).toMatchObject({
@@ -712,6 +1287,7 @@ describe("WorkspaceGitServiceImpl", () => {
         workspaceObservationSetupAdmissionPendingCount:
           cwds.length - WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY,
       });
+      expect(subscribe).toHaveBeenCalledTimes(WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY);
     });
     const queuedRefreshSettlement = service.getSnapshot(cwds.at(-1)!).then(
       () => ({ status: "fulfilled" as const, error: null }),
@@ -741,6 +1317,7 @@ describe("WorkspaceGitServiceImpl", () => {
       }
       expect(service.getMetrics().workspaceRefreshAdmissionActiveCount).toBe(0);
     });
+    await refreshes;
   });
 
   test("cleans a watcher subscription that resolves after its deadline", async () => {
@@ -884,6 +1461,10 @@ describe("WorkspaceGitServiceImpl", () => {
       runGitFetch,
     });
 
+    await Promise.all([
+      service.getSnapshot(REPO_CWD),
+      service.getSnapshot(join(REPO_CWD, "packages", "server")),
+    ]);
     const first = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
     const second = service.registerWorkspace(
       { cwd: join(REPO_CWD, "packages", "server") },
@@ -943,6 +1524,10 @@ describe("WorkspaceGitServiceImpl", () => {
       hasOriginRemote: vi.fn(async () => true),
       runGitFetch,
     });
+    await Promise.all([
+      service.getSnapshot(REPO_CWD),
+      service.getSnapshot(join(REPO_CWD, "packages", "server")),
+    ]);
     const first = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
     const second = service.registerWorkspace(
       { cwd: join(REPO_CWD, "packages", "server") },
@@ -1006,6 +1591,10 @@ describe("WorkspaceGitServiceImpl", () => {
         return result;
       }),
     });
+    await Promise.all([
+      service.getSnapshot(REPO_CWD),
+      service.getSnapshot(join(REPO_CWD, "packages", "server")),
+    ]);
     const first = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
     const second = service.registerWorkspace(
       { cwd: join(REPO_CWD, "packages", "server") },
@@ -1262,6 +1851,8 @@ describe("WorkspaceGitServiceImpl", () => {
     expect(subscribe).toHaveBeenCalledTimes(1);
     expect(subscribe).toHaveBeenCalledWith(REPO_CWD, expect.any(Function), {
       ignore: [join(REPO_CWD, ".git")],
+      signal: expect.any(AbortSignal),
+      onInventoryProgress: expect.any(Function),
     });
 
     subscription.unsubscribe();
@@ -1296,16 +1887,22 @@ describe("WorkspaceGitServiceImpl", () => {
     service.dispose();
   });
 
-  test("sets a bounded polling fallback when recursive observation is unavailable", async () => {
+  test("sets bounded polling and recovery when recursive observation is unavailable", async () => {
     const subscribe = vi.fn(async () => {
       throw new Error("watcher unavailable");
     });
     const service = createService({ subscribe });
     const subscription = await service.requestWorkingTreeWatch(REPO_CWD, vi.fn());
 
-    expect(vi.getTimerCount()).toBe(1);
+    // Polling and recovery remain bounded. Ignore inventories may retain one
+    // interval timer rather than immediately rerunning on recovery.
+    expect(vi.getTimerCount()).toBe(2);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(subscribe).toHaveBeenCalledTimes(2);
+    expect(vi.getTimerCount()).toBeLessThanOrEqual(3);
 
     subscription.unsubscribe();
+    expect(vi.getTimerCount()).toBe(0);
     service.dispose();
   });
 
@@ -1327,6 +1924,8 @@ describe("WorkspaceGitServiceImpl", () => {
     expect(subscription.repoRoot).toBeNull();
     expect(subscribe).toHaveBeenCalledWith(plainCwd, expect.any(Function), {
       ignore: [join(plainCwd, ".git")],
+      signal: expect.any(AbortSignal),
+      onInventoryProgress: expect.any(Function),
     });
     expect(vi.getTimerCount()).toBe(1);
 

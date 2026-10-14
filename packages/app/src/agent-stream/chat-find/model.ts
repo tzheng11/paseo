@@ -51,7 +51,7 @@ interface Snapshot {
 }
 export interface ChatFindOperations {
   search(query: string, cursor?: number): Promise<AgentTimelineSearchPayload>;
-  load(epoch: string, seq: number): Promise<unknown>;
+  load(epoch: string, seq: number, historyIndex?: number): Promise<unknown>;
   reveal(
     messageId: string,
     query: string,
@@ -157,6 +157,8 @@ export class ChatFindModel {
           ...result.locations.map((location) => ({
             seq: location.seq,
             role: location.role,
+            historyIndex: location.historyIndex,
+            messageId: location.messageId,
             // COMPAT(timelineSearchCount): hosts before v0.9.0 send no count; remove after 2027-09-22.
             count: location.count ?? 1,
           })),
@@ -184,6 +186,17 @@ export class ChatFindModel {
   private target(location: Location, exact: boolean): Target | null {
     let before = 0;
     for (const item of this.items) {
+      if (location.historyIndex !== undefined) {
+        if (
+          (item.providerHistoryIndex === location.historyIndex ||
+            (location.messageId !== undefined &&
+              (item.kind === "user_message" || item.kind === "assistant_message") &&
+              item.messageId === location.messageId)) &&
+          item.kind === `${location.role}_message`
+        )
+          return { id: item.id, seq: location.seq, before: location.seq - 1 };
+        continue;
+      }
       if (item.timelineCursor?.epoch !== this.resultEpoch) continue;
       const seq = item.timelineCursor.seq;
       if (seq < location.seq) {
@@ -229,10 +242,19 @@ export class ChatFindModel {
       const cached = this.resolved.get(location);
       const stillLoaded =
         cached &&
-        this.items.some((item) => item.id === cached.id && item.timelineCursor?.seq === cached.seq);
+        this.items.some(
+          (item) =>
+            item.id === cached.id &&
+            (location.historyIndex === undefined
+              ? item.timelineCursor?.seq === cached.seq
+              : item.providerHistoryIndex === location.historyIndex),
+        );
       let target = stillLoaded ? cached : this.target(location, true);
       if (!target) {
-        await tagged("connection", this.operations.load(epoch, location.seq));
+        await tagged(
+          "connection",
+          this.operations.load(epoch, location.seq, location.historyIndex),
+        );
         if (signal.aborted) return;
         target = await this.waitForTarget(location, signal);
       }

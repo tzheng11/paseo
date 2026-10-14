@@ -2,8 +2,10 @@ import { watch, type FSWatcher } from "node:fs";
 import path from "node:path";
 import type { FileVersion } from "@getpaseo/protocol/messages";
 import { getExplorerFileVersion, resolveExplorerFilePath } from "./service.js";
+import { nativeWatchHost } from "../file-observer/internal/native-watch-client.js";
 
 interface FileWatch {
+  ready?: Promise<void>;
   close(): void;
 }
 
@@ -35,6 +37,14 @@ interface ObservedFile {
 
 const nodeDependencies: FileObserverDependencies = {
   watchDirectory(directory, onChange, onError) {
+    if (process.platform === "darwin") {
+      const watcher = nativeWatchHost.watch(
+        { root: directory, kind: "directory" },
+        (_event, filename) => onChange(filename),
+      );
+      watcher.on("error", onError);
+      return watcher;
+    }
     const watcher: FSWatcher = watch(directory, (_event, filename) => {
       onChange(filename === null ? null : filename.toString());
     });
@@ -77,6 +87,13 @@ export class FileObserver {
         };
         this.observed.set(target, observed);
         this.startWatching(target, path.dirname(target), observed);
+      }
+    }
+    if (observed.watcher?.ready) {
+      try {
+        await observed.watcher.ready;
+      } catch {
+        this.useFallback(target, observed);
       }
     }
     const initial = await getExplorerFileVersion({
@@ -125,6 +142,7 @@ export class FileObserver {
   }
 
   private useFallback(target: string, observed: ObservedFile): void {
+    if (this.observed.get(target) !== observed) return;
     observed.watcher?.close();
     observed.watcher = null;
     if (observed.fallback) return;
