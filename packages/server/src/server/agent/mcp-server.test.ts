@@ -3,9 +3,9 @@ import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { realpathSync } from "node:fs";
-import { access, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve as resolvePath } from "node:path";
 import { tmpdir } from "node:os";
 import { z } from "zod";
@@ -36,6 +36,7 @@ import {
 import {
   createPersistedProjectRecord,
   createPersistedWorkspaceRecord,
+  FileBackedWorkspaceRegistry,
   type PersistedProjectRecord,
   type PersistedWorkspaceRecord,
   type ProjectRegistry,
@@ -70,6 +71,8 @@ import type { BrowserToolsBroker, BrowserToolsExecuteInput } from "../browser-to
 import type { BrowserToolsResponsePayload } from "../browser-tools/errors.js";
 import { readPaseoWorktreeMetadata } from "../../utils/worktree-metadata.js";
 import { createWorkspaceProvisioningService } from "../session/workspace-provisioning/workspace-provisioning-service.js";
+import { setWorkspaceFieldValue } from "../workspace-fields.js";
+import { writeJsonFileAtomic } from "../atomic-file.js";
 
 const REPO_CWD = resolvePath("/tmp/repo");
 const TARGET_CWD = resolvePath("/tmp/target");
@@ -6605,5 +6608,369 @@ describe("agent snapshot MCP serialization", () => {
     expect(content).not.toContain("[User] u2");
     expect(content).not.toContain("second answer");
     expect(content).not.toContain("first answer");
+  });
+});
+
+describe("workspace field MCP tools", () => {
+  let directory: string;
+  let registry: FileBackedWorkspaceRegistry;
+  let writes: number;
+  let emitted: PersistedWorkspaceRecord[];
+  const logger = createTestLogger();
+
+  beforeEach(async () => {
+    directory = await mkdtemp(join(tmpdir(), "paseo-mcp-fields-"));
+    writes = 0;
+    emitted = [];
+    registry = new FileBackedWorkspaceRegistry(join(directory, "workspaces.json"), logger, {
+      writeRecords: async (file, records) => {
+        writes++;
+        await writeJsonFileAtomic(file, records);
+      },
+    });
+    for (const workspaceId of ["A", "B", "archived"]) {
+      await registry.upsert(
+        createPersistedWorkspaceRecord({
+          workspaceId,
+          projectId: "project",
+          cwd: directory,
+          kind: "directory",
+          displayName: workspaceId,
+          title: "Retained title",
+          pinnedAt: "2026-10-14",
+          createdAt: "2026-10-14",
+          updatedAt: "2026-10-14",
+          archivedAt: workspaceId === "archived" ? "2026-10-14" : null,
+          ...(workspaceId === "A" ? { fieldValues: { future: "retained" } } : {}),
+        }),
+      );
+    }
+  });
+
+  afterEach(async () => {
+    await removeTempDir(directory);
+  });
+
+  function makeServer(options: Partial<Parameters<typeof createAgentMcpServer>[0]> = {}) {
+    const { agentManager, agentStorage, spies } = createTestDeps();
+    spies.agentManager.getAgent.mockReturnValue({
+      id: "caller",
+      workspaceId: "A",
+      cwd: directory,
+    } as ManagedAgent);
+    return createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      providerSnapshotManager: createOpenCodeManager().manager,
+      workspaceRegistry: registry,
+      setWorkspaceFieldValue: (input) => setWorkspaceFieldValue(registry, input),
+      emitWorkspaceUpdatesForWorkspaceIds: async (ids) => {
+        for (const id of ids) {
+          const workspace = await registry.get(id);
+          if (!workspace) throw new Error("Emitted workspace missing");
+          emitted.push(workspace);
+        }
+      },
+      logger,
+      ...options,
+    });
+  }
+
+  it("reads the ordered catalogue and atomically saves with reload, broadcast and sibling isolation", async () => {
+    const server = await makeServer();
+    const get = registeredTool(server, "get_workspace_fields");
+    expect((await invokeToolWithParsedInput(get, { workspaceId: "A" })).structuredContent).toEqual({
+      workspaceId: "A",
+      catalogVersion: 1,
+      fields: [
+        { key: "notionProjectUrl", label: "Notion Project URL" },
+        { key: "notionIssueUrl", label: "Notion Issue URL" },
+      ],
+      fieldValues: { future: "retained" },
+    });
+    const set = registeredTool(server, "set_workspace_field");
+    expect(
+      (
+        await invokeToolWithParsedInput(set, {
+          workspaceId: "A",
+          fieldKey: "notionProjectUrl",
+          value: "https://notion.so/project\n<strong>literal</strong>",
+          expectedValue: "",
+        })
+      ).structuredContent,
+    ).toEqual({
+      workspaceId: "A",
+      fieldKey: "notionProjectUrl",
+      accepted: true,
+      value: "https://notion.so/project\n<strong>literal</strong>",
+      error: null,
+      errorCode: null,
+    });
+    const reloaded = new FileBackedWorkspaceRegistry(join(directory, "workspaces.json"), logger);
+    expect(await reloaded.get("A")).toMatchObject({
+      fieldValues: {
+        future: "retained",
+        notionProjectUrl: "https://notion.so/project\n<strong>literal</strong>",
+      },
+      title: "Retained title",
+      pinnedAt: "2026-10-14",
+    });
+    expect((await reloaded.get("B"))?.fieldValues).toBeUndefined();
+    expect(emitted).toEqual([await registry.get("A")]);
+    expect(
+      (await invokeToolWithParsedInput(get, { workspaceId: "A" })).structuredContent,
+    ).toMatchObject({
+      fieldValues: { notionProjectUrl: "https://notion.so/project\n<strong>literal</strong>" },
+    });
+    await server.close();
+  });
+
+  it("resolves the caller workspace and requires an explicit target outside agent scope", async () => {
+    const scoped = await makeServer({ callerAgentId: "caller" });
+    const get = registeredTool(scoped, "get_workspace_fields");
+    expect((await invokeToolWithParsedInput(get, {})).structuredContent).toMatchObject({
+      workspaceId: "A",
+    });
+    expect(
+      (await invokeToolWithParsedInput(get, { workspaceId: "B" })).structuredContent,
+    ).toMatchObject({
+      workspaceId: "B",
+      fieldValues: {},
+    });
+    const input = { fieldKey: "notionIssueUrl", value: "issue", expectedValue: "" };
+    expect(
+      (await invokeToolWithParsedInput(registeredTool(scoped, "set_workspace_field"), input))
+        .structuredContent,
+    ).toMatchObject({ workspaceId: "A", accepted: true, value: "issue" });
+    const topLevel = await makeServer();
+    await expect(
+      invokeToolWithParsedInput(registeredTool(topLevel, "get_workspace_fields"), {}),
+    ).rejects.toThrow("workspaceId is required");
+    await expect(
+      invokeToolWithParsedInput(registeredTool(topLevel, "set_workspace_field"), input),
+    ).rejects.toThrow("workspaceId is required");
+    for (const workspaceId of ["missing", "archived"]) {
+      await expect(invokeToolWithParsedInput(get, { workspaceId })).rejects.toThrow(
+        "Active workspace not found",
+      );
+    }
+    const { agentManager, spies } = createTestDeps();
+    const orphan = await makeServer({ callerAgentId: "orphan", agentManager });
+    spies.agentManager.getAgent.mockReturnValue({ id: "orphan", cwd: directory } as ManagedAgent);
+    await expect(
+      invokeToolWithParsedInput(registeredTool(orphan, "get_workspace_fields"), {}),
+    ).rejects.toThrow("has no current workspace");
+    spies.agentManager.getAgent.mockReturnValue(undefined);
+    await expect(
+      invokeToolWithParsedInput(registeredTool(orphan, "get_workspace_fields"), {}),
+    ).rejects.toThrow("not found");
+    await scoped.close();
+    await topLevel.close();
+    await orphan.close();
+  });
+
+  it("merges concurrent fields, rejects conflicts, acknowledges no-op retries and clears values", async () => {
+    const server = await makeServer();
+    const set = registeredTool(server, "set_workspace_field");
+    const project = {
+      workspaceId: "A",
+      fieldKey: "notionProjectUrl",
+      value: "project",
+      expectedValue: "",
+    };
+    await Promise.all([
+      invokeToolWithParsedInput(set, project),
+      invokeToolWithParsedInput(set, { ...project, fieldKey: "notionIssueUrl", value: "issue" }),
+    ]);
+    expect((await registry.get("A"))?.fieldValues).toEqual({
+      future: "retained",
+      notionProjectUrl: "project",
+      notionIssueUrl: "issue",
+    });
+    const committedWrites = writes;
+    const emittedCount = emitted.length;
+    expect((await invokeToolWithParsedInput(set, project)).structuredContent).toMatchObject({
+      accepted: true,
+      value: "project",
+    });
+    expect(writes).toBe(committedWrites);
+    expect(emitted).toHaveLength(emittedCount + 1);
+    await invokeToolWithParsedInput(set, { ...project, value: "newer", expectedValue: "project" });
+    const beforeConflict = writes;
+    const beforeConflictEmissions = emitted.length;
+    expect(await invokeToolWithParsedInput(set, project)).toMatchObject({
+      isError: true,
+      structuredContent: {
+        workspaceId: "A",
+        fieldKey: "notionProjectUrl",
+        accepted: false,
+        value: null,
+        errorCode: "conflict",
+      },
+    });
+    expect(writes).toBe(beforeConflict);
+    expect(emitted).toHaveLength(beforeConflictEmissions);
+    await invokeToolWithParsedInput(set, { ...project, value: "", expectedValue: "newer" });
+    expect((await registry.get("A"))?.fieldValues).toEqual({
+      future: "retained",
+      notionProjectUrl: "",
+      notionIssueUrl: "issue",
+    });
+    await server.close();
+  });
+
+  it("repairs a failed post-commit emission on retry without rewriting, then rejects divergent retries", async () => {
+    let attempts = 0;
+    const server = await makeServer({
+      emitWorkspaceUpdatesForWorkspaceIds: async (ids) => {
+        attempts++;
+        if (attempts === 1) throw new Error("Injected post-commit emitter loss");
+        for (const id of ids) {
+          const workspace = await registry.get(id);
+          if (!workspace) throw new Error("Emitted workspace missing");
+          emitted.push(workspace);
+        }
+      },
+    });
+    const set = registeredTool(server, "set_workspace_field");
+    const get = registeredTool(server, "get_workspace_fields");
+    const input = {
+      workspaceId: "A",
+      fieldKey: "notionProjectUrl",
+      value: "committed",
+      expectedValue: "",
+    };
+    await expect(invokeToolWithParsedInput(set, input)).rejects.toThrow(
+      "Injected post-commit emitter loss",
+    );
+    expect(
+      (await invokeToolWithParsedInput(get, { workspaceId: "A" })).structuredContent,
+    ).toMatchObject({ fieldValues: { notionProjectUrl: "committed" } });
+    const committedWrites = writes;
+    expect((await invokeToolWithParsedInput(set, input)).structuredContent).toMatchObject({
+      accepted: true,
+      value: "committed",
+    });
+    expect(writes).toBe(committedWrites);
+    expect(attempts).toBe(2);
+    expect(emitted).toEqual([await registry.get("A")]);
+    await setWorkspaceFieldValue(registry, {
+      ...input,
+      value: "another client",
+      expectedValue: "committed",
+    });
+    const divergentWrites = writes;
+    expect(await invokeToolWithParsedInput(set, input)).toMatchObject({
+      isError: true,
+      structuredContent: { accepted: false, errorCode: "conflict" },
+    });
+    expect(writes).toBe(divergentWrites);
+    expect(attempts).toBe(2);
+    expect(
+      (await invokeToolWithParsedInput(get, { workspaceId: "A" })).structuredContent,
+    ).toMatchObject({ fieldValues: { notionProjectUrl: "another client" } });
+    await server.close();
+  });
+
+  it.each([
+    { fieldKey: "unknown", workspaceId: "A", value: "bad", errorCode: "unknown_field" },
+    { fieldKey: "__proto__", workspaceId: "A", value: "bad", errorCode: "unknown_field" },
+    { fieldKey: "notionIssueUrl", workspaceId: "missing", value: "bad", errorCode: "not_found" },
+    { fieldKey: "notionIssueUrl", workspaceId: "archived", value: "bad", errorCode: "not_found" },
+    {
+      fieldKey: "notionIssueUrl",
+      workspaceId: "A",
+      value: "x".repeat(8_001),
+      errorCode: "invalid_value",
+    },
+    {
+      fieldKey: "notionIssueUrl",
+      workspaceId: "A",
+      value: "雪".repeat(8_000),
+      errorCode: "invalid_value",
+    },
+  ])(
+    "rejects $fieldKey/$workspaceId/$errorCode before mutation",
+    async ({ errorCode, ...input }) => {
+      await setWorkspaceFieldValue(registry, {
+        workspaceId: "A",
+        fieldKey: "notionProjectUrl",
+        value: "雪".repeat(8_000),
+        expectedValue: "",
+      });
+      const before = await readFile(join(directory, "workspaces.json"), "utf8");
+      const beforeWrites = writes;
+      const server = await makeServer();
+      expect(
+        await invokeToolWithParsedInput(registeredTool(server, "set_workspace_field"), {
+          ...input,
+          expectedValue: "",
+        }),
+      ).toMatchObject({
+        isError: true,
+        structuredContent: { accepted: false, value: null, errorCode },
+      });
+      expect(await readFile(join(directory, "workspaces.json"), "utf8")).toBe(before);
+      expect(writes).toBe(beforeWrites);
+      expect(emitted).toEqual([]);
+      await server.close();
+    },
+  );
+
+  it("requires an expected value and honors provider tool-policy exclusions", async () => {
+    const server = await makeServer();
+    expect(
+      (
+        await registeredTool(server, "set_workspace_field").inputSchema.safeParseAsync({
+          workspaceId: "A",
+          fieldKey: "notionIssueUrl",
+          value: "issue",
+        })
+      ).success,
+    ).toBe(false);
+    const blocked = await makeServer({
+      paseoToolPolicy: { disabledTools: ["set_workspace_field"] },
+    });
+    expect(lookupTool(blocked, "get_workspace_fields")).toBeDefined();
+    expect(lookupTool(blocked, "set_workspace_field")).toBeUndefined();
+    const disabled = await makeServer({ paseoToolPolicy: { enabled: false } });
+    expect(lookupTool(disabled, "get_workspace_fields")).toBeUndefined();
+    expect(lookupTool(disabled, "set_workspace_field")).toBeUndefined();
+    expect((await registry.get("A"))?.fieldValues).toEqual({ future: "retained" });
+    await server.close();
+    await blocked.close();
+    await disabled.close();
+  });
+
+  it("discovers the exact tools and required CAS argument through MCP tools/list", async () => {
+    const server = await makeServer();
+    const client = await connectInMemoryMcpClient(server);
+    try {
+      const { tools } = await client.listTools();
+      expect(tools.map((tool) => tool.name)).toEqual(
+        expect.arrayContaining(["get_workspace_fields", "set_workspace_field"]),
+      );
+      expect(
+        tools.find((tool) => tool.name === "set_workspace_field")?.inputSchema.required,
+      ).toEqual(["fieldKey", "value", "expectedValue"]);
+      const result = await client.callTool({
+        name: "get_workspace_fields",
+        arguments: { workspaceId: "B" },
+      });
+      expect(result.structuredContent).toMatchObject({
+        workspaceId: "B",
+        catalogVersion: 1,
+        fieldValues: {},
+      });
+      expect(result.content).toEqual([
+        expect.objectContaining({
+          type: "text",
+          text: expect.stringContaining("notionProjectUrl"),
+        }),
+      ]);
+    } finally {
+      await client.close();
+      await server.close();
+    }
   });
 });

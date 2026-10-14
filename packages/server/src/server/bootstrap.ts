@@ -121,6 +121,7 @@ export async function fanOutReconciledWorkspaceUpdates(input: {
 
 import { VoiceAssistantWebSocketServer } from "./websocket-server.js";
 import { WorkspaceSetupRuntime } from "./workspace-setup-runtime.js";
+import { setWorkspaceFieldValue } from "./workspace-fields.js";
 import { createWorkspaceLabelService } from "./workspace-labels/index.js";
 import { createGitHubService } from "../services/github-service.js";
 import { createPaseoWorktree as createRegisteredPaseoWorktree } from "./paseo-worktree-service.js";
@@ -1418,6 +1419,7 @@ export async function createPaseoDaemon(
       await emitWorkspaceUpdatesExternal([workspace.workspaceId]);
       return workspace;
     },
+    setWorkspaceFieldValue: (input) => setWorkspaceFieldValue(workspaceRegistry, input),
     workspaceScripts: createWorkspaceScriptsService({
       serviceProxy,
       scriptRuntimeStore,
