@@ -22,22 +22,33 @@ export interface CodexUserMessageTurnIndex {
 
 type CodexThreadHistoryMode = "legacy" | "paginated";
 
+export interface CodexThreadHistoryMetadata {
+  mode: CodexThreadHistoryMode;
+  path: string | null;
+}
+
+export async function readCodexThreadHistoryMetadata(
+  client: CodexRewindClient,
+  threadId: string,
+): Promise<CodexThreadHistoryMetadata> {
+  const response = await client.request("thread/read", { threadId, includeTurns: false });
+  if (typeof response !== "object" || response === null || !("thread" in response))
+    throw new Error("Codex thread/read did not return thread metadata");
+  const thread = response.thread;
+  if (typeof thread !== "object" || thread === null)
+    throw new Error("Codex thread/read did not return thread metadata");
+  const path = "path" in thread && typeof thread.path === "string" ? thread.path : null;
+  if (!("historyMode" in thread)) return { mode: "legacy", path };
+  if (thread.historyMode === "legacy" || thread.historyMode === "paginated")
+    return { mode: thread.historyMode, path };
+  throw new Error(`Codex thread/read returned unknown history mode ${String(thread.historyMode)}`);
+}
+
 export async function readCodexThreadHistoryMode(
   client: CodexRewindClient,
   threadId: string,
 ): Promise<CodexThreadHistoryMode> {
-  const response = await client.request("thread/read", { threadId, includeTurns: false });
-  if (typeof response !== "object" || response === null || !("thread" in response)) {
-    throw new Error("Codex thread/read did not return thread metadata");
-  }
-  const thread = response.thread;
-  if (typeof thread !== "object" || thread === null || !("historyMode" in thread)) {
-    return "legacy";
-  }
-  if (thread.historyMode === "legacy" || thread.historyMode === "paginated") {
-    return thread.historyMode;
-  }
-  throw new Error(`Codex thread/read returned unknown history mode ${String(thread.historyMode)}`);
+  return (await readCodexThreadHistoryMetadata(client, threadId)).mode;
 }
 
 async function forkCodexThread(
@@ -108,6 +119,7 @@ export async function revertCodexConversation(input: {
     }
     const forked = await forkCodexThread(input.client, {
       ...forkParams,
+      excludeTurns: true,
       beforeTurnId: targetTurn.turnId,
     });
     await input.setThreadId(forked.thread.id);

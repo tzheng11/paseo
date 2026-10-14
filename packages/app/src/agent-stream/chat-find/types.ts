@@ -10,6 +10,7 @@ export interface ChatFindProps {
   viewportRef: RefObject<StreamViewportHandle | null>;
   revealLoadedMessage(messageId: string): boolean;
   visibleMessageIds: ReadonlySet<string>;
+  loadHistoryIndex?: (index: number) => Promise<void>;
   children: ReactNode;
 }
 export interface ChatFindExpansionProps {

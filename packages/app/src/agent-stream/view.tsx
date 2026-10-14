@@ -33,7 +33,6 @@ import {
   AssistantMessage,
   SpeakMessage,
   UserMessage,
-  Notification,
   ToolCall,
   TodoListCard,
   CompactionMarker,
@@ -54,6 +53,11 @@ import type { AgentScreenAgent } from "@/hooks/use-agent-screen-state-machine";
 import { useSessionStore } from "@/stores/session-store";
 import { useRevealedText } from "@/hooks/use-revealed-text";
 import { useFileExplorerActions } from "@/hooks/use-file-explorer-actions";
+import { BoundedHistoryNotice } from "./bounded-history-view";
+import {
+  useBoundedAgentTimeline,
+  supportsBoundedAgentHistory,
+} from "@/hooks/use-bounded-agent-timeline";
 import { useLoadOlderAgentHistory } from "@/hooks/use-load-older-agent-history";
 import { resolveContentMaxWidth, useSettings } from "@/hooks/use-settings";
 import type { ToastApi } from "@/components/toast-host";
@@ -531,7 +535,21 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
     // When isActive flips back to true, the context change triggers a re-render and
     // the component reads the current (fresh) streamItems/streamHead from props.
     const isActive = useRetainedPanelActive();
-    const effectiveStreamItems = useRetainedValue(streamItems, isActive);
+    const supportsBoundedHistory = useSessionStore(
+      (state) =>
+        state.sessions[resolvedServerId]?.serverInfo?.features?.boundedTimelineHistory === true,
+    );
+    const boundedHistory = useBoundedAgentTimeline({
+      client,
+      agentId,
+      epoch: timelineEpoch,
+      enabled: supportsBoundedHistory,
+      providerSupported: supportsBoundedAgentHistory(context.capabilities),
+      active: isActive,
+      customPagination: historyPagination !== undefined,
+      live: streamItems,
+    });
+    const effectiveStreamItems = useRetainedValue(boundedHistory.items, isActive);
     const effectiveStreamHead = useRetainedValue(streamHead, isActive);
     const effectiveTurnPresentation = useRetainedValue(turnPresentation, isActive);
     const isTurnActive = effectiveTurnPresentation.isActive;
@@ -628,6 +646,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
       onJumpError: handleTimelineHistoryLoadError,
       visibleMessageIds,
       revealLoadedMessage: revealLoadedHistory,
+      loadHistoryIndex: boundedHistory.loadAt,
     });
 
     useImperativeHandle(
@@ -876,7 +895,14 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
             return renderToolCallItem(layoutItem, item);
 
           case "notification":
-            return <Notification level={item.level} message={item.message} />;
+            return (
+              <BoundedHistoryNotice
+                item={item}
+                loading={boundedHistory.loading}
+                error={boundedHistory.error}
+                onLoad={boundedHistory.loadMiddle}
+              />
+            );
 
           case "todo_list":
             return <TodoListCard items={item.items} activity={item.activity} />;
@@ -900,6 +926,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
         }
       },
       [
+        boundedHistory,
         agentId,
         renderUserMessageItem,
         renderAssistantMessageItem,
@@ -1106,6 +1133,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
         viewportRef={viewportRef}
         revealLoadedMessage={revealLoadedHistory}
         visibleMessageIds={visibleMessageIds}
+        loadHistoryIndex={boundedHistory.loadAt}
       >
         <ToolCallSheetProvider>
           <AssistantSelectionCopySurface style={stylesheet.container}>

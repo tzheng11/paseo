@@ -320,6 +320,9 @@ export type PaseoAgentTimelineEvent =
 export type PaseoAgentTimelineSubscription = ReturnType<DaemonClient["subscribeAgentTimeline"]>;
 
 export interface PaseoAgentTimelineHandle {
+  history(
+    input: Omit<Parameters<DaemonClient["fetchAgentTimelineHistory"]>[0], "agentId">,
+  ): ReturnType<DaemonClient["fetchAgentTimelineHistory"]>;
   append(item: Omit<PluginTimelineItem, "pluginId">): Promise<{ seq: number; epoch: string }>;
   /**
    * Fetches a fresh timeline page through the existing daemon RPC. If the daemon
@@ -868,6 +871,7 @@ function createAgentHandleFactory(
     const handle: PaseoAgentHandle = {
       id,
       timeline: {
+        history: (input) => daemonClient.fetchAgentTimelineHistory({ agentId: id, ...input }),
         append: (item) => daemonClient.appendAgentTimelineItem(id, item),
         refetch: async (options) => {
           const result = await daemonClient.fetchAgentTimeline(id, options);

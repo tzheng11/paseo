@@ -26,6 +26,7 @@ import type { ProviderSnapshotManager } from "../agent/provider-snapshot-manager
 import { createWorkspaceProvisioningService } from "../session/workspace-provisioning/workspace-provisioning-service.js";
 import { resolveWorkspaceIdForPath } from "../resolve-workspace-id-for-path.js";
 import { createNoopWorkspaceGitService } from "../test-utils/workspace-git-service-stub.js";
+import type { WorkspaceGitService } from "../workspace-git-service.js";
 import {
   type PersistedWorkspaceRecord,
   FileBackedProjectRegistry,
@@ -42,6 +43,7 @@ import type { ScheduleExecutionResult, StoredSchedule } from "@getpaseo/protocol
 
 interface ScheduleServiceInternals {
   executeSchedule(schedule: StoredSchedule, runId: string): Promise<ScheduleExecutionResult>;
+  runSchedule(schedule: StoredSchedule, now: Date): Promise<void>;
 }
 
 const SCHEDULE_TEST_CAPABILITIES: AgentCapabilityFlags = {
@@ -187,6 +189,7 @@ async function createRegistryBackedScheduleWorkspaceDeps(rootDir: string): Promi
     agentManager: AgentManager;
     agentStorage: AgentStorage;
     logger?: ScheduleServiceOptions["logger"];
+    workspaceGitService?: Pick<WorkspaceGitService, "getSnapshot">;
   }) => ScheduleServiceOptions["archiveWorkspace"];
 }> {
   const workspaceRegistry = new FileBackedWorkspaceRegistry(
@@ -215,14 +218,19 @@ async function createRegistryBackedScheduleWorkspaceDeps(rootDir: string): Promi
       );
     },
     createArchiveWorkspace:
-      ({ agentManager, agentStorage, logger = createTestLogger() }) =>
+      ({
+        agentManager,
+        agentStorage,
+        logger = createTestLogger(),
+        workspaceGitService: archiveGitService,
+      }) =>
       async (workspaceId) => {
         workspaceArchiveInProgress = true;
         try {
           await archiveByScope(
             {
               github: { invalidate: () => {} } as never,
-              workspaceGitService,
+              workspaceGitService: archiveGitService ?? workspaceGitService,
               agentManager,
               agentStorage,
               findWorkspaceIdForCwd: async (cwd) =>
@@ -234,6 +242,7 @@ async function createRegistryBackedScheduleWorkspaceDeps(rootDir: string): Promi
                     workspaceId: workspace.workspaceId,
                     cwd: workspace.cwd,
                     kind: workspace.kind,
+                    mainRepoRoot: workspace.mainRepoRoot,
                   })),
               archiveWorkspaceRecord: async (id) => {
                 await workspaceRegistry.archive(id, new Date().toISOString());
@@ -344,6 +353,51 @@ describe("ScheduleService", () => {
     });
     expect(inspected.nextRunAt).toBe("2026-01-01T00:02:00.000Z");
   });
+
+  test.each([
+    {
+      name: "hourly interval",
+      cadence: { type: "every", everyMs: 3_600_000 } as const,
+      followingPeriod: "2026-01-01T02:00:00.000Z",
+    },
+    {
+      name: "daily cron",
+      cadence: { type: "cron", expression: "0 0 * * *", timezone: "UTC" } as const,
+      followingPeriod: "2026-01-03T00:00:00.000Z",
+    },
+  ])(
+    "advances one period when the same $name slot fires three times",
+    async ({ cadence, followingPeriod }) => {
+      const service = createScheduleService({
+        paseoHome: tempDir,
+        logger: createTestLogger(),
+        agentManager: new AgentManager({ logger: createTestLogger() }),
+        agentStorage,
+        providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+        now: () => now,
+        runner: async () => ({ agentId: null, output: "ok" }),
+      });
+      const due = await service.create({
+        prompt: "check the recurring slot",
+        cadence,
+        runOnCreate: false,
+        target: { type: "new-agent", config: { provider: "claude", cwd: tempDir } },
+      });
+      now = new Date(due.nextRunAt!);
+
+      // Replay the same captured due slot, as duplicate fires do. Normal tick
+      // admission would read the advanced schedule and suppress these duplicates.
+      for (let fire = 0; fire < 3; fire++) {
+        await (service as unknown as ScheduleServiceInternals).runSchedule(due, now);
+        const inspected = await service.inspect(due.id);
+        expect(inspected.runs).toHaveLength(fire + 1);
+        expect(inspected.runs.every((run) => run.scheduledFor === due.nextRunAt)).toBe(true);
+        expect(inspected.runs.every((run) => run.status === "succeeded")).toBe(true);
+        expect(inspected.nextRunAt).toBe(followingPeriod);
+        now = new Date(now.getTime() + 1_000);
+      }
+    },
+  );
 
   test("pause and resume update persisted schedule state", async () => {
     const service = createScheduleService({
@@ -695,6 +749,76 @@ describe("ScheduleService", () => {
         archivedAt: expect.any(String),
       }),
     );
+  });
+
+  test("fires again when the post-archive snapshot never settles", async () => {
+    const { workspaceRegistry, createDirectoryWorkspace, createArchiveWorkspace } =
+      await createRegistryBackedScheduleWorkspaceDeps(tempDir);
+    const manager = new AgentManager({
+      logger: createTestLogger(),
+      clients: createTestAgentClients(),
+      registry: agentStorage,
+    });
+    const getSnapshot = vi.fn<WorkspaceGitService["getSnapshot"]>(() => new Promise(() => {}));
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: manager,
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      createDirectoryWorkspace: async (input) => {
+        const workspace = await createDirectoryWorkspace(input);
+        const updated = await workspaceRegistry.update(workspace.workspaceId, (record) => ({
+          ...record,
+          mainRepoRoot: tempDir,
+        }));
+        if (!updated) throw new Error("Missing scheduled workspace");
+        return updated;
+      },
+      archiveWorkspace: createArchiveWorkspace({
+        agentManager: manager,
+        agentStorage,
+        workspaceGitService: { getSnapshot },
+      }),
+      now: () => now,
+    });
+    const created = await service.create({
+      prompt: "archive and run again despite a blocked snapshot",
+      cadence: { type: "every", everyMs: 60_000 },
+      target: {
+        type: "new-agent",
+        config: { provider: "claude", model: "test-model", cwd: tempDir, archiveOnFinish: true },
+      },
+    });
+    for (let run = 0; run < 2; run++) {
+      const tick = service.tick();
+      let finished = false;
+      void tick.then(
+        () => {
+          finished = true;
+          return true;
+        },
+        () => {
+          finished = true;
+          return true;
+        },
+      );
+      await vi.waitFor(() => expect(finished).toBe(true), { timeout: 7_000 });
+      await tick;
+      const inspected = await service.inspect(created.id);
+      expect(inspected.runs).toHaveLength(run + 1);
+      expect(inspected.runs.every((entry) => entry.status === "succeeded")).toBe(true);
+      const agentId = inspected.runs[run]!.agentId!;
+      expect((await agentStorage.get(agentId))?.archivedAt).toBeTruthy();
+      const workspaceId = inspected.runs[run]!.workspaceId!;
+      expect((await workspaceRegistry.get(workspaceId))?.archivedAt).toBeTruthy();
+      expect(getSnapshot).toHaveBeenCalledWith(tempDir, {
+        force: true,
+        reason: "archive-worktree",
+      });
+      now = new Date(inspected.nextRunAt!);
+    }
+    expect(getSnapshot).toHaveBeenCalledTimes(2);
   });
 
   test("archives the run workspace when scheduled agent creation fails before archive opt-out can preserve an agent", async () => {

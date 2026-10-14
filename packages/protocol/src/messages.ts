@@ -1867,6 +1867,40 @@ export const AgentTimelineCursorSchema = z.object({
   seq: z.number().int().nonnegative(),
 });
 
+export const TimelineHistoryGapSchema = z.object({
+  startIndex: z.number().int().nonnegative(),
+  endIndex: z.number().int().nonnegative(),
+  count: z.number().int().nonnegative(),
+  bytes: z.number().int().nonnegative(),
+});
+export const TimelineHistoryWindowInfoSchema = z.object({
+  headEvents: z.number().int().nonnegative(),
+  tailEvents: z.number().int().nonnegative(),
+  gap: TimelineHistoryGapSchema.nullable(),
+  totalEvents: z.number().int().nonnegative(),
+  totalBytes: z.number().int().nonnegative(),
+  unit: z.enum(["events", "provider_items"]),
+});
+export const AgentTimelineHistoryRequestMessageSchema = z.object({
+  type: z.literal("agent.timeline.history.request"),
+  requestId: z.string(),
+  agentId: z.string(),
+  operation: z.enum(["windows", "page"]),
+  epoch: z.string().optional(),
+  cursor: z.number().int().nonnegative().optional(),
+  direction: z.enum(["before", "after"]).optional(),
+  limit: z
+    .object({
+      events: z.number().int().min(1).max(128),
+      bytes: z
+        .number()
+        .int()
+        .min(1)
+        .max(256 * 1024),
+    })
+    .optional(),
+});
+
 export const FetchAgentTimelineRequestMessageSchema = z.object({
   type: z.literal("fetch_agent_timeline_request"),
   agentId: z.string(),
@@ -1887,12 +1921,14 @@ export const AgentTimelineSearchRequestMessageSchema = z.object({
   requestId: z.string(),
   query: z.string(),
   cursor: z.number().int().nonnegative().optional(),
+  includeProviderHistory: z.boolean().optional(),
 });
 
 export const AgentTimelineListPromptsRequestMessageSchema = z.object({
   type: z.literal("agent.timeline.list_prompts.request"),
   agentId: z.string(),
   requestId: z.string(),
+  includeProviderHistory: z.boolean().optional(),
 });
 
 export const ProviderSubagentListRequestMessageSchema = z.object({
@@ -3286,6 +3322,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   RestartServerRequestMessageSchema,
   DaemonUpdateRequestMessageSchema,
   FetchAgentTimelineRequestMessageSchema,
+  AgentTimelineHistoryRequestMessageSchema,
   AgentTimelineSearchRequestMessageSchema,
   AgentTimelineListPromptsRequestMessageSchema,
   ProviderSubagentListRequestMessageSchema,
@@ -3577,6 +3614,7 @@ export const ServerInfoStatusPayloadSchema = z
         // COMPAT(workspaceRequestReceipts): added in v0.8.0; remove gate after 2027-03-07.
         workspaceRequestReceipts: z.boolean().optional(),
         creationLifecycle: z.boolean().optional(),
+        boundedTimelineHistory: z.boolean().optional(),
         // COMPAT(hubAgentRpc): added in v0.8.0; remove gate after 2027-03-05.
         hubAgentRpc: z.boolean().optional(),
         // COMPAT(internalAgents): added in v0.9.0; remove gate after 2027-03-17.
@@ -4622,6 +4660,40 @@ export const AgentTimelineEntryPayloadSchema = z.object({
   collapsed: z.array(z.enum(["assistant_merge", "reasoning_merge", "tool_lifecycle", "identity"])),
 });
 
+export const TimelineHistoryEntrySchema = z.object({
+  index: z.number().int().nonnegative(),
+  bytes: z.number().int().nonnegative(),
+  provider: AgentProviderSchema,
+  item: AgentTimelineItemPayloadSchema,
+  timestamp: z.string().optional(),
+  turnId: z.string().optional(),
+});
+export const AgentTimelineHistoryResponseMessageSchema = z.object({
+  type: z.literal("agent.timeline.history.response"),
+  payload: z.object({
+    requestId: z.string(),
+    agentId: z.string(),
+    epoch: z.string(),
+    unit: z.enum(["events", "provider_items"]),
+    liveAfterSeq: z.number().int().nonnegative().optional(),
+    head: z.array(TimelineHistoryEntrySchema).optional(),
+    tail: z.array(TimelineHistoryEntrySchema).optional(),
+    gap: TimelineHistoryGapSchema.nullable().optional(),
+    totalEvents: z.number().int().nonnegative().optional(),
+    totalBytes: z.number().int().nonnegative().optional(),
+    entries: z.array(TimelineHistoryEntrySchema).optional(),
+    oversized: z
+      .array(
+        z.object({ index: z.number().int().nonnegative(), bytes: z.number().int().nonnegative() }),
+      )
+      .optional(),
+    nextCursor: z.number().int().nonnegative().nullable().optional(),
+    coveredCount: z.number().int().nonnegative().optional(),
+    coveredBytes: z.number().int().nonnegative().optional(),
+    error: z.string().nullable(),
+  }),
+});
+
 export const FetchAgentTimelineResponseMessageSchema = z.object({
   type: z.literal("fetch_agent_timeline_response"),
   payload: z.object({
@@ -4645,6 +4717,7 @@ export const FetchAgentTimelineResponseMessageSchema = z.object({
     hasNewer: z.boolean(),
     mergeWindow: z.boolean().optional(),
     entries: z.array(AgentTimelineEntryPayloadSchema),
+    historyWindow: TimelineHistoryWindowInfoSchema.optional(),
     error: z.string().nullable(),
   }),
 });
@@ -4671,6 +4744,8 @@ export const AgentTimelineSearchResponseMessageSchema = z.object({
         // Estimated occurrences in the message; the client verifies against rendered text.
         // COMPAT(timelineSearchCount): added in v0.9.0, remove optional after 2027-09-22.
         count: z.number().int().positive().optional(),
+        historyIndex: z.number().int().nonnegative().optional(),
+        messageId: z.string().optional(),
       }),
     ),
     nextCursor: z.number().int().nonnegative().nullable(),
@@ -4689,6 +4764,8 @@ export const AgentTimelineListPromptsResponseMessageSchema = z.object({
         seq: z.number().int().nonnegative(),
         timestamp: z.string(),
         preview: z.string(),
+        historyIndex: z.number().int().nonnegative().optional(),
+        messageId: z.string().optional(),
       }),
     ),
     error: z.string().nullable(),
@@ -6922,6 +6999,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   ArchiveWorkspaceResponseMessageSchema,
   FetchAgentResponseMessageSchema,
   FetchAgentTimelineResponseMessageSchema,
+  AgentTimelineHistoryResponseMessageSchema,
   AgentTimelineReplacementMessageSchema,
   AgentTimelineSearchResponseMessageSchema,
   AgentTimelineListPromptsResponseMessageSchema,

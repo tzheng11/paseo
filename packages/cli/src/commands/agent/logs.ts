@@ -4,6 +4,7 @@ import { waitForStop } from "../../utils/wait-for-stop.js";
 import type { CommandOptions } from "../../output/index.js";
 import {
   fetchProjectedTimelineItems,
+  fetchProjectedHistoryPage,
   LIVE_HISTORY_FETCH_TIMEOUT_MS,
 } from "../../utils/timeline.js";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
@@ -16,6 +17,7 @@ export function addLogsOptions(cmd: Command): Command {
     .argument("<id>", "Agent ID (or prefix)")
     .option("-f, --follow", "Follow log output (streaming)")
     .option("--tail <n>", "Show last n entries")
+    .option("--history-cursor <index>", "Read a bounded page from the middle of stored history")
     .option("--filter <type>", "Filter by event type (tools, text, errors, permissions)")
     .option("--since <time>", "Show logs since timestamp");
 }
@@ -25,6 +27,7 @@ export interface AgentLogsOptions extends CommandOptions {
   tail?: string;
   filter?: string;
   since?: string;
+  historyCursor?: string;
 }
 
 // Logs command returns void - it outputs directly to console
@@ -47,10 +50,19 @@ export function formatAgentActivityTranscript(
   if (tailCount === 0) {
     return "";
   }
-  return curateAgentActivity(
+  const notices = timelineItems.flatMap((item) =>
+    item.type === "notification" &&
+    (item.message.startsWith("History gap:") ||
+      item.message.startsWith("Next history cursor:") ||
+      item.message.startsWith("Oversized history items:"))
+      ? [item.message]
+      : [],
+  );
+  const activity = curateAgentActivity(
     timelineItems,
     tailCount !== undefined ? { maxItems: tailCount } : undefined,
   );
+  return [...notices, activity].filter(Boolean).join("\n\n");
 }
 
 function parseTailCount(raw: string | undefined): number | undefined {
@@ -85,6 +97,31 @@ function matchesFilter(item: AgentTimelineItem, filter?: string): boolean {
       // If filter doesn't match predefined types, match against the actual type
       return type.includes(filterLower);
   }
+}
+
+export async function fetchAgentHistoryCursorItems(
+  client: DaemonClient,
+  agentId: string,
+  historyCursor: string,
+): Promise<AgentTimelineItem[]> {
+  const cursor = Number(historyCursor);
+  if (!Number.isSafeInteger(cursor) || cursor < 0 || !/^\d+$/.test(historyCursor))
+    throw new Error("--history-cursor requires a nonnegative integer");
+  const page = await fetchProjectedHistoryPage({ client, agentId: agentId, cursor });
+  const timelineItems: AgentTimelineItem[] = (page.entries ?? []).map((entry) => entry.item);
+  if (page.nextCursor !== null && page.nextCursor !== undefined)
+    timelineItems.unshift({
+      type: "notification",
+      level: "info",
+      message: `Next history cursor: ${page.nextCursor}`,
+    });
+  if (page.oversized?.length)
+    timelineItems.unshift({
+      type: "notification",
+      level: "info",
+      message: `Oversized history items: ${page.oversized.length} (not decoded in this page)`,
+    });
+  return timelineItems;
 }
 
 export async function runLogsCommand(
@@ -123,7 +160,10 @@ export async function runLogsCommand(
     }
 
     // Fetch timeline directly via cursor RPC.
-    let timelineItems = await fetchAgentTimelineItems(client, resolvedId);
+    let timelineItems =
+      options.historyCursor === undefined
+        ? await fetchAgentTimelineItems(client, resolvedId)
+        : await fetchAgentHistoryCursorItems(client, resolvedId, options.historyCursor);
 
     // Apply filter
     if (options.filter) {

@@ -6028,6 +6028,40 @@ test("getTimelineRows falls back to the in-memory timeline when no durable store
   ]);
 });
 
+test("streamTimelineRows yields projected history without calling the full-array reader", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-stream-timeline-"));
+  const timelineStore = new InMemoryAgentTimelineStore();
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    timelineStore,
+    logger,
+  });
+  let agentId: string | undefined;
+  try {
+    const snapshot = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = snapshot.id;
+    await manager.appendTimelineItem(snapshot.id, { type: "assistant_message", text: "first" });
+    await manager.appendTimelineItem(snapshot.id, { type: "assistant_message", text: " second" });
+    const fullReader = vi.spyOn(timelineStore, "getRows").mockImplementation(() => {
+      throw new Error("full materialization");
+    });
+    const result: AgentTimelineRow[] = [];
+    for await (const row of manager.streamTimelineRows(snapshot.id)) result.push(row);
+    expect(result).toEqual([
+      expect.objectContaining({
+        seq: 2,
+        item: { type: "assistant_message", text: "first second" },
+      }),
+    ]);
+    expect(fullReader).not.toHaveBeenCalled();
+  } finally {
+    if (agentId) await manager.closeAgent(agentId);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("getAgent does not expose committed history internals once manager owns the seam", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-timeline-boundary-"));
   const storagePath = join(workdir, "agents");
@@ -12115,3 +12149,63 @@ test.each([false, true])(
     }
   },
 );
+
+test("metrics count projected history without materializing timeline arrays", async () => {
+  const manager = new AgentManager({ clients: { codex: new TestAgentClient() }, logger });
+  const agent = await manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
+    workspaceId: undefined,
+  });
+  await manager.appendTimelineItem(agent.id, { type: "assistant_message", text: "A" });
+  await manager.appendTimelineItem(agent.id, { type: "assistant_message", text: "B" });
+  await manager.appendTimelineItem(agent.id, { type: "user_message", text: "next" });
+  const snapshotSpy = vi
+    .spyOn(InMemoryAgentTimelineStore.prototype, "getItems")
+    .mockImplementation(() => {
+      throw new Error("metrics must not materialize history");
+    });
+  try {
+    expect(manager.getMetricsSnapshot().timelineStats).toEqual({
+      totalItems: 2,
+      maxItemsPerAgent: 2,
+    });
+  } finally {
+    snapshotSpy.mockRestore();
+    await manager.closeAgent(agent.id);
+  }
+});
+
+test("provider metadata reaches clients without materializing plugin timeline history", async () => {
+  const client = new SessionRecordingAgentClient();
+  const store = new InMemoryAgentTimelineStore();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    logger,
+    timelineStore: store,
+    pluginLifecycle: { emit: vi.fn(), before: async (_name, request) => request },
+  });
+  const agent = await manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
+    workspaceId: undefined,
+  });
+  const snapshots = vi.spyOn(store, "getItems");
+  const events: AgentManagerEvent[] = [];
+  const unsubscribe = manager.subscribe((event) => events.push(event));
+  try {
+    client.sessions[0].pushEvent({
+      type: "usage_updated",
+      provider: "codex",
+      usage: { inputTokens: 1 },
+    });
+    await manager.flush();
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "agent_stream",
+        agentId: agent.id,
+        event: { type: "usage_updated", provider: "codex", usage: { inputTokens: 1 } },
+      }),
+    );
+    expect(snapshots).not.toHaveBeenCalled();
+  } finally {
+    unsubscribe();
+    await manager.closeAgent(agent.id);
+  }
+});

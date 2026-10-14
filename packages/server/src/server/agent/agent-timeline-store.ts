@@ -1,3 +1,4 @@
+import type { HistoryReadLimit, HistoryWindows } from "./agent-history-replay.js";
 import { randomUUID } from "node:crypto";
 import { TimelineProjection, type ProjectedTimelineRow } from "./timeline-projection.js";
 import type { AgentTimelineItem } from "./agent-sdk-types.js";
@@ -65,6 +66,50 @@ export class InMemoryAgentTimelineStore {
     return this.requireState(agentId).projection.getRecentItems(limit);
   }
 
+  readWindows(
+    agentId: string,
+    limits: { head: HistoryReadLimit; tail: HistoryReadLimit },
+  ): HistoryWindows<AgentTimelineItem> {
+    const rows = this.requireState(agentId).projection.getRows();
+    const records = rows.map((row, index) => ({
+      index,
+      bytes: Buffer.byteLength(JSON.stringify(row), "utf8"),
+      value: row.item,
+    }));
+    const head = [];
+    let bytes = 0;
+    for (const record of records.slice(0, limits.head.events)) {
+      if (bytes + record.bytes > limits.head.bytes) break;
+      head.push(record);
+      bytes += record.bytes;
+    }
+    const tail = [];
+    bytes = 0;
+    for (const record of records.slice(head.length).toReversed().slice(0, limits.tail.events)) {
+      if (bytes + record.bytes > limits.tail.bytes) break;
+      tail.push(record);
+      bytes += record.bytes;
+    }
+    tail.reverse();
+    const end = tail[0]?.index ?? records.length;
+    const totalBytes = records.reduce((sum, record) => sum + record.bytes, 0);
+    return {
+      head,
+      tail,
+      totalEvents: records.length,
+      totalBytes,
+      gap:
+        head.length < end
+          ? {
+              startIndex: head.length,
+              endIndex: end - 1,
+              count: end - head.length,
+              bytes: totalBytes - [...head, ...tail].reduce((sum, entry) => sum + entry.bytes, 0),
+            }
+          : null,
+    };
+  }
+
   getItems(agentId: string): AgentTimelineItem[] {
     return this.requireState(agentId)
       .projection.getRows()
@@ -73,6 +118,18 @@ export class InMemoryAgentTimelineStore {
 
   getRows(agentId: string): ProjectedTimelineRow[] {
     return this.requireState(agentId).projection.getRows();
+  }
+
+  async *streamRows(agentId: string): AsyncGenerator<ProjectedTimelineRow> {
+    // This store is for tests and small provider-subagent projections. The
+    // production disk store decodes one row at a time without collecting it.
+    const state = this.requireState(agentId);
+    const nextSeq = state.nextSeq;
+    for (const row of state.projection.getRows()) {
+      if (this.states.get(agentId) !== state || state.nextSeq !== nextSeq)
+        throw new Error("History changed during streamed read");
+      yield cloneRow(row);
+    }
   }
 
   getSubmittedUserMessage(agentId: string, clientMessageId: string): AgentTimelineRow | null {
@@ -166,6 +223,27 @@ export class InMemoryAgentTimelineStore {
 
   getLastAssistantMessageSegment(agentId: string): string | null {
     return this.requireState(agentId).projection.getLastAssistantMessageSegment();
+  }
+
+  getLastAssistantMessageSegmentInfo(
+    agentId: string,
+  ): { text: string; startsAtBeginning: boolean } | null {
+    // This small in-memory projection is used by tests/subagents; production reads
+    // only the final segment from SQLite metadata and payload rows.
+    const rows = this.requireState(agentId).projection.getRows();
+    const chunks: string[] = [];
+    let pos = rows.length - 1;
+    for (; pos >= 0; pos--) {
+      const item = rows[pos].item;
+      if (item.type !== "assistant_message") {
+        if (chunks.length) break;
+        continue;
+      }
+      chunks.push(item.text);
+    }
+    return chunks.length
+      ? { text: chunks.toReversed().join(""), startsAtBeginning: pos < 0 }
+      : null;
   }
 
   getLastAssistantMessage(agentId: string): string | null {

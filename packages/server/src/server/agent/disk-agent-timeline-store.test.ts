@@ -29,6 +29,43 @@ const tool = (callId: string, status: "running" | "completed"): AgentTimelineIte
 });
 
 describe("DiskAgentTimelineStore", () => {
+  it("reads only the final assistant segment and identifies a durable-history join", () => {
+    const store = createStore();
+    store.initialize("segment");
+    store.append("segment", { type: "assistant_message", messageId: "first", text: "A" });
+    expect(store.getLastAssistantMessageSegmentInfo("segment")).toEqual({
+      text: "A",
+      startsAtBeginning: true,
+    });
+    store.append("segment", { type: "user_message", text: "Boundary" });
+    store.append("segment", { type: "assistant_message", messageId: "last", text: "B" });
+    expect(store.getLastAssistantMessageSegmentInfo("segment")).toEqual({
+      text: "B",
+      startsAtBeginning: false,
+    });
+    expect(store.getLastAssistantMessageSegment("segment")).toBe("B");
+  });
+  it("streams projected history without collecting payloads and rejects a changing epoch", async () => {
+    const store = createStore();
+    store.initialize("stream", { epoch: "before" });
+    for (let index = 0; index < 1000; index++)
+      store.append("stream", {
+        type: "user_message",
+        text: "x".repeat(4096),
+        messageId: String(index),
+      });
+    let count = 0;
+    for await (const row of store.streamRows("stream")) {
+      expect(row.seq).toBe(++count);
+      expect(row.item.type).toBe("user_message");
+    }
+    expect(count).toBe(1000);
+    expect(store.cachedBytes).toBeLessThanOrEqual(1024);
+    const iterator = store.streamRows("stream");
+    expect((await iterator.next()).done).toBe(false);
+    store.initialize("stream", { epoch: "after" });
+    await expect(iterator.next()).rejects.toThrow("History changed");
+  });
   it("cleans caches left by a dead process without touching live or unrelated directories", () => {
     const directory = mkdtempSync(path.join(tmpdir(), "paseo-timeline-owner-test-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
@@ -160,4 +197,33 @@ describe("DiskAgentTimelineStore", () => {
     expect(disk.getItems("a")).toEqual([]);
     expect(disk.append("a", { type: "user_message", text: "fresh" }).seq).toBe(1);
   });
+});
+
+it("decodes bounded projection edges and accounts for a huge unloaded middle", () => {
+  const store = createStore(1024);
+  store.initialize("windows");
+  for (let index = 0; index < 10; index++)
+    store.append("windows", {
+      type: "user_message",
+      messageId: String(index),
+      text: "x".repeat(index === 5 ? 1024 * 1024 : 100),
+    });
+  const windows = store.readWindows("windows", {
+    head: { events: 2, bytes: 4096 },
+    tail: { events: 3, bytes: 4096 },
+  });
+  expect(windows.head.map((entry) => entry.index)).toEqual([0, 1]);
+  expect(windows.tail.map((entry) => entry.index)).toEqual([7, 8, 9]);
+  expect(windows.gap).toMatchObject({ startIndex: 2, endIndex: 6, count: 5 });
+  expect(windows.gap!.bytes).toBeGreaterThan(1024 * 1024);
+  const before = windows.totalBytes;
+  store.append("windows", { type: "assistant_message", messageId: "a", text: "small" });
+  store.append("windows", { type: "assistant_message", messageId: "a", text: " suffix" });
+  const updated = store.readWindows("windows", {
+    head: { events: 1, bytes: 4096 },
+    tail: { events: 1, bytes: 4096 },
+  });
+  expect(updated.totalEvents).toBe(11);
+  expect(updated.totalBytes).toBeGreaterThan(before);
+  expect(updated.tail[0].value).toMatchObject({ type: "assistant_message", text: "small suffix" });
 });

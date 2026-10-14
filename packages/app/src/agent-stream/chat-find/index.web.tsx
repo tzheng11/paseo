@@ -60,13 +60,19 @@ export function ChatFind({
   viewportRef,
   revealLoadedMessage,
   visibleMessageIds,
+  loadHistoryIndex,
   children,
 }: ChatFindProps) {
   const { t } = useTranslation();
   const widget = useRef<PaneFindHandle>(null);
   const root = useRef<HTMLDivElement>(null);
-  const bindings = useRef({ viewportRef, revealLoadedMessage, visibleMessageIds });
-  bindings.current = { viewportRef, revealLoadedMessage, visibleMessageIds };
+  const bindings = useRef({
+    viewportRef,
+    revealLoadedMessage,
+    visibleMessageIds,
+    loadHistoryIndex,
+  });
+  bindings.current = { viewportRef, revealLoadedMessage, visibleMessageIds, loadHistoryIndex };
   const [highlightName] = useState(() => `paseo-chat-find-${++nextHighlightId}`);
   const { isInteractive } = usePaneFocus();
   const active = useRetainedPanelActive();
@@ -76,9 +82,19 @@ export function ChatFind({
         search(query, cursor) {
           const client = getHostRuntimeStore().getClient(serverId);
           if (!client) return Promise.reject(new Error("Host disconnected"));
-          return client.searchAgentTimeline({ agentId, query, cursor });
+          return client.searchAgentTimeline({
+            agentId,
+            query,
+            cursor,
+            includeProviderHistory: bindings.current.loadHistoryIndex !== undefined,
+          });
         },
-        load(targetEpoch, seq) {
+        load(targetEpoch, seq, historyIndex) {
+          if (historyIndex !== undefined) {
+            if (!bindings.current.loadHistoryIndex)
+              throw new Error("History paging is unavailable");
+            return bindings.current.loadHistoryIndex(historyIndex);
+          }
           return getHostRuntimeStore().fetchAgentTimeline(
             serverId,
             agentId,

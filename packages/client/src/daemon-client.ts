@@ -678,6 +678,7 @@ export interface AgentTimelineSearchOptions {
   agentId: string;
   query: string;
   cursor?: number;
+  includeProviderHistory?: boolean;
 }
 
 export type AgentTimelineSearchPayload = Extract<
@@ -3258,6 +3259,25 @@ export class DaemonClient {
     });
   }
 
+  async fetchAgentTimelineHistory(
+    input: Omit<
+      Extract<SessionInboundMessage, { type: "agent.timeline.history.request" }>,
+      "type" | "requestId"
+    >,
+  ) {
+    // COMPAT(boundedTimelineHistory): added in v0.11.2; remove after 2027-04-12.
+    if (this.lastServerInfoMessage?.features?.boundedTimelineHistory !== true)
+      throw new Error("Update the host to load bounded history pages.");
+    const requestId = this.createRequestId();
+    const payload = await this.sendCorrelatedSessionRequest({
+      requestId,
+      message: { type: "agent.timeline.history.request", requestId, ...input },
+      responseType: "agent.timeline.history.response",
+    });
+    if (payload.error) throw new Error(payload.error);
+    return payload;
+  }
+
   async fetchAgentTimeline(
     agentId: string,
     options: FetchAgentTimelineOptions = {},
@@ -3314,11 +3334,19 @@ export class DaemonClient {
     agentId,
     query,
     cursor,
+    includeProviderHistory,
   }: AgentTimelineSearchOptions): Promise<AgentTimelineSearchPayload> {
     const requestId = this.createRequestId();
     const payload = await this.sendCorrelatedSessionRequest({
       requestId,
-      message: { type: "agent.timeline.search.request", requestId, agentId, query, cursor },
+      message: {
+        type: "agent.timeline.search.request",
+        requestId,
+        agentId,
+        query,
+        cursor,
+        includeProviderHistory,
+      },
       responseType: "agent.timeline.search.response",
     });
     if (payload.error) throw new Error(payload.error);
@@ -3327,13 +3355,14 @@ export class DaemonClient {
 
   async listAgentTimelinePrompts(
     agentId: string,
-    options: { requestId?: string; timeout?: number } = {},
+    options: { requestId?: string; timeout?: number; includeProviderHistory?: boolean } = {},
   ): Promise<AgentTimelinePromptIndexPayload> {
     const requestId = this.createRequestId(options.requestId);
     const message = SessionInboundMessageSchema.parse({
       type: "agent.timeline.list_prompts.request",
       agentId,
       requestId,
+      includeProviderHistory: options.includeProviderHistory,
     });
     const payload = await this.sendRequest({
       requestId,

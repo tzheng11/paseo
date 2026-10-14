@@ -91,6 +91,18 @@ await daemon.close(); // stops daemon + cleans up temp dirs
 
 The test helper does **not** expose `providerOverrides`. In test harnesses, use `createPaseoDaemon` directly when you need it (see quick start above).
 
+## macOS Git and watcher load
+
+Use `packages/server/scripts/measure-workspace-watch-load.ts` for the isolated real Git/FSEvents replay. It creates its own repositories and daemon home, uses an ephemeral loopback port, and bounds its child with an external watchdog. Run it through the host's heavy-job admission wrapper. Never point its entry overrides at a serving runtime.
+
+The default topology is 85 repositories with 160 packages each. Repeat with `PASEO_WATCH_LOAD_FD_LIMIT=256` and `1024`. Native setup uses the Git service's observation admission bound; starting 85 inventories together exercises a different load. Set `PASEO_WATCH_LOAD_NEXT_ROOT` to an installed Next app's node_modules. The real build starts only after every workspace's tracked edit reaches the daemon. Its child has a separate 4,096 descriptor limit so a build-process EMFILE does not masquerade as a watcher result.
+
+The all-polling phase deliberately rejects watcher admission with EMFILE and holds polling refresh dependencies pending. Other checkout operations remain real Git. It measures an uncached demand snapshot while the fault is present, releases the hold, then requires native recovery and an edit callback from every workspace. This reproduces starvation tolerance at known boundaries; it does not identify why a production dependency stopped settling. The separate fresh-daemon phase measures actual checkout_status protocol reads during cold refresh.
+
+For a focused failure comparison, set `PASEO_WATCH_LOAD_POLLING_ONLY=1`. `PASEO_WATCH_LOAD_GIT_SERVICE_ENTRY` can select a preserved compiled service; `PASEO_WATCH_LOAD_EXPECT_STARVATION=1` records the old failure rather than calling it a candidate pass. Use independent validation copies with workspace links bound to their own packages. Preserve failed attempts and admission diagnostics.
+
+Full tracked-edit coverage and actual cold reads below ten seconds are functional requirements. Responsiveness acceptance needs paired complete windows under the same load: compare distinct stalls over ten seconds, count per hour, maximum and histogram p99 at the same resolution. Short successful runs do not establish that comparison.
+
 ## Common client methods
 
 ```typescript

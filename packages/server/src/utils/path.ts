@@ -47,6 +47,42 @@ export function createPathEquivalenceMatcher(target: string): (candidate: string
   };
 }
 
+interface WatchPathFilterOptions {
+  root: string;
+  ignoredRoots: Iterable<string>;
+}
+
+/**
+ * Filter observer paths constructed in the same lexical namespace as root.
+ * Dependency installs can deliver thousands of ignored paths at once. Resolving
+ * each event/ignore pair on disk blocks the daemon; ancestor lookups cost only
+ * path depth, preserve deleted paths, and never access the filesystem.
+ */
+export function createLexicalWatchPathFilter({
+  root,
+  ignoredRoots,
+}: WatchPathFilterOptions): (candidate: string) => boolean {
+  const compareAsWindows = looksLikeDefiniteWindowsPath(root);
+  const pathApi = compareAsWindows ? nodePath.win32 : nodePath.posix;
+  const normalizedRoot = normalizePathForComparison(root, compareAsWindows);
+  const ignored = new Set(
+    Array.from(ignoredRoots, (value) => normalizePathForComparison(value, compareAsWindows)),
+  );
+
+  return (candidate) => {
+    let ancestor = normalizePathForComparison(candidate, compareAsWindows);
+    // A root metadata event does not describe a changed descendant.
+    if (ancestor === normalizedRoot) return false;
+    for (;;) {
+      if (ignored.has(ancestor)) return false;
+      if (ancestor === normalizedRoot) return true;
+      const parent = pathApi.dirname(ancestor);
+      if (parent === ancestor) return false;
+      ancestor = parent;
+    }
+  };
+}
+
 export function createRealpathAwarePathMatcher(target: string): (candidate: string) => boolean {
   const targetMatchers = collectPathVariants(target).map((variant) =>
     createPathEquivalenceMatcher(variant),
