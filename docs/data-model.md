@@ -590,7 +590,9 @@ host, kinds, and ids. Opening a cached workspace uses exact workspace and projec
 directory scan. One invalid row is deleted and returned as a miss without affecting other rows.
 An invalid directory row and its affected checkpoint cursor are repaired in one transaction, so a
 later launch cannot accept a checkpoint for a partial baseline. Directory changes and their
-checkpoint are also applied in one transaction.
+checkpoint are also applied in one transaction. Workspace Info values travel with their cached
+workspace row. Checkpoints from clients that omitted those values refresh only the workspace
+baseline, preserving project/agent cursors and cached timelines.
 
 The cache is capped at 32 MiB and evicts whole hosts in least-recently-written order. Budget
 bookkeeping may scan opaque row sizes during a deferred write, never during host registry startup or

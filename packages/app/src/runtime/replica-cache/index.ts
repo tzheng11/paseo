@@ -313,6 +313,7 @@ const StoredWorkspaceSchema = z.strictObject({
   // dropped them painted its row without its chips and stayed that way: the directory cursor is
   // current on reconnect, so the daemon has nothing newer to send back.
   labels: z.array(z.string()).optional(),
+  fieldValues: z.record(z.string(), z.string()).optional(),
   status: z.enum(["needs_input", "failed", "running", "attention", "done"]),
   statusEnteredAt: IsoDateSchema.nullable(),
   activityAt: z.null(),
@@ -382,15 +383,22 @@ const DirectoryCheckpointSchema = z.strictObject({
 // Revalidate directory contents once without evicting cached rows or timelines.
 const StoredDirectoryCheckpointSchema = z.strictObject({
   version: z.literal(1),
+  workspaceFieldsVersion: z.literal(1).optional(),
   cursors: DirectoryCheckpointSchema,
 });
 
 function serializeDirectoryCheckpoint(cursors: DirectoryCheckpoint) {
-  return { version: 1 as const, cursors };
+  return { version: 1 as const, workspaceFieldsVersion: 1 as const, cursors };
 }
 
 function deserializeDirectoryCheckpoint(payload: string): DirectoryCheckpoint {
-  return parseStoredPayload(StoredDirectoryCheckpointSchema, payload).cursors;
+  const stored = parseStoredPayload(StoredDirectoryCheckpointSchema, payload);
+  const cursors = { ...stored.cursors };
+  // COMPAT(workspaceFieldCache): added in v0.11.3; remove after 2027-04-15.
+  // Earlier workspace rows omitted Info values. Refresh that baseline even when
+  // its cursor is current, preserving other cached directories and timelines.
+  if (stored.workspaceFieldsVersion === undefined) delete cursors.workspaces;
+  return cursors;
 }
 
 function deserializeTimeline(stored: StoredTimeline | null): CachedTimeline | null {
@@ -702,6 +710,7 @@ function serializeWorkspace(workspace: WorkspaceDescriptor): StoredWorkspace {
     title: workspace.title ?? null,
     pinnedAt: workspace.pinnedAt ?? null,
     labels: workspace.labels,
+    fieldValues: workspace.fieldValues ?? {},
     status: workspace.status,
     statusEnteredAt: workspace.statusEnteredAt?.toISOString() ?? null,
     activityAt: null,
