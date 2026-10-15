@@ -21,6 +21,7 @@ describe("migrateSidebarOrderState", () => {
     expect(migrated).toEqual({
       projectOrder: ["project-a"],
       pinnedWorkspaceOrder: [],
+      pinnedWorkspaceSortMode: "manual",
       workspaceOrderByProject: {
         "project-a": ["host-a:main", "host-a:feature", "host-b:main"],
       },
@@ -33,6 +34,35 @@ describe("migrateSidebarOrderState", () => {
     });
 
     expect(migrated.pinnedWorkspaceOrder).toEqual(["host-a:one", "host-b:two"]);
+  });
+
+  it("preserves alphabetical sorting and manual order during migration", () => {
+    expect(
+      migrateSidebarOrderState({
+        pinnedWorkspaceSortMode: "alphabetical",
+        pinnedWorkspaceOrder: ["b", "a"],
+      }),
+    ).toMatchObject({
+      pinnedWorkspaceSortMode: "alphabetical",
+      pinnedWorkspaceOrder: ["b", "a"],
+    });
+  });
+
+  it("restores the saved manual order after toggling sort modes", () => {
+    const store = useSidebarOrderStore.getState();
+    store.setPinnedWorkspaceOrder(["b", "a"]);
+    store.setPinnedWorkspaceSortMode("alphabetical");
+    expect(useSidebarOrderStore.getState().pinnedWorkspaceOrder).toEqual(["b", "a"]);
+    store.setPinnedWorkspaceSortMode("manual");
+    expect(useSidebarOrderStore.getState().pinnedWorkspaceOrder).toEqual(["b", "a"]);
+  });
+
+  it("returns to manual sorting when pinned workspaces are dragged", () => {
+    const store = useSidebarOrderStore.getState();
+    store.setPinnedWorkspaceSortMode("alphabetical");
+    store.setPinnedWorkspaceOrder(["c", "a", "b"]);
+    expect(useSidebarOrderStore.getState().pinnedWorkspaceSortMode).toBe("manual");
+    expect(useSidebarOrderStore.getState().pinnedWorkspaceOrder).toEqual(["c", "a", "b"]);
   });
 });
 

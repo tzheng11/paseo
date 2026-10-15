@@ -113,6 +113,76 @@ function twoProjectInput(groupMode: "project" | "status") {
 }
 
 describe("buildSidebarProjection", () => {
+  for (const groupMode of ["project", "status"] as const) {
+    it(`sorts pinned display names naturally and keeps ${groupMode} shortcuts in the same order`, () => {
+      const workspaces = [makeWorkspace("z"), makeWorkspace("a10"), makeWorkspace("a2")];
+      workspaces[0]!.entry.name = "Zeta";
+      workspaces[1]!.entry.name = "alpha 10";
+      workspaces[2]!.entry.name = "Alpha 2";
+      const input = {
+        ...projectionInput({ groupMode }),
+        projects: [makeProject(workspaces.map((workspace) => workspace.placement))],
+        pinnedKeys: {
+          pinnedWorkspaceKeys: workspaces.map((workspace) => workspace.placement.workspaceKey),
+          pinnedAtByKey: {},
+        },
+        pinnedWorkspaceOrder: workspaces.map((workspace) => workspace.placement.workspaceKey),
+        workspaceEntriesByKey: new Map(workspaces.map(({ entry }) => [entry.workspaceKey, entry])),
+      };
+      const alphabetical = buildSidebarProjection({
+        ...input,
+        pinnedWorkspaceSortMode: "alphabetical",
+      });
+      expect(
+        alphabetical.pinnedGroups.pinnedChats.map((workspace) => workspace.workspaceId),
+      ).toEqual(["a2", "a10", "z"]);
+      expect(
+        alphabetical.shortcutModel.shortcutTargets.map((workspace) => workspace.workspaceId),
+      ).toEqual(["a2", "a10", "z"]);
+      expect(
+        buildSidebarProjection({
+          ...input,
+          pinnedWorkspaceSortMode: "manual",
+        }).pinnedGroups.pinnedChats.map((workspace) => workspace.workspaceId),
+      ).toEqual(["z", "a10", "a2"]);
+
+      const renamed = workspaces[0]!.entry;
+      input.workspaceEntriesByKey.set(renamed.workspaceKey, { ...renamed, name: "Aardvark" });
+      expect(
+        buildSidebarProjection({ ...input, pinnedWorkspaceSortMode: "alphabetical" }).pinnedGroups
+          .pinnedChats[0]?.workspaceId,
+      ).toBe("z");
+    });
+  }
+
+  it("sorts by the visible branch label and falls back to the workspace name", () => {
+    const first = makeWorkspace("one");
+    const second = makeWorkspace("two");
+    first.entry.name = "Alpha";
+    first.entry.currentBranch = "zeta-branch";
+    second.entry.name = "Beta";
+    const input = {
+      ...projectionInput(),
+      projects: [makeProject([first.placement, second.placement])],
+      pinnedKeys: {
+        pinnedWorkspaceKeys: [first.placement.workspaceKey, second.placement.workspaceKey],
+        pinnedAtByKey: {},
+      },
+      workspaceEntriesByKey: new Map(
+        [first.entry, second.entry].map((entry) => [entry.workspaceKey, entry]),
+      ),
+      pinnedWorkspaceSortMode: "alphabetical" as const,
+    };
+    expect(
+      buildSidebarProjection({ ...input, workspaceTitleSource: "title" }).pinnedGroups
+        .pinnedChats[0]?.workspaceId,
+    ).toBe("one");
+    expect(
+      buildSidebarProjection({ ...input, workspaceTitleSource: "branch" }).pinnedGroups
+        .pinnedChats[0]?.workspaceId,
+    ).toBe("two");
+  });
+
   // The rule that outlived the bug it was written for: a project icon is fetched per project, so
   // whatever a mode groups by, the rows it produces can only reference projects already covered.
   for (const groupMode of ["project", "status"] as const) {
