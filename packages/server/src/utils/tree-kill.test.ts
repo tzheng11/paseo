@@ -2,8 +2,8 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
-import { terminateWithTreeKill } from "./tree-kill.js";
+import { afterEach, describe, expect, test, vi } from "vitest";
+import { signalProcessTree, terminateWithTreeKill, type ChildPidLister } from "./tree-kill.js";
 
 const pollIntervalMs = 50;
 
@@ -178,6 +178,83 @@ describe("terminateWithTreeKill", () => {
       expect(result).toBe("killed");
       await expectOwnerAndDescendantStopped(
         "owner or separate-process-group descendant survived terminateWithTreeKill",
+      );
+    },
+  );
+});
+
+describe("signalProcessTree", () => {
+  test.runIf(process.platform !== "win32")(
+    "signals descendants before their ancestors",
+    async () => {
+      const kill = vi.spyOn(process, "kill").mockReturnValue(true);
+      const descendants = new Map([
+        [901, [902, 903]],
+        [902, [904]],
+      ]);
+      try {
+        await signalProcessTree({ pid: 901, kill: () => true }, "SIGTERM", async (pid) => ({
+          pids: descendants.get(pid) ?? [],
+          error: null,
+        }));
+        expect(kill.mock.calls).toEqual([
+          [904, "SIGTERM"],
+          [903, "SIGTERM"],
+          [902, "SIGTERM"],
+          [901, "SIGTERM"],
+        ]);
+      } finally {
+        kill.mockRestore();
+      }
+    },
+  );
+
+  test.runIf(process.platform !== "win32")(
+    "still signals the descendants it found when a later listing throws",
+    async () => {
+      tempDir = await mkdtemp(join(tmpdir(), "paseo-server-tree-kill-"));
+      const childPidPath = join(tempDir, "descendant.pid");
+      ownerProcess = spawnOwnerWithDescendant({ childPidPath, detachedDescendant: false });
+      await waitForFixtureReady(childPidPath);
+      const ownerPid = ownerProcess.pid;
+      const listedDescendantPid = descendantPid;
+
+      // The walk that crashed the daemon: listing the owner works, then the next spawn
+      // throws synchronously, as spawn does once descriptors pass 10,240 on macOS.
+      const listChildPids: ChildPidLister = async (parentPid) => {
+        if (parentPid === ownerPid && listedDescendantPid !== null) {
+          return { pids: [listedDescendantPid], error: null };
+        }
+        throw Object.assign(new Error("spawn EBADF"), { code: "EBADF" });
+      };
+
+      await signalProcessTree(ownerProcess, "SIGKILL", listChildPids);
+
+      await expectOwnerAndDescendantStopped(
+        "owner or listed descendant survived a walk whose next listing threw",
+      );
+    },
+  );
+
+  test.runIf(process.platform !== "win32")(
+    "signals the direct child when listing its children fails",
+    async () => {
+      tempDir = await mkdtemp(join(tmpdir(), "paseo-server-tree-kill-"));
+      const childPidPath = join(tempDir, "descendant.pid");
+      ownerProcess = spawnOwnerWithDescendant({ childPidPath, detachedDescendant: false });
+      await waitForFixtureReady(childPidPath);
+
+      const listChildPids: ChildPidLister = async () => ({
+        pids: [],
+        error: Object.assign(new Error("spawn EMFILE"), { code: "EMFILE" }),
+      });
+
+      await signalProcessTree(ownerProcess, "SIGKILL", listChildPids);
+
+      await waitFor(
+        () => !isProcessRunning(ownerProcess?.pid ?? -1),
+        5000,
+        "owner survived a failed child listing",
       );
     },
   );

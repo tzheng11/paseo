@@ -1928,6 +1928,21 @@ export const ru: TranslationResources = {
     archiveFinishedRetry: "Повторить ({{failed}}/{{total}})",
   },
   panels: {
+    info: {
+      label: "Информация",
+      fields: "Поля",
+      empty: "Пусто",
+      unavailable: "Недоступно",
+      save: "Сохранить",
+      saving: "Сохранение…",
+      retry: "Повторить",
+      cancel: "Отмена",
+      loading: "Загрузка полей…",
+      update: "Обновите хост для редактирования полей.",
+      readOnly: "Доступ только для чтения.",
+      offline: "Хост отключён. Черновик сохранён. Подключитесь и повторите.",
+      conflict: "Отмените и откройте поле снова, чтобы изменить последнее значение.",
+    },
     draft: {
       newAgent: "Новый агент",
       creatingAgent: "Создание агента",

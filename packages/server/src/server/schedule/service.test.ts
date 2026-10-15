@@ -983,6 +983,89 @@ describe("ScheduleService", () => {
     });
   });
 
+  test("lists schedule files from one tick at a time while a listing is slow", async () => {
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: new AgentManager({ logger: createTestLogger() }),
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+      runner: async () => ({ agentId: null, output: "unused" }),
+    });
+    const store = (service as unknown as { store: ScheduleStore }).store;
+    let releaseListing: (() => void) | null = null;
+    const listingBlocked = new Promise<void>((resolve) => {
+      releaseListing = resolve;
+    });
+    let listings = 0;
+    vi.spyOn(store, "list").mockImplementation(async () => {
+      listings += 1;
+      await listingBlocked;
+      return [];
+    });
+
+    // Each overlapping listing used to hold a descriptor per schedule file.
+    const ticks = [service.tick(), service.tick(), service.tick()];
+    releaseListing?.();
+    await Promise.all(ticks);
+
+    expect(listings).toBe(1);
+  });
+
+  test("keeps listing on later ticks while a schedule run is in progress", async () => {
+    let finishRun: (() => void) | null = null;
+    const runBlocked = new Promise<void>((resolve) => {
+      finishRun = resolve;
+    });
+    let markRunStarted: (() => void) | null = null;
+    const runStarted = new Promise<void>((resolve) => {
+      markRunStarted = resolve;
+    });
+    let runs = 0;
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: new AgentManager({ logger: createTestLogger() }),
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+      runner: async () => {
+        runs += 1;
+        markRunStarted?.();
+        await runBlocked;
+        return { agentId: null, output: "slow run" };
+      },
+    });
+    const created = await service.create({
+      prompt: "Slow scheduled run",
+      cadence: { type: "every", everyMs: 60_000 },
+      target: {
+        type: "new-agent",
+        config: {
+          provider: "claude",
+          cwd: tempDir,
+        },
+      },
+    });
+
+    now = new Date("2026-01-01T00:01:00.000Z");
+    const firstTick = service.tick();
+    await runStarted;
+
+    const store = (service as unknown as { store: ScheduleStore }).store;
+    const listSpy = vi.spyOn(store, "list");
+    await service.tick();
+    expect(listSpy).toHaveBeenCalledTimes(1);
+    expect(runs).toBe(1);
+
+    finishRun?.();
+    await firstTick;
+    const inspected = await service.inspect(created.id);
+    expect(inspected.runs).toHaveLength(1);
+    expect(inspected.runs[0]).toMatchObject({ status: "succeeded", output: "slow run" });
+  });
+
   test("scheduled new-agent slash prompts run as normal foreground prompts", async () => {
     const createdInputs: Parameters<ScheduleServiceOptions["createAgent"]>[0][] = [];
     const runPrompts: AgentPromptInput[] = [];

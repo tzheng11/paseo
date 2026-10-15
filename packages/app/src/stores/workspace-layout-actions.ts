@@ -2,7 +2,7 @@ import invariant from "tiny-invariant";
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
 import type { WorkspaceTab, WorkspaceTabTarget } from "@/workspace-tabs/model";
 import { MIN_SPLIT_SIZE } from "@/stores/workspace-layout-constants";
-import { panelResourceKey, panelSupportsHost } from "@/panels/panel-manifest";
+import { getPanelManifest, panelResourceKey, panelSupportsHost } from "@/panels/panel-manifest";
 import { defaultWorkspaceLayoutIds } from "@/stores/workspace-layout-ids";
 import type { WorkspaceLayoutNodeIdPrefix } from "@/stores/workspace-layout-ids";
 import {
@@ -1150,6 +1150,19 @@ function restoreEmptyPanesInNode(
   explorerSidebarPaneId: string | null,
 ): SplitNodeInternal {
   if (node.kind === "pane") {
+    if (
+      node.pane.id === explorerSidebarPaneId &&
+      node.pane.tabs.length > 0 &&
+      !node.pane.tabs.some((tab) => tab.target.kind === "info")
+    ) {
+      return createPaneNode({
+        ...node.pane,
+        tabs: [
+          ...node.pane.tabs,
+          { tabId: "info", target: { kind: "info" }, createdAt: Date.now() },
+        ],
+      });
+    }
     return node.pane.tabs.length > 0
       ? node
       : createPaneNode({
@@ -1245,7 +1258,7 @@ export function createDefaultLayout(): WorkspaceLayout {
 
 function createDefaultExplorerSidebarTabs(): WorkspaceTab[] {
   const createdAt = Date.now();
-  const targets = [{ kind: "files" }, { kind: "changes_tree" }] as const;
+  const targets = [{ kind: "files" }, { kind: "changes_tree" }, { kind: "info" }] as const;
   return targets.map((target) => ({
     tabId: buildDeterministicWorkspaceTabId(target),
     target,
@@ -1264,6 +1277,7 @@ export function createWorkspaceLayoutWithExplorerSidebar(): WorkspaceLayout {
         createPaneNode({
           id: EXPLORER_SIDEBAR_PANE_ID,
           tabs: createDefaultExplorerSidebarTabs(),
+          focusedTabId: "changes_tree",
           hidden: true,
         }),
       ],
@@ -1519,6 +1533,8 @@ export function openTabInLayoutBackground(
 }
 
 export function closeTabInLayout(input: CloseTabInLayoutInput): WorkspaceLayout | null {
+  const target = collectAllTabs(input.layout.root).find((tab) => tab.tabId === input.tabId)?.target;
+  if (target && getPanelManifest(target.kind).permanent) return null;
   const internalLayout = asInternalLayout(input.layout);
   const pane = findPaneContainingTab(internalLayout.root, input.tabId);
   if (!pane) {

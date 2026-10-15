@@ -118,6 +118,7 @@ export interface WorkspaceDescriptor {
   title?: string | null;
   pinnedAt?: string | null;
   labels?: string[];
+  fieldValues?: WorkspaceDescriptorPayload["fieldValues"];
   status: WorkspaceDescriptorPayload["status"];
   statusEnteredAt: Date | null;
   archivingAt: string | null;
@@ -157,6 +158,8 @@ export function normalizeWorkspaceDescriptor(
     pinnedAt: payload.pinnedAt ?? null,
     // COMPAT(workspaceLabels): old daemons omit assignments.
     labels: payload.labels ?? [],
+    // COMPAT(workspaceFields): added in v0.11.3; remove fallback after 2027-04-14.
+    fieldValues: payload.fieldValues ?? {},
     status: payload.status,
     statusEnteredAt,
     archivingAt: payload.archivingAt ?? null,
@@ -285,6 +288,8 @@ export interface DaemonServerInfo {
   desktopManaged?: boolean;
   capabilities?: ServerCapabilities;
   features?: ServerInfoStatusPayload["features"];
+  permissions?: ServerInfoStatusPayload["permissions"];
+  workspaceFieldCatalogVersion?: number;
 }
 
 export function toDaemonServerInfo(serverInfo: ServerInfoStatusPayload): DaemonServerInfo {
@@ -297,6 +302,8 @@ export function toDaemonServerInfo(serverInfo: ServerInfoStatusPayload): DaemonS
       : {}),
     ...(serverInfo.capabilities ? { capabilities: serverInfo.capabilities } : {}),
     ...(serverInfo.features ? { features: serverInfo.features } : {}),
+    permissions: serverInfo.permissions,
+    workspaceFieldCatalogVersion: serverInfo.workspaceFieldCatalogVersion,
   };
 }
 
@@ -693,6 +700,8 @@ function isSessionServerInfoUnchanged(input: {
   nextCapabilities: ServerCapabilities | undefined;
   nextFeatures: ServerInfoStatusPayload["features"] | undefined;
   nextServerId: string;
+  nextPermissions: ServerInfoStatusPayload["permissions"];
+  nextFieldCatalogVersion: number | undefined;
 }): boolean {
   const {
     currentServerInfo,
@@ -706,6 +715,8 @@ function isSessionServerInfoUnchanged(input: {
   const prevVersion = currentServerInfo?.version?.trim() || null;
   return (
     currentServerInfo?.serverId === input.nextServerId &&
+    JSON.stringify(currentServerInfo?.permissions) === JSON.stringify(input.nextPermissions) &&
+    currentServerInfo?.workspaceFieldCatalogVersion === input.nextFieldCatalogVersion &&
     prevHostname === nextHostname &&
     prevVersion === nextVersion &&
     currentServerInfo?.desktopManaged === nextDesktopManaged &&
@@ -858,6 +869,8 @@ export const useSessionStore = create<SessionStore>()(
               nextCapabilities,
               nextFeatures,
               nextServerId: info.serverId,
+              nextPermissions: info.permissions,
+              nextFieldCatalogVersion: info.workspaceFieldCatalogVersion,
             })
           ) {
             return prev;
@@ -878,6 +891,8 @@ export const useSessionStore = create<SessionStore>()(
                     : {}),
                   ...(nextCapabilities ? { capabilities: nextCapabilities } : {}),
                   ...(nextFeatures ? { features: nextFeatures } : {}),
+                  permissions: info.permissions,
+                  workspaceFieldCatalogVersion: info.workspaceFieldCatalogVersion,
                 },
               },
             },

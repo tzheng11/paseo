@@ -3,10 +3,10 @@
 The Explorer sidebar and the side pane share panel implementations, but they have different shell
 contracts.
 
-| Surface          | Purpose                      | Lifecycle                                  |
-| ---------------- | ---------------------------- | ------------------------------------------ |
-| Explorer sidebar | Files and Changes navigation | Cmd+E shows or hides the dedicated dock    |
-| Side pane        | Ordinary workspace content   | Created and closed like any workspace pane |
+| Surface          | Purpose                           | Lifecycle                                  |
+| ---------------- | --------------------------------- | ------------------------------------------ |
+| Explorer sidebar | Files, Changes and workspace Info | Cmd+E shows or hides the dedicated dock    |
+| Side pane        | Ordinary workspace content        | Created and closed like any workspace pane |
 
 ## Panel host contract
 
@@ -15,7 +15,9 @@ fixed-target labels and icons from that registration, filter by host, and never 
 panel type for another. Tab moves reject unsupported destinations, and placement resolves only to
 a compatible pane.
 
-Files and Changes are the Explorer defaults. Their panel manifests mark them as singletons,
+Files, Changes and Info are the Explorer defaults. Info is permanent: it cannot be closed individually
+or by bulk-close actions. Restoring older layouts adds it without changing the selected tab.
+Their panel manifests mark them as singletons,
 so a pane’s + menu omits each while that pane already contains it. Closing one makes its menu
 item available again. Other compatible tabs, including agents, terminals, files, and diffs,
 can move between Explorer and main panes.
@@ -57,6 +59,17 @@ Wide native layouts without pane splits use the same combined content in a resiz
 opening a file leaves that dock visible. Both presentations keep their selection in the panel store
 and reuse the layout store's per-workspace Explorer width. They do not create a second Explorer
 lifecycle.
+
+## Workspace Info
+
+Info uses one code-defined field catalogue across hosts. Values belong to the daemon-local workspace
+ID, including when several workspaces share a directory. They are metadata, never automatic agent
+instructions. There is no cross-host value synchronization.
+
+The capability flag and matching catalogue version protect clients from unsupported writes on older
+hosts. Saves compare the last observed field value inside the registry transaction; they merge
+different-field edits and reject divergent same-field edits. Repeating an already committed value
+succeeds without rewriting, so retrying a lost acknowledgement is safe.
 
 ## Side pane
 
