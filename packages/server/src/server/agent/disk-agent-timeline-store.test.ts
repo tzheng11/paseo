@@ -1,6 +1,7 @@
 import { mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { setImmediate } from "node:timers/promises";
 import { afterEach, describe, expect, it } from "vitest";
 import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 import { DiskAgentTimelineStore } from "./disk-agent-timeline-store.js";
@@ -29,6 +30,38 @@ const tool = (callId: string, status: "running" | "completed"): AgentTimelineIte
 });
 
 describe("DiskAgentTimelineStore", () => {
+  it("serves other event-loop work while reading a tail expanded by an old tool", async () => {
+    const store = createStore();
+    store.initialize("busy", { epoch: "epoch" });
+    store.append("busy", tool("old", "running"));
+    for (let index = 0; index < 300; index++) {
+      store.append("busy", { type: "user_message", text: `${index}:${"x".repeat(8192)}` });
+    }
+    store.append("busy", tool("old", "completed"));
+    const expected = store.fetch("busy", { limit: 1 });
+    expect(expected.rows).toHaveLength(301);
+    let completed = false;
+    const probe = setImmediate().then(() => completed);
+    const reading = store.fetchAsync("busy", { limit: 1 }).then((page) => {
+      completed = true;
+      return page;
+    });
+    expect(await probe).toBe(false);
+    expect(await reading).toEqual(expected);
+  });
+
+  it("rejects a page invalidated between read batches instead of mixing epochs", async () => {
+    const store = createStore();
+    store.initialize("changing", { epoch: "before" });
+    for (let index = 0; index < 100; index++)
+      store.append("changing", { type: "user_message", text: String(index) });
+    const reading = store.fetchAsync("changing", { limit: 0 });
+    const rejected = expect(reading).rejects.toThrow("History changed during paged read");
+    store.initialize("changing", { epoch: "after" });
+    await rejected;
+    expect((await store.fetchAsync("changing")).epoch).toBe("after");
+  });
+
   it("rolls back a failed batch and keeps the prior projection and sequence", () => {
     const store = createStore();
     store.initialize("rollback", { epoch: "epoch" });
@@ -130,7 +163,7 @@ describe("DiskAgentTimelineStore", () => {
     expect(disk.appendBatch("a", entries)).toEqual(memory.appendBatch("a", entries));
     expect(disk.fetch("a")).toEqual(memory.fetch("a"));
   });
-  it("matches memory-store paging with interleaved lifecycle updates and evicted rows", () => {
+  it("matches memory-store paging with interleaved lifecycle updates and evicted rows", async () => {
     const disk = createStore();
     const memory = new InMemoryAgentTimelineStore();
     for (const store of [disk, memory]) {
@@ -150,10 +183,14 @@ describe("DiskAgentTimelineStore", () => {
         for (const limit of [0, 1, 2, 200]) {
           const options = { direction, limit, cursor: { epoch: "epoch", seq } };
           expect(disk.fetch("a", options)).toEqual(memory.fetch("a", options));
+          expect(await disk.fetchAsync("a", options)).toEqual(memory.fetch("a", options));
         }
       }
     }
     expect(disk.fetch("a", { cursor: { epoch: "old", seq: 3 } })).toEqual(
+      memory.fetch("a", { cursor: { epoch: "old", seq: 3 } }),
+    );
+    expect(await disk.fetchAsync("a", { cursor: { epoch: "old", seq: 3 } })).toEqual(
       memory.fetch("a", { cursor: { epoch: "old", seq: 3 } }),
     );
     expect(disk.getSubmittedUserMessage("a", "user")).toEqual(

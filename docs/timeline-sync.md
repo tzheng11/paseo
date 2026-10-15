@@ -28,7 +28,14 @@ remain responsive. History requests wait for that queue until the agent's histor
 A failed provider stream leaves the previous timeline readable. Deferred publication
 replays the staged file instead of retaining another full timeline array.
 
-Ordinary pages read selected rows from disk. Codex reloads retain a bounded start and recent
+Ordinary pages decode selected disk rows in slices of at most 32 rows or 4 ms, yielding between
+slices. An old tool anchor can expand a nominally small tail across older rows to preserve cursor
+coverage; that expansion must use the same cooperative reader. Reads share the agent's live-event
+queue so a page cannot mix versions while it yields. Epoch-only operations never decode history.
+These limits bound uninterrupted decoding work, not the size of an explicit complete-projection
+response or the duration of one SQLite operation.
+
+Codex reloads retain a bounded start and recent
 suffix: at most 64 events / 256 KiB at the head and 256 events / 2 MiB at the tail. Both limits
 apply independently. A notice separates these ranges for clients without middle-page support.
 
