@@ -53,6 +53,7 @@ export interface SeedDaemonClient {
     requestId?: string;
   }): Promise<{ value: string }>;
   setWorkspacePinned(workspaceId: string, pinned: boolean): Promise<{ pinnedAt: string | null }>;
+  setWorkspaceTitle(workspaceId: string, title: string | null): Promise<{ title: string | null }>;
   clearWorkspaceAttention(workspaceId: string): Promise<void>;
   setWorkspaceLabel(input: {
     workspaceId: string;

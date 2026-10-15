@@ -5302,8 +5302,11 @@ export class AgentManager {
   /**
    * Flush any background persistence work (best-effort).
    */
-  async flush(): Promise<void> {
-    await this.flushTasks({ includeAgentRegistrations: false });
+  async flush(options?: { coalesced?: boolean }): Promise<void> {
+    await this.flushTasks({
+      includeAgentRegistrations: false,
+      coalesced: options?.coalesced ?? true,
+    });
   }
 
   /**
@@ -5312,11 +5315,14 @@ export class AgentManager {
    * either install them or close them.
    */
   async flushForShutdown(): Promise<void> {
-    await this.flushTasks({ includeAgentRegistrations: true });
+    await this.flushTasks({ includeAgentRegistrations: true, coalesced: true });
   }
 
-  private async flushTasks(options: { includeAgentRegistrations: boolean }): Promise<void> {
-    this.agentStreamCoalescer.flushAll();
+  private async flushTasks(options: {
+    includeAgentRegistrations: boolean;
+    coalesced: boolean;
+  }): Promise<void> {
+    if (options.coalesced) this.agentStreamCoalescer.flushAll();
     // Drain tasks, including tasks spawned while awaiting.
     while (
       this.backgroundTasks.size > 0 ||
@@ -5326,6 +5332,8 @@ export class AgentManager {
         ? [...this.backgroundTasks, ...this.agentRegistrationTasks]
         : [...this.backgroundTasks];
       await Promise.allSettled(pending);
+      // Queued provider events can create new buffers while the drain is awaiting.
+      if (options.coalesced) this.agentStreamCoalescer.flushAll();
     }
   }
 
