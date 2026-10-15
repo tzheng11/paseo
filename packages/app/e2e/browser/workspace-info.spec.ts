@@ -4,6 +4,7 @@ import { test, expect } from "../support/fixtures";
 import { seedWorkspace } from "../support/helpers/seed-client";
 import { gotoWorkspace } from "../support/helpers/launcher";
 import { ensureExplorerSidebar } from "../support/helpers/workspace-tabs";
+import { waitForWorkspaceInReplicaCache } from "../support/helpers/replica-cache-storage";
 import { installDaemonWebSocketGate } from "../support/helpers/daemon-websocket-gate";
 
 test.use({
@@ -170,6 +171,111 @@ test("fixed Info fields save, reload, cancel, clear, merge, retry and recover co
   } finally {
     gate.restore();
     await b.cleanup();
+    await workspace.cleanup();
+  }
+});
+
+test("Info waits for workspace data and preserves values while reconnecting", async ({
+  page,
+}, testInfo) => {
+  const gate = await installDaemonWebSocketGate(page);
+  const workspace = await seedWorkspace({ repoPrefix: "workspace-info-loading-" });
+  await workspace.client.setWorkspaceFieldValue({
+    workspaceId: workspace.workspaceId,
+    fieldKey: "notionProjectUrl",
+    value: "saved before opening",
+    expectedValue: "",
+  });
+  const field = page.getByTestId("workspace-info-field-notionProjectUrl").filter({ visible: true });
+  const value = page.getByTestId("workspace-info-value-notionProjectUrl").filter({ visible: true });
+  try {
+    await gotoWorkspace(page, workspace.workspaceId);
+    await waitForWorkspaceInReplicaCache(page, workspace.workspaceId);
+    // A legacy cache can know the workspace before its field values are refreshed.
+    await page.evaluate(
+      async (workspaceId) =>
+        new Promise<void>((resolve, reject) => {
+          const request = indexedDB.open("paseo-replica-row-store");
+          request.onsuccess = () => {
+            const db = request.result;
+            const tx = db.transaction("rows", "readwrite");
+            const store = tx.objectStore("rows");
+            const rows = store.getAll();
+            rows.onsuccess = () => {
+              for (const row of rows.result) {
+                const payload = JSON.parse(row.payload);
+                if (row.kind === "workspace" && row.id === workspaceId) {
+                  delete payload.fieldValues;
+                  row.payload = JSON.stringify(payload);
+                  store.put(row);
+                } else if (row.kind === "checkpoint") {
+                  delete payload.workspaceFieldsVersion;
+                  row.payload = JSON.stringify(payload);
+                  store.put(row);
+                }
+              }
+            };
+            tx.oncomplete = () => {
+              db.close();
+              resolve();
+            };
+            tx.addEventListener("error", () => reject(tx.error));
+          };
+          request.addEventListener("error", () => reject(request.error));
+        }),
+      workspace.workspaceId,
+    );
+    gate.holdNextServerMessage("fetch_workspaces_response");
+    await page.reload();
+    await ensureExplorerSidebar(page);
+    await page.getByTestId("workspace-tab-info").filter({ visible: true }).click();
+    await gate.waitForHeldServerMessage("fetch_workspaces_response");
+    await expect(
+      page.getByTestId("workspace-info-loading-notionProjectUrl").filter({ visible: true }),
+    ).toBeVisible();
+    await expect(field).toBeDisabled();
+    await expect(value).toHaveCount(0);
+    await expect(
+      page.getByTestId("workspace-info-content").filter({ visible: true }),
+    ).not.toContainText("Unavailable");
+    await page.screenshot({ path: testInfo.outputPath("info-loading.png") });
+    gate.releaseHeldServerMessage("fetch_workspaces_response");
+    await expect(value).toHaveText("saved before opening");
+    await expect(field).toBeEnabled();
+    await gate.drop();
+    await expect(field).toBeDisabled();
+    await expect(value).toHaveText("saved before opening");
+    await workspace.client.setWorkspaceFieldValue({
+      workspaceId: workspace.workspaceId,
+      fieldKey: "notionProjectUrl",
+      value: "changed while disconnected",
+      expectedValue: "saved before opening",
+    });
+    gate.holdNextServerMessage("fetch_workspaces_response");
+    gate.restore();
+    await gate.waitForHeldServerMessage("fetch_workspaces_response");
+    await expect(field).toBeDisabled();
+    await expect(value).toHaveText("saved before opening");
+    gate.releaseHeldServerMessage("fetch_workspaces_response");
+    await expect(value).toHaveText("changed while disconnected");
+    await expect(field).toBeEnabled();
+    await field.click();
+    await expect(page.getByTestId("workspace-info-input").filter({ visible: true })).toHaveValue(
+      "changed while disconnected",
+    );
+    await page
+      .getByTestId("workspace-info-input")
+      .filter({ visible: true })
+      .fill("saved after reconnect");
+    await page.getByTestId("workspace-info-save").filter({ visible: true }).click();
+    await expect(value).toHaveText("saved after reconnect");
+    await expect(page.getByTestId("workspace-info-error").filter({ visible: true })).toHaveCount(0);
+    await page.reload();
+    await ensureExplorerSidebar(page);
+    await page.getByTestId("workspace-tab-info").filter({ visible: true }).click();
+    await expect(value).toHaveText("saved after reconnect");
+  } finally {
+    gate.restore();
     await workspace.cleanup();
   }
 });
@@ -391,7 +497,7 @@ for (const variant of ["v0.11.2-omitted-feature", "version-2", "read-only", "hub
         await expect(row).toBeDisabled();
         await expect(
           page.getByTestId(`workspace-info-value-${key}`).filter({ visible: true }),
-        ).toHaveText(update ? "Unavailable" : "Empty");
+        ).toHaveText(update ? "—" : "Empty");
       }
       await expect(page.getByTestId("workspace-info-input").filter({ visible: true })).toHaveCount(
         0,

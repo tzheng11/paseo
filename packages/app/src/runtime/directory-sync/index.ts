@@ -191,6 +191,8 @@ export class DirectorySync {
     this.releaseSubscriptions();
     workspaceLabels.disconnect(this.serverId);
     this.connection = connection;
+    // Cached values remain visible, but edits must wait for this connection's baseline.
+    this.markWorkspacesHydrated(false);
     this.abortPendingSessionWaits();
     if (!connection.client || connection.status !== "online") return true;
     // Reattach labels here because route-only demand can satisfy the epoch before full demand requests them.

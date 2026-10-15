@@ -15,11 +15,14 @@ export function workspaceFieldsAvailability(
     | null
     | undefined,
   connected: boolean,
+  valuesLoaded = true,
 ): WorkspaceFieldsAvailability {
   if (!info) return "loading";
   if (!supportsWorkspaceFields(info)) return "update";
+  if (!connected) return "offline";
+  if (!valuesLoaded) return "loading";
   if (!info.permissions?.includes("workspace.manage")) return "readOnly";
-  return connected ? "ready" : "offline";
+  return "ready";
 }
 export interface FieldEditor {
   key: WorkspaceFieldKey;
@@ -32,11 +35,12 @@ export interface FieldEditor {
 export interface FieldsSnapshot {
   values: Record<string, string>;
   availability: WorkspaceFieldsAvailability;
+  hasValues: boolean;
   editor: FieldEditor | null;
 }
 export class WorkspaceFieldsModel {
   private editedValueRevision = 0;
-  private state: FieldsSnapshot = { values: {}, availability: "loading", editor: null };
+  private state: FieldsSnapshot;
   private listeners = new Set<() => void>();
   constructor(
     private readonly commit: (input: {
@@ -44,7 +48,15 @@ export class WorkspaceFieldsModel {
       value: string;
       expectedValue: string;
     }) => Promise<{ value: string }>,
-  ) {}
+    initial?: { values: Record<string, string> | null; availability: WorkspaceFieldsAvailability },
+  ) {
+    this.state = {
+      values: initial?.values ?? {},
+      hasValues: initial?.values != null,
+      availability: initial?.availability ?? "loading",
+      editor: null,
+    };
+  }
   snapshot = (): FieldsSnapshot => this.state;
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
@@ -54,15 +66,21 @@ export class WorkspaceFieldsModel {
     this.state = state;
     for (const listener of this.listeners) listener();
   }
-  receive(values: Record<string, string>, availability: WorkspaceFieldsAvailability): void {
+  receive(values: Record<string, string> | null, availability: WorkspaceFieldsAvailability): void {
     const key = this.state.editor?.key;
-    if (key && (values[key] ?? "") !== (this.state.values[key] ?? "")) {
+    if (values && key && (values[key] ?? "") !== (this.state.values[key] ?? "")) {
       this.editedValueRevision++;
     }
-    this.publish({ ...this.state, values, availability });
+    this.publish({
+      ...this.state,
+      values: values ?? this.state.values,
+      hasValues: values !== null || this.state.hasValues,
+      availability,
+    });
   }
   edit(key: WorkspaceFieldKey): void {
-    if (this.state.availability !== "ready" || this.state.editor !== null) return;
+    if (!this.state.hasValues || this.state.availability !== "ready" || this.state.editor !== null)
+      return;
     const current = this.state.values[key] ?? "";
     this.publish({
       ...this.state,

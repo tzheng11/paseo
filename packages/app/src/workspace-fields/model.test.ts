@@ -159,3 +159,44 @@ test("disconnect retains draft with visible error and reconnect permits retry; C
   model.cancel();
   expect(model.snapshot().values.notionProjectUrl).toBe("draft");
 });
+
+test("unknown workspace data never becomes an editable empty value", () => {
+  const info = {
+    features: { workspaceFields: true },
+    workspaceFieldCatalogVersion: 1,
+    permissions: ["workspace.manage"],
+  };
+  expect(workspaceFieldsAvailability(info, true, false)).toBe("loading");
+  const model = new WorkspaceFieldsModel(async () => ({ value: "saved" }));
+  model.receive(null, "loading");
+  expect(model.snapshot().hasValues).toBe(false);
+  model.edit("notionProjectUrl");
+  expect(model.snapshot().editor).toBeNull();
+  model.receive({ notionProjectUrl: "saved" }, "ready");
+  model.receive(null, "loading");
+  expect(model.snapshot()).toMatchObject({
+    hasValues: true,
+    values: { notionProjectUrl: "saved" },
+  });
+  model.edit("notionProjectUrl");
+  expect(model.snapshot().editor).toBeNull();
+  model.receive({ notionProjectUrl: "newer" }, "ready");
+  model.edit("notionProjectUrl");
+  expect(model.snapshot().editor).toMatchObject({ expectedValue: "newer", draft: "newer" });
+});
+
+test("saved snapshots seed the first render and remain visible during reconnect", () => {
+  const model = new WorkspaceFieldsModel(async (input) => ({ value: input.value }), {
+    values: { notionProjectUrl: "saved URL", notionIssueUrl: "" },
+    availability: "loading",
+  });
+  expect(model.snapshot()).toMatchObject({
+    values: { notionProjectUrl: "saved URL", notionIssueUrl: "" },
+    hasValues: true,
+  });
+  model.receive(null, "offline");
+  expect(model.snapshot().values.notionProjectUrl).toBe("saved URL");
+  model.receive({ notionProjectUrl: "new URL" }, "ready");
+  model.edit("notionProjectUrl");
+  expect(model.snapshot().editor?.expectedValue).toBe("new URL");
+});
