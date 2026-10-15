@@ -758,6 +758,37 @@ test("refreshing an agent replaces the injected timeline store instead of append
   }
 });
 
+test("flush waits for queued session events and their trailing coalesced output", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-flush-queued-"));
+  const session = new TestAgentSession({ provider: "codex", cwd: workdir });
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    logger,
+    agentStreamCoalesceWindowMs: 60_000,
+  });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {});
+  try {
+    for (const text of ["one", "two"]) {
+      session.pushEvent({
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", text },
+      });
+    }
+    await manager.flush();
+    expect(manager.getTimeline(agent.id)).toEqual([{ type: "assistant_message", text: "onetwo" }]);
+  } finally {
+    await manager.closeAgent(agent.id);
+    await manager.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("concurrent live streams yield to requests and preserve per-agent event order", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-live-budget-"));
   const count = 4;
