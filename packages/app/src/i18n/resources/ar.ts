@@ -1896,6 +1896,21 @@ export const ar: TranslationResources = {
     archiveFinishedRetry: "إعادة المحاولة ({{failed}}/{{total}})",
   },
   panels: {
+    info: {
+      label: "معلومات",
+      fields: "الحقول",
+      empty: "فارغ",
+      unavailable: "غير متاح",
+      save: "حفظ",
+      saving: "جارٍ الحفظ…",
+      retry: "إعادة المحاولة",
+      cancel: "إلغاء",
+      loading: "جارٍ تحميل الحقول…",
+      update: "حدّث هذا المضيف لتعديل الحقول.",
+      readOnly: "لديك صلاحية القراءة فقط.",
+      offline: "المضيف غير متصل. تم الاحتفاظ بالمسودة. أعد الاتصال وحاول مجددًا.",
+      conflict: "ألغِ وافتح الحقل مجددًا لتعديل أحدث قيمة.",
+    },
     draft: {
       newAgent: "وكيل جديد",
       creatingAgent: "وكيل الخلق",

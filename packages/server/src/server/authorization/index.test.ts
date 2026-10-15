@@ -150,3 +150,20 @@ describe("SessionAuthorization", () => {
     expect(() => parseDaemonPermissions(["hub.execution.*"])).toThrow("Invalid daemon permission");
   });
 });
+
+test("workspace field writes and responses are manage-only; descriptors remain readable", () => {
+  for (const permission of ["workspace.read", "hub.execute", "workspace.manage"] as const) {
+    const authorization = new SessionAuthorization([permission]);
+    expect(authorization.allowsInbound(inboundMessage("workspace.field.value.set.request"))).toBe(
+      permission === "workspace.manage",
+    );
+    expect(
+      authorization.allowsOutbound(outboundMessage("workspace.field.value.set.response")),
+    ).toBe(permission === "workspace.manage");
+  }
+  expect(
+    new SessionAuthorization(["workspace.read"]).allowsOutbound(
+      outboundMessage("fetch_workspaces_response"),
+    ),
+  ).toBe(true);
+});

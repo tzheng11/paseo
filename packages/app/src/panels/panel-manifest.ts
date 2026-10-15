@@ -7,6 +7,7 @@ export interface PanelManifest<K extends WorkspaceTabTarget["kind"] = WorkspaceT
   supportedHosts: readonly PaneHost[];
   showCloseButton: boolean;
   singleton: boolean;
+  permanent?: boolean;
   resourceKey(target: Extract<WorkspaceTabTarget, { kind: K }>): string;
 }
 
@@ -63,6 +64,14 @@ const manifests = {
     showCloseButton: false,
     singleton: true,
     resourceKey: () => "changes_tree",
+  },
+  info: {
+    kind: "info",
+    supportedHosts: ["explorer"],
+    showCloseButton: false,
+    singleton: true,
+    permanent: true,
+    resourceKey: () => "info",
   },
   files: {
     kind: "files",

@@ -1915,6 +1915,21 @@ export const ja: TranslationResources = {
     archiveFinishedRetry: "再試行 ({{failed}}/{{total}})",
   },
   panels: {
+    info: {
+      label: "情報",
+      fields: "フィールド",
+      empty: "空",
+      unavailable: "利用不可",
+      save: "保存",
+      saving: "保存中…",
+      retry: "再試行",
+      cancel: "キャンセル",
+      loading: "フィールドを読み込み中…",
+      update: "フィールドを編集するにはホストを更新してください。",
+      readOnly: "読み取り専用です。",
+      offline: "ホストが切断されています。下書きは保持されます。再接続して再試行してください。",
+      conflict: "キャンセルして再度開くと、最新の値を編集できます。",
+    },
     draft: {
       newAgent: "新しいエージェント",
       creatingAgent: "エージェントを作成中",

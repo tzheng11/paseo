@@ -1,3 +1,4 @@
+import { supportsWorkspaceFields, WorkspaceFieldError } from "@getpaseo/protocol/workspace-fields";
 import { legacyUsageIcon } from "./legacy-usage-icons.js";
 import { subscribeTimeline, type TimelineMessage } from "./timeline-subscription/index.js";
 import { ProviderSnapshotUpdates } from "./provider-snapshots/index.js";
@@ -3090,6 +3091,32 @@ export class DaemonClient {
       throw new Error(payload.error ?? "removeProject rejected");
     }
     return { removedWorkspaceIds: payload.removedWorkspaceIds };
+  }
+
+  async setWorkspaceFieldValue(input: {
+    workspaceId: string;
+    fieldKey: string;
+    value: string;
+    expectedValue: string;
+    requestId?: string;
+  }): Promise<{ value: string }> {
+    if (!supportsWorkspaceFields(this.lastServerInfoMessage))
+      throw new Error("Update this host to edit workspace fields.");
+    const { requestId, ...message } = input;
+    const payload = await this.sendCorrelatedSessionRequest({
+      requestId,
+      message: { type: "workspace.field.value.set.request", ...message },
+      responseType: "workspace.field.value.set.response",
+    });
+    if (!payload.accepted) {
+      if (payload.errorCode)
+        throw new WorkspaceFieldError(
+          payload.errorCode,
+          payload.error ?? "Unable to save workspace field.",
+        );
+      throw new Error(payload.error ?? "Unable to save workspace field.");
+    }
+    return { value: payload.value };
   }
 
   async setWorkspaceTitle(
