@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { signalProcessTree, terminateWithTreeKill, type ChildPidLister } from "./tree-kill.js";
 
 const pollIntervalMs = 50;
@@ -184,6 +184,31 @@ describe("terminateWithTreeKill", () => {
 });
 
 describe("signalProcessTree", () => {
+  test.runIf(process.platform !== "win32")(
+    "signals descendants before their ancestors",
+    async () => {
+      const kill = vi.spyOn(process, "kill").mockReturnValue(true);
+      const descendants = new Map([
+        [901, [902, 903]],
+        [902, [904]],
+      ]);
+      try {
+        await signalProcessTree({ pid: 901, kill: () => true }, "SIGTERM", async (pid) => ({
+          pids: descendants.get(pid) ?? [],
+          error: null,
+        }));
+        expect(kill.mock.calls).toEqual([
+          [904, "SIGTERM"],
+          [903, "SIGTERM"],
+          [902, "SIGTERM"],
+          [901, "SIGTERM"],
+        ]);
+      } finally {
+        kill.mockRestore();
+      }
+    },
+  );
+
   test.runIf(process.platform !== "win32")(
     "still signals the descendants it found when a later listing throws",
     async () => {
