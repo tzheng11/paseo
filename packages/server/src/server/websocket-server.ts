@@ -1,3 +1,4 @@
+import { WORKSPACE_FIELD_CATALOG_VERSION } from "@getpaseo/protocol/workspace-fields";
 import {
   withAgentHistoryReadMetrics,
   type AgentHistoryReadMetrics,
@@ -1789,11 +1790,13 @@ export class VoiceAssistantWebSocketServer {
       hostname: getHostName(),
       version: this.daemonVersion,
       permissions: session.getPermissions(),
+      workspaceFieldCatalogVersion: WORKSPACE_FIELD_CATALOG_VERSION,
       // COMPAT(desktopManaged): added in v0.1.X, remove optional parsing after 2027-01-16.
       desktopManaged: this.daemonRuntimeConfig?.desktopManaged === true,
       ...(this.serverCapabilities ? { capabilities: this.serverCapabilities } : {}),
       features: {
         usageSources: true,
+        workspaceFields: true,
         ownedSubscriptions: true,
         agentRequestReceipts: true,
         workspaceRequestReceipts: true,

@@ -1,3 +1,4 @@
+import { getPanelManifest } from "@/panels/panel-manifest";
 import type { WorkspaceTabDescriptor } from "@/screens/workspace/workspace-tabs-types";
 import { i18n } from "@/i18n/i18next";
 import { encodeFilePathForPathSegment, encodeWorkspaceIdForPathSegment } from "@/utils/host-routes";
@@ -151,7 +152,11 @@ function getCloseButtonTestId(tab: WorkspaceTabDescriptor): string {
   if (tab.target.kind === "working_diff" || tab.target.kind === "changes_tree") {
     return `workspace-working-diff-close-${encodeFilePathForPathSegment(buildDeterministicWorkspaceTabId(tab.target))}`;
   }
-  if (tab.target.kind === "files" || tab.target.kind === "pull_request") {
+  if (
+    tab.target.kind === "info" ||
+    tab.target.kind === "files" ||
+    tab.target.kind === "pull_request"
+  ) {
     return `workspace-${tab.target.kind}-close`;
   }
   if (tab.target.kind === "plugin") {
@@ -310,6 +315,7 @@ export function buildWorkspaceTabMenuEntries(
   entries.push({
     kind: "item",
     key: "close",
+    disabled: getPanelManifest(tab.target.kind).permanent === true,
     label: labels.close,
     icon: "x",
     testID: `${menuTestIDBase}-close`,

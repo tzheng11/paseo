@@ -448,6 +448,42 @@ All providers:
 
 Providers that can accept native tool definitions should set `supportsNativePaseoTools` and read `launchContext.paseoTools`. The daemon then passes the shared Paseo tool catalog directly and removes the internal Paseo MCP server from that provider launch config. Providers that only support MCP continue to receive the same tools through the MCP fallback at `/mcp/agents`.
 
+### Workspace Info tools
+
+The shared host/MCP catalog includes `get_workspace_fields` and `set_workspace_field`.
+Both accept an optional `workspaceId`; omission selects the calling agent's registered workspace,
+while top-level calls must supply an ID. They never infer workspace identity from a directory.
+
+`get_workspace_fields` returns `workspaceId`, `catalogVersion`, ordered `fields` definitions
+(`key`, `label`) and the saved `fieldValues` map. Catalogue version 1 defines `notionProjectUrl`
+(Notion Project URL) followed by `notionIssueUrl` (Notion Issue URL). An absent value means empty text.
+Values belong to the workspace and are shared by its agents, rather than belonging to an individual
+agent or the Paseo project registry. They persist in `$PASEO_HOME/projects/workspaces.json`.
+
+`set_workspace_field` requires `fieldKey`, literal text `value` and `expectedValue`, the last value
+read (empty string if absent). It reuses the serialized workspace-field transaction: a divergent
+current value conflicts; an already-current desired value succeeds without another disk write;
+different-key edits merge. Empty text clears a value. Each value is limited to 8,000 JavaScript
+string code units and the complete UTF-8 JSON value map to 32 KiB. Unknown keys and missing or
+archived workspaces reject without mutation.
+
+The result contains `workspaceId`, `fieldKey`, `accepted`, `value`, `error` and `errorCode`.
+Success has the canonical value and null errors. Domain failure has `isError: true`, `accepted: false`,
+null value and `invalid_value`, `unknown_field`, `not_found` or `conflict` as its error code.
+Every accepted attempt broadcasts the canonical workspace descriptor, including an idempotent
+retry. A post-commit broadcast failure can fail the call after storage committed; repeating the
+identical desired/expected inputs repairs the broadcast without rewriting. Re-read after a save
+or lost acknowledgement. Preserve a differing existing backlink instead of blindly overwriting
+it in a retry loop.
+
+These tools follow the existing trusted MCP endpoint authorization (injected capability token or
+daemon-password bearer on password-protected daemons) and provider tool policy. They do not model
+attenuated WebSocket principal grants. The WebSocket setter separately requires `workspace.manage`.
+Discover MCP tools and require catalogue version 1 before using the adapter; the package version
+alone does not establish availability. Existing CLI workspace summaries omit field values and
+there is no CLI field setter. Reading these values explicitly as tool data does not add them to
+automatic agent configuration, initial prompts or message construction.
+
 ## Data flow: running an agent
 
 1. Client sends `CreateAgentRequestMessage` with config (prompt, cwd, provider, model, mode)

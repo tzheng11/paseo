@@ -1,3 +1,4 @@
+import { WorkspaceFieldsContent } from "@/workspace-fields/content";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { View, Text, Pressable } from "react-native";
 import { Gesture } from "react-native-gesture-handler";
@@ -352,7 +353,7 @@ function ExplorerSidebarContent({
   const resolvedTab: ExplorerTab = requestedTab === "pr" && !showPrTab ? "changes" : requestedTab;
   const prTabLabel = formatPrTabLabel(prPane.prNumber);
   const availableTabs = useMemo<ExplorerTab[]>(() => {
-    const tabs: ExplorerTab[] = isGit ? ["changes", "files"] : ["files"];
+    const tabs: ExplorerTab[] = isGit ? ["changes", "files", "info"] : ["files", "info"];
     if (isGit && showPrTab) tabs.push("pr");
     return tabs;
   }, [isGit, showPrTab]);
@@ -383,6 +384,13 @@ function ExplorerSidebarContent({
             label={t("workspace.tabs.explorerSidebar.files")}
             onTabPress={onTabPress}
             testID="explorer-tab-files"
+          />
+          <ExplorerTabButton
+            tab="info"
+            active={resolvedTab === "info"}
+            label={t("panels.info.label")}
+            onTabPress={onTabPress}
+            testID="explorer-tab-info"
           />
           {isGit && showPrTab && (
             <ExplorerTabButton
@@ -437,6 +445,15 @@ function ExplorerSidebarContent({
               workspaceId={workspaceId}
               workspaceRoot={workspaceRoot}
               onOpenFile={onOpenFile}
+            />
+          </RetainedPanel>
+        ) : null}
+        {mountedTabIds.has("info") && workspaceId ? (
+          <RetainedPanel active={resolvedTab === "info"}>
+            <WorkspaceFieldsContent
+              key={`${serverId}:${workspaceId}`}
+              serverId={serverId}
+              workspaceId={workspaceId}
             />
           </RetainedPanel>
         ) : null}

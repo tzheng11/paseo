@@ -3,6 +3,12 @@ import { promises as fs } from "node:fs";
 import type { Logger } from "pino";
 import { z } from "zod";
 
+import {
+  MAX_WORKSPACE_FIELD_VALUE_LENGTH,
+  MAX_WORKSPACE_FIELD_VALUES_BYTES,
+  workspaceFieldValuesByteLength,
+} from "@getpaseo/protocol/workspace-fields";
+
 import { writeJsonFileAtomic } from "./atomic-file.js";
 import { areEquivalentPaths } from "../utils/path.js";
 import {
@@ -101,6 +107,14 @@ const PersistedWorkspaceRecordSchema = z.object({
     .optional()
     .transform((value) => value ?? null),
   labels: z.array(z.string()).optional(),
+  // COMPAT(workspaceFields): old records have no values; remove optional after 2027-04-14.
+  fieldValues: z
+    .record(z.string(), z.string().max(MAX_WORKSPACE_FIELD_VALUE_LENGTH))
+    .refine(
+      (values) => workspaceFieldValuesByteLength(values) <= MAX_WORKSPACE_FIELD_VALUES_BYTES,
+      "Workspace fields exceed 32 KiB",
+    )
+    .optional(),
   untrustedSource: UntrustedWorkspaceSourceSchema.optional(),
   // Public discovery visibility. Contents retain their ordinary lifecycle.
   background: z.boolean().optional().default(false),
@@ -241,7 +255,9 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
     return this.mutateCache((records) => {
       const existing = records.get(id);
       if (!existing) return null;
-      const next = this.schema.parse(updater(existing));
+      const proposed = updater(existing);
+      if (proposed === existing) return existing;
+      const next = this.schema.parse(proposed);
       records.set(id, next);
       return next;
     });

@@ -12,6 +12,9 @@ import { createTestPaseoDaemon, type TestPaseoDaemon } from "../test-utils/paseo
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
 import type { AgentClient, AgentProvider, AgentSessionConfig } from "./agent-sdk-types.js";
 import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
+import { DaemonClient } from "../test-utils/daemon-client.js";
+import { FileBackedWorkspaceRegistry } from "../workspace-registry.js";
+import { createTestLogger } from "../../test-utils/test-logger.js";
 
 interface StructuredContent {
   [key: string]: unknown;
@@ -822,6 +825,178 @@ describe("Suite D: Provider Tools", () => {
 });
 
 describe("Suite E: Workspace Tools", () => {
+  test("workspace fields persist MCP writes, broadcast to SDK observers and retain shared-cwd isolation", async () => {
+    const create = () =>
+      callToolStructured(topLevelClient, "create_workspace", {
+        isolation: "local",
+        path: parentAgentCwd,
+        title: "MCP field owner",
+      });
+    const a = str((await create()).workspaceId);
+    const b = str((await create()).workspaceId);
+    const sdk = new DaemonClient({ url: `ws://127.0.0.1:${daemonHandle.port}/ws` });
+    await sdk.connect();
+    const updates: unknown[] = [];
+    const subscription = sdk.observeWorkspaces();
+    subscription.subscribe({ snapshot: () => {}, update: (message) => updates.push(message) });
+    await subscription.ready;
+    try {
+      expect(
+        await callToolStructured(topLevelClient, "get_workspace_fields", { workspaceId: a }),
+      ).toEqual({
+        workspaceId: a,
+        catalogVersion: 1,
+        fields: [
+          { key: "notionProjectUrl", label: "Notion Project URL" },
+          { key: "notionIssueUrl", label: "Notion Issue URL" },
+        ],
+        fieldValues: {},
+      });
+      const project = {
+        workspaceId: a,
+        fieldKey: "notionProjectUrl",
+        value: "https://notion.so/project",
+        expectedValue: "",
+      };
+      const issue = {
+        workspaceId: a,
+        fieldKey: "notionIssueUrl",
+        value: "https://notion.so/issue\n<strong>literal</strong>",
+        expectedValue: "",
+      };
+      const saved = await Promise.all([
+        callToolStructured(topLevelClient, "set_workspace_field", project),
+        callToolStructured(agentScopedClient, "set_workspace_field", issue),
+      ]);
+      expect(saved).toEqual([
+        {
+          workspaceId: a,
+          fieldKey: project.fieldKey,
+          accepted: true,
+          value: project.value,
+          error: null,
+          errorCode: null,
+        },
+        {
+          workspaceId: a,
+          fieldKey: issue.fieldKey,
+          accepted: true,
+          value: issue.value,
+          error: null,
+          errorCode: null,
+        },
+      ]);
+      const values = { notionProjectUrl: project.value, notionIssueUrl: issue.value };
+      expect(
+        await callToolStructured(topLevelClient, "get_workspace_fields", { workspaceId: a }),
+      ).toMatchObject({ fieldValues: values });
+      await expect
+        .poll(() => updates)
+        .toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              type: "workspace_update",
+              payload: expect.objectContaining({
+                kind: "upsert",
+                workspace: expect.objectContaining({ id: a, fieldValues: values }),
+              }),
+            }),
+          ]),
+        );
+      expect(
+        (await sdk.fetchWorkspaces()).entries.find((workspace) => workspace.id === a)?.fieldValues,
+      ).toEqual(values);
+      const reloaded = new FileBackedWorkspaceRegistry(
+        path.join(daemonHandle.paseoHome, "projects", "workspaces.json"),
+        createTestLogger(),
+      );
+      expect(await reloaded.get(a)).toMatchObject({
+        fieldValues: values,
+        title: "MCP field owner",
+        cwd: parentAgentCwd,
+      });
+      expect((await reloaded.get(b))?.fieldValues).toBeUndefined();
+      expect(
+        await callToolStructured(topLevelClient, "get_workspace_fields", { workspaceId: b }),
+      ).toMatchObject({ fieldValues: {} });
+      expect(
+        await callToolStructured(topLevelClient, "set_workspace_field", project),
+      ).toMatchObject({ accepted: true, value: project.value });
+      expect(
+        await callToolStructured(topLevelClient, "set_workspace_field", {
+          ...project,
+          value: "newer",
+          expectedValue: project.value,
+        }),
+      ).toMatchObject({ accepted: true, value: "newer" });
+      const conflict = await topLevelClient.callTool({
+        name: "set_workspace_field",
+        args: project,
+      });
+      expect(conflict.isError).toBe(true);
+      expect(getStructuredContent(conflict)).toMatchObject({
+        workspaceId: a,
+        fieldKey: project.fieldKey,
+        accepted: false,
+        value: null,
+        errorCode: "conflict",
+      });
+      expect(
+        await callToolStructured(topLevelClient, "get_workspace_fields", { workspaceId: a }),
+      ).toMatchObject({ fieldValues: { ...values, notionProjectUrl: "newer" } });
+      expect(
+        await callToolStructured(topLevelClient, "set_workspace_field", {
+          ...project,
+          value: "",
+          expectedValue: "newer",
+        }),
+      ).toMatchObject({ accepted: true, value: "" });
+      expect(
+        await callToolStructured(topLevelClient, "get_workspace_fields", { workspaceId: a }),
+      ).toMatchObject({ fieldValues: { ...values, notionProjectUrl: "" } });
+      await topLevelClient.callTool({ name: "archive_workspace", args: { workspaceId: a } });
+      const archived = await topLevelClient.callTool({
+        name: "set_workspace_field",
+        args: project,
+      });
+      expect(archived.isError).toBe(true);
+      expect(getStructuredContent(archived)).toMatchObject({
+        accepted: false,
+        errorCode: "not_found",
+      });
+    } finally {
+      await subscription.release();
+      await sdk.close();
+      await topLevelClient.callTool({ name: "archive_workspace", args: { workspaceId: a } });
+      await topLevelClient.callTool({ name: "archive_workspace", args: { workspaceId: b } });
+    }
+  }, 30_000);
+
+  test("workspace fields resolve the agent's current workspace and reject top-level omission", async () => {
+    const status = await callToolStructured(topLevelClient, "get_agent_status", {
+      agentId: parentAgentId,
+    });
+    const callerWorkspaceId = str((status.snapshot as StructuredContent).workspaceId);
+    expect(await callToolStructured(agentScopedClient, "get_workspace_fields")).toMatchObject({
+      workspaceId: callerWorkspaceId,
+      catalogVersion: 1,
+    });
+    const input = {
+      fieldKey: "notionIssueUrl",
+      value: "https://notion.so/caller-issue",
+      expectedValue: "",
+    };
+    expect(await callToolStructured(agentScopedClient, "set_workspace_field", input)).toMatchObject(
+      { workspaceId: callerWorkspaceId, accepted: true, value: input.value },
+    );
+    expect(await callToolStructured(agentScopedClient, "get_workspace_fields")).toMatchObject({
+      workspaceId: callerWorkspaceId,
+      fieldValues: { notionIssueUrl: input.value },
+    });
+    await expectToolError(topLevelClient, "get_workspace_fields", {}, /workspaceId is required/);
+    await expectToolError(topLevelClient, "set_workspace_field", input, /workspaceId is required/);
+  });
+
   test("background worktree creation, discovery and archive use ordinary workspace ownership", async () => {
     const created = await callToolStructured(topLevelClient, "create_workspace", {
       isolation: "worktree",
