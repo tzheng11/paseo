@@ -259,6 +259,7 @@ export class ScheduleService {
   ) => Promise<ScheduleExecutionResult>;
   private readonly runningScheduleIds = new Set<string>();
   private tickTimer: ReturnType<typeof setInterval> | null = null;
+  private tickListing = false;
 
   constructor(options: ScheduleServiceOptions) {
     this.logger = options.logger.child({ module: "schedule-service" });
@@ -544,8 +545,21 @@ export class ScheduleService {
   }
 
   async tick(): Promise<void> {
+    // Ticks fire every second and overlap while one awaits a schedule run, which is how
+    // other schedules keep firing. Listing reads every schedule file, though, and on a slow
+    // disk overlapping listings each held a descriptor per file: 11,603 on 14 Oct 2026, past
+    // the 10,240 where macOS spawn fails with EBADF. Let one tick list at a time.
+    if (this.tickListing) {
+      return;
+    }
+    this.tickListing = true;
     const now = this.now();
-    const schedules = await this.store.list();
+    let schedules: StoredSchedule[];
+    try {
+      schedules = await this.store.list();
+    } finally {
+      this.tickListing = false;
+    }
     for (const schedule of schedules) {
       if (schedule.status !== "active" || !schedule.nextRunAt) {
         continue;

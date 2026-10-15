@@ -1,3 +1,4 @@
+import { spawn, type ChildProcess } from "node:child_process";
 import treeKill from "tree-kill";
 
 export interface TreeKillTarget {
@@ -21,6 +22,15 @@ export type TerminateWithTreeKillResult =
   | "terminated"
   | "killed"
   | "kill-timeout";
+
+export interface ChildPidListing {
+  pids: number[];
+  error: unknown;
+}
+
+// Injection seam: production lists children with pgrep (macOS) or ps (Linux); tests
+// wire a lister that throws or reports a failed spawn.
+export type ChildPidLister = (parentPid: number) => Promise<ChildPidListing>;
 
 // Injection seam: production wires terminateWithTreeKill; tests wire a fake that
 // records which children were terminated as observable state.
@@ -53,7 +63,11 @@ export async function terminateWithTreeKill(
     : "kill-timeout";
 }
 
-export function signalProcessTree(child: TreeKillTarget, signal: NodeJS.Signals): Promise<void> {
+export function signalProcessTree(
+  child: TreeKillTarget,
+  signal: NodeJS.Signals,
+  listChildPids: ChildPidLister = listChildPidsWithSpawn,
+): Promise<void> {
   if (isProcessExited(child)) {
     return Promise.resolve();
   }
@@ -64,12 +78,130 @@ export function signalProcessTree(child: TreeKillTarget, signal: NodeJS.Signals)
     return Promise.resolve();
   }
 
-  return new Promise((resolve) => {
-    treeKill(pid, signal, (error) => {
-      if (error) {
-        signalDirectChild(child, signal);
+  return signalPidTree(pid, signal, listChildPids).catch(() => {
+    signalDirectChild(child, signal);
+  });
+}
+
+// Signals a process and every descendant it can find. Rejects with the first listing or
+// signal error, after signalling everything already found.
+export async function signalPidTree(
+  pid: number,
+  signal: NodeJS.Signals,
+  listChildPids: ChildPidLister = listChildPidsWithSpawn,
+): Promise<void> {
+  if (process.platform === "win32") {
+    await new Promise<void>((resolve, reject) => {
+      treeKill(pid, signal, (error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
+    });
+    return;
+  }
+  const error = await signalKnownTree(pid, signal, listChildPids);
+  if (error) {
+    throw error;
+  }
+}
+
+// tree-kill lists children by spawning pgrep or ps again from each child's "close"
+// handler. A spawn that throws there, or emits "error" with no listener, is an uncaught
+// exception: on 14 Oct 2026 spawn threw EBADF (the daemon held descriptors numbered past
+// 10,240, where macOS posix_spawn rejects them) and the whole daemon crashed. This walk
+// guards every listing and, if one fails, still signals every process already found.
+async function signalKnownTree(
+  rootPid: number,
+  signal: NodeJS.Signals,
+  listChildPids: ChildPidLister,
+): Promise<unknown> {
+  const seen = new Set<number>([rootPid]);
+  const order: number[] = [];
+  let level = [rootPid];
+  let firstError: unknown = null;
+  while (level.length > 0) {
+    const listings = await Promise.all(
+      level.map((parentPid) => listChildPidsSafely(listChildPids, parentPid)),
+    );
+    order.push(...level);
+    const next: number[] = [];
+    for (const listing of listings) {
+      firstError = firstError ?? listing.error;
+      for (const childPid of listing.pids) {
+        if (!seen.has(childPid)) {
+          seen.add(childPid);
+          next.push(childPid);
+        }
       }
-      resolve();
+    }
+    level = next;
+  }
+
+  for (const targetPid of order.toReversed()) {
+    try {
+      process.kill(targetPid, signal);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+        firstError = firstError ?? error;
+      }
+    }
+  }
+  return firstError;
+}
+
+async function listChildPidsSafely(
+  listChildPids: ChildPidLister,
+  parentPid: number,
+): Promise<ChildPidListing> {
+  try {
+    return await listChildPids(parentPid);
+  } catch (error) {
+    return { pids: [], error };
+  }
+}
+
+function listChildPidsWithSpawn(parentPid: number): Promise<ChildPidListing> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (listing: ChildPidListing): void => {
+      if (!settled) {
+        settled = true;
+        resolve(listing);
+      }
+    };
+
+    let lister: ChildProcess;
+    try {
+      lister =
+        process.platform === "darwin"
+          ? spawn("pgrep", ["-P", String(parentPid)], { stdio: ["ignore", "pipe", "ignore"] })
+          : spawn("ps", ["-o", "pid", "--no-headers", "--ppid", String(parentPid)], {
+              stdio: ["ignore", "pipe", "ignore"],
+            });
+    } catch (error) {
+      settle({ pids: [], error });
+      return;
+    }
+
+    let output = "";
+    lister.stdout?.on("data", (data: Buffer) => {
+      output += data.toString("ascii");
+    });
+    lister.stdout?.on("error", () => undefined);
+    lister.on("error", (error) => settle({ pids: [], error }));
+    lister.on("close", (code) => {
+      // pgrep and ps exit non-zero when the process has no children.
+      if (code !== 0) {
+        settle({ pids: [], error: null });
+        return;
+      }
+      const pids = (output.match(/\d+/g) ?? [])
+        .map((value) => Number.parseInt(value, 10))
+        .filter((value) => Number.isInteger(value) && value > 0);
+      settle({ pids, error: null });
     });
   });
 }
