@@ -1187,6 +1187,41 @@ describe("DirectorySync session readiness", () => {
     directory.dispose();
   });
 
+  it("requires fresh workspace data after reconnect without discarding saved values", async () => {
+    const serverId = "workspace-reconnect-readiness";
+    const { client, directory } = createDirectory(serverId);
+    const store = useSessionStore.getState();
+    store.initializeSession(serverId, client as unknown as DaemonClient, 1);
+    store.updateSessionServerInfo(serverId, {
+      serverId,
+      hostname: null,
+      version: "test",
+      features: { workspaceMultiplicity: true },
+    });
+    const saved = normalizeWorkspaceDescriptor(createWorkspaceEntry("saved"));
+    saved.fieldValues = { notionProjectUrl: "saved URL" };
+    directory.acceptWorkspaces([saved]);
+    directory.markWorkspacesHydrated(true);
+    directory.connectionChanged({
+      client: null,
+      status: "offline",
+      source: { clientGeneration: 1, connectionEpoch: 1 },
+    });
+    expect(store.getSession(serverId)?.hasHydratedWorkspaces).toBe(false);
+    expect(store.getSession(serverId)?.workspaces.get("saved")?.fieldValues).toEqual(
+      saved.fieldValues,
+    );
+    directory.connectionChanged({
+      client: client as unknown as DaemonClient,
+      status: "online",
+      source: { clientGeneration: 1, connectionEpoch: 2 },
+    });
+    expect(store.getSession(serverId)?.hasHydratedWorkspaces).toBe(false);
+    await directory.refreshWorkspaces();
+    expect(store.getSession(serverId)?.hasHydratedWorkspaces).toBe(true);
+    directory.dispose();
+  });
+
   it("rejects a session wait on disconnect so the reconnect can refresh", async () => {
     const serverId = "session-wait-reconnect";
     const { client, directory } = createDirectory(serverId);

@@ -17,6 +17,9 @@ a compatible pane.
 
 Files, Changes and Info are the Explorer defaults. Info is permanent: it cannot be closed individually
 or by bulk-close actions. Restoring older layouts adds it without changing the selected tab.
+Info distinguishes pending workspace data from a confirmed empty value. It preserves known values
+while reconnecting, shows a spinner for unresolved values, and permits editing only after the
+current connection has hydrated the workspace baseline.
 Their panel manifests mark them as singletons,
 so a pane’s + menu omits each while that pane already contains it. Closing one makes its menu
 item available again. Other compatible tabs, including agents, terminals, files, and diffs,

@@ -1,7 +1,9 @@
 import { useCallback } from "react";
 import { type WorkspaceFieldsModel, type FieldsSnapshot } from "./model";
 import { Pressable, ScrollView, Text, View } from "react-native";
-import { StyleSheet } from "react-native-unistyles";
+import { StyleSheet, withUnistyles } from "react-native-unistyles";
+import { LoadingSpinner } from "@/components/ui/loading-spinner";
+import type { Theme } from "@/styles/theme";
 import { useTranslation } from "react-i18next";
 import {
   WORKSPACE_FIELDS,
@@ -10,6 +12,9 @@ import {
 import { FormTextInput } from "@/components/ui/form-field";
 import { Button } from "@/components/ui/button";
 import { useWorkspaceFieldsModel } from "./use-workspace-fields-model";
+
+const ThemedLoadingSpinner = withUnistyles(LoadingSpinner);
+const mutedSpinner = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
 
 export function WorkspaceFieldsContent(props: { serverId: string; workspaceId: string }) {
   const { t } = useTranslation();
@@ -22,7 +27,7 @@ export function WorkspaceFieldsContent(props: { serverId: string; workspaceId: s
       keyboardShouldPersistTaps="handled"
     >
       <Text style={styles.heading}>{t("panels.info.fields")}</Text>
-      {state.availability !== "ready" ? (
+      {state.availability !== "ready" && state.availability !== "loading" ? (
         <Text style={styles.hint} testID="workspace-info-availability">
           {t(`panels.info.${state.availability}`)}
         </Text>
@@ -45,7 +50,6 @@ function WorkspaceFieldRow({
   const { t } = useTranslation();
   const editor = state.editor?.key === field.key ? state.editor : null;
   const pending = state.editor?.status === "saving";
-  const canRead = state.availability !== "loading" && state.availability !== "update";
   const edit = useCallback(() => model.edit(field.key), [model, field.key]);
   const change = useCallback((draft: string) => model.change(draft), [model]);
   const save = useCallback(() => {
@@ -69,11 +73,7 @@ function WorkspaceFieldRow({
         testID={`workspace-info-field-${field.key}`}
       >
         <Text style={styles.label}>{field.label}</Text>
-        <Text style={styles.value} numberOfLines={4} testID={`workspace-info-value-${field.key}`}>
-          {canRead
-            ? state.values[field.key] || t("panels.info.empty")
-            : t("panels.info.unavailable")}
-        </Text>
+        <WorkspaceFieldValue fieldKey={field.key} state={state} />
       </Pressable>
       {editor ? (
         <View style={styles.editor}>
@@ -98,7 +98,7 @@ function WorkspaceFieldRow({
             <Button
               size="sm"
               onPress={save}
-              disabled={pending}
+              disabled={pending || editor.conflict || state.availability === "loading"}
               loading={pending}
               testID="workspace-info-save"
             >
@@ -117,6 +117,31 @@ function WorkspaceFieldRow({
         </View>
       ) : null}
     </View>
+  );
+}
+function WorkspaceFieldValue({ fieldKey, state }: { fieldKey: string; state: FieldsSnapshot }) {
+  const { t } = useTranslation();
+  const value = state.values[fieldKey] ?? "";
+  const loading = state.availability === "loading" && !value;
+  const canRead = state.hasValues && state.availability !== "update";
+  const waiting = loading || (!state.hasValues && state.availability !== "update");
+  return waiting ? (
+    <View
+      style={styles.valueLoading}
+      accessibilityRole="progressbar"
+      accessibilityLabel={t("panels.info.loading")}
+      testID={`workspace-info-loading-${fieldKey}`}
+    >
+      <ThemedLoadingSpinner size={14} uniProps={mutedSpinner} />
+    </View>
+  ) : (
+    <Text
+      style={[styles.value, !value ? styles.emptyValue : undefined]}
+      numberOfLines={4}
+      testID={`workspace-info-value-${fieldKey}`}
+    >
+      {canRead ? value || t("panels.info.empty") : "—"}
+    </Text>
   );
 }
 const styles = StyleSheet.create((theme) => ({
@@ -148,12 +173,14 @@ const styles = StyleSheet.create((theme) => ({
     fontSize: theme.fontSize.base,
   },
   value: { flex: 1, minWidth: 0, color: theme.colors.foreground, fontSize: theme.fontSize.base },
+  emptyValue: { color: theme.colors.foregroundMuted },
+  valueLoading: { flex: 1, minHeight: 20, alignItems: "flex-start", justifyContent: "center" },
   editor: {
     paddingHorizontal: theme.spacing[4],
     paddingBottom: theme.spacing[3],
     gap: theme.spacing[3],
   },
-  input: { minHeight: 140, maxHeight: 320, textAlignVertical: "top" },
+  input: { minHeight: 72, maxHeight: 240, textAlignVertical: "top" },
   actions: { flexDirection: "row", gap: theme.spacing[2] },
   error: { color: theme.colors.destructive, fontSize: theme.fontSize.sm },
 }));
