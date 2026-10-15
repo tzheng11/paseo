@@ -33,6 +33,12 @@ interface TimelineState {
   bytes: number;
 }
 
+interface PreparedTimelineFetch {
+  state: TimelineState;
+  positions: Iterable<number>;
+  finish(entries: ProjectedTimelineRow[]): AgentTimelineFetchResult;
+}
+
 /** Disposable projection cache. Provider transcripts remain authoritative. */
 export class DiskAgentTimelineStore implements AgentRuntimeTimelineStore {
   private readonly database: DatabaseSync;
@@ -333,6 +339,43 @@ export class DiskAgentTimelineStore implements AgentRuntimeTimelineStore {
   }
 
   fetch(agentId: string, options?: AgentTimelineFetchOptions): AgentTimelineFetchResult {
+    const page = this.prepareFetch(agentId, options);
+    return page.finish(Array.from(page.positions, (pos) => this.readRow(page.state, pos)));
+  }
+
+  async fetchAsync(
+    agentId: string,
+    options?: AgentTimelineFetchOptions,
+  ): Promise<AgentTimelineFetchResult> {
+    const page = this.prepareFetch(agentId, options);
+    const state = page.state;
+    const nextSeq = state.nextSeq;
+    const entries: ProjectedTimelineRow[] = [];
+    let started = performance.now();
+    let decoded = 0;
+    const assertCurrent = () => {
+      if (this.closed || this.states.get(agentId) !== state || state.nextSeq !== nextSeq)
+        throw new Error("History changed during paged read");
+    };
+    for (const pos of page.positions) {
+      assertCurrent();
+      entries.push(this.readRow(state, pos));
+      // Tool updates can expand even a one-item tail across the entire timeline.
+      // Yield while decoding it, without weakening the page's coverage/cursors.
+      if (++decoded >= 32 || performance.now() - started >= 4) {
+        await setImmediate();
+        decoded = 0;
+        started = performance.now();
+      }
+    }
+    assertCurrent();
+    return page.finish(entries);
+  }
+
+  private prepareFetch(
+    agentId: string,
+    options?: AgentTimelineFetchOptions,
+  ): PreparedTimelineFetch {
     const state = this.requireState(agentId);
     const direction = options?.direction ?? "tail";
     const cursor = options?.cursor;
@@ -347,39 +390,50 @@ export class DiskAgentTimelineStore implements AgentRuntimeTimelineStore {
       cursor.seq < state.minSeq - 1;
     const reset = staleCursor || gap;
     const selectedDirection = reset ? "tail" : direction;
-    const { entries, hasOlder } = this.selectRows(state, selectedDirection, cursor?.seq, limit);
-    const page = selectProjectedEntriesPage({
-      entries,
-      bounds: window,
-      direction: selectedDirection,
-      cursorSeq: cursor?.seq,
-      limit: 0,
-    });
+    const { positions, hasOlder } = this.selectPositions(
+      state,
+      selectedDirection,
+      cursor?.seq,
+      limit,
+    );
     return {
-      epoch: state.epoch,
-      direction,
-      reset,
-      staleCursor,
-      gap,
-      window,
-      hasOlder: hasOlder ?? page.hasOlder,
-      hasNewer: page.hasNewer,
-      startSeq: page.startSeq,
-      endSeq: page.endSeq,
-      rows: page.entries.map((entry) => Object.assign({ seq: entry.seqEnd }, entry)),
+      state,
+      positions,
+      finish: (entries) => {
+        const page = selectProjectedEntriesPage({
+          entries,
+          bounds: window,
+          direction: selectedDirection,
+          cursorSeq: cursor?.seq,
+          limit: 0,
+        });
+        return {
+          epoch: state.epoch,
+          direction,
+          reset,
+          staleCursor,
+          gap,
+          window,
+          hasOlder: hasOlder ?? page.hasOlder,
+          hasNewer: page.hasNewer,
+          startSeq: page.startSeq,
+          endSeq: page.endSeq,
+          rows: page.entries.map((entry) => Object.assign({ seq: entry.seqEnd }, entry)),
+        };
+      },
     };
   }
 
-  private selectRows(
+  private selectPositions(
     state: TimelineState,
     selectedDirection: "tail" | "before" | "after",
     cursorSeq: number | undefined,
     limit: number,
-  ): { entries: ProjectedTimelineRow[]; hasOlder?: boolean } {
-    let entries: ProjectedTimelineRow[];
+  ): { positions: Iterable<number>; hasOlder?: boolean } {
+    let selected: Iterable<number>;
     let hasOlder: boolean | undefined;
     if (state.count === 0) {
-      entries = [];
+      selected = [];
     } else if (selectedDirection === "tail") {
       let start = limit === 0 ? 0 : Math.max(0, state.count - limit);
       // An old tool anchor can own new source events. Expand transitively just as
@@ -395,7 +449,7 @@ export class DiskAgentTimelineStore implements AgentRuntimeTimelineStore {
         if (overlap?.pos === null || overlap?.pos === undefined) break;
         start = Number(overlap.pos);
       }
-      entries = this.readRows(state, start);
+      selected = this.rowPositions(start, state.count);
       hasOlder = start > 0;
     } else if (selectedDirection === "before") {
       const endSeq = Math.min(state.nextSeq - 1, (cursorSeq ?? state.nextSeq) - 1);
@@ -404,7 +458,7 @@ export class DiskAgentTimelineStore implements AgentRuntimeTimelineStore {
       ).all(state.key, endSeq, limit === 0 ? -1 : limit + 1);
       hasOlder = limit > 0 && positions.length > limit;
       if (hasOlder) positions.pop();
-      entries = positions.toReversed().map((row) => this.readRow(state, Number(row.pos)));
+      selected = positions.toReversed().map((row) => Number(row.pos));
     } else {
       const startSeq = Math.max(state.minSeq, (cursorSeq ?? state.minSeq - 1) + 1);
       const positions = this.statement(`SELECT pos, MIN(MAX(start_seq, ?)) AS first_seq FROM ranges
@@ -415,11 +469,15 @@ export class DiskAgentTimelineStore implements AgentRuntimeTimelineStore {
         state.nextSeq - 1,
         limit === 0 ? -1 : limit,
       );
-      entries = positions
+      selected = positions
         .sort((a, b) => Number(a.pos) - Number(b.pos))
-        .map((row) => this.readRow(state, Number(row.pos)));
+        .map((row) => Number(row.pos));
     }
-    return { entries, hasOlder };
+    return { positions: selected, hasOlder };
+  }
+
+  private *rowPositions(start: number, count: number): Generator<number> {
+    for (let pos = start; pos < count; pos++) yield pos;
   }
 
   private projectRow(state: TimelineState, row: AgentTimelineRow): void {

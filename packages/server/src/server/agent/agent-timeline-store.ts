@@ -190,6 +190,13 @@ export class InMemoryAgentTimelineStore {
     };
   }
 
+  async fetchAsync(
+    agentId: string,
+    options?: AgentTimelineFetchOptions,
+  ): Promise<AgentTimelineFetchResult> {
+    return this.fetch(agentId, options);
+  }
+
   append(
     agentId: string,
     item: AgentTimelineItem,

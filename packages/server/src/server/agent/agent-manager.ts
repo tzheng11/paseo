@@ -1283,13 +1283,14 @@ export class AgentManager {
 
   async getTimelineRows(id: string): Promise<AgentTimelineRow[]> {
     this.requireAgent(id);
+    await this.drainSessionEvents(id);
     if (this.durableTimelineStore) {
       return projectTimelineRows({
         rows: await this.durableTimelineStore.getCommittedRows(id),
         mode: "projected",
       }).map((entry) => Object.assign({ seq: entry.seqEnd }, entry));
     }
-    return this.timelineStore.getRows(id);
+    return (await this.fetchTimelineAsync(id, { limit: 0 })).rows;
   }
 
   /** Search, export and hooks must consume rows incrementally. */
@@ -1399,6 +1400,21 @@ export class AgentManager {
   fetchTimeline(id: string, options?: AgentTimelineFetchOptions): AgentTimelineFetchResult {
     this.requireAgent(id);
     return this.timelineStore.fetch(id, options);
+  }
+
+  getTimelineEpoch(id: string): string {
+    this.requireAgent(id);
+    return this.timelineStore.getEpoch(id);
+  }
+
+  fetchTimelineAsync(
+    id: string,
+    options?: AgentTimelineFetchOptions,
+  ): Promise<AgentTimelineFetchResult> {
+    this.requireAgent(id);
+    // Live writes and hydration share this queue. Other agents remain free to
+    // advance while this read yields, without mixing two versions of this page.
+    return this.runSessionOperation(id, () => this.timelineStore.fetchAsync(id, options));
   }
 
   listProviderSubagents(parentAgentId: string): ProviderSubagentDescriptor[] {

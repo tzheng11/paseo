@@ -119,6 +119,14 @@ class InMemoryAgentManager {
     return this.timeline.fetch("agent-1", options);
   }
 
+  fetchTimelineAsync(_agentId: string, options?: AgentTimelineFetchOptions) {
+    return this.timeline.fetchAsync("agent-1", options);
+  }
+
+  getTimelineEpoch() {
+    return this.timeline.getEpoch("agent-1");
+  }
+
   listAgents() {
     return [];
   }

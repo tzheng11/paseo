@@ -4808,12 +4808,14 @@ export class Session {
   private deliverTimelineReplacement(agentId: string, initiatingSource?: object): void {
     const agent = this.agentManager.getAgent(agentId);
     if (!agent) return;
-    const timeline = this.agentManager.fetchTimeline(agentId, { limit: 0 });
-    const epoch = timeline.epoch;
+    const epoch = this.agentManager.getTimelineEpoch(agentId);
+    let timeline: AgentTimelineFetchResult | undefined;
+    const legacyRows = () =>
+      (timeline ??= this.agentManager.fetchTimeline(agentId, { limit: 0 })).rows;
 
     if (this.clientSources.size === 0 || !this.onMessageToSource) {
       if (!this.supports(CLIENT_CAPS.timelineReplacementInvalidation)) {
-        this.emitReconstructedTimelineRows(agentId, agent.provider, timeline.rows, epoch);
+        this.emitReconstructedTimelineRows(agentId, agent.provider, legacyRows(), epoch);
       }
       return;
     }
@@ -4839,7 +4841,7 @@ export class Session {
         !this.delivery.isModern(source) &&
         !capabilities.has(CLIENT_CAPS.timelineReplacementInvalidation)
       ) {
-        this.emitReconstructedTimelineRows(agentId, agent.provider, timeline.rows, epoch, source);
+        this.emitReconstructedTimelineRows(agentId, agent.provider, legacyRows(), epoch, source);
       }
     }
   }
@@ -7845,7 +7847,7 @@ export class Session {
       });
       const agentPayload = await this.buildAgentPayload(snapshot);
 
-      const fetchedControlTimeline = this.agentManager.fetchTimeline(msg.agentId, {
+      const fetchedControlTimeline = await this.agentManager.fetchTimelineAsync(msg.agentId, {
         direction,
         cursor,
         limit: pageLimit,
@@ -7977,15 +7979,9 @@ export class Session {
       const rows = msg.includeProviderHistory
         ? this.agentManager.streamFullHistoryMessages(msg.agentId)
         : this.agentManager.streamTimelineRows(msg.agentId);
-      const { epoch } = this.agentManager.fetchTimeline(msg.agentId, {
-        direction: "tail",
-        limit: 1,
-      });
+      const epoch = this.agentManager.getTimelineEpoch(msg.agentId);
       const result = await searchTimeline({ rows, query: msg.query, cursor: msg.cursor });
-      if (
-        this.agentManager.fetchTimeline(msg.agentId, { direction: "tail", limit: 1 }).epoch !==
-        epoch
-      ) {
+      if (this.agentManager.getTimelineEpoch(msg.agentId) !== epoch) {
         throw new Error("History changed; search again");
       }
       this.emitForSource(
@@ -8032,11 +8028,8 @@ export class Session {
       const rows = msg.includeProviderHistory
         ? this.agentManager.streamFullHistoryMessages(msg.agentId)
         : this.agentManager.streamTimelineRows(msg.agentId);
-      const timeline = this.agentManager.fetchTimeline(msg.agentId, {
-        direction: "tail",
-        limit: 1,
-      });
-      const index = await streamTimelinePromptIndex(timeline.epoch, rows);
+      const epoch = this.agentManager.getTimelineEpoch(msg.agentId);
+      const index = await streamTimelinePromptIndex(epoch, rows);
       this.emitForSource(
         {
           type: "agent.timeline.list_prompts.response",
@@ -8211,20 +8204,19 @@ export class Session {
         logger: this.sessionLogger,
       });
       const agentPayload = await this.buildAgentPayload(snapshot);
-      const timeline = this.agentManager.fetchTimeline(msg.agentId, {
-        direction: "tail",
-        limit: 1,
-      });
+      const epoch = this.agentManager.getTimelineEpoch(msg.agentId);
       const fullSource = Boolean(this.agentManager.getHistoryWindowInfo(msg.agentId)?.gap);
       let boundaryMessageId = msg.boundaryMessageId;
       if (fullSource && msg.boundaryCursor) {
-        if (msg.boundaryCursor.epoch !== timeline.epoch)
+        if (msg.boundaryCursor.epoch !== epoch)
           throw new Error("Selected timeline position is no longer available.");
-        const row = this.agentManager.fetchTimeline(msg.agentId, {
-          direction: "before",
-          cursor: { ...msg.boundaryCursor, seq: msg.boundaryCursor.seq + 1 },
-          limit: 1,
-        }).rows[0];
+        const row = (
+          await this.agentManager.fetchTimelineAsync(msg.agentId, {
+            direction: "before",
+            cursor: { ...msg.boundaryCursor, seq: msg.boundaryCursor.seq + 1 },
+            limit: 1,
+          })
+        ).rows[0];
         if (
           !row ||
           row.seqEnd !== msg.boundaryCursor.seq ||
@@ -8240,7 +8232,7 @@ export class Session {
           : this.agentManager.streamTimelineRows(msg.agentId),
         cursorBoundary:
           msg.boundaryCursor && !fullSource
-            ? { timelineEpoch: timeline.epoch, cursor: msg.boundaryCursor }
+            ? { timelineEpoch: epoch, cursor: msg.boundaryCursor }
             : null,
         boundaryMessageId,
         agentTitle: agentPayload.title,

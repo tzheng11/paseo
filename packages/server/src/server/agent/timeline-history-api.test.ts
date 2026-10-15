@@ -6,7 +6,42 @@ import pino from "pino";
 import { createDaemonTestContext } from "../test-utils/daemon-test-context.js";
 import { CodexAppServerAgentSession } from "./providers/codex-app-server-agent.js";
 import { createFakeCodexAppServer } from "./providers/codex/test-utils/fake-app-server.js";
-import type { AgentClient } from "./agent-sdk-types.js";
+import type { AgentClient, AgentTimelineItem } from "./agent-sdk-types.js";
+
+test("serves complete expanded projection pages and health requests on an isolated daemon", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "paseo-history-page-"));
+  const ctx = await createDaemonTestContext({ pluginsEnabled: false, relayEnabled: false });
+  try {
+    const agent = await ctx.client.createAgent({ provider: "codex", cwd });
+    const manager = ctx.daemon.daemon.agentManager;
+    const tool = (status: "running" | "completed"): AgentTimelineItem => ({
+      type: "tool_call",
+      callId: "old",
+      status,
+      name: "shell",
+      error: null,
+      detail: { type: "plain_text", label: "work" },
+    });
+    await manager.appendTimelineItem(agent.id, tool("running"));
+    for (let index = 0; index < 300; index++)
+      await manager.appendTimelineItem(agent.id, {
+        type: "user_message",
+        text: `${index}:${"x".repeat(8192)}`,
+      });
+    await manager.appendTimelineItem(agent.id, tool("completed"));
+    const [page, health] = await Promise.all([
+      ctx.client.fetchAgentTimeline(agent.id, { limit: 1 }),
+      fetch(`http://127.0.0.1:${ctx.daemon.port}/api/health`).then((response) => response.json()),
+    ]);
+    expect(page.entries).toHaveLength(301);
+    expect(page.startCursor?.seq).toBe(1);
+    expect(page.endCursor?.seq).toBe(302);
+    expect(health.status).toBe("ok");
+  } finally {
+    await ctx.cleanup();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
 
 test("serves bounded head/tail and lazy middle pages without consuming a full history response", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "paseo-history-api-"));
