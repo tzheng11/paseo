@@ -510,7 +510,7 @@ describe("target coalesced behavior", () => {
   });
 
   test(`coalesces a same-tick assistant burst after the ${COALESCE_WINDOW_MS}ms window`, async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const harness = createHarness();
     try {
       const { agentId, session } = await createManagedSession(harness);
@@ -559,7 +559,7 @@ describe("target coalesced behavior", () => {
   });
 
   test(`coalesces same-tick reasoning chunks after the ${COALESCE_WINDOW_MS}ms window`, async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const harness = createHarness();
     try {
       const { agentId, session } = await createManagedSession(harness);
@@ -586,7 +586,7 @@ describe("target coalesced behavior", () => {
   });
 
   test("coalesces running tool calls without flushing buffered text", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const harness = createHarness();
     try {
       const { agentId, session } = await createManagedSession(harness);
@@ -643,7 +643,7 @@ describe("target coalesced behavior", () => {
   });
 
   test("coalesces same-window tool call updates to the latest snapshot", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const harness = createHarness();
     try {
       const { agentId, session } = await createManagedSession(harness);
@@ -677,7 +677,7 @@ describe("target coalesced behavior", () => {
   });
 
   test("coalesces interleaved tool calls independently and preserves first arrival order", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const harness = createHarness();
     try {
       const { agentId, session } = await createManagedSession(harness);
@@ -709,7 +709,7 @@ describe("target coalesced behavior", () => {
   });
 
   test("terminal tool call statuses flush immediately with pending text", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const harness = createHarness();
     try {
       const { agentId, session } = await createManagedSession(harness);
@@ -745,7 +745,7 @@ describe("target coalesced behavior", () => {
   });
 
   test("preserves mixed text and tool call order after coalescing", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const harness = createHarness();
     try {
       const { agentId, session } = await createManagedSession(harness);
@@ -776,7 +776,7 @@ describe("target coalesced behavior", () => {
   });
 
   test("preserves assistant and reasoning interleave", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const harness = createHarness();
     try {
       const { agentId, session } = await createManagedSession(harness);
@@ -805,7 +805,7 @@ describe("target coalesced behavior", () => {
   });
 
   test("preserves strict alternating assistant/reasoning order", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const harness = createHarness();
     try {
       const { agentId, session } = await createManagedSession(harness);
@@ -848,7 +848,7 @@ describe("target coalesced behavior", () => {
   });
 
   test("isolates buffers per agent", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const harness = createHarness();
     try {
       const first = await createManagedSession(harness, {
@@ -894,7 +894,7 @@ describe("target coalesced behavior", () => {
   });
 
   test("provider boundaries break collapse", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const harness = createHarness();
     try {
       const { agentId, session } = await createManagedSession(harness);
@@ -924,7 +924,7 @@ describe("target coalesced behavior", () => {
   });
 
   test("turnId boundaries break collapse", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const harness = createHarness();
     try {
       const { agentId, session } = await createManagedSession(harness);
@@ -963,7 +963,7 @@ describe("target coalesced behavior", () => {
   });
 
   test("drops empty text but preserves whitespace byte-exactly", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const harness = createHarness();
     try {
       const { agentId, session } = await createManagedSession(harness);
@@ -992,7 +992,7 @@ describe("target coalesced behavior", () => {
   });
 
   test("flushes pending chunks before terminal lifecycle events by dispatch order", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
 
     for (const terminalType of ["turn_completed", "turn_failed", "turn_canceled"] as const) {
       const harness = createHarness();
@@ -1049,7 +1049,7 @@ describe("target coalesced behavior", () => {
   });
 
   test("lifecycle paths are timer-safe", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
 
     const closeHarness = createHarness();
     try {
@@ -1100,7 +1100,7 @@ describe("target coalesced behavior", () => {
   });
 
   test("old timers cannot write into reused agent ids", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
 
     const reloadHarness = createHarness();
     try {
@@ -1158,7 +1158,7 @@ describe("target coalesced behavior", () => {
   });
 
   test("flush helper is idempotent and re-entry safe", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const idempotencyHarness = createHarness();
     try {
       const { agentId, session } = await createManagedSession(idempotencyHarness);
@@ -1238,7 +1238,7 @@ describe("target coalesced behavior", () => {
   });
 
   test("manager flush drains pending chunks before background tasks", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const harness = createHarness();
     try {
       const { agentId, session } = await createManagedSession(harness);
@@ -1269,7 +1269,7 @@ describe("target coalesced behavior", () => {
   });
 
   test("history hydration projects immediately without waiting for a streaming window", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const harness = createHarness();
     try {
       const { agentId, session } = await createManagedSession(harness);
@@ -1296,7 +1296,7 @@ describe("target coalesced behavior", () => {
   });
 
   test("foreground stream yields coalesced timeline events before terminal events", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const harness = createHarness();
     try {
       const { agentId, session } = await createManagedSession(harness);
@@ -1375,7 +1375,7 @@ describe("target coalesced behavior", () => {
   });
 
   test("every collapsed item is one timeline row with monotonic seqs", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const harness = createHarness();
     try {
       const { agentId, session } = await createManagedSession(harness);

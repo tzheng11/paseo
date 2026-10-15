@@ -10,6 +10,9 @@ import type {
   SidebarWorkspaceEntry,
 } from "@/hooks/use-sidebar-workspaces-list";
 import type { SidebarGroupMode } from "@/stores/sidebar-view-store";
+import type { PinnedWorkspaceSortMode } from "@/stores/sidebar-order-store";
+import type { WorkspaceTitleSource } from "@/hooks/use-settings";
+import { resolveSidebarWorkspacePrimaryLabel } from "./sidebar-workspace-title";
 import {
   resolveSidebarProjectIconTargets,
   type SidebarProjectIconTarget,
@@ -40,6 +43,8 @@ export interface SidebarProjectionInput {
   projects: SidebarProjectEntry[];
   pinnedKeys: PinnedSidebarKeys;
   pinnedWorkspaceOrder: string[];
+  pinnedWorkspaceSortMode?: PinnedWorkspaceSortMode;
+  workspaceTitleSource?: WorkspaceTitleSource;
   workspaceEntriesByKey: ReadonlyMap<string, SidebarWorkspaceEntry>;
   projectNamesByViewKey: Map<string, string>;
   groupMode: SidebarGroupMode;
@@ -55,6 +60,22 @@ export function buildSidebarProjection(input: SidebarProjectionInput): SidebarPr
     keys: input.pinnedKeys,
     pinnedWorkspaceOrder: input.pinnedWorkspaceOrder,
   });
+  if (input.pinnedWorkspaceSortMode === "alphabetical") {
+    const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+    const label = (workspace: (typeof pinnedGroups.pinnedChats)[number]) => {
+      const entry = input.workspaceEntriesByKey.get(workspace.workspaceKey);
+      return entry
+        ? resolveSidebarWorkspacePrimaryLabel({
+            workspace: entry,
+            workspaceTitleSource: input.workspaceTitleSource ?? "title",
+          })
+        : workspace.name;
+    };
+    pinnedGroups.pinnedChats.sort(
+      (a, b) =>
+        collator.compare(label(a), label(b)) || a.workspaceKey.localeCompare(b.workspaceKey),
+    );
+  }
   const pinnedWorkspaceKeys = new Set(input.pinnedKeys.pinnedWorkspaceKeys);
   const unpinnedWorkspaces = Array.from(input.workspaceEntriesByKey.values()).filter(
     (workspace) => !pinnedWorkspaceKeys.has(workspace.workspaceKey),

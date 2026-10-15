@@ -1223,6 +1223,11 @@ export const fr: TranslationResources = {
     },
     pinned: {
       title: "Épinglés",
+      sort: {
+        label: "Trier les espaces de travail épinglés",
+        manual: "Manuel",
+        alphabetical: "A–Z",
+      },
     },
     host: {
       noHost: "Aucun hôte",

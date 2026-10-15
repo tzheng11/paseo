@@ -442,6 +442,19 @@ so the port may already be bound. `portScript` takes precedence when both values
 
 > The user-facing guide for this feature (enabling it, reverse proxy, TLS, tunnels, security) lives at [public-docs/web-ui.md](../public-docs/web-ui.md). This section is the contributor/build reference: how the artifact is produced, bundled, and excluded from desktop packaging.
 
+For UI-only fork development, build an independent browser export with
+`npm run build:web --workspace=@getpaseo/app`. Serve `packages/app/dist` with a static server that
+falls back to `index.html` for client routes. It connects to existing hosts through Add Host,
+so installing a new UI does not require restarting those hosts' daemons. Host connections and
+display preferences belong to the browser origin; a new self-hosted URL starts with its own state.
+The same UI changes appear in desktop after a separate desktop build.
+
+Keep a private deployment on a loopback listener behind Tailscale Serve. For example, pinned
+`serve@14.2.6` with `--single --listen tcp://127.0.0.1:6770` serves the export, and
+`tailscale serve --bg --https=443 http://127.0.0.1:6770` gives it a private HTTPS origin. Preserve
+existing Serve routes. Store exports by source commit and switch a `current` symlink for upgrades
+or rollback; restart only the static server's own login job. No agent state needs to move.
+
 The daemon can optionally serve the browser web client from the same HTTP server. This is disabled by default.
 
 Enable it in persistent configuration:

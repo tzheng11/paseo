@@ -8102,6 +8102,94 @@ test("listAgents excludes internal agents", async () => {
   ]);
 });
 
+test.each<AgentStreamEvent>([
+  { type: "turn_completed", provider: "codex", turnId: "stream-read-test" },
+  { type: "turn_failed", provider: "codex", turnId: "stream-read-test", error: "provider failed" },
+  { type: "turn_canceled", provider: "codex", turnId: "stream-read-test", reason: "user canceled" },
+])("plugin stream hooks read bounded history only for terminal $type", async (terminal) => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-plugin-stream-read-"));
+  const session = new TestAgentSession({ provider: "codex", cwd: workdir });
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+  let fullHistoryReads = 0;
+  let historyWindowReads = 0;
+  const store = new (class extends DiskAgentTimelineStore {
+    override getItems(agentId: string): AgentTimelineItem[] {
+      fullHistoryReads++;
+      return super.getItems(agentId);
+    }
+    override readWindows(
+      ...args: Parameters<DiskAgentTimelineStore["readWindows"]>
+    ): ReturnType<DiskAgentTimelineStore["readWindows"]> {
+      historyWindowReads++;
+      return super.readWindows(...args);
+    }
+  })({ directory: join(workdir, "cache") });
+  const lifecycleEvents: Array<{ name: string; payload: unknown }> = [];
+  const manager = new AgentManager({
+    clients: { codex: client },
+    timelineStore: store,
+    logger,
+    pluginLifecycle: {
+      emit: (name, payload) => {
+        lifecycleEvents.push({ name, payload });
+      },
+      before: async (_name, request) => request,
+    },
+  });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  try {
+    const historical: AgentTimelineItem = {
+      type: "user_message",
+      messageId: "old",
+      text: "history",
+    };
+    store.append(agent.id, historical);
+    let deliveredUsageEvents = 0;
+    const unsubscribe = manager.subscribe((event) => {
+      if (event.type === "agent_stream" && event.event.type === "usage_updated")
+        deliveredUsageEvents++;
+    });
+    session.pushEvent({ type: "turn_started", provider: "codex", turnId: "stream-read-test" });
+    for (let index = 0; index < 100; index++) {
+      session.pushEvent({
+        type: "usage_updated",
+        provider: "codex",
+        usage: { inputTokens: index, outputTokens: index },
+      });
+    }
+    await manager.flush();
+    expect(deliveredUsageEvents).toBe(100);
+    expect(fullHistoryReads).toBe(0);
+    expect(historyWindowReads).toBe(0);
+    expect(lifecycleEvents.filter((event) => event.name === "agent.turn_started")).toHaveLength(1);
+    session.pushEvent(terminal);
+    await manager.flush();
+    expect(fullHistoryReads).toBe(0);
+    expect(historyWindowReads).toBe(1);
+    expect(lifecycleEvents.filter((event) => event.name === "agent.turn_ended")).toEqual([
+      {
+        name: "agent.turn_ended",
+        payload: expect.objectContaining({
+          timeline: store.getRows(agent.id).map((row) => row.item),
+          outcome: expect.objectContaining({ kind: terminal.type.slice(5) }),
+        }),
+      },
+    ]);
+    unsubscribe();
+  } finally {
+    await manager.closeAgent(agent.id);
+    await manager.flush();
+    store.close();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("workspace ownership does not turn an ordinary agent into a disposable helper", async () => {
   const agentId = "00000000-0000-4000-8000-000000000115";
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
