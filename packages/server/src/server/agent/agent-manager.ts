@@ -13,6 +13,7 @@ import { randomUUID } from "node:crypto";
 import { basename, resolve } from "node:path";
 import { stat } from "node:fs/promises";
 import { setImmediate } from "node:timers/promises";
+import { setImmediate as scheduleImmediate } from "node:timers";
 import {
   AGENT_LIFECYCLE_STATUSES,
   type AgentLifecycleStatus,
@@ -794,6 +795,8 @@ export class AgentManager {
   private readonly providerSubagents = new ProviderSubagentStore();
   private readonly agentsAwaitingInitialSnapshotPersist = new Set<string>();
   private readonly sessionEventTails = new Map<string, Promise<void>>();
+  private readonly pendingSessionOperations: Array<() => void> = [];
+  private sessionOperationDrainScheduled = false;
   private historyReplayBatchTail: Promise<void> = Promise.resolve();
   private readonly steerEventBarriers = new Map<string, SteerEventBarrier>();
   private readonly foregroundMutationTails = new Map<string, Promise<void>>();
@@ -4075,7 +4078,7 @@ export class AgentManager {
 
   private runSessionOperation<T>(agentId: string, operation: () => Promise<T>): Promise<T> {
     const previous = this.sessionEventTails.get(agentId) ?? Promise.resolve();
-    const result = previous.then(operation);
+    const result = previous.then(() => this.scheduleSessionOperation(operation));
     const settled = result.then(
       () => undefined,
       () => undefined,
@@ -4087,6 +4090,37 @@ export class AgentManager {
       return undefined;
     });
     return result;
+  }
+
+  private scheduleSessionOperation<T>(operation: () => Promise<T>): Promise<T> {
+    return new Promise<T>((complete, reject) => {
+      this.pendingSessionOperations.push(() => {
+        try {
+          complete(operation());
+        } catch (error) {
+          reject(error);
+        }
+      });
+      this.scheduleSessionOperationDrain();
+    });
+  }
+
+  private scheduleSessionOperationDrain(): void {
+    if (this.sessionOperationDrainScheduled) return;
+    this.sessionOperationDrainScheduled = true;
+    scheduleImmediate(() => {
+      this.sessionOperationDrainScheduled = false;
+      const started = performance.now();
+      let processed = 0;
+      // Share the budget across agents. Promise-only per-agent tails can drain an
+      // entire provider burst without allowing sockets or timers to run.
+      while (this.pendingSessionOperations.length && processed < 32) {
+        this.pendingSessionOperations.shift()!();
+        processed++;
+        if (performance.now() - started >= 4) break;
+      }
+      if (this.pendingSessionOperations.length) this.scheduleSessionOperationDrain();
+    });
   }
 
   /**
@@ -5252,8 +5286,11 @@ export class AgentManager {
   /**
    * Flush any background persistence work (best-effort).
    */
-  async flush(): Promise<void> {
-    await this.flushTasks({ includeAgentRegistrations: false });
+  async flush(options?: { coalesced?: boolean }): Promise<void> {
+    await this.flushTasks({
+      includeAgentRegistrations: false,
+      coalesced: options?.coalesced ?? true,
+    });
   }
 
   /**
@@ -5262,11 +5299,14 @@ export class AgentManager {
    * either install them or close them.
    */
   async flushForShutdown(): Promise<void> {
-    await this.flushTasks({ includeAgentRegistrations: true });
+    await this.flushTasks({ includeAgentRegistrations: true, coalesced: true });
   }
 
-  private async flushTasks(options: { includeAgentRegistrations: boolean }): Promise<void> {
-    this.agentStreamCoalescer.flushAll();
+  private async flushTasks(options: {
+    includeAgentRegistrations: boolean;
+    coalesced: boolean;
+  }): Promise<void> {
+    if (options.coalesced) this.agentStreamCoalescer.flushAll();
     // Drain tasks, including tasks spawned while awaiting.
     while (
       this.backgroundTasks.size > 0 ||
@@ -5276,6 +5316,8 @@ export class AgentManager {
         ? [...this.backgroundTasks, ...this.agentRegistrationTasks]
         : [...this.backgroundTasks];
       await Promise.allSettled(pending);
+      // Queued provider events can create new buffers while the drain is awaiting.
+      if (options.coalesced) this.agentStreamCoalescer.flushAll();
     }
   }
 

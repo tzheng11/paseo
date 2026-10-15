@@ -758,6 +758,97 @@ test("refreshing an agent replaces the injected timeline store instead of append
   }
 });
 
+test("flush waits for queued session events and their trailing coalesced output", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-flush-queued-"));
+  const session = new TestAgentSession({ provider: "codex", cwd: workdir });
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    logger,
+    agentStreamCoalesceWindowMs: 60_000,
+  });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {});
+  try {
+    for (const text of ["one", "two"]) {
+      session.pushEvent({
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", text },
+      });
+    }
+    await manager.flush();
+    expect(manager.getTimeline(agent.id)).toEqual([{ type: "assistant_message", text: "onetwo" }]);
+  } finally {
+    await manager.closeAgent(agent.id);
+    await manager.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("concurrent live streams yield to requests and preserve per-agent event order", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-live-budget-"));
+  const count = 4;
+  const eventsPerAgent = 80;
+  const probe = deferred<number>();
+  const sessions: TestAgentSession[] = [];
+  let appended = 0;
+  let armed = false;
+  const store = new (class extends DiskAgentTimelineStore {
+    override append(...args: Parameters<DiskAgentTimelineStore["append"]>): AgentTimelineRow {
+      const row = super.append(...args);
+      appended++;
+      if (armed) {
+        armed = false;
+        setImmediate(() => probe.resolve(appended));
+      }
+      return row;
+    }
+  })({ directory: join(workdir, "cache") });
+  const client = new (class extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      const session = new TestAgentSession(config);
+      sessions.push(session);
+      return session;
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, timelineStore: store, logger });
+  const agents = [];
+  try {
+    for (let index = 0; index < count; index++)
+      agents.push(await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {}));
+    appended = 0;
+    armed = true;
+    for (let index = 0; index < eventsPerAgent; index++) {
+      for (const session of sessions)
+        session.pushEvent({
+          type: "timeline",
+          provider: "codex",
+          item: { type: "user_message", messageId: String(index), text: "live" },
+        });
+    }
+    await manager.flush();
+    const atProbe = await probe.promise;
+    expect(atProbe).toBeGreaterThan(0);
+    expect(atProbe).toBeLessThanOrEqual(32);
+    expect(appended).toBe(count * eventsPerAgent);
+    for (const agent of agents)
+      expect(
+        manager
+          .getTimeline(agent.id)
+          .map((item) => (item.type === "user_message" ? item.messageId : item.type)),
+      ).toEqual(Array.from({ length: eventsPerAgent }, (_, index) => String(index)));
+  } finally {
+    for (const agent of agents) await manager.closeAgent(agent.id);
+    await manager.flush();
+    store.close();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("history replay yields to other requests and orders live events after the complete replay", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-cooperative-history-"));
   const historyCount = 256;

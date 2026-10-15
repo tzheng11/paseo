@@ -54,7 +54,10 @@ export class DiskAgentTimelineStore implements AgentRuntimeTimelineStore {
       sizeCalculation: (value, key) => 2 * (value.length + key.length) + 256,
     });
     this.database.exec(`
-      PRAGMA journal_mode = DELETE;
+      -- This cache is rebuilt from provider transcripts after a process exit.
+      -- Keep transaction rollback, without synchronously writing and unlinking
+      -- a disk journal for every streamed projection update.
+      PRAGMA journal_mode = MEMORY;
       PRAGMA synchronous = OFF;
       PRAGMA cache_size = -4096;
       PRAGMA temp_store = FILE;
