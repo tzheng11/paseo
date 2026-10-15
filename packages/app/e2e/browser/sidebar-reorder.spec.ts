@@ -108,3 +108,64 @@ test("projects, workspaces, and pinned chats reorder with an immediate mouse dra
     await secondProject.cleanup();
   }
 });
+
+test("pinned A–Z sorting persists, follows renames, and restores manual order", async ({
+  page,
+}) => {
+  test.setTimeout(120_000);
+  const zeta = await seedWorkspace({
+    title: "Zeta pinned",
+    repoPrefix: "pinned-sort-zeta-",
+  });
+  const alpha = await seedWorkspace({
+    title: "Alpha pinned",
+    repoPrefix: "pinned-sort-alpha-",
+  });
+  try {
+    await alpha.client.setWorkspacePinned(alpha.workspaceId, true);
+    await zeta.client.setWorkspacePinned(zeta.workspaceId, true);
+    await page.setViewportSize({ width: 1440, height: 1200 });
+    await gotoAppShell(page);
+    await waitForSidebarHydration(page);
+    const section = page.getByTestId("sidebar-pinned-section").filter({ visible: true }).first();
+    const zetaRow = section.getByTestId(
+      `sidebar-workspace-row-${getServerId()}:${zeta.workspaceId}`,
+    );
+    const alphaRow = section.getByTestId(
+      `sidebar-workspace-row-${getServerId()}:${alpha.workspaceId}`,
+    );
+    const sort = section.getByTestId("sidebar-pinned-sort");
+    async function expectAbove(first: Locator, second: Locator) {
+      await expect
+        .poll(async () => {
+          const firstBox = await first.boundingBox();
+          const secondBox = await second.boundingBox();
+          return firstBox && secondBox ? firstBox.y < secondBox.y : false;
+        })
+        .toBe(true);
+    }
+    await expectAbove(zetaRow, alphaRow);
+    await sort.click();
+    await page.getByTestId("sidebar-pinned-sort-alphabetical").click();
+    await expectAbove(alphaRow, zetaRow);
+    await expect(sort).toContainText("A–Z");
+    await page.reload();
+    await expect(sort).toContainText("A–Z");
+    await expectAbove(alphaRow, zetaRow);
+    await sort.click();
+    await page.getByTestId("sidebar-pinned-sort-manual").click();
+    await expectAbove(zetaRow, alphaRow);
+    await sort.click();
+    await page.getByTestId("sidebar-pinned-sort-alphabetical").click();
+    await alpha.client.setWorkspaceTitle(alpha.workspaceId, "Zulu renamed");
+    await expect(alphaRow).toContainText("Zulu renamed");
+    await expectAbove(zetaRow, alphaRow);
+    await page.mouse.move(1000, 800);
+    await page.screenshot({
+      path: "../../artifacts/pinned-workspace-sort.png",
+      animations: "disabled",
+    });
+  } finally {
+    await Promise.all([zeta.cleanup(), alpha.cleanup()]);
+  }
+});

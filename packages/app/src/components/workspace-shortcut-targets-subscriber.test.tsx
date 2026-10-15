@@ -3,6 +3,7 @@
  */
 import React from "react";
 import { act } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -17,6 +18,7 @@ import type { HostProfile } from "@/types/host-connection";
 import { WorkspaceShortcutTargetsSubscriber } from "./workspace-shortcut-targets-subscriber";
 import { SidebarModelProvider } from "./sidebar/sidebar-model";
 import { defaultHostAppearance } from "@/hosts/appearance";
+import { APP_SETTINGS_QUERY_KEY, DEFAULT_CLIENT_SETTINGS } from "@/hooks/use-settings/storage";
 
 vi.hoisted(() => {
   (globalThis as unknown as { __DEV__: boolean }).__DEV__ = false;
@@ -72,8 +74,21 @@ function setHostProfiles(hosts: HostProfile[]): void {
 describe("WorkspaceShortcutTargetsSubscriber", () => {
   let root: Root | null = null;
   let container: HTMLElement | null = null;
+  let queryClient: QueryClient;
+
+  function renderSubscriber(enabled = true): void {
+    root?.render(
+      <QueryClientProvider client={queryClient}>
+        <SidebarModelProvider>
+          <WorkspaceShortcutTargetsSubscriber enabled={enabled} />
+        </SidebarModelProvider>
+      </QueryClientProvider>,
+    );
+  }
 
   beforeEach(() => {
+    queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(APP_SETTINGS_QUERY_KEY, DEFAULT_CLIENT_SETTINGS);
     container = document.createElement("div");
     document.body.appendChild(container);
     root = createRoot(container);
@@ -83,10 +98,13 @@ describe("WorkspaceShortcutTargetsSubscriber", () => {
     });
     useSidebarCollapsedSectionsStore.setState({
       collapsedProjectKeys: new Set(),
+      collapsedPinned: false,
     });
     useSidebarOrderStore.setState({
       projectOrder: [],
       workspaceOrderByProject: {},
+      pinnedWorkspaceOrder: [],
+      pinnedWorkspaceSortMode: "manual",
     });
     useSidebarViewStore.setState({
       groupMode: "project",
@@ -114,6 +132,7 @@ describe("WorkspaceShortcutTargetsSubscriber", () => {
       });
     }
     root = null;
+    queryClient.clear();
     container?.remove();
     container = null;
     act(() => {
@@ -126,11 +145,7 @@ describe("WorkspaceShortcutTargetsSubscriber", () => {
 
   it("publishes workspace shortcut targets without rendering the sidebar", async () => {
     await act(async () => {
-      root?.render(
-        <SidebarModelProvider>
-          <WorkspaceShortcutTargetsSubscriber enabled={true} />
-        </SidebarModelProvider>,
-      );
+      renderSubscriber();
     });
 
     expect(useKeyboardShortcutsStore.getState().sidebarShortcutWorkspaceTargets).toEqual([
@@ -138,6 +153,52 @@ describe("WorkspaceShortcutTargetsSubscriber", () => {
       { serverId: "srv", workspaceId: "ws-2" },
     ]);
   });
+
+  it.each(["project", "status"] as const)(
+    "publishes A–Z pinned shortcuts and restores manual order in %s mode",
+    async (groupMode) => {
+      act(() => {
+        useSidebarViewStore.getState().setGroupMode(groupMode);
+        seedRuntimeWorkspaces(
+          "srv",
+          new Map([
+            [
+              "ws-z",
+              {
+                ...workspaceDescriptor({ id: "ws-z", name: "Zeta" }),
+                pinnedAt: "2026-10-01T00:00:00.000Z",
+              },
+            ],
+            [
+              "ws-a",
+              {
+                ...workspaceDescriptor({ id: "ws-a", name: "Alpha" }),
+                pinnedAt: "2026-10-02T00:00:00.000Z",
+              },
+            ],
+          ]),
+        );
+        useSidebarOrderStore.getState().setPinnedWorkspaceOrder(["srv:ws-z", "srv:ws-a"]);
+        useSidebarOrderStore.getState().setPinnedWorkspaceSortMode("alphabetical");
+      });
+
+      await act(async () => {
+        renderSubscriber();
+      });
+      expect(useKeyboardShortcutsStore.getState().sidebarShortcutWorkspaceTargets).toEqual([
+        { serverId: "srv", workspaceId: "ws-a" },
+        { serverId: "srv", workspaceId: "ws-z" },
+      ]);
+
+      await act(async () => {
+        useSidebarOrderStore.getState().setPinnedWorkspaceSortMode("manual");
+      });
+      expect(useKeyboardShortcutsStore.getState().sidebarShortcutWorkspaceTargets).toEqual([
+        { serverId: "srv", workspaceId: "ws-z" },
+        { serverId: "srv", workspaceId: "ws-a" },
+      ]);
+    },
+  );
 
   it("publishes status-mode shortcut targets in visual status order", async () => {
     act(() => {
@@ -194,11 +255,7 @@ describe("WorkspaceShortcutTargetsSubscriber", () => {
     });
 
     await act(async () => {
-      root?.render(
-        <SidebarModelProvider>
-          <WorkspaceShortcutTargetsSubscriber enabled={true} />
-        </SidebarModelProvider>,
-      );
+      renderSubscriber();
     });
 
     expect(useKeyboardShortcutsStore.getState().sidebarShortcutWorkspaceTargets).toEqual([
@@ -228,11 +285,7 @@ describe("WorkspaceShortcutTargetsSubscriber", () => {
     });
 
     await act(async () => {
-      root?.render(
-        <SidebarModelProvider>
-          <WorkspaceShortcutTargetsSubscriber enabled={true} />
-        </SidebarModelProvider>,
-      );
+      renderSubscriber();
     });
 
     expect(useKeyboardShortcutsStore.getState().sidebarShortcutWorkspaceTargets).toEqual([
@@ -250,19 +303,11 @@ describe("WorkspaceShortcutTargetsSubscriber", () => {
 
   it("clears targets when disabled", async () => {
     await act(async () => {
-      root?.render(
-        <SidebarModelProvider>
-          <WorkspaceShortcutTargetsSubscriber enabled={true} />
-        </SidebarModelProvider>,
-      );
+      renderSubscriber();
     });
 
     await act(async () => {
-      root?.render(
-        <SidebarModelProvider>
-          <WorkspaceShortcutTargetsSubscriber enabled={false} />
-        </SidebarModelProvider>,
-      );
+      renderSubscriber(false);
     });
 
     expect(useKeyboardShortcutsStore.getState().sidebarShortcutWorkspaceTargets).toEqual([]);

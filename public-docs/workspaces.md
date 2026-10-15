@@ -29,6 +29,16 @@ Each workspace is a separate place to work. You can keep one for your main check
 
 Use the [CLI project commands](/docs/cli#projects) to register, list, rename, or delete projects.
 
+## Pinned workspaces
+
+Pin a workspace to keep it in the Pinned section above the project list. The menu beside Pinned
+chooses **Manual** or **A–Z**. A–Z follows the displayed workspace title (or branch name when that
+display option is selected), ignores case, and puts numbered names such as Task 2 before Task 10.
+Renaming a workspace updates its position.
+
+The choice is saved on this client. Switching back to Manual restores your saved drag order.
+Dragging a pinned workspace selects Manual and saves the new order.
+
 ## Workspaces contain sessions
 
 Agents run inside a workspace as sessions. A workspace can have one agent session, several agent sessions, terminals, browsers, and diffs open at the same time.

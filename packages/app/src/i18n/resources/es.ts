@@ -1231,6 +1231,11 @@ export const es: TranslationResources = {
     },
     pinned: {
       title: "Anclados",
+      sort: {
+        label: "Ordenar espacios de trabajo fijados",
+        manual: "Manual",
+        alphabetical: "A–Z",
+      },
     },
     host: {
       noHost: "Sin anfitrión",
