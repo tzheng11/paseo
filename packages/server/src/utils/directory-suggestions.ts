@@ -4,7 +4,9 @@ import path from "node:path";
 import pLimit from "p-limit";
 import { scorePathMatch, type MatchScore } from "@getpaseo/protocol/search/text-match";
 import { isPathInsideRoot } from "./path.js";
-import { runGitCommand } from "./run-git-command.js";
+import { createRunGitCommand } from "./run-git-command.js";
+
+const runDirectoryInventory = createRunGitCommand("directory-suggestions");
 
 export type DirectorySuggestionKind = "file" | "directory";
 export type DirectorySuggestionPathFormat = "absolute" | "relative";
@@ -783,11 +785,14 @@ async function loadGitIgnoredPaths(root: string): Promise<Set<string>> {
   const cached = gitIgnoredPathsCache.get(root);
   if (cached && cached.expiresAt > now) return cached.paths;
 
-  const paths = runGitCommand(["ls-files", "-o", "-i", "--directory", "--exclude-standard", "-z"], {
-    cwd: root,
-    envOverlay: { GIT_OPTIONAL_LOCKS: "0" },
-    timeout: 10_000,
-  })
+  const paths = runDirectoryInventory(
+    ["ls-files", "-o", "-i", "--directory", "--exclude-standard", "-z"],
+    {
+      cwd: root,
+      envOverlay: { GIT_OPTIONAL_LOCKS: "0" },
+      timeout: 10_000,
+    },
+  )
     .then(
       (result) =>
         new Set(
@@ -797,10 +802,17 @@ async function loadGitIgnoredPaths(root: string): Promise<Set<string>> {
             .map((relativePath) => path.resolve(root, relativePath.replace(/\/$/, ""))),
         ),
     )
-    .catch(() => new Set<string>());
+    .catch(() => new Set<string>())
+    .finally(() => {
+      const entry = gitIgnoredPathsCache.get(root);
+      if (entry?.paths === paths) {
+        entry.expiresAt = Date.now() + GIT_IGNORED_PATHS_CACHE_TTL_MS;
+      }
+    });
 
   gitIgnoredPathsCache.set(root, {
-    expiresAt: now + GIT_IGNORED_PATHS_CACHE_TTL_MS,
+    // An admitted-but-queued inventory must remain shared until it settles.
+    expiresAt: Number.POSITIVE_INFINITY,
     paths,
   });
   pruneGitIgnoredPathsCache(now);

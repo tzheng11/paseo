@@ -1202,6 +1202,11 @@ export const ko: TranslationResources = {
     },
     pinned: {
       title: "고정됨",
+      sort: {
+        label: "고정한 작업 공간 정렬",
+        manual: "수동",
+        alphabetical: "A–Z",
+      },
     },
     host: {
       noHost: "호스트 없음",
@@ -1906,6 +1911,21 @@ export const ko: TranslationResources = {
     archiveFinishedRetry: "다시 시도 ({{failed}}/{{total}})",
   },
   panels: {
+    info: {
+      label: "정보",
+      fields: "필드",
+      empty: "비어 있음",
+      unavailable: "사용 불가",
+      save: "저장",
+      saving: "저장 중…",
+      retry: "다시 시도",
+      cancel: "취소",
+      loading: "필드 로딩 중…",
+      update: "필드를 편집하려면 호스트를 업데이트하세요.",
+      readOnly: "읽기 전용 접근 권한입니다.",
+      offline: "호스트가 연결되지 않았습니다. 초안은 유지됩니다. 다시 연결하고 시도하세요.",
+      conflict: "취소 후 필드를 다시 열어 최신 값을 편집하세요.",
+    },
     draft: {
       newAgent: "새 에이전트",
       creatingAgent: "에이전트 생성 중",

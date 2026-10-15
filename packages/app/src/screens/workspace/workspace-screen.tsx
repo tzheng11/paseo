@@ -1,3 +1,4 @@
+import { i18n } from "@/i18n/i18next";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
 import { getOpenAgentTabLabel } from "@getpaseo/protocol/agent-labels";
@@ -336,6 +337,7 @@ function getFallbackTabOptionLabel(
   if (tab.target.kind === "working_diff" || tab.target.kind === "changes_tree") {
     return labels.changes;
   }
+  if (tab.target.kind === "info") return i18n.t("panels.info.label");
   if (tab.target.kind === "files") {
     return labels.files;
   }
@@ -389,6 +391,7 @@ function getFallbackTabOptionDescription(
   if (tab.target.kind === "working_diff" || tab.target.kind === "changes_tree") {
     return labels.changes;
   }
+  if (tab.target.kind === "info") return i18n.t("panels.info.label");
   if (tab.target.kind === "files") {
     return labels.files;
   }

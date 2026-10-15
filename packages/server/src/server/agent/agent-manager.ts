@@ -1,4 +1,10 @@
-import { AgentHistoryReplay } from "./agent-history-replay.js";
+import {
+  AgentHistoryReplay,
+  DEFAULT_HISTORY_WINDOWS,
+  type HistoryWindowInfo,
+  type HistoryWindows,
+  type HistoryReadLimit,
+} from "./agent-history-replay.js";
 import { projectTimelineRows } from "./timeline-projection.js";
 import type { PluginLifecycle } from "../plugins/lifecycle/index.js";
 import { describeHookAgent, publishAgentStream } from "../plugins/lifecycle/index.js";
@@ -784,6 +790,7 @@ export class AgentManager {
   private readonly providerDefinitions = new Map<AgentProvider, ProviderEnabledFlag>();
   private readonly agents = new Map<string, LiveManagedAgent>();
   private readonly timelineStore: AgentRuntimeTimelineStore;
+  private readonly historySourceBoundarySeq = new Map<string, number>();
   private readonly providerSubagents = new ProviderSubagentStore();
   private readonly agentsAwaitingInitialSnapshotPersist = new Set<string>();
   private readonly sessionEventTails = new Map<string, Promise<void>>();
@@ -1280,6 +1287,110 @@ export class AgentManager {
       }).map((entry) => Object.assign({ seq: entry.seqEnd }, entry));
     }
     return this.timelineStore.getRows(id);
+  }
+
+  /** Search, export and hooks must consume rows incrementally. */
+  async *streamTimelineRows(id: string): AsyncGenerator<AgentTimelineRow> {
+    this.requireAgent(id);
+    if (this.durableTimelineStore) {
+      const initial = await this.durableTimelineStore.fetchCommitted(id, { limit: 1 });
+      let seq = initial.window.minSeq - 1;
+      while (seq < initial.window.maxSeq) {
+        const page = await this.durableTimelineStore.fetchCommitted(id, {
+          direction: "after",
+          cursor: { epoch: initial.epoch, seq },
+          limit: 128,
+        });
+        if (page.epoch !== initial.epoch || page.window.maxSeq !== initial.window.maxSeq)
+          throw new Error("History changed during streamed read");
+        for (const row of page.rows) yield row;
+        if (page.endSeq === null || page.endSeq <= seq)
+          throw new Error("Streamed history page did not advance");
+        seq = page.endSeq;
+      }
+      return;
+    }
+    yield* this.timelineStore.streamRows(id);
+  }
+
+  getHistoryWindowInfo(id: string): HistoryWindowInfo | undefined {
+    return this.requireAgent(id).session?.historyWindowInfo;
+  }
+
+  /** Search and prompt indexing explicitly traverse the unloaded provider middle. */
+  async *streamFullHistoryMessages(id: string): AsyncGenerator<AgentTimelineRow> {
+    yield* this.streamFullHistoryRows(id, { messagesOnly: true });
+  }
+
+  async *streamFullHistoryRows(
+    id: string,
+    options?: { messagesOnly?: boolean },
+  ): AsyncGenerator<AgentTimelineRow> {
+    const agent = this.requireSessionAgent(id);
+    if (!agent.session.streamHistoryEntries)
+      throw new Error("Provider has no streamed history source");
+    const epoch = this.timelineStore.getEpoch(id);
+    for await (const entry of agent.session.streamHistoryEntries(options)) {
+      if (this.timelineStore.getEpoch(id) !== epoch)
+        throw new Error("History changed during streamed read");
+      const event = entry.value;
+      if (event.type !== "timeline") continue;
+      if (
+        options?.messagesOnly &&
+        event.item.type !== "user_message" &&
+        event.item.type !== "assistant_message"
+      )
+        continue;
+      const item = projectAgentMessage(limitAgentTimelineItemContent(event.item));
+      if (!item) continue;
+      yield {
+        seq: entry.index + 1,
+        historyIndex: entry.index,
+        providerMessageId:
+          item.type === "user_message" || item.type === "assistant_message"
+            ? item.messageId
+            : undefined,
+        timestamp: event.timestamp ?? "1970-01-01T00:00:00.000Z",
+        item,
+      };
+    }
+  }
+
+  async readTimelineHistory(
+    id: string,
+    request: {
+      operation: "windows" | "page";
+      cursor?: number;
+      direction?: "before" | "after";
+      limit?: HistoryReadLimit;
+      epoch?: string;
+    },
+  ) {
+    const agent = this.requireSessionAgent(id);
+    return this.runSessionOperation(id, async () => {
+      const epoch = this.timelineStore.getEpoch(id);
+      if (request.epoch !== undefined && request.epoch !== epoch)
+        throw new Error("History epoch changed; reload its windows");
+      if (request.operation === "windows") {
+        if (!agent.session.readHistoryWindows)
+          throw new Error("Provider does not support bounded history");
+        const windows = await agent.session.readHistoryWindows(DEFAULT_HISTORY_WINDOWS);
+        return {
+          epoch,
+          ...windows,
+          liveAfterSeq: this.historySourceBoundarySeq.get(id),
+          unit: agent.session.historyWindowInfo?.unit ?? ("events" as const),
+        };
+      }
+      if (!agent.session.readHistoryPage || request.cursor === undefined)
+        throw new Error("Provider history requires a supported page cursor");
+      const page = await agent.session.readHistoryPage({
+        cursor: request.cursor,
+        direction: request.direction ?? "after",
+        limit: request.limit ?? { events: 128, bytes: 256 * 1024 },
+      });
+      return { epoch, ...page, unit: agent.session.historyWindowInfo?.unit ?? ("events" as const) };
+    });
   }
 
   fetchTimeline(id: string, options?: AgentTimelineFetchOptions): AgentTimelineFetchResult {
@@ -3303,14 +3414,11 @@ export class AgentManager {
 
   async rewind(agentId: string, messageId: string, mode: RewindMode): Promise<void> {
     const agent = this.requireSessionAgent(agentId);
-    const submittedRow = this.timelineStore
-      .getRows(agentId)
-      .find(
-        (row) =>
-          row.item.type === "user_message" &&
-          row.item.messageId === messageId &&
-          row.item.clientMessageId === messageId,
-      );
+    const candidate = this.timelineStore.getSubmittedUserMessage(agentId, messageId);
+    const submittedRow =
+      candidate?.item.type === "user_message" && candidate.item.messageId === messageId
+        ? candidate
+        : null;
     if (submittedRow && !submittedRow.providerMessageId) {
       throw new Error("Cannot rewind before the provider acknowledges the submitted prompt");
     }
@@ -3415,8 +3523,7 @@ export class AgentManager {
     if (!this.durableTimelineStore) {
       return this.timelineStore.getLastAssistantMessageSegment(agentId);
     }
-    const liveTimeline = this.timelineStore.getItems(agentId);
-    const liveSegment = this.getLastAssistantMessageSegmentFromTimeline(liveTimeline);
+    const liveSegment = this.timelineStore.getLastAssistantMessageSegmentInfo(agentId);
     if (!liveSegment) {
       return await this.durableTimelineStore.getLastAssistantMessage(agentId);
     }
@@ -3966,7 +4073,7 @@ export class AgentManager {
     });
   }
 
-  private runSessionOperation(agentId: string, operation: () => Promise<void>): Promise<void> {
+  private runSessionOperation<T>(agentId: string, operation: () => Promise<T>): Promise<T> {
     const previous = this.sessionEventTails.get(agentId) ?? Promise.resolve();
     const result = previous.then(operation);
     const settled = result.then(
@@ -4209,6 +4316,7 @@ export class AgentManager {
               });
             }
         }
+        this.historySourceBoundarySeq.set(agent.id, this.timelineStore.getNextSeq(agent.id) - 1);
         agent.historyPrimed = true;
         this.touchUpdatedAt(agent);
         this.emitState(agent);
@@ -4265,6 +4373,7 @@ export class AgentManager {
               });
             }
         }
+        this.historySourceBoundarySeq.set(agent.id, this.timelineStore.getNextSeq(agent.id) - 1);
         agent.historyPrimed = true;
         if (typeof broadcast !== "function" || !broadcast()) return;
         for (const event of providerSubagentEvents) this.dispatch(event);
@@ -5214,13 +5323,18 @@ export class AgentManager {
     );
     this.dispatch({ type: "agent_stream", agentId, event, ...metadata });
     if (this.pluginLifecycle && agent && !agent.internal && event.type !== "timeline") {
+      let window: HistoryWindows<AgentTimelineItem> | undefined;
+      const getWindow = () =>
+        (window ??= this.timelineStore.readWindows(agentId, DEFAULT_HISTORY_WINDOWS));
       publishAgentStream(
         this.pluginLifecycle,
         describeHookAgent({ ...agent, title: agent.config.title }),
         event,
-        // Only turn-ended hooks consume history. Usage updates can arrive per token;
-        // materializing a disk-backed timeline here blocks every daemon request.
-        isTurnTerminalEvent(event) ? this.timelineStore.getItems(agentId) : [],
+        () => [...getWindow().head, ...getWindow().tail].map((entry) => entry.value),
+        () => ({
+          timelineGap: getWindow().gap,
+          providerHistoryGap: agent.session?.historyWindowInfo?.gap,
+        }),
       );
     }
   }

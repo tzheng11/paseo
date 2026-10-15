@@ -1,3 +1,8 @@
+import { WORKSPACE_FIELD_CATALOG_VERSION } from "@getpaseo/protocol/workspace-fields";
+import {
+  withAgentHistoryReadMetrics,
+  type AgentHistoryReadMetrics,
+} from "./agent/agent-history-replay.js";
 import { stat } from "node:fs/promises";
 import type { CreationSnapshot } from "@getpaseo/protocol/messages";
 import { CreationService } from "./creation/index.js";
@@ -274,6 +279,8 @@ function createFallbackWorkspaceGitService(): WorkspaceGitService {
       workspaceRefreshQueuedCount: 0,
       workspaceRefreshAdmissionActiveCount: 0,
       workspaceRefreshAdmissionPendingCount: 0,
+      workspaceInitialRefreshActiveCount: 0,
+      workspaceInitialRefreshPendingCount: 0,
       workspaceObservationSetupAdmissionActiveCount: 0,
       workspaceObservationSetupAdmissionPendingCount: 0,
       fetchInFlightCount: 0,
@@ -1783,11 +1790,13 @@ export class VoiceAssistantWebSocketServer {
       hostname: getHostName(),
       version: this.daemonVersion,
       permissions: session.getPermissions(),
+      workspaceFieldCatalogVersion: WORKSPACE_FIELD_CATALOG_VERSION,
       // COMPAT(desktopManaged): added in v0.1.X, remove optional parsing after 2027-01-16.
       desktopManaged: this.daemonRuntimeConfig?.desktopManaged === true,
       ...(this.serverCapabilities ? { capabilities: this.serverCapabilities } : {}),
       features: {
         usageSources: true,
+        workspaceFields: true,
         ownedSubscriptions: true,
         agentRequestReceipts: true,
         workspaceRequestReceipts: true,
@@ -1892,6 +1901,7 @@ export class VoiceAssistantWebSocketServer {
         providerSubagents: true,
         // COMPAT(projectedSubagentTimeline): added after v0.8.0, remove gates after 2027-03-14; retain advertisement.
         projectedSubagentTimeline: true,
+        boundedTimelineHistory: true,
         // COMPAT(providerSubagentNesting): added in v0.7, remove gate after 2027-03-04.
         providerSubagentNesting: true,
         // COMPAT(workspacePinning): added in v0.1.107, remove gate after 2027-01-12.
@@ -2393,8 +2403,23 @@ export class VoiceAssistantWebSocketServer {
         "ws_control_rpc_received",
       );
     }
+    const refreshRequest =
+      message.message.type === "refresh_agent_request" ? message.message : null;
+    const historyReads: AgentHistoryReadMetrics | null = refreshRequest
+      ? {
+          historyEventsRead: 0,
+          historyBytesRead: 0,
+          historyReplayCount: 0,
+        }
+      : null;
     const startMs = performance.now();
-    await activeConnection.session.handleMessage(message.message, ws);
+    if (historyReads) {
+      await withAgentHistoryReadMetrics(historyReads, () =>
+        activeConnection.session.handleMessage(message.message, ws),
+      );
+    } else {
+      await activeConnection.session.handleMessage(message.message, ws);
+    }
     const durationMs = performance.now() - startMs;
     this.recordRequestLatency(message.message.type, durationMs);
 
@@ -2402,6 +2427,14 @@ export class VoiceAssistantWebSocketServer {
       activeConnection.connectionLogger.warn(
         {
           requestType: message.message.type,
+          ...(refreshRequest
+            ? {
+                agentId: refreshRequest.agentId,
+                requestId: refreshRequest.requestId,
+                ...historyReads,
+                historyReadMeasurement: "request-local-normalized-provider-events",
+              }
+            : {}),
           durationMs: Math.round(durationMs),
           inflightRequests: activeConnection.session.getRuntimeMetrics().inflightRequests,
         },

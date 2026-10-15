@@ -78,7 +78,7 @@ function createAssistantItemId(
   return `${segmentId}:${suffix.toString(36)}`;
 }
 
-export type StreamItem =
+export type StreamItem = (
   | UserMessageItem
   | AssistantMessageItem
   | ThoughtItem
@@ -86,7 +86,8 @@ export type StreamItem =
   | TodoListItem
   | NotificationItem
   | CompactionItem
-  | PluginTimelineStreamItem;
+  | PluginTimelineStreamItem
+) & { providerHistoryIndex?: number };
 
 export type UserMessageImageAttachment = AttachmentMetadata;
 
@@ -788,6 +789,7 @@ export interface NotificationItem {
   timestamp: Date;
   level: NotificationLevel;
   message: string;
+  historyGap?: { cursor: number; count: number; bytes: number };
 }
 
 export interface CompactionItem {

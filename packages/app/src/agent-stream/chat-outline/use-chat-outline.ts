@@ -35,6 +35,7 @@ export interface UseChatOutlineInput {
   onJumpError: () => void;
   visibleMessageIds?: ReadonlySet<string>;
   revealLoadedMessage?: (messageId: string) => boolean;
+  loadHistoryIndex?: (index: number) => Promise<void>;
 }
 
 export interface ChatOutline {
@@ -55,6 +56,7 @@ export function useChatOutline({
   onJumpError,
   visibleMessageIds,
   revealLoadedMessage,
+  loadHistoryIndex,
 }: UseChatOutlineInput): ChatOutline {
   const [index, setIndex] = useState<AgentTimelinePromptIndexPayload | null>(null);
   const [pendingJump, setPendingJump] = useState<PendingPromptJump | null>(null);
@@ -63,6 +65,7 @@ export function useChatOutline({
   const nextJumpRequestIdRef = useRef(0);
   const nextIndexRequestIdRef = useRef(0);
   const loadedItems = useMemo(() => [...tail, ...(head ?? NO_STREAM_ITEMS)], [head, tail]);
+  const includeProviderHistory = loadHistoryIndex !== undefined;
   const prompts = enabled ? (index?.prompts ?? NO_PROMPTS) : NO_PROMPTS;
 
   // The viewed timeline already owns live delivery and reconnect catch-up. Its complete
@@ -89,8 +92,10 @@ export function useChatOutline({
     let active = true;
     const refresh = () => {
       const requestId = ++nextIndexRequestIdRef.current;
-      void client
-        .listAgentTimelinePrompts(agentId)
+      const request = includeProviderHistory
+        ? client.listAgentTimelinePrompts(agentId, { includeProviderHistory: true })
+        : client.listAgentTimelinePrompts(agentId);
+      void request
         .then((payload) => {
           if (
             active &&
@@ -107,7 +112,7 @@ export function useChatOutline({
     return () => {
       active = false;
     };
-  }, [agentId, enabled, serverId, timelineEpoch, latestPromptSeq]);
+  }, [agentId, enabled, serverId, timelineEpoch, latestPromptSeq, includeProviderHistory]);
 
   // The transcript resolves display rows (including Markdown blocks and plugin cards) to
   // timeline positions. The outline uses the complete index, including unloaded prompts.
@@ -135,7 +140,8 @@ export function useChatOutline({
 
   useEffect(() => {
     if (pendingJump === null) return;
-    const target = loadedItems.find((item) => item.timelineCursor?.seq === pendingJump.seq);
+    const prompt = prompts.find((entry) => entry.seq === pendingJump.seq);
+    const target = loadedItems.find((item) => matchesPrompt(item, pendingJump.seq, prompt));
     if (target) {
       if (pendingJump.hasScrolled) return;
       if (visibleMessageIds?.has(target.id) === false) {
@@ -150,13 +156,15 @@ export function useChatOutline({
       return;
     }
     if (pendingJump.fetchSettled) setPendingJump(null);
-  }, [loadedItems, pendingJump, revealLoadedMessage, viewportRef, visibleMessageIds]);
+  }, [loadedItems, pendingJump, prompts, revealLoadedMessage, viewportRef, visibleMessageIds]);
 
   const jumpToPrompt = useCallback(
     (seq: number) => {
       nextJumpRequestIdRef.current += 1;
       setPendingJump(null);
-      const loaded = loadedItems.find((item) => item.timelineCursor?.seq === seq);
+      const prompt = prompts.find((entry) => entry.seq === seq);
+      const position = prompt?.historyIndex;
+      const loaded = loadedItems.find((item) => matchesPrompt(item, seq, prompt));
       if (loaded) {
         if (revealLoadedMessage?.(loaded.id)) {
           const requestId = nextJumpRequestIdRef.current;
@@ -169,8 +177,15 @@ export function useChatOutline({
       if (!index) return;
       const requestId = nextJumpRequestIdRef.current;
       setPendingJump({ requestId, seq, fetchSettled: false, hasScrolled: false });
-      void getHostRuntimeStore()
-        .fetchAgentTimeline(serverId, agentId, planTimelinePromptJump({ epoch: index.epoch, seq }))
+      const request =
+        position !== undefined && loadHistoryIndex
+          ? loadHistoryIndex(position)
+          : getHostRuntimeStore().fetchAgentTimeline(
+              serverId,
+              agentId,
+              planTimelinePromptJump({ epoch: index.epoch, seq }),
+            );
+      void request
         .catch((error: unknown) => {
           console.warn("Failed to load a Chat outline window", error);
           onJumpError();
@@ -182,8 +197,32 @@ export function useChatOutline({
           });
         });
     },
-    [agentId, index, loadedItems, onJumpError, revealLoadedMessage, serverId, viewportRef],
+    [
+      agentId,
+      index,
+      loadedItems,
+      loadHistoryIndex,
+      prompts,
+      onJumpError,
+      revealLoadedMessage,
+      serverId,
+      viewportRef,
+    ],
   );
 
   return { prompts, activePrompt, jumpToPrompt, reportReadingPosition };
+}
+
+function matchesPrompt(
+  item: StreamItem,
+  seq: number,
+  prompt: ChatOutlinePrompt | undefined,
+): boolean {
+  if (prompt?.historyIndex === undefined) return item.timelineCursor?.seq === seq;
+  return (
+    item.providerHistoryIndex === prompt.historyIndex ||
+    (prompt.messageId !== undefined &&
+      item.kind === "user_message" &&
+      item.messageId === prompt.messageId)
+  );
 }

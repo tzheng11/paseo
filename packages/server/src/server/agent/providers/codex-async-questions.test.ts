@@ -434,3 +434,9 @@ test("restores unanswered questions and does not reopen answered questions on du
     await resumed.session.close();
   }
 });
+
+test("lists only native item identifiers for retention without reading timeline payloads", async () => {
+  const { CodexAsyncQuestions } = await import("./codex/async-questions.js");
+  const questions = new CodexAsyncQuestions([{ item: questionItem }]);
+  expect(questions.historyItemIds()).toEqual([questionItem.id]);
+});

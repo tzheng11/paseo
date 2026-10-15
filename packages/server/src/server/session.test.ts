@@ -30,7 +30,12 @@ import type { StoredAgentRecord } from "./agent/agent-storage.js";
 import type { AgentManagerEvent } from "./agent/agent-manager.js";
 import type { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import { WorkspaceLabelError, type WorkspaceLabelService } from "./workspace-labels/index.js";
-import { createPersistedProjectRecord } from "./workspace-registry.js";
+import {
+  createPersistedProjectRecord,
+  createPersistedWorkspaceRecord,
+  FileBackedWorkspaceRegistry,
+  type WorkspaceRegistry,
+} from "./workspace-registry.js";
 import { deriveProjectKey } from "./project-key.js";
 import type { SessionOptions } from "./session.js";
 import type { SessionInboundMessage, SessionOutboundMessage } from "./messages.js";
@@ -309,7 +314,7 @@ interface SessionForTestOptions {
     getWorkspaceGitMetadata?: ReturnType<typeof vi.fn>;
     getProjectSlug?: ReturnType<typeof vi.fn>;
   };
-  workspaceRegistry?: { get: ReturnType<typeof vi.fn> };
+  workspaceRegistry?: { get: ReturnType<typeof vi.fn> } | WorkspaceRegistry;
   projectRegistry?: Partial<SessionOptions["projectRegistry"]>;
   terminalManager?: SessionOptions["terminalManager"];
   serviceProxy?: SessionOptions["serviceProxy"];
@@ -5813,4 +5818,68 @@ test("provider snapshots preserve versionless visibility while capabilities upda
     "plugin-provider",
   ]);
   expect(references.compactSnapshot!.entries[0]!.modes![0]!.icon).toBe("ShieldCheck");
+});
+
+test("workspace field mutations require manage at the session boundary and preserve denied data", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "paseo-fields-permission-"));
+  const registry = new FileBackedWorkspaceRegistry(
+    join(directory, "workspaces.json"),
+    pino({ level: "silent" }),
+  );
+  try {
+    await registry.upsert(
+      createPersistedWorkspaceRecord({
+        workspaceId: "A",
+        projectId: "project",
+        cwd: directory,
+        kind: "directory",
+        displayName: "A",
+        createdAt: "2026-10-14",
+        updatedAt: "2026-10-14",
+      }),
+    );
+    for (const permissions of [
+      ["workspace.read"],
+      ["hub.execute"],
+      ["workspace.manage"],
+    ] as const) {
+      const messages: SessionOutboundMessage[] = [];
+      const session = createSessionForTest({ permissions, messages, workspaceRegistry: registry });
+      await session.handleMessage({
+        type: "workspace.field.value.set.request",
+        workspaceId: "A",
+        fieldKey: "notionProjectUrl",
+        value: "allowed",
+        expectedValue: "",
+        requestId: "permission-test",
+      });
+      if (permissions[0] === "workspace.manage") {
+        expect(messages).toContainEqual({
+          type: "workspace.field.value.set.response",
+          payload: {
+            requestId: "permission-test",
+            workspaceId: "A",
+            value: "allowed",
+            accepted: true,
+            error: null,
+            errorCode: null,
+          },
+        });
+        expect((await registry.get("A"))?.fieldValues).toEqual({ notionProjectUrl: "allowed" });
+      } else {
+        expect(messages).toContainEqual({
+          type: "rpc_error",
+          payload: {
+            requestId: "permission-test",
+            requestType: "workspace.field.value.set.request",
+            code: "access_denied",
+            error: "Session is not authorized for workspace.field.value.set.request",
+          },
+        });
+        expect((await registry.get("A"))?.fieldValues).toBeUndefined();
+      }
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

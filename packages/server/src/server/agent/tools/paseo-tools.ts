@@ -7,6 +7,12 @@ import type { Logger } from "pino";
 import type { AgentMode, AgentProvider, AgentSessionConfig } from "../agent-sdk-types.js";
 import type { AgentManager } from "../agent-manager.js";
 import { AgentProfileSchema } from "@getpaseo/protocol/messages";
+import {
+  WORKSPACE_FIELDS,
+  WORKSPACE_FIELD_CATALOG_VERSION,
+  WorkspaceFieldError,
+} from "@getpaseo/protocol/workspace-fields";
+import type { setWorkspaceFieldValue as setWorkspaceFieldValueTransaction } from "../../workspace-fields.js";
 import type { DaemonConfigStore } from "../../daemon-config-store.js";
 import {
   AgentFeatureSchema,
@@ -118,6 +124,9 @@ export interface PaseoToolHostDependencies {
   archiveWorkspaceRecord?: ArchiveDependencies["archiveWorkspaceRecord"];
   emitWorkspaceUpdatesForWorkspaceIds?: ArchiveDependencies["emitWorkspaceUpdatesForWorkspaceIds"];
   workspaceRegistry?: Pick<WorkspaceRegistry, "get" | "list" | "upsert">;
+  setWorkspaceFieldValue?: (
+    input: Parameters<typeof setWorkspaceFieldValueTransaction>[1],
+  ) => Promise<string>;
   projectRegistry?: Pick<ProjectRegistry, "get" | "list">;
   createDirectoryWorkspace?: (
     cwd: string,
@@ -716,7 +725,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
     return options.ensureWorkspaceForCreate(resolvedCwd);
   }
 
-  function resolveWorkspaceIdForRename(requestedWorkspaceId?: string): string {
+  function resolveWorkspaceId(requestedWorkspaceId?: string): string {
     const explicitWorkspaceId = requestedWorkspaceId?.trim();
     if (explicitWorkspaceId) {
       return explicitWorkspaceId;
@@ -1377,6 +1386,105 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         content: [],
         structuredContent: ensureValidJson({ workspaces }),
       };
+    },
+  );
+
+  registerTool(
+    "get_workspace_fields",
+    {
+      title: "Get workspace fields",
+      description:
+        "Read the fixed Info field catalogue and saved values. Omit workspaceId to read your current workspace. Missing values mean empty text. Values belong to the workspace, shared by its agents.",
+      inputSchema: {
+        workspaceId: z.string().trim().min(1).optional(),
+      },
+      outputSchema: {
+        workspaceId: z.string(),
+        catalogVersion: z.number(),
+        fields: z.array(z.object({ key: z.string(), label: z.string() })),
+        fieldValues: z.record(z.string(), z.string()),
+      },
+    },
+    async ({ workspaceId: requestedWorkspaceId }) => {
+      if (!options.workspaceRegistry) throw new Error("Workspace registry is not configured");
+      const workspaceId = resolveWorkspaceId(requestedWorkspaceId);
+      const workspace = await options.workspaceRegistry.get(workspaceId);
+      if (!workspace || workspace.archivedAt)
+        throw new WorkspaceFieldError("not_found", "Active workspace not found.");
+      return {
+        content: [],
+        structuredContent: ensureValidJson({
+          workspaceId,
+          catalogVersion: WORKSPACE_FIELD_CATALOG_VERSION,
+          fields: WORKSPACE_FIELDS,
+          fieldValues: workspace.fieldValues ?? {},
+        }),
+      };
+    },
+  );
+
+  registerTool(
+    "set_workspace_field",
+    {
+      title: "Set workspace field",
+      description:
+        "Save a workspace Info text value: notionProjectUrl or notionIssueUrl. Read get_workspace_fields first and supply its current value as expectedValue (missing means empty string). A conflicting edit is rejected; preserve different existing links. Repeat identical inputs after a lost acknowledgement, then read back. Empty value clears the text. Omit workspaceId for your current workspace.",
+      inputSchema: {
+        workspaceId: z.string().trim().min(1).optional(),
+        fieldKey: z.string().describe("notionProjectUrl or notionIssueUrl"),
+        value: z.string().describe("New literal text; empty string clears the value."),
+        expectedValue: z.string().describe("Last saved value read, or empty string if missing."),
+      },
+      outputSchema: {
+        workspaceId: z.string(),
+        fieldKey: z.string(),
+        accepted: z.boolean(),
+        value: z.string().nullable(),
+        error: z.string().nullable(),
+        errorCode: z.enum(["invalid_value", "unknown_field", "not_found", "conflict"]).nullable(),
+      },
+    },
+    async ({ workspaceId: requestedWorkspaceId, fieldKey, value, expectedValue }) => {
+      if (!options.setWorkspaceFieldValue)
+        throw new Error("Workspace field mutation service is not configured");
+      if (!options.emitWorkspaceUpdatesForWorkspaceIds)
+        throw new Error("Workspace update emitter is not configured");
+      const workspaceId = resolveWorkspaceId(requestedWorkspaceId);
+      try {
+        const savedValue = await options.setWorkspaceFieldValue({
+          workspaceId,
+          fieldKey,
+          value,
+          expectedValue,
+        });
+        // Even idempotent retries must repair a failed post-commit broadcast.
+        await options.emitWorkspaceUpdatesForWorkspaceIds([workspaceId]);
+        return {
+          content: [],
+          structuredContent: ensureValidJson({
+            workspaceId,
+            fieldKey,
+            accepted: true,
+            value: savedValue,
+            error: null,
+            errorCode: null,
+          }),
+        };
+      } catch (error) {
+        if (!(error instanceof WorkspaceFieldError)) throw error;
+        return {
+          content: [{ type: "text", text: error.message }],
+          isError: true,
+          structuredContent: ensureValidJson({
+            workspaceId,
+            fieldKey,
+            accepted: false,
+            value: null,
+            error: error.message,
+            errorCode: error.code,
+          }),
+        };
+      }
     },
   );
 
@@ -2190,7 +2298,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         throw new Error("Workspace update emitter is required to rename workspaces");
       }
 
-      const workspaceId = resolveWorkspaceIdForRename(requestedWorkspaceId);
+      const workspaceId = resolveWorkspaceId(requestedWorkspaceId);
       const existing = await options.workspaceRegistry.get(workspaceId);
       if (!existing) {
         throw new Error(`Workspace ${workspaceId} not found`);

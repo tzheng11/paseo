@@ -6,9 +6,76 @@ import { describe, expect, test } from "vitest";
 import {
   areEquivalentPaths,
   createPathEquivalenceMatcher,
+  createLexicalWatchPathFilter,
   getRealpathAwareRelativePath,
   isPathInsideRoot,
 } from "./path.js";
+
+describe("lexical watcher filtering", () => {
+  test("filters a dependency burst against many ignored roots and retains a tracked edit", () => {
+    const ignoredRoots = Array.from({ length: 198 }, (_, index) => `/repo/ignored-${index}`);
+    ignoredRoots.push("/repo/node_modules");
+    const relevant = createLexicalWatchPathFilter({ root: "/repo", ignoredRoots });
+    const events = Array.from(
+      { length: 26_079 },
+      (_, index) => `/repo/node_modules/.pnpm/pkg-${index}/node_modules/pkg/file.js`,
+    );
+
+    expect(events.some(relevant)).toBe(false);
+    expect([...events, "/repo/src/changed.ts"].filter(relevant)).toEqual(["/repo/src/changed.ts"]);
+  });
+
+  test("keeps root metadata, exclusions and similarly named siblings distinct", () => {
+    const relevant = createLexicalWatchPathFilter({
+      root: "/repo",
+      ignoredRoots: ["/repo/.git", "/repo/node_modules"],
+    });
+    expect(
+      [
+        "/repo",
+        "/repo/",
+        "/repo/.git",
+        "/repo/.git/HEAD",
+        "/repo/node_modules/deleted/file.js",
+      ].filter(relevant),
+    ).toEqual([]);
+    expect(
+      ["/repo/.github/ci.yml", "/repo/node_modules-extra/file.js", "/repo/src/deleted.ts"].filter(
+        relevant,
+      ),
+    ).toEqual(["/repo/.github/ci.yml", "/repo/node_modules-extra/file.js", "/repo/src/deleted.ts"]);
+    expect(relevant("/repo-other/file.js")).toBe(false);
+    expect(relevant("/repo/../outside/file.js")).toBe(false);
+  });
+
+  test.each([
+    ["C:\\Repo", "c:/REPO"],
+    [String.raw`\\server\share\Repo`, String.raw`\\SERVER\share\REPO`],
+    [String.raw`\\?\C:\Repo`, "c:/REPO"],
+  ])("normalizes Windows observer paths under %s", (root, eventRoot) => {
+    const relevant = createLexicalWatchPathFilter({
+      root,
+      ignoredRoots: [`${root}\\node_modules`],
+    });
+    expect(relevant(eventRoot)).toBe(false);
+    expect(relevant(`${eventRoot}/NODE_MODULES/deleted/file.js`)).toBe(false);
+    expect(relevant(`${eventRoot}/node_modules-extra/file.js`)).toBe(true);
+    expect(relevant(`${eventRoot}/src/../tracked.ts`)).toBe(true);
+  });
+
+  test("uses lexical symlink roots and handles filesystem roots", () => {
+    const relevant = createLexicalWatchPathFilter({
+      root: "/workspace-alias",
+      ignoredRoots: ["/workspace-alias/node_modules"],
+    });
+    expect(relevant("/workspace-alias/node_modules/package/file.js")).toBe(false);
+    expect(relevant("/workspace-alias/src/tracked.ts")).toBe(true);
+    const rootFilter = createLexicalWatchPathFilter({ root: "/", ignoredRoots: ["/ignored"] });
+    expect(rootFilter("/")).toBe(false);
+    expect(rootFilter("/ignored/file.js")).toBe(false);
+    expect(rootFilter("/tracked.ts")).toBe(true);
+  });
+});
 
 describe("path equivalence", () => {
   test.each([

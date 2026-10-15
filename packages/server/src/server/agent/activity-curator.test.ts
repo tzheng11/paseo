@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { buildAgentForkContextAttachment, curateAgentActivity } from "./activity-curator.js";
+import {
+  buildAgentForkContextAttachment,
+  streamAgentForkContextAttachment,
+  curateAgentActivity,
+} from "./activity-curator.js";
 import type { AgentTimelineItem } from "./agent-sdk-types.js";
 import type { AgentTimelineRow } from "./agent-timeline-store-types.js";
 
@@ -483,4 +487,47 @@ it("preserves every message in fork history below the character budget", () => {
   expect(result.attachment.text).toBe(
     `<chat-history-summary>\nChat history from a previous Paseo agent.\n\n[User] ${text}\n</chat-history-summary>`,
   );
+});
+
+it("streams a large fork context into a bounded summary while retaining its final response", async () => {
+  async function* rows() {
+    for (let seq = 1; seq <= 10000; seq++)
+      yield {
+        seq,
+        timestamp: "now",
+        item: {
+          type: "assistant_message" as const,
+          messageId: String(seq),
+          text: `Response ${seq}: ${"x".repeat(1024)}`,
+        },
+      };
+  }
+  const result = await streamAgentForkContextAttachment({ rows: rows() });
+  expect(result.itemCount).toBe(10000);
+  expect(result.attachment.text.length).toBeLessThanOrEqual(100000);
+  expect(result.attachment.text).toContain("Response 10000:");
+  expect(result.attachment.text).toContain("[Earlier chat history omitted]");
+});
+
+it("stops streamed fork context at the selected unloaded message", async () => {
+  let read = 0;
+  async function* rows() {
+    for (let seq = 1; seq <= 1000; seq++) {
+      read++;
+      yield {
+        seq,
+        timestamp: "now",
+        item: {
+          type: "assistant_message" as const,
+          messageId: String(seq),
+          text: `Response ${seq}`,
+        },
+      };
+    }
+  }
+  const result = await streamAgentForkContextAttachment({ rows: rows(), boundaryMessageId: "500" });
+  expect(read).toBe(500);
+  expect(result.attachment.text).toContain("Response 500");
+  expect(result.attachment.text).not.toContain("Response 501");
+  expect(result.boundaryMessageId).toBe("500");
 });

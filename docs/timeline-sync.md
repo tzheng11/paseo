@@ -23,18 +23,66 @@ remain responsive. History requests wait for that queue until the agent's histor
 A failed provider stream leaves the previous timeline readable. Deferred publication
 replays the staged file instead of retaining another full timeline array.
 
-Ordinary pages read only selected rows from disk. Explicit full-history reads (`limit: 0`, exports,
-and forks) and tails expanded by interleaved lifecycle updates can still allocate large responses.
-The row-cache budget excludes those responses and provider-owned history-loading buffers. On
-Codex 0.159.2+, resume omits turns and history loads through paged endpoints: paginated threads
-use metadata-only turn pages and bounded item pages; legacy threads load one full turn at a time.
-Their persisted history mode is preserved. Older Codex binaries and Claude's transcript reader
-still materialize provider history before yielding it. Projected provider items can also accumulate
-before replay; these bounds do not cover every provider's peak allocation.
-Codex and JSONL RPC transports bound each stdout frame to 64 MiB before decoding it. An oversized
-frame closes only that provider process and rejects its pending requests. Provider transcripts
-remain unchanged; the transport does not discard a response and keep pretending the session is healthy.
+Ordinary pages read selected rows from disk. Codex reloads retain a bounded start and recent
+suffix: at most 64 events / 256 KiB at the head and 256 events / 2 MiB at the tail. Both limits
+apply independently. A notice separates these ranges for clients without middle-page support.
+
+On Codex 0.159.2+, local paginated history uses the native SQLite projection as a metadata index.
+The reader respects the provider's separate `CODEX_SQLITE_HOME`, asks it to index missing history
+through a metadata-only turn page, and selects item identifiers and UTF-8 sizes in a worker.
+Only selected items pass through the provider decoder. Native item anchors preserve cursor
+positions without requesting every intervening page. The same loader serves refresh, resume,
+archived reads and imports; it does not build a complete normalized replay before these reads.
+
+`agent.timeline.history.request` returns head/tail windows or a middle page. The omitted range
+reports its source count and bytes. Its `unit` distinguishes native provider items from normalized
+replay events; these counts are not projected UI-row counts. A page skips an oversized source
+record, reports its size and advances. Selected items remain bounded by serialized bytes and event
+count after normalization. History-page clients use a separate read-only provider connection,
+so an export or page failure cannot close an agent's writer channel. `streamAllHistory` is the
+explicit full provider replay path.
+
+Provider positions are separate from live-stream cursors. The client gates middle paging on
+`server_info.features.boundedTimelineHistory` and the agent's `supportsBoundedHistory` capability,
+then renders its start, requested middle pages, gap and recent work. Live items keep their delivery
+cursors and replace matching history identities. CLI logs and attach read a bounded tail; logs
+report an omitted middle and `--history-cursor` reads its next bounded page.
+
+Legacy Codex threads stage normalized parent/child replay files, keeping routing and rewind
+identifiers in memory. Their ordinary replay also selects bounded edges; building those indexes
+still traverses provider pages. Older binaries and other adapters can retain large provider-owned
+buffers. The projection row-cache budget does not cover explicit `limit: 0` responses.
+Turn-end hooks carry bounded projection edges, `timelineGap`, and `providerHistoryGap` when
+provider history is unloaded; they do not clone the complete timeline. Search and prompt indexing
+explicitly stream provider messages when the client supports middle pages. Results carry a
+provider index for loading their bounded window; that index never becomes a live stream cursor.
+Clients without middle-page support search their readable projection.
+
+Full-history consumers have distinct contracts:
+
+| Caller                                            | History contract                                                                                                                                                |
+| ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Codex provider replay/export (`streamAllHistory`) | Explicit eight-item provider pages on a separate read-only connection; no aggregate timeline array.                                                             |
+| Search / prompt outline                           | Explicit message stream with provider positions; retains only bounded matches or prompt previews.                                                               |
+| Turn-end hooks                                    | Bounded edges with both projection and provider gap metadata. Plugins can request ordinary middle pages through the timeline SDK.                               |
+| Fork-context attachment                           | Explicit stream to the chosen message, retaining at most 100,000 characters / 2,000 summary entries. Native provider positions stay separate from live cursors. |
+| Import / native fork / archived read / refresh    | Ordinary bounded provider replay. Native rewind uses user-message identifiers, and modern forks exclude turn payloads.                                          |
+| CLI logs / attach                                 | Bounded tail and explicit bounded middle pages; oversized records are reported rather than silently dropped.                                                    |
+| SDK `timeline.refetch` / catch-up                 | Readable projection pages. `limit: 0` is an explicit complete projection request, not a provider-transcript export.                                             |
+
+Legacy Codex and other provider adapters still need native window support to remove their
+provider-owned full response buffers. This Codex native candidate does not establish that bound
+for those adapters.
+
+Codex and JSONL RPC transports bound each stdout frame to 64 MiB before decoding. An oversized
+frame closes that provider process and rejects pending requests. Provider transcripts stay intact.
 The cache requires Node 22.13 or later, or Electron's bundled Node with `node:sqlite` support.
+
+Runtime metrics count projected rows on disk; `timelineStats.totalItems` is not a count of resident
+JavaScript objects. Metadata events do not load timelines for hooks. Slow refresh logs include
+`agentId`, `requestId`, `historyEventsRead`, `historyBytesRead` and `historyReplayCount`. Those sizes
+count normalized UTF-8 replay bytes once, excluding raw provider buffers and repeated spool reads.
+A request waiting on another caller's load can report zero. Transcript content is never logged.
 
 The invariants are:
 

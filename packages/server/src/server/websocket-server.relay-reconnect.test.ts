@@ -1,3 +1,4 @@
+import { AgentHistoryReplay } from "./agent/agent-history-replay.js";
 import { SessionDelivery } from "./session/owned-subscriptions/index.js";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { Server as HTTPServer } from "http";
@@ -903,6 +904,49 @@ describe("relay external socket reconnect behavior", () => {
     );
 
     await server.close();
+  });
+
+  test("slow refresh logs agent identity and request-local history bytes", async () => {
+    const logger = createLogger();
+    const server = createServer({ logger });
+    const socket = new MockSocket();
+    await attachRelayAndHello({ server, socket, clientId: "cid-slow-refresh" });
+    const agentId = "00000000-0000-4000-8000-000000000001";
+    const event = { text: "🧠 history" };
+    let now = 0;
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
+    sessionMock.instances[0].handleMessage.mockImplementation(async () => {
+      const replay = await AgentHistoryReplay.create([event]);
+      await replay.close();
+      now = 900;
+    });
+    try {
+      socket.emit(
+        "message",
+        JSON.stringify({
+          type: "session",
+          message: { type: "refresh_agent_request", requestId: "refresh-slow", agentId },
+        }),
+      );
+      await vi.waitFor(() =>
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.objectContaining({
+            requestType: "refresh_agent_request",
+            requestId: "refresh-slow",
+            agentId,
+            durationMs: 900,
+            historyEventsRead: 1,
+            historyReplayCount: 1,
+            historyBytesRead: Buffer.byteLength(JSON.stringify(event) + "\n"),
+            historyReadMeasurement: "request-local-normalized-provider-events",
+          }),
+          "ws_slow_request",
+        ),
+      );
+    } finally {
+      clock.mockRestore();
+      await server.close();
+    }
   });
 
   test("responds to top-level ping while provider diagnostic is still running", async () => {

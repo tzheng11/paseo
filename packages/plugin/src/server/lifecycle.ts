@@ -44,6 +44,13 @@ export type PluginTurnOutcome =
   | { kind: "failed"; error: { message: string; code?: string } }
   | { kind: "canceled"; reason: string };
 
+export interface PluginHistoryGap {
+  startIndex: number;
+  endIndex: number;
+  count: number;
+  bytes: number;
+}
+
 export interface PluginLifecycleEvents {
   "agent.turn_started": { agent: PluginHookAgent; turnId: string | null };
   "agent.turn_ended": {
@@ -51,6 +58,8 @@ export interface PluginLifecycleEvents {
     turnId: string | null;
     outcome: PluginTurnOutcome;
     timeline: readonly AgentTimelineItem[];
+    timelineGap?: PluginHistoryGap | null;
+    providerHistoryGap?: PluginHistoryGap | null;
   };
   "agent.permission_requested": { agent: PluginHookAgent; request: AgentPermissionRequest };
   "agent.permission_resolved": {

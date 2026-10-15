@@ -234,6 +234,66 @@ describe("runGitCommand", () => {
     vi.unstubAllEnvs();
   });
 
+  it("keeps ignored-directory inventories outside read admission and labels their queue", async () => {
+    const { runGitCommand, snapshotGitCommandRuntimeMetrics } = await loadRunGitCommand(1);
+    enqueueSpawnBehaviors({ delayMs: 60_000 });
+    const args = ["ls-files", "-o", "-i", "--directory", "--exclude-standard"];
+    const inventories = Array.from({ length: 5 }, () =>
+      runGitCommand(args, { cwd: process.cwd() }),
+    );
+    await vi.waitFor(() => expect(fakeSpawnController.processes).toHaveLength(1));
+
+    await expect(
+      runGitCommand(["status", "--short"], { cwd: process.cwd() }),
+    ).resolves.toMatchObject({ exitCode: 0 });
+    expect(fakeSpawnController.processes[0]?.exited).toBe(false);
+    expect(snapshotGitCommandRuntimeMetrics()).toMatchObject({
+      active: 0,
+      pending: 0,
+      inventory: {
+        concurrencyLimit: 1,
+        active: 1,
+        pending: 4,
+        activeProvenanceTop: [["git-ignore-inventory", 1]],
+        pendingProvenanceTop: [["git-ignore-inventory", 4]],
+      },
+    });
+
+    const first = fakeSpawnController.processes[0]!;
+    first.dispose();
+    first.emit("exit", 0, null);
+    first.emit("close", 0, null);
+    await Promise.all(inventories);
+    expect(snapshotGitCommandRuntimeMetrics().inventory).toMatchObject({
+      peakActive: 1,
+      pending: 0,
+    });
+  });
+
+  it("initial watcher inventories pass warm re-inventories without adding another process", async () => {
+    const { runGitCommand, runWithGitCommandPriority } = await loadRunGitCommand(1);
+    const { spawn } = await import("node:child_process");
+    const args = ["ls-files", "-o", "-i", "--directory", "--exclude-standard"];
+    enqueueSpawnBehaviors({ delayMs: 60_000 });
+    const first = runGitCommand(args, { cwd: "/seed-held" });
+    const warm = runGitCommand(args, { cwd: "/warm-reinventory" });
+    const initial = runWithGitCommandPriority("high", () =>
+      runGitCommand(args, { cwd: "/new-watcher" }),
+    );
+    await vi.waitFor(() => expect(fakeSpawnController.processes).toHaveLength(1));
+    const held = fakeSpawnController.processes[0]!;
+    held.dispose();
+    held.emit("exit", 0, null);
+    held.emit("close", 0, null);
+    await Promise.all([first, warm, initial]);
+    const calls = vi.mocked(spawn).mock.calls;
+    const newWatcher = calls.findIndex(([, , options]) => options?.cwd === "/new-watcher");
+    const reinventory = calls.findIndex(([, , options]) => options?.cwd === "/warm-reinventory");
+    expect(newWatcher).toBeGreaterThanOrEqual(0);
+    expect(reinventory).toBeGreaterThan(newWatcher);
+    expect(fakeSpawnController.peakActiveCount).toBe(1);
+  });
+
   it("throttles concurrent git commands to the configured limit", async () => {
     const { runGitCommand } = await loadRunGitCommand(2);
 
@@ -407,6 +467,41 @@ describe("runGitCommand", () => {
       expect.objectContaining({ stdout: "high" }),
       expect.objectContaining({ stdout: "normal" }),
     ]);
+  });
+
+  it("a cold workspace live read overtakes already queued background Git commands", async () => {
+    const { runGitCommand } = await loadRunGitCommand(1);
+    const [{ WorkspaceGitServiceImpl }, { default: pino }] = await Promise.all([
+      import("../server/workspace-git-service.js"),
+      import("pino"),
+    ]);
+    enqueueSpawnBehaviors(
+      { delayMs: 100, stdoutData: "active" },
+      { stdoutData: "live" },
+      { stdoutData: "background" },
+    );
+    const active = runGitCommand(["status"], { cwd: process.cwd() });
+    await vi.waitFor(() => expect(fakeSpawnController.processes).toHaveLength(1));
+    const background = runGitCommand(["rev-parse", "background"], { cwd: process.cwd() });
+    let factsOutput: string | undefined;
+    const service = new WorkspaceGitServiceImpl({
+      logger: pino({ level: "silent" }),
+      paseoHome: process.cwd(),
+      deps: {
+        getCheckoutSnapshotFacts: async (cwd, context) => {
+          const result = await context.runGitCommand!(["rev-parse", "live"], { cwd });
+          factsOutput = result.stdout;
+          return { isGit: false };
+        },
+      },
+    });
+    try {
+      await service.getSnapshot(process.cwd(), { includeForge: false });
+      expect(factsOutput).toBe("live");
+    } finally {
+      service.dispose();
+      await Promise.allSettled([active, background]);
+    }
   });
 
   it("binds queue provenance to a Git command runner", async () => {

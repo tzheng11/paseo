@@ -16,6 +16,7 @@ import {
 } from "./workspace-registry-model.js";
 import { workspaceIdsForProjects } from "./workspace-directory.js";
 import { deriveProjectKey } from "./project-key.js";
+import { nativeWatchHost } from "./file-observer/internal/native-watch-client.js";
 
 const DEFAULT_RESCAN_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_DEBOUNCE_MS = 100;
@@ -34,7 +35,7 @@ export interface ProjectRootWatch {
     options: { recursive: false },
     onChange: (event: string, filename: string | Buffer | null) => void,
     onError: (error: Error) => void,
-  ): ProjectRootWatcher;
+  ): ProjectRootWatcher | Promise<ProjectRootWatcher>;
 }
 
 export interface ReconciliationTimer {
@@ -55,7 +56,18 @@ const systemClock: ReconciliationClock = {
   clearInterval: (timer) => clearInterval(timer as ReturnType<typeof setInterval>),
 };
 
-const watchProjectRoot: ProjectRootWatch = (rootPath, options, onChange, onError) => {
+const watchProjectRoot: ProjectRootWatch = async (rootPath, options, onChange, onError) => {
+  if (process.platform === "darwin") {
+    const watcher = nativeWatchHost.watch({ root: rootPath, kind: "directory" }, onChange);
+    try {
+      await watcher.ready;
+    } catch (error) {
+      await watcher.close();
+      throw error;
+    }
+    watcher.on("error", onError);
+    return watcher;
+  }
   const watcher = watchPath(rootPath, options, onChange);
   watcher.on("error", onError);
   return watcher;
@@ -134,6 +146,7 @@ export class WorkspaceReconciliationService {
   private started = false;
   private reconciling = false;
   private reconcileQueuedMode: "metadata" | "full" | null = null;
+  private watchSync: Promise<void> = Promise.resolve();
 
   constructor(options: WorkspaceReconciliationServiceOptions) {
     this.serverId = options.serverId;
@@ -171,6 +184,7 @@ export class WorkspaceReconciliationService {
         }
       }) ?? null;
     await this.syncProjectRootWatches();
+    if (this.disposed) return;
     this.rescanTimer = this.clock.setInterval(
       () => this.reconcileObservedGitMetadata("full"),
       this.rescanIntervalMs,
@@ -416,7 +430,13 @@ export class WorkspaceReconciliationService {
     );
   }
 
-  private async syncProjectRootWatches(): Promise<void> {
+  private syncProjectRootWatches(): Promise<void> {
+    const result = this.watchSync.then(() => this.updateProjectRootWatches());
+    this.watchSync = result.catch(() => undefined);
+    return result;
+  }
+
+  private async updateProjectRootWatches(): Promise<void> {
     if (this.disposed) return;
     const projects = await this.projectRegistry.list();
     if (this.disposed) return;
@@ -438,8 +458,9 @@ export class WorkspaceReconciliationService {
       );
       if (alreadyWatching) continue;
       try {
-        let watcher: ProjectRootWatcher;
-        watcher = this.watchProjectRoot(
+        let watcher: ProjectRootWatcher | null = null;
+        let watchFailed = false;
+        watcher = await this.watchProjectRoot(
           project.rootPath,
           { recursive: false },
           (_event, filename) => {
@@ -448,7 +469,8 @@ export class WorkspaceReconciliationService {
             }
           },
           (error) => {
-            watcher.close();
+            watchFailed = true;
+            watcher?.close();
             const index = this.watchers.findIndex((target) => target.watcher === watcher);
             if (index >= 0) this.watchers.splice(index, 1);
             this.logger.warn(
@@ -457,6 +479,14 @@ export class WorkspaceReconciliationService {
             );
           },
         );
+        if (this.disposed) {
+          watcher.close();
+          return;
+        }
+        if (watchFailed) {
+          watcher.close();
+          continue;
+        }
         this.watchers.push({ rootPath: project.rootPath, watcher });
       } catch (error) {
         // The periodic reconciliation is the convergence path for roots that

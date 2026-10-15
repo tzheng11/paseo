@@ -2,6 +2,7 @@ import { describe, expect, test, vi } from "vitest";
 import { z } from "zod";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { DatabaseSync } from "node:sqlite";
 import { type Dirent, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -2212,7 +2213,7 @@ describe("Codex app-server provider", () => {
         cwd: "/workspace/project",
         model: "gpt-5.4",
         serviceTier: null,
-        excludeTurns: false,
+        excludeTurns: true,
         persistExtendedHistory: true,
       },
     ]);
@@ -2268,7 +2269,7 @@ describe("Codex app-server provider", () => {
         cwd: "/workspace/project",
         model: "gpt-5.4",
         serviceTier: null,
-        excludeTurns: false,
+        excludeTurns: true,
         persistExtendedHistory: true,
       },
     ]);
@@ -4690,6 +4691,179 @@ describe("Codex app-server provider", () => {
         },
       },
     ]);
+  });
+
+  test.each([false, true])(
+    "reloads a native indexed transcript without decoding the middle (separate SQL home: %s)",
+    async (separateSqlHome) => {
+      const home = await mkdtemp(path.join(tmpdir(), "codex-bounded-native-"));
+      mkdirSync(path.join(home, "sessions"));
+      const sqlHome = separateSqlHome ? path.join(home, "sql") : home;
+      mkdirSync(sqlHome, { recursive: true });
+      const db = new DatabaseSync(path.join(sqlHome, "thread_history_1.sqlite"));
+      db.exec(`CREATE TABLE thread_items(thread_id TEXT, turn_id TEXT, item_id TEXT,
+      rollout_ordinal INTEGER, updated_at_ordinal INTEGER, item_type TEXT, item_json TEXT);`);
+      const insert = db.prepare(
+        "INSERT INTO thread_items VALUES ('test-thread', 'turn', ?, ?, ?, ?, ?)",
+      );
+      db.exec("BEGIN");
+      for (let index = 0; index < 1000; index++)
+        insert.run(
+          String(index),
+          index,
+          index,
+          index === 0 ? "userMessage" : "agentMessage",
+          "invalid payload never parsed",
+        );
+      db.exec("COMMIT");
+      db.close();
+      const readerApp = createFakeCodexAppServer();
+      const session = new CodexAppServerAgentSession(
+        createConfig(),
+        { sessionId: "test-thread" },
+        createTestLogger(),
+        async () => readerApp.child,
+        {
+          codexHome: home,
+          environment: { CODEX_SQLITE_HOME: sqlHome },
+          _createCodexClient: () => ({
+            request,
+            notify: () => {},
+            dispose: async () => {},
+            setUnexpectedTerminationHandler: () => {},
+            setNotificationHandler: () => {},
+            setRequestHandler: () => {},
+          }),
+        },
+      ) as CodexTestSession;
+      asInternals(session).pagedHistoryAvailable = true;
+      const decoded: number[] = [];
+      const request = vi.fn(async (method: string, raw: unknown) => {
+        if (method === "initialize") return { userAgent: "paseo/0.159.2" };
+        if (method === "thread/read")
+          return {
+            thread: {
+              historyMode: "paginated",
+              path: path.join(home, "sessions", "rollout.jsonl"),
+            },
+          };
+        if (method === "thread/turns/list")
+          return { data: [{ id: "turn", items: [] }], nextCursor: null };
+        if (method !== "thread/items/list") throw new Error("Full history endpoint was requested");
+        const params = z
+          .object({ limit: z.literal(1), cursor: z.object({ itemId: z.string() }).optional() })
+          .parse(raw);
+        const index = params.cursor ? Number(params.cursor.itemId) + 1 : 0;
+        decoded.push(index);
+        return {
+          data: [
+            {
+              turnId: "turn",
+              item: { type: "agentMessage", id: String(index), text: String(index) },
+            },
+          ],
+          nextCursor: null,
+        };
+      });
+      session.client = { request };
+      try {
+        await asInternals(session).loadPersistedHistory(session.client);
+        const events: AgentStreamEvent[] = [];
+        for await (const event of session.streamHistory()) events.push(event);
+        expect(events).toHaveLength(321);
+        expect(decoded).toHaveLength(320);
+        expect(decoded.every((index) => index < 64 || index >= 744)).toBe(true);
+        const primaryRequest = vi.fn(async () => {
+          throw new Error("History must not use the writer's RPC channel");
+        });
+        session.client = { request: primaryRequest };
+        session.activeForegroundTurnId = "foreground";
+        const page = await session.readHistoryPage!({
+          cursor: 500,
+          direction: "after",
+          limit: { events: 2, bytes: 4096 },
+        });
+        expect(page.entries.map((entry) => entry.index)).toEqual([500, 501]);
+        expect(page.nextCursor).toBe(502);
+        expect(primaryRequest).not.toHaveBeenCalled();
+        expect(request.mock.calls.every(([method]) => method !== "thread/resume")).toBe(true);
+      } finally {
+        session.client = null;
+        await session.close();
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("reads bounded history edges and middle pages without another provider request", async () => {
+    const session = createSession();
+    asInternals(session).pagedHistoryAvailable = true;
+    const request = vi.fn(async (method: string, raw: unknown) => {
+      const params = z.record(z.string(), z.unknown()).parse(raw);
+      if (method === "thread/read") return { thread: { historyMode: "paginated" } };
+      if (method === "thread/turns/list")
+        return { data: [{ id: "turn", items: [] }], nextCursor: null };
+      if (method !== "thread/items/list") throw new Error("Unexpected request " + method);
+      const start = Number(params.cursor ?? 0);
+      const end = Math.min(start + 8, 300);
+      const data = [];
+      for (let index = start; index < end; index++)
+        data.push({
+          turnId: "turn",
+          item: {
+            type: "agentMessage",
+            id: String(index),
+            text: "x".repeat(index === 150 ? 2 * 1024 * 1024 : 4096),
+          },
+          completedAtMs: 1777633200000,
+        });
+      return {
+        data,
+        nextCursor: end < 300 ? String(end) : null,
+      };
+    });
+    session.client = { request };
+    try {
+      await asInternals(session).loadPersistedHistory(session.client);
+      request.mockClear();
+      const window = await session.readHistoryWindows!({
+        head: { events: 2, bytes: 10000 },
+        tail: { events: 3, bytes: 14000 },
+      });
+      expect(window.totalEvents).toBe(300);
+      expect(window.head.map((entry) => entry.index)).toEqual([0, 1]);
+      expect(window.tail.map((entry) => entry.index)).toEqual([297, 298, 299]);
+      expect(window.gap).toEqual({
+        startIndex: 2,
+        endIndex: 296,
+        count: 295,
+        bytes:
+          window.totalBytes -
+          [...window.head, ...window.tail].reduce((sum, entry) => sum + entry.bytes, 0),
+      });
+      expect(window.head.reduce((sum, entry) => sum + entry.bytes, 0)).toBeLessThanOrEqual(10000);
+      expect(window.tail.reduce((sum, entry) => sum + entry.bytes, 0)).toBeLessThanOrEqual(14000);
+      const middle = await session.readHistoryPage!({
+        cursor: 150,
+        direction: "after",
+        limit: { events: 1, bytes: 16000 },
+      });
+      expect(middle.entries).toEqual([]);
+      expect(middle.oversized).toEqual([{ index: 150, bytes: expect.any(Number) }]);
+      expect(middle.nextCursor).toBe(151);
+      for (let pass = 0; pass < 2; pass++) {
+        let count = 0;
+        for await (const event of session.streamAllHistory!()) {
+          expect(event.type).toBe("timeline");
+          count++;
+        }
+        expect(count).toBe(300);
+      }
+      expect(request).not.toHaveBeenCalled();
+    } finally {
+      session.client = null;
+      await session.close();
+    }
   });
 
   test("loads paginated turns and item pages in order without a full-history response", async () => {

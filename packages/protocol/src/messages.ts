@@ -980,6 +980,15 @@ export const WorkspaceTitleSetRequestSchema = z.object({
   requestId: z.string(),
 });
 
+export const WorkspaceFieldValueSetRequestSchema = z.object({
+  type: z.literal("workspace.field.value.set.request"),
+  workspaceId: z.string(),
+  fieldKey: z.string(),
+  value: z.string(),
+  expectedValue: z.string(),
+  requestId: z.string(),
+});
+
 export const WorkspacePinSetRequestSchema = z.object({
   type: z.literal("workspace.pin.set.request"),
   workspaceId: z.string(),
@@ -1867,6 +1876,40 @@ export const AgentTimelineCursorSchema = z.object({
   seq: z.number().int().nonnegative(),
 });
 
+export const TimelineHistoryGapSchema = z.object({
+  startIndex: z.number().int().nonnegative(),
+  endIndex: z.number().int().nonnegative(),
+  count: z.number().int().nonnegative(),
+  bytes: z.number().int().nonnegative(),
+});
+export const TimelineHistoryWindowInfoSchema = z.object({
+  headEvents: z.number().int().nonnegative(),
+  tailEvents: z.number().int().nonnegative(),
+  gap: TimelineHistoryGapSchema.nullable(),
+  totalEvents: z.number().int().nonnegative(),
+  totalBytes: z.number().int().nonnegative(),
+  unit: z.enum(["events", "provider_items"]),
+});
+export const AgentTimelineHistoryRequestMessageSchema = z.object({
+  type: z.literal("agent.timeline.history.request"),
+  requestId: z.string(),
+  agentId: z.string(),
+  operation: z.enum(["windows", "page"]),
+  epoch: z.string().optional(),
+  cursor: z.number().int().nonnegative().optional(),
+  direction: z.enum(["before", "after"]).optional(),
+  limit: z
+    .object({
+      events: z.number().int().min(1).max(128),
+      bytes: z
+        .number()
+        .int()
+        .min(1)
+        .max(256 * 1024),
+    })
+    .optional(),
+});
+
 export const FetchAgentTimelineRequestMessageSchema = z.object({
   type: z.literal("fetch_agent_timeline_request"),
   agentId: z.string(),
@@ -1887,12 +1930,14 @@ export const AgentTimelineSearchRequestMessageSchema = z.object({
   requestId: z.string(),
   query: z.string(),
   cursor: z.number().int().nonnegative().optional(),
+  includeProviderHistory: z.boolean().optional(),
 });
 
 export const AgentTimelineListPromptsRequestMessageSchema = z.object({
   type: z.literal("agent.timeline.list_prompts.request"),
   agentId: z.string(),
   requestId: z.string(),
+  includeProviderHistory: z.boolean().optional(),
 });
 
 export const ProviderSubagentListRequestMessageSchema = z.object({
@@ -2097,6 +2142,18 @@ export const WorkspaceTitleSetResponsePayloadSchema = z.object({
 export const WorkspaceTitleSetResponseSchema = z.object({
   type: z.literal("workspace.title.set.response"),
   payload: WorkspaceTitleSetResponsePayloadSchema,
+});
+
+export const WorkspaceFieldValueSetResponseSchema = z.object({
+  type: z.literal("workspace.field.value.set.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    accepted: z.boolean(),
+    value: z.string(),
+    error: z.string().nullable(),
+    errorCode: z.enum(["invalid_value", "unknown_field", "not_found", "conflict"]).nullable(),
+  }),
 });
 
 export const WorkspacePinSetResponsePayloadSchema = z.object({
@@ -3220,6 +3277,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   ProjectIconSetRequestSchema,
   ProjectRemoveRequestSchema,
   WorkspaceTitleSetRequestSchema,
+  WorkspaceFieldValueSetRequestSchema,
   WorkspacePinSetRequestSchema,
   WorkspaceLabelListRequestSchema,
   WorkspaceLabelAssignmentSetRequestSchema,
@@ -3286,6 +3344,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   RestartServerRequestMessageSchema,
   DaemonUpdateRequestMessageSchema,
   FetchAgentTimelineRequestMessageSchema,
+  AgentTimelineHistoryRequestMessageSchema,
   AgentTimelineSearchRequestMessageSchema,
   AgentTimelineListPromptsRequestMessageSchema,
   ProviderSubagentListRequestMessageSchema,
@@ -3561,6 +3620,8 @@ export const ServerInfoStatusPayloadSchema = z
   .object({
     status: z.literal("server_info"),
     protocolVersion: z.number().int().optional(),
+    // COMPAT(workspaceFields): added in v0.11.3; remove optional after 2027-04-14.
+    workspaceFieldCatalogVersion: z.number().int().positive().optional(),
     serverId: z.string().trim().min(1),
     hostname: ServerInfoHostnameSchema.optional(),
     version: ServerInfoVersionSchema.optional(),
@@ -3577,6 +3638,7 @@ export const ServerInfoStatusPayloadSchema = z
         // COMPAT(workspaceRequestReceipts): added in v0.8.0; remove gate after 2027-03-07.
         workspaceRequestReceipts: z.boolean().optional(),
         creationLifecycle: z.boolean().optional(),
+        boundedTimelineHistory: z.boolean().optional(),
         // COMPAT(hubAgentRpc): added in v0.8.0; remove gate after 2027-03-05.
         hubAgentRpc: z.boolean().optional(),
         // COMPAT(internalAgents): added in v0.9.0; remove gate after 2027-03-17.
@@ -3584,6 +3646,8 @@ export const ServerInfoStatusPayloadSchema = z
         // COMPAT(internalWorkspaces): added in v0.9.0; remove gate after 2027-03-17.
         internalWorkspaces: z.boolean().optional(),
         backgroundWorkspaces: z.boolean().optional(),
+        // COMPAT(workspaceFields): added in v0.11.3; remove gate after 2027-04-14.
+        workspaceFields: z.boolean().optional(),
         providersSnapshot: z.boolean().optional(),
         usageSources: z.boolean().optional(),
         // COMPAT(providersSnapshotCwd): added in v0.3.2, remove gate after 2027-02-10.
@@ -4047,6 +4111,8 @@ export const WorkspaceDescriptorPayloadSchema = z
     // is derived from the branch/directory.
     title: z.string().nullable().optional(),
     // COMPAT(workspacePinning): added in v0.1.107, remove optional after 2027-01-12.
+    // COMPAT(workspaceFields): added in v0.11.3; remove optional after 2027-04-14.
+    fieldValues: z.record(z.string(), z.string()).optional(),
     pinnedAt: z.string().nullable().optional(),
     // COMPAT(workspaceLabels): added in v0.5.0, remove optional after 2027-08-14.
     labels: z.array(z.string()).optional(),
@@ -4622,6 +4688,40 @@ export const AgentTimelineEntryPayloadSchema = z.object({
   collapsed: z.array(z.enum(["assistant_merge", "reasoning_merge", "tool_lifecycle", "identity"])),
 });
 
+export const TimelineHistoryEntrySchema = z.object({
+  index: z.number().int().nonnegative(),
+  bytes: z.number().int().nonnegative(),
+  provider: AgentProviderSchema,
+  item: AgentTimelineItemPayloadSchema,
+  timestamp: z.string().optional(),
+  turnId: z.string().optional(),
+});
+export const AgentTimelineHistoryResponseMessageSchema = z.object({
+  type: z.literal("agent.timeline.history.response"),
+  payload: z.object({
+    requestId: z.string(),
+    agentId: z.string(),
+    epoch: z.string(),
+    unit: z.enum(["events", "provider_items"]),
+    liveAfterSeq: z.number().int().nonnegative().optional(),
+    head: z.array(TimelineHistoryEntrySchema).optional(),
+    tail: z.array(TimelineHistoryEntrySchema).optional(),
+    gap: TimelineHistoryGapSchema.nullable().optional(),
+    totalEvents: z.number().int().nonnegative().optional(),
+    totalBytes: z.number().int().nonnegative().optional(),
+    entries: z.array(TimelineHistoryEntrySchema).optional(),
+    oversized: z
+      .array(
+        z.object({ index: z.number().int().nonnegative(), bytes: z.number().int().nonnegative() }),
+      )
+      .optional(),
+    nextCursor: z.number().int().nonnegative().nullable().optional(),
+    coveredCount: z.number().int().nonnegative().optional(),
+    coveredBytes: z.number().int().nonnegative().optional(),
+    error: z.string().nullable(),
+  }),
+});
+
 export const FetchAgentTimelineResponseMessageSchema = z.object({
   type: z.literal("fetch_agent_timeline_response"),
   payload: z.object({
@@ -4645,6 +4745,7 @@ export const FetchAgentTimelineResponseMessageSchema = z.object({
     hasNewer: z.boolean(),
     mergeWindow: z.boolean().optional(),
     entries: z.array(AgentTimelineEntryPayloadSchema),
+    historyWindow: TimelineHistoryWindowInfoSchema.optional(),
     error: z.string().nullable(),
   }),
 });
@@ -4671,6 +4772,8 @@ export const AgentTimelineSearchResponseMessageSchema = z.object({
         // Estimated occurrences in the message; the client verifies against rendered text.
         // COMPAT(timelineSearchCount): added in v0.9.0, remove optional after 2027-09-22.
         count: z.number().int().positive().optional(),
+        historyIndex: z.number().int().nonnegative().optional(),
+        messageId: z.string().optional(),
       }),
     ),
     nextCursor: z.number().int().nonnegative().nullable(),
@@ -4689,6 +4792,8 @@ export const AgentTimelineListPromptsResponseMessageSchema = z.object({
         seq: z.number().int().nonnegative(),
         timestamp: z.string(),
         preview: z.string(),
+        historyIndex: z.number().int().nonnegative().optional(),
+        messageId: z.string().optional(),
       }),
     ),
     error: z.string().nullable(),
@@ -6922,6 +7027,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   ArchiveWorkspaceResponseMessageSchema,
   FetchAgentResponseMessageSchema,
   FetchAgentTimelineResponseMessageSchema,
+  AgentTimelineHistoryResponseMessageSchema,
   AgentTimelineReplacementMessageSchema,
   AgentTimelineSearchResponseMessageSchema,
   AgentTimelineListPromptsResponseMessageSchema,
@@ -6966,6 +7072,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   ProjectIconSetResponseSchema,
   ProjectRemoveResponseSchema,
   WorkspaceTitleSetResponseSchema,
+  WorkspaceFieldValueSetResponseSchema,
   WorkspacePinSetResponseSchema,
   WorkspaceRecoveryInspectResponseSchema,
   WorkspaceRecoveryRestoreResponseSchema,

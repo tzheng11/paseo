@@ -1,9 +1,11 @@
 import { pruneAbandonedHistoryCaches } from "./agent-history-cache-directory.js";
+import type { HistoryReadLimit, HistoryWindows } from "./agent-history-replay.js";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 import { LRUCache } from "lru-cache";
+import { setImmediate } from "node:timers/promises";
 import { timelineItemIdentity } from "@getpaseo/protocol/timeline-identity";
 import type { AgentTimelineItem } from "./agent-sdk-types.js";
 import type {
@@ -28,6 +30,7 @@ interface TimelineState {
   minSeq: number;
   nextSeq: number;
   count: number;
+  bytes: number;
 }
 
 /** Disposable projection cache. Provider transcripts remain authoritative. */
@@ -57,7 +60,7 @@ export class DiskAgentTimelineStore implements AgentRuntimeTimelineStore {
       PRAGMA temp_store = FILE;
       CREATE TABLE rows (
         sid TEXT NOT NULL, pos INTEGER NOT NULL, seq_start INTEGER NOT NULL,
-        seq_end INTEGER NOT NULL, identity TEXT, user_id TEXT, item_type TEXT NOT NULL,
+        seq_end INTEGER NOT NULL, identity TEXT, user_id TEXT, item_type TEXT NOT NULL, data_bytes INTEGER NOT NULL,
         PRIMARY KEY (sid, pos)
       ) WITHOUT ROWID;
       CREATE TABLE payloads (
@@ -104,6 +107,7 @@ export class DiskAgentTimelineStore implements AgentRuntimeTimelineStore {
       minSeq: 0,
       nextSeq: options?.nextSeq ?? 1,
       count: 0,
+      bytes: 0,
     };
     const timestamp = options?.timestamp ?? new Date().toISOString();
     this.transaction(() => {
@@ -144,12 +148,75 @@ export class DiskAgentTimelineStore implements AgentRuntimeTimelineStore {
     return positions.toReversed().map((row) => this.readRow(state, Number(row.pos)).item);
   }
 
+  readWindows(
+    agentId: string,
+    limits: { head: HistoryReadLimit; tail: HistoryReadLimit },
+  ): HistoryWindows<AgentTimelineItem> {
+    const state = this.requireState(agentId);
+    const select = (direction: "ASC" | "DESC", limit: HistoryReadLimit, boundary: number) => {
+      const candidates = this.statement(`SELECT pos, data_bytes AS bytes FROM rows
+        WHERE sid = ? AND pos >= ? ORDER BY pos ${direction} LIMIT ?`).all(
+        state.key,
+        boundary,
+        limit.events,
+      );
+      const selected: Array<{ index: number; bytes: number; value: AgentTimelineItem }> = [];
+      let bytes = 0;
+      for (const row of candidates) {
+        const size = Number(row.bytes);
+        if (bytes + size > limit.bytes) break;
+        selected.push({
+          index: Number(row.pos),
+          bytes: size,
+          value: this.readRow(state, Number(row.pos)).item,
+        });
+        bytes += size;
+      }
+      return selected;
+    };
+    const head = select("ASC", limits.head, 0);
+    const tail = select("DESC", limits.tail, head.length).toReversed();
+    const end = tail[0]?.index ?? state.count;
+    return {
+      head,
+      tail,
+      totalEvents: state.count,
+      totalBytes: state.bytes,
+      gap:
+        head.length < end
+          ? {
+              startIndex: head.length,
+              endIndex: end - 1,
+              count: end - head.length,
+              bytes: state.bytes - [...head, ...tail].reduce((sum, entry) => sum + entry.bytes, 0),
+            }
+          : null,
+    };
+  }
+
   getItems(agentId: string): AgentTimelineItem[] {
     return this.getRows(agentId).map((row) => row.item);
   }
   getRows(agentId: string): ProjectedTimelineRow[] {
     const state = this.requireState(agentId);
     return this.readRows(state, 0);
+  }
+
+  /** Explicit full-history access without an array of decoded payloads. */
+  async *streamRows(agentId: string): AsyncGenerator<ProjectedTimelineRow> {
+    const state = this.requireState(agentId);
+    const count = state.count,
+      nextSeq = state.nextSeq;
+    let lastYield = performance.now();
+    for (let pos = 0; pos < count; pos++) {
+      if (this.states.get(agentId) !== state || state.nextSeq !== nextSeq)
+        throw new Error("History changed during streamed read");
+      yield this.readRow(state, pos);
+      if (performance.now() - lastYield >= 4) {
+        await setImmediate();
+        lastYield = performance.now();
+      }
+    }
   }
 
   getSubmittedUserMessage(agentId: string, clientMessageId: string): AgentTimelineRow | null {
@@ -241,18 +308,25 @@ export class DiskAgentTimelineStore implements AgentRuntimeTimelineStore {
   }
 
   getLastAssistantMessageSegment(agentId: string): string | null {
+    return this.getLastAssistantMessageSegmentInfo(agentId)?.text ?? null;
+  }
+
+  getLastAssistantMessageSegmentInfo(
+    agentId: string,
+  ): { text: string; startsAtBeginning: boolean } | null {
     const state = this.requireState(agentId);
     const found = this.statement(
       "SELECT pos FROM rows WHERE sid = ? AND item_type = 'assistant_message' ORDER BY pos DESC LIMIT 1",
     ).get(state.key);
     if (!found) return null;
     const chunks: string[] = [];
-    for (let pos = Number(found.pos); pos >= 0; pos--) {
+    let pos = Number(found.pos);
+    for (; pos >= 0; pos--) {
       const item = this.readRow(state, pos).item;
       if (item.type !== "assistant_message") break;
       chunks.push(item.text);
     }
-    return chunks.toReversed().join("");
+    return { text: chunks.toReversed().join(""), startsAtBeginning: pos < 0 };
   }
 
   fetch(agentId: string, options?: AgentTimelineFetchOptions): AgentTimelineFetchResult {
@@ -373,7 +447,12 @@ export class DiskAgentTimelineStore implements AgentRuntimeTimelineStore {
 
   private writeRow(state: TimelineState, pos: number, row: ProjectedTimelineRow): void {
     const data = JSON.stringify(row);
-    this.statement(`INSERT OR REPLACE INTO rows VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
+    const bytes = Buffer.byteLength(data, "utf8");
+    const previous = this.statement(
+      "SELECT data_bytes AS bytes FROM rows WHERE sid = ? AND pos = ?",
+    ).get(state.key, pos);
+    state.bytes += bytes - Number(previous?.bytes ?? 0);
+    this.statement(`INSERT OR REPLACE INTO rows VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
       state.key,
       pos,
       row.seqStart,
@@ -381,6 +460,7 @@ export class DiskAgentTimelineStore implements AgentRuntimeTimelineStore {
       timelineItemIdentity(row.item),
       row.item.type === "user_message" ? (row.item.clientMessageId ?? null) : null,
       row.item.type,
+      bytes,
     );
     this.statement("INSERT OR REPLACE INTO payloads VALUES (?, ?, ?)").run(state.key, pos, data);
     this.statement("DELETE FROM ranges WHERE sid = ? AND pos = ?").run(state.key, pos);

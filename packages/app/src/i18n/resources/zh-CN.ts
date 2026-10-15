@@ -1187,6 +1187,11 @@ export const zhCN: TranslationResources = {
     },
     pinned: {
       title: "已置顶",
+      sort: {
+        label: "对置顶工作区排序",
+        manual: "手动",
+        alphabetical: "A–Z",
+      },
     },
     host: {
       noHost: "没有 Host",
@@ -1874,6 +1879,21 @@ export const zhCN: TranslationResources = {
     archiveFinishedRetry: "重试 ({{failed}}/{{total}})",
   },
   panels: {
+    info: {
+      label: "信息",
+      fields: "字段",
+      empty: "空",
+      unavailable: "不可用",
+      save: "保存",
+      saving: "保存中…",
+      retry: "重试",
+      cancel: "取消",
+      loading: "正在加载字段…",
+      update: "请更新此主机以编辑字段。",
+      readOnly: "您只有只读权限。",
+      offline: "主机已断开，草稿已保留。重新连接后重试。",
+      conflict: "取消并重新打开字段以编辑最新值。",
+    },
     draft: {
       newAgent: "新建 Agent",
       creatingAgent: "正在创建 Agent",

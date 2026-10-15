@@ -2,6 +2,24 @@ import { win32 } from "node:path";
 import { describe, expect, test } from "vitest";
 import { createObserverPaths } from "./paths.js";
 
+test.each(["darwin", "win32"] as const)(
+  "indexed ignores preserve literal subtree boundaries on %s",
+  (platform) => {
+    const paths = createObserverPaths(platform);
+    const root = platform === "win32" ? "C:\\repo" : "/repo";
+    const sep = platform === "win32" ? "\\" : "/";
+    const ignored = Array.from({ length: 1000 }, (_, i) => `${root}${sep}pkg-${i}${sep}[output]`);
+    const matches = paths.ignoredMatcher(ignored);
+    expect(matches(`${ignored[999]}${sep}nested${sep}file.js`)).toBe(true);
+    expect(matches(ignored[0])).toBe(true);
+    expect(matches(`${ignored[999]}-source${sep}file.js`)).toBe(false);
+    expect(matches(`${root}${sep}pkg-999${sep}src${sep}file.js`)).toBe(false);
+    if (platform === "win32")
+      expect(matches(`${ignored[500].toUpperCase()}${sep}FILE.JS`)).toBe(true);
+    else expect(matches(`${ignored[500].toUpperCase()}${sep}file.js`)).toBe(false);
+  },
+);
+
 // m3 regression: plain lexicographic sort does not put a parent immediately
 // before its descendants. A sibling whose name extends the parent's with a
 // character that sorts below the separator (POSIX "/" = 0x2F, so "-" and "."

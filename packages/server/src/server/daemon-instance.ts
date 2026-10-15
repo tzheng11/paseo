@@ -11,17 +11,8 @@ import {
 } from "./pid-lock.js";
 import { daemonLaunchEnvironment } from "./config-environment.js";
 import { readPersistedConfig } from "./persisted-config.js";
-import treeKill from "tree-kill";
-const killTree = (pid: number, signal: string): Promise<void> =>
-  new Promise((resolve, reject) =>
-    treeKill(pid, signal, (error) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve();
-    }),
-  );
+import { signalPidTree } from "../utils/tree-kill.js";
+const killTree = (pid: number, signal: NodeJS.Signals): Promise<void> => signalPidTree(pid, signal);
 
 // Process ownership only: desktop and CLI load this entry in their own processes.
 // Keep daemon bootstrap and WebSocket schemas out of its dependency tree.

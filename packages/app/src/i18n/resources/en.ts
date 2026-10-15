@@ -1203,6 +1203,11 @@ export const en = {
     },
     pinned: {
       title: "Pinned",
+      sort: {
+        label: "Sort pinned workspaces",
+        manual: "Manual",
+        alphabetical: "A–Z",
+      },
     },
     host: {
       noHost: "No host",
@@ -1921,6 +1926,21 @@ export const en = {
     archiveFinishedRetry: "Retry ({{failed}}/{{total}})",
   },
   panels: {
+    info: {
+      label: "Info",
+      fields: "Fields",
+      empty: "Empty",
+      unavailable: "Unavailable",
+      save: "Save",
+      saving: "Saving…",
+      retry: "Retry",
+      cancel: "Cancel",
+      loading: "Loading workspace fields…",
+      update: "Update this host to edit workspace fields.",
+      readOnly: "You have read-only access to these fields.",
+      offline: "Host is disconnected. Your draft is kept. Reconnect and retry.",
+      conflict: "Cancel and reopen this field to edit the latest saved value.",
+    },
     draft: {
       newAgent: "New Agent",
       creatingAgent: "Creating agent",

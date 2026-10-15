@@ -1,3 +1,5 @@
+import { WorkspaceFieldError } from "@getpaseo/protocol/workspace-fields";
+import { setWorkspaceFieldValue } from "./workspace-fields.js";
 import { AgentDirectory } from "./agent/directory.js";
 import { searchTimeline } from "./agent/chat-search/index.js";
 import type { BrowserToolsBroker } from "./browser-tools/broker.js";
@@ -101,7 +103,7 @@ import {
 } from "./workspace-labels/index.js";
 
 import { AgentManager, AgentRunCancellationError } from "./agent/agent-manager.js";
-import { buildTimelinePromptIndex } from "./agent/timeline-prompt-index.js";
+import { streamTimelinePromptIndex } from "./agent/timeline-prompt-index.js";
 import { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import type {
   AgentManagerEvent,
@@ -127,7 +129,7 @@ import {
 } from "./agent/timeline-append.js";
 import { assertPluginTimelineDataSize } from "./agent/agent-timeline-content.js";
 import { parsePluginClientId } from "./plugins/plugin-session-identity.js";
-import { buildAgentForkContextAttachment } from "./agent/activity-curator.js";
+import { streamAgentForkContextAttachment } from "./agent/activity-curator.js";
 import { buildAgentPrompt } from "./agent/prompt-attachments.js";
 import type { StructuredGenerationDaemonConfig } from "./agent/structured-generation-providers.js";
 import {
@@ -2661,6 +2663,8 @@ export class Session {
     switch (msg.type) {
       case "fetch_agent_timeline_request":
         return this.handleFetchAgentTimelineRequest(msg, source);
+      case "agent.timeline.history.request":
+        return this.handleTimelineHistoryRequest(msg, source);
       case "agent.timeline.append.request":
         return this.handleAgentTimelineAppendRequest(msg);
       case "agent.timeline.search.request":
@@ -2942,6 +2946,8 @@ export class Session {
         return this.handleArchiveWorkspaceRequest(msg);
       case "project.remove.request":
         return this.handleProjectRemoveRequest(msg);
+      case "workspace.field.value.set.request":
+        return this.handleWorkspaceFieldValueSetRequest(msg);
       case "workspace.title.set.request":
         return this.handleWorkspaceTitleSetRequest(msg.workspaceId, msg.title, msg.requestId);
       case "workspace.pin.set.request":
@@ -3703,6 +3709,40 @@ export class Session {
           accepted: false,
           removedWorkspaceIds: [],
           error: getErrorMessageOr(error, "Failed to remove project"),
+        },
+      });
+    }
+  }
+
+  private async handleWorkspaceFieldValueSetRequest(input: {
+    workspaceId: string;
+    fieldKey: string;
+    value: string;
+    expectedValue: string;
+    requestId: string;
+  }): Promise<void> {
+    const { requestId, workspaceId } = input;
+    try {
+      const value = await setWorkspaceFieldValue(this.workspaceRegistry, input);
+      this.emit({
+        type: "workspace.field.value.set.response",
+        payload: { requestId, workspaceId, accepted: true, value, error: null, errorCode: null },
+      });
+      await this.emitWorkspaceUpdatesForWorkspaceIds([workspaceId]);
+    } catch (error) {
+      this.sessionLogger.error(
+        { err: error, workspaceId, requestId },
+        "session: workspace.field.value.set.request failed",
+      );
+      this.emit({
+        type: "workspace.field.value.set.response",
+        payload: {
+          requestId,
+          workspaceId,
+          accepted: false,
+          value: "",
+          error: error instanceof Error ? error.message : "Unable to save workspace field.",
+          errorCode: error instanceof WorkspaceFieldError ? error.code : null,
         },
       });
     }
@@ -5608,6 +5648,7 @@ export class Session {
       name: resolveWorkspaceDisplayName(workspace),
       title: workspace.title,
       pinnedAt: workspace.pinnedAt,
+      fieldValues: workspace.fieldValues ?? {},
       ...(workspace.labels && workspace.labels.length > 0 ? { labels: workspace.labels } : {}),
       background: workspace.background,
       archivingAt: null,
@@ -7724,6 +7765,63 @@ export class Session {
     });
   }
 
+  private async handleTimelineHistoryRequest(
+    msg: Extract<SessionInboundMessage, { type: "agent.timeline.history.request" }>,
+    source?: object,
+  ): Promise<void> {
+    const convert = (
+      entries: import("./agent/agent-history-replay.js").HistoryWindowEntry<
+        import("./agent/agent-sdk-types.js").AgentStreamEvent
+      >[],
+    ) =>
+      entries.flatMap(({ index, bytes, value }) =>
+        value.type === "timeline" && this.supportsTimelineItem(value.item, source)
+          ? [
+              {
+                index,
+                bytes,
+                provider: value.provider,
+                item: value.item,
+                timestamp: value.timestamp,
+              },
+            ]
+          : [],
+      );
+    try {
+      await ensureAgentLoaded(msg.agentId, {
+        agentManager: this.agentManager,
+        agentStorage: this.agentStorage,
+        logger: this.sessionLogger,
+      });
+      const result = await this.agentManager.readTimelineHistory(msg.agentId, msg);
+      const payload =
+        "head" in result
+          ? { ...result, head: convert(result.head), tail: convert(result.tail) }
+          : { ...result, entries: convert(result.entries) };
+      this.emitForSource(
+        {
+          type: "agent.timeline.history.response",
+          payload: { ...payload, requestId: msg.requestId, agentId: msg.agentId, error: null },
+        },
+        source,
+      );
+    } catch (error) {
+      this.emitForSource(
+        {
+          type: "agent.timeline.history.response",
+          payload: {
+            requestId: msg.requestId,
+            agentId: msg.agentId,
+            epoch: "",
+            unit: "events",
+            error: getErrorMessage(error),
+          },
+        },
+        source,
+      );
+    }
+  }
+
   private async handleFetchAgentTimelineRequest(
     msg: Extract<SessionInboundMessage, { type: "fetch_agent_timeline_request" }>,
     source?: object,
@@ -7785,6 +7883,7 @@ export class Session {
             reset: fetchedControlTimeline.reset,
             staleCursor: fetchedControlTimeline.staleCursor,
             gap: fetchedControlTimeline.gap,
+            historyWindow: this.agentManager.getHistoryWindowInfo(msg.agentId),
             window: selectedTimeline.timeline.window,
             startCursor,
             endCursor,
@@ -7875,7 +7974,9 @@ export class Session {
         agentStorage: this.agentStorage,
         logger: this.sessionLogger,
       });
-      const rows = await this.agentManager.getTimelineRows(msg.agentId);
+      const rows = msg.includeProviderHistory
+        ? this.agentManager.streamFullHistoryMessages(msg.agentId)
+        : this.agentManager.streamTimelineRows(msg.agentId);
       const { epoch } = this.agentManager.fetchTimeline(msg.agentId, {
         direction: "tail",
         limit: 1,
@@ -7928,12 +8029,14 @@ export class Session {
         agentStorage: this.agentStorage,
         logger: this.sessionLogger,
       });
-      const rows = await this.agentManager.getTimelineRows(msg.agentId);
+      const rows = msg.includeProviderHistory
+        ? this.agentManager.streamFullHistoryMessages(msg.agentId)
+        : this.agentManager.streamTimelineRows(msg.agentId);
       const timeline = this.agentManager.fetchTimeline(msg.agentId, {
         direction: "tail",
         limit: 1,
       });
-      const index = buildTimelinePromptIndex(timeline.epoch, rows);
+      const index = await streamTimelinePromptIndex(timeline.epoch, rows);
       this.emitForSource(
         {
           type: "agent.timeline.list_prompts.response",
@@ -8110,17 +8213,40 @@ export class Session {
       const agentPayload = await this.buildAgentPayload(snapshot);
       const timeline = this.agentManager.fetchTimeline(msg.agentId, {
         direction: "tail",
-        limit: 0,
+        limit: 1,
       });
-      const forkContext = buildAgentForkContextAttachment({
-        rows: timeline.rows,
-        cursorBoundary: msg.boundaryCursor
-          ? { timelineEpoch: timeline.epoch, cursor: msg.boundaryCursor }
-          : null,
-        boundaryMessageId: msg.boundaryMessageId,
+      const fullSource = Boolean(this.agentManager.getHistoryWindowInfo(msg.agentId)?.gap);
+      let boundaryMessageId = msg.boundaryMessageId;
+      if (fullSource && msg.boundaryCursor) {
+        if (msg.boundaryCursor.epoch !== timeline.epoch)
+          throw new Error("Selected timeline position is no longer available.");
+        const row = this.agentManager.fetchTimeline(msg.agentId, {
+          direction: "before",
+          cursor: { ...msg.boundaryCursor, seq: msg.boundaryCursor.seq + 1 },
+          limit: 1,
+        }).rows[0];
+        if (
+          !row ||
+          row.seqEnd !== msg.boundaryCursor.seq ||
+          row.item.type !== "assistant_message" ||
+          !row.item.messageId
+        )
+          throw new Error("Selected timeline position is no longer available.");
+        boundaryMessageId = row.item.messageId;
+      }
+      const forkContext = await streamAgentForkContextAttachment({
+        rows: fullSource
+          ? this.agentManager.streamFullHistoryRows(msg.agentId)
+          : this.agentManager.streamTimelineRows(msg.agentId),
+        cursorBoundary:
+          msg.boundaryCursor && !fullSource
+            ? { timelineEpoch: timeline.epoch, cursor: msg.boundaryCursor }
+            : null,
+        boundaryMessageId,
         agentTitle: agentPayload.title,
         cwd: snapshot.cwd,
       });
+      if (fullSource) forkContext.boundaryCursor = msg.boundaryCursor ?? null;
 
       this.emit({
         type: "agent.fork_context.response",
