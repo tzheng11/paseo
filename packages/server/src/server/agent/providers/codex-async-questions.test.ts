@@ -225,6 +225,7 @@ test("manager snapshots capture pending and answered question state before the t
   const { manager, agent } = await manage(session);
   try {
     await ask();
+    await manager.flush();
     const [permission] = session.getPendingPermissions();
     expect(manager.getAgent(agent.id)?.persistence?.metadata?.asyncQuestions).toEqual([
       {
