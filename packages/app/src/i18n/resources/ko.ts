@@ -1202,6 +1202,11 @@ export const ko: TranslationResources = {
     },
     pinned: {
       title: "고정됨",
+      sort: {
+        label: "고정한 작업 공간 정렬",
+        manual: "수동",
+        alphabetical: "A–Z",
+      },
     },
     host: {
       noHost: "호스트 없음",
