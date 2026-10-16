@@ -86,6 +86,7 @@ import { projectIconCache } from "@/projects/icon-cache";
 import { nativePerformanceTrace } from "@/performance/native-trace";
 import { revokePushNotifications } from "@/push-notifications";
 import { createAppWebSocketFactory } from "./websocket-factory";
+import { mergeInitialHosts, readInitialHosts } from "./initial-hosts";
 
 export type HostRuntimeConnectionStatus = "idle" | "connecting" | "online" | "offline" | "error";
 export type PairingNavigationTarget = "openProject" | "hostRoot" | "hostSettings";
@@ -204,6 +205,7 @@ export interface HostRuntimeControllerDeps {
   }>;
   getClientId: () => Promise<string>;
   readInitialConnectionHint?: () => InitialDaemonConnectionHint | null;
+  readInitialHosts?: () => HostProfile[];
   mountClientHandlers?: (input: {
     client: DaemonClient;
     host: HostProfile;
@@ -1495,6 +1497,7 @@ export class HostRuntimeStore {
   private hostListVersion = 0;
   private hostRegistryLoaded = false;
   private hosts: HostProfile[] = [];
+  private initialHosts: HostProfile[] = [];
   private hostAppearanceMutationTail: Promise<void> = Promise.resolve();
   private hostRegistryStatus: HostRegistryStatus = "loading";
   private deps: HostRuntimeControllerDeps;
@@ -1574,6 +1577,12 @@ export class HostRuntimeStore {
       return;
     }
 
+    // A self-hosted deployment already knows its daemon identities. Register
+    // them without discovery and let the ordinary host controllers reconnect.
+    if (this.initialHosts.length > 0) {
+      return;
+    }
+
     const initialHint = this.deps.readInitialConnectionHint
       ? this.deps.readInitialConnectionHint()
       : readInitialDaemonConnectionHint();
@@ -1630,6 +1639,14 @@ export class HostRuntimeStore {
         if (profiles.length !== normalizedProfiles.length) {
           shouldPersistHosts = true;
         }
+      }
+      this.initialHosts = this.deps.readInitialHosts
+        ? this.deps.readInitialHosts()
+        : readInitialHosts({ isWebRuntime: isWeb && !shouldUseDesktopDaemon() });
+      const mergedProfiles = mergeInitialHosts(profiles, this.initialHosts);
+      if (mergedProfiles !== profiles) {
+        shouldPersistHosts = true;
+        profiles = mergedProfiles;
       }
       this.hosts = profiles;
       this.replicaCache.setHosts(profiles.map((profile) => profile.serverId));

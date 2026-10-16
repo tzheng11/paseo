@@ -4051,6 +4051,63 @@ describe("readInitialDaemonConnectionHint", () => {
 });
 
 describe("HostRuntimeStore initial connection hint bootstrap", () => {
+  it.each([false, true])(
+    "registers the deployment catalogue while daemons are offline (saved browser: %s)",
+    async (hasSavedHost) => {
+      const origin: HostConnection = {
+        id: "direct:self.example:443",
+        type: "directTcp",
+        endpoint: "self.example:443",
+        useTls: true,
+      };
+      const studio = makeHost({
+        serverId: "srv_studio",
+        connections: [origin],
+        preferredConnectionId: origin.id,
+      });
+      const notebook = makeHost({ serverId: "srv_notebook" });
+      const storage = createMemoryHostRuntimeStorage();
+      if (hasSavedHost) {
+        await storage.setItem(
+          "@paseo:daemon-registry",
+          JSON.stringify([makeHost({ serverId: notebook.serverId, label: "My notebook" })]),
+        );
+      }
+      const store = new HostRuntimeStore({
+        storage,
+        deps: {
+          createClient: () => new FakeDaemonClient() as unknown as DaemonClient,
+          connectToDaemon: async () => {
+            throw new Error("Daemon temporarily offline");
+          },
+          getClientId: async () => "cid_catalogue",
+          readInitialHosts: () => [studio, notebook],
+          readInitialConnectionHint: () => ({ listen: origin.endpoint, useTls: true }),
+        },
+      });
+
+      try {
+        await store.boot();
+        expect(
+          store
+            .getHosts()
+            .map((host) => host.serverId)
+            .sort(),
+        ).toEqual(["srv_notebook", "srv_studio"]);
+        expect(
+          store.getHosts().find((host) => host.serverId === studio.serverId)?.connections,
+        ).toEqual([origin]);
+        if (hasSavedHost) {
+          expect(store.getHosts().find((host) => host.serverId === notebook.serverId)?.label).toBe(
+            "My notebook",
+          );
+        }
+      } finally {
+        store.syncHosts([]);
+      }
+    },
+  );
+
   it("starts saved remote-host probes while desktop daemon startup is still pending", async () => {
     const host = makeHost({
       serverId: "srv_remote_saved",
