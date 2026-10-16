@@ -1185,6 +1185,12 @@ export const zhCN: TranslationResources = {
       description: "更改或清除侧边栏筛选以查看工作区。",
       clear: "清除筛选",
     },
+    workspaceSort: {
+      label: "工作区排序",
+      manual: "手动",
+      alphabetical: "A–Z",
+      activity: "最近活动",
+    },
     pinned: {
       title: "已置顶",
       sort: {

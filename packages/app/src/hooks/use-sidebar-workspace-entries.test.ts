@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { WorkspaceDescriptor } from "@/stores/session-store";
+import type { Agent, WorkspaceDescriptor } from "@/stores/session-store";
 import type { WorkspaceAgentActivity } from "@/utils/workspace-agent-activity";
 import {
   areSidebarWorkspaceSessionsEqual,
@@ -17,6 +17,7 @@ function activityMap(): Map<string, WorkspaceAgentActivity> {
 
 function sidebarSession(input?: Partial<Omit<SidebarWorkspaceSession, "serverId">>) {
   return {
+    agents: input?.agents ?? new Map<string, Agent>(),
     workspaces: input?.workspaces ?? workspaceMap(),
     workspaceAgentActivity: input?.workspaceAgentActivity ?? activityMap(),
   };
@@ -40,11 +41,13 @@ describe("sidebar workspace session selection", () => {
     ).toEqual([
       {
         serverId: "host-b",
+        agents: hostB.agents,
         workspaces: hostB.workspaces,
         workspaceAgentActivity: hostB.workspaceAgentActivity,
       },
       {
         serverId: "host-a",
+        agents: hostA.agents,
         workspaces: hostA.workspaces,
         workspaceAgentActivity: hostA.workspaceAgentActivity,
       },
@@ -54,13 +57,14 @@ describe("sidebar workspace session selection", () => {
   it("ignores high-frequency session changes outside the sidebar indexes", () => {
     const workspaces = workspaceMap();
     const workspaceAgentActivity = activityMap();
+    const agents = new Map<string, Agent>();
 
     const previous = selectSidebarWorkspaceSessions(
-      { "host-a": sidebarSession({ workspaces, workspaceAgentActivity }) },
+      { "host-a": sidebarSession({ workspaces, workspaceAgentActivity, agents }) },
       ["host-a"],
     );
     const next = selectSidebarWorkspaceSessions(
-      { "host-a": sidebarSession({ workspaces, workspaceAgentActivity }) },
+      { "host-a": sidebarSession({ workspaces, workspaceAgentActivity, agents }) },
       ["host-a"],
     );
 
@@ -68,7 +72,7 @@ describe("sidebar workspace session selection", () => {
     expect(areSidebarWorkspaceSessionsEqual(previous, next)).toBe(true);
   });
 
-  it("detects changes to a selected workspace or activity index", () => {
+  it("detects changes to a selected workspace or status index", () => {
     const workspaceAgentActivity = activityMap();
     const previous = selectSidebarWorkspaceSessions(
       { "host-a": sidebarSession({ workspaceAgentActivity, workspaces: workspaceMap() }) },
@@ -79,6 +83,20 @@ describe("sidebar workspace session selection", () => {
       ["host-a"],
     );
 
+    expect(areSidebarWorkspaceSessionsEqual(previous, next)).toBe(false);
+  });
+
+  it("detects agent updates even when workspace and status indexes are unchanged", () => {
+    const workspaces = workspaceMap();
+    const workspaceAgentActivity = activityMap();
+    const previous = selectSidebarWorkspaceSessions(
+      { "host-a": sidebarSession({ workspaces, workspaceAgentActivity, agents: new Map() }) },
+      ["host-a"],
+    );
+    const next = selectSidebarWorkspaceSessions(
+      { "host-a": sidebarSession({ workspaces, workspaceAgentActivity, agents: new Map() }) },
+      ["host-a"],
+    );
     expect(areSidebarWorkspaceSessionsEqual(previous, next)).toBe(false);
   });
 });

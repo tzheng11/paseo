@@ -1200,6 +1200,12 @@ export const ko: TranslationResources = {
       description: "워크스페이스를 보려면 사이드바 필터를 변경하거나 지우세요.",
       clear: "필터 지우기",
     },
+    workspaceSort: {
+      label: "작업 공간 정렬",
+      manual: "수동",
+      alphabetical: "A–Z",
+      activity: "최근 활동",
+    },
     pinned: {
       title: "고정됨",
       sort: {

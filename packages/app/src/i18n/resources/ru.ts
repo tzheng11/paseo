@@ -1211,6 +1211,12 @@ export const ru: TranslationResources = {
         "Измените или очистите фильтры боковой панели, чтобы увидеть рабочие пространства.",
       clear: "Очистить фильтры",
     },
+    workspaceSort: {
+      label: "Сортировать рабочие пространства",
+      manual: "Вручную",
+      alphabetical: "А–Я",
+      activity: "Последняя активность",
+    },
     pinned: {
       title: "Закреплённые",
       sort: {

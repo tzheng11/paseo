@@ -1207,6 +1207,12 @@ export const ja: TranslationResources = {
         "ワークスペースを表示するにはサイドバーのフィルターを変更またはクリアしてください。",
       clear: "フィルターをクリア",
     },
+    workspaceSort: {
+      label: "ワークスペースの並べ替え",
+      manual: "手動",
+      alphabetical: "A–Z",
+      activity: "最終アクティビティ",
+    },
     pinned: {
       title: "固定済み",
       sort: {

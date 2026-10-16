@@ -169,3 +169,139 @@ test("pinned A–Z sorting persists, follows renames, and restores manual order"
     await Promise.all([zeta.cleanup(), alpha.cleanup()]);
   }
 });
+
+test("project sorts are independent, persist, and restore the dragged manual order", async ({
+  page,
+}) => {
+  test.setTimeout(120_000);
+  const first = await seedWorkspace({
+    title: "Zeta project workspace",
+    repoPrefix: "project-sort-first-",
+  });
+  const second = await seedWorkspace({
+    title: "Zeta other workspace",
+    repoPrefix: "project-sort-second-",
+  });
+  const pinned = await seedWorkspace({
+    title: "Pinned workspace",
+    repoPrefix: "project-sort-pinned-",
+  });
+  try {
+    const firstAlpha = await first.client.createWorkspace({
+      source: { kind: "directory", path: first.repoPath, projectId: first.projectId },
+      title: "Alpha project workspace",
+    });
+    const secondAlpha = await second.client.createWorkspace({
+      source: { kind: "directory", path: second.repoPath, projectId: second.projectId },
+      title: "Alpha other workspace",
+    });
+    if (!firstAlpha.workspace || !secondAlpha.workspace)
+      throw new Error("Failed to seed sorting workspaces");
+    await pinned.client.setWorkspacePinned(pinned.workspaceId, true);
+    await page.setViewportSize({ width: 1440, height: 1200 });
+    await gotoAppShell(page);
+    await waitForSidebarHydration(page);
+
+    const firstSortId = `sidebar-project-sort-${projectEquivalenceViewKey(first.projectKey)}`;
+    const secondSortId = `sidebar-project-sort-${projectEquivalenceViewKey(second.projectKey)}`;
+    const firstSort = page.getByTestId(firstSortId).filter({ visible: true }).first();
+    const secondSort = page.getByTestId(secondSortId).filter({ visible: true }).first();
+    const pinnedSort = page.getByTestId("sidebar-pinned-sort").filter({ visible: true }).first();
+    const zetaId = `sidebar-workspace-row-${getServerId()}:${first.workspaceId}`;
+    const alphaId = `sidebar-workspace-row-${getServerId()}:${firstAlpha.workspace.id}`;
+    const rows = page.locator(`[data-testid="${zetaId}"], [data-testid="${alphaId}"]`);
+    const otherRows = page.locator(
+      `[data-testid="sidebar-workspace-row-${getServerId()}:${second.workspaceId}"], [data-testid="sidebar-workspace-row-${getServerId()}:${secondAlpha.workspace.id}"]`,
+    );
+    await expect(rows).toHaveCount(2);
+    await expect(otherRows).toHaveCount(2);
+    const otherManualOrder = await rowTestIds(otherRows);
+
+    await firstSort.click();
+    await page.getByTestId(`${firstSortId}-alphabetical`).click();
+    await expect.poll(() => rowTestIds(rows)).toEqual([alphaId, zetaId]);
+    await quickDragFirstRowAfterSecond(rows, pressWorkspaceRow);
+    await expect(firstSort).toContainText("Manual");
+    await expect.poll(() => rowTestIds(rows)).toEqual([zetaId, alphaId]);
+
+    await firstSort.click();
+    await page.getByTestId(`${firstSortId}-alphabetical`).click();
+    await expect.poll(() => rowTestIds(rows)).toEqual([alphaId, zetaId]);
+    await expect(secondSort).toContainText("Manual");
+    await expect(pinnedSort).toContainText("Manual");
+    await expect.poll(() => rowTestIds(otherRows)).toEqual(otherManualOrder);
+
+    await page.reload();
+    await waitForSidebarHydration(page);
+    await expect(firstSort).toContainText("A–Z");
+    await expect(secondSort).toContainText("Manual");
+    await expect(pinnedSort).toContainText("Manual");
+    await expect.poll(() => rowTestIds(rows)).toEqual([alphaId, zetaId]);
+    await firstSort.click();
+    await page.getByTestId(`${firstSortId}-manual`).click();
+    await expect.poll(() => rowTestIds(rows)).toEqual([zetaId, alphaId]);
+    await expect.poll(() => rowTestIds(otherRows)).toEqual(otherManualOrder);
+  } finally {
+    await Promise.all([first.cleanup(), second.cleanup(), pinned.cleanup()]);
+  }
+});
+
+test("Last Activity follows live agent activity in project and Pinned lists", async ({ page }) => {
+  test.setTimeout(120_000);
+  const project = await seedWorkspace({
+    title: "Zeta activity",
+    repoPrefix: "project-activity-sort-",
+  });
+  try {
+    const alpha = await project.client.createWorkspace({
+      source: { kind: "directory", path: project.repoPath, projectId: project.projectId },
+      title: "Alpha activity",
+    });
+    if (!alpha.workspace) throw new Error(alpha.error ?? "Failed to seed activity workspace");
+    const olderAgent = await project.client.createAgent({
+      provider: "mock",
+      cwd: project.repoPath,
+      workspaceId: project.workspaceId,
+      title: "Zeta worker",
+      model: "e2e-fast-stream",
+      modeId: "load-test",
+    });
+    await project.client.createAgent({
+      provider: "mock",
+      cwd: project.repoPath,
+      workspaceId: alpha.workspace.id,
+      title: "Alpha worker",
+      model: "e2e-fast-stream",
+      modeId: "load-test",
+    });
+    await page.setViewportSize({ width: 1440, height: 1200 });
+    await gotoAppShell(page);
+    await waitForSidebarHydration(page);
+    const projectSortId = `sidebar-project-sort-${projectEquivalenceViewKey(project.projectKey)}`;
+    const projectSort = page.getByTestId(projectSortId).filter({ visible: true }).first();
+    const zetaId = `sidebar-workspace-row-${getServerId()}:${project.workspaceId}`;
+    const alphaId = `sidebar-workspace-row-${getServerId()}:${alpha.workspace.id}`;
+    const rows = page.locator(`[data-testid="${zetaId}"], [data-testid="${alphaId}"]`);
+    await projectSort.click();
+    await page.getByTestId(`${projectSortId}-activity`).click();
+    await expect(projectSort).toContainText("Last Activity");
+    await expect.poll(() => rowTestIds(rows)).toEqual([alphaId, zetaId]);
+    await project.client.sendAgentMessage(olderAgent.id, "Update this workspace's activity.");
+    await project.client.waitForFinish(olderAgent.id, 20_000);
+    await expect.poll(() => rowTestIds(rows)).toEqual([zetaId, alphaId]);
+
+    await project.client.setWorkspacePinned(project.workspaceId, true);
+    await project.client.setWorkspacePinned(alpha.workspace.id, true);
+    const pinnedSort = page.getByTestId("sidebar-pinned-sort").filter({ visible: true }).first();
+    await pinnedSort.click();
+    await page.getByTestId("sidebar-pinned-sort-activity").click();
+    await expect.poll(() => rowTestIds(rows)).toEqual([zetaId, alphaId]);
+    await page.reload();
+    await waitForSidebarHydration(page);
+    await expect(pinnedSort).toContainText("Last Activity");
+    await expect(projectSort).toContainText("Last Activity");
+    await expect.poll(() => rowTestIds(rows)).toEqual([zetaId, alphaId]);
+  } finally {
+    await project.cleanup();
+  }
+});

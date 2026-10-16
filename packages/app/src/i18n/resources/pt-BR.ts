@@ -1219,6 +1219,12 @@ export const ptBR: TranslationResources = {
       description: "Altere ou limpe os filtros da barra lateral para ver espaços de trabalho.",
       clear: "Limpar filtros",
     },
+    workspaceSort: {
+      label: "Ordenar espaços de trabalho",
+      manual: "Manual",
+      alphabetical: "A–Z",
+      activity: "Última atividade",
+    },
     pinned: {
       title: "Fixados",
       sort: {

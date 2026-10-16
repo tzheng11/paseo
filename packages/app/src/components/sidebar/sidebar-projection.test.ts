@@ -43,6 +43,10 @@ function makeWorkspace(
   return { placement, entry };
 }
 
+function workspaceIds(workspaces: readonly SidebarWorkspacePlacement[]): string[] {
+  return workspaces.map((workspace) => workspace.workspaceId);
+}
+
 function makeProject(
   workspaces: SidebarWorkspacePlacement[],
   viewKey = "project",
@@ -181,6 +185,130 @@ describe("buildSidebarProjection", () => {
       buildSidebarProjection({ ...input, workspaceTitleSource: "branch" }).pinnedGroups
         .pinnedChats[0]?.workspaceId,
     ).toBe("two");
+  });
+
+  it("sorts each project independently without changing Pinned or manual placement order", () => {
+    const first = [makeWorkspace("z"), makeWorkspace("a")];
+    const second = [
+      makeWorkspace("y", "done", [], "other"),
+      makeWorkspace("b", "done", [], "other"),
+    ];
+    const pinned = makeWorkspace("pinned");
+    const input = {
+      ...projectionInput(),
+      projects: [
+        makeProject([pinned.placement, ...first.map(({ placement }) => placement)]),
+        makeProject(
+          second.map(({ placement }) => placement),
+          "other",
+        ),
+      ],
+      workspaceEntriesByKey: new Map(
+        [pinned, ...first, ...second].map(({ entry }) => [entry.workspaceKey, entry]),
+      ),
+      workspaceSortModeByProject: { project: "alphabetical" as const },
+    };
+    const sorted = buildSidebarProjection(input);
+    expect(
+      sorted.pinnedGroups.unpinnedProjects.map((project) => workspaceIds(project.workspaces)),
+    ).toEqual([
+      ["a", "z"],
+      ["y", "b"],
+    ]);
+    expect(sorted.shortcutModel.shortcutTargets.map((workspace) => workspace.workspaceId)).toEqual([
+      "pinned",
+      "a",
+      "z",
+      "y",
+      "b",
+    ]);
+    const manual = buildSidebarProjection({
+      ...input,
+      workspaceSortModeByProject: { project: "manual" },
+    });
+    expect(
+      manual.pinnedGroups.unpinnedProjects[0]?.workspaces.map((workspace) => workspace.workspaceId),
+    ).toEqual(["z", "a"]);
+    expect(input.projects[0]?.workspaces.map((workspace) => workspace.workspaceId)).toEqual([
+      "pinned",
+      "z",
+      "a",
+    ]);
+  });
+
+  it("uses displayed branch names for project A–Z sorting", () => {
+    const first = makeWorkspace("alpha");
+    const second = makeWorkspace("beta");
+    first.entry.currentBranch = "zeta";
+    const input = {
+      ...projectionInput(),
+      projects: [makeProject([first.placement, second.placement])],
+      pinnedKeys: { pinnedWorkspaceKeys: [], pinnedAtByKey: {} },
+      workspaceEntriesByKey: new Map(
+        [first, second].map(({ entry }) => [entry.workspaceKey, entry]),
+      ),
+      workspaceSortModeByProject: { project: "alphabetical" as const },
+      workspaceTitleSource: "branch" as const,
+    };
+    const projection = buildSidebarProjection(input);
+    expect(
+      projection.pinnedGroups.unpinnedProjects[0]?.workspaces.map(
+        (workspace) => workspace.workspaceId,
+      ),
+    ).toEqual(["beta", "alpha"]);
+    expect(
+      projection.shortcutModel.shortcutTargets.map((workspace) => workspace.workspaceId),
+    ).toEqual(["beta", "alpha"]);
+  });
+
+  it("keeps project and Pinned Last Activity order aligned with shortcuts after an update", () => {
+    const older = makeWorkspace("older");
+    const newer = makeWorkspace("newer");
+    const pinnedOlder = makeWorkspace("pinned-older");
+    const pinnedNewer = makeWorkspace("pinned-newer");
+    older.entry.lastActivityAt = new Date("2026-10-16T10:00:00Z");
+    newer.entry.lastActivityAt = new Date("2026-10-16T11:00:00Z");
+    pinnedOlder.entry.lastActivityAt = new Date("2026-10-16T09:00:00Z");
+    pinnedNewer.entry.lastActivityAt = new Date("2026-10-16T12:00:00Z");
+    const workspaces = [older, newer, pinnedOlder, pinnedNewer];
+    const input = {
+      ...projectionInput(),
+      projects: [makeProject(workspaces.map(({ placement }) => placement))],
+      pinnedKeys: {
+        pinnedWorkspaceKeys: [
+          pinnedOlder.placement.workspaceKey,
+          pinnedNewer.placement.workspaceKey,
+        ],
+        pinnedAtByKey: {},
+      },
+      workspaceEntriesByKey: new Map(workspaces.map(({ entry }) => [entry.workspaceKey, entry])),
+      workspaceSortModeByProject: { project: "activity" as const },
+      pinnedWorkspaceSortMode: "activity" as const,
+    };
+    const projection = buildSidebarProjection(input);
+    expect(workspaceIds(projection.pinnedGroups.pinnedChats)).toEqual([
+      "pinned-newer",
+      "pinned-older",
+    ]);
+    expect(workspaceIds(projection.pinnedGroups.unpinnedProjects[0]!.workspaces)).toEqual([
+      "newer",
+      "older",
+    ]);
+    expect(
+      projection.shortcutModel.shortcutTargets.map((workspace) => workspace.workspaceId),
+    ).toEqual(["pinned-newer", "pinned-older", "newer", "older"]);
+    input.workspaceEntriesByKey.set(older.entry.workspaceKey, {
+      ...older.entry,
+      lastActivityAt: new Date("2026-10-16T13:00:00Z"),
+    });
+    const updated = buildSidebarProjection(input);
+    expect(workspaceIds(updated.pinnedGroups.unpinnedProjects[0]!.workspaces)).toEqual([
+      "older",
+      "newer",
+    ]);
+    expect(updated.shortcutModel.shortcutTargets.map((workspace) => workspace.workspaceId)).toEqual(
+      ["pinned-newer", "pinned-older", "older", "newer"],
+    );
   });
 
   // The rule that outlived the bug it was written for: a project icon is fetched per project, so
