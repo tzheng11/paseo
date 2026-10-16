@@ -22,6 +22,7 @@ describe("migrateSidebarOrderState", () => {
       projectOrder: ["project-a"],
       pinnedWorkspaceOrder: [],
       pinnedWorkspaceSortMode: "manual",
+      workspaceSortModeByProject: {},
       workspaceOrderByProject: {
         "project-a": ["host-a:main", "host-a:feature", "host-b:main"],
       },
@@ -64,6 +65,40 @@ describe("migrateSidebarOrderState", () => {
     expect(useSidebarOrderStore.getState().pinnedWorkspaceSortMode).toBe("manual");
     expect(useSidebarOrderStore.getState().pinnedWorkspaceOrder).toEqual(["c", "a", "b"]);
   });
+
+  it("persists project sort modes independently of pinned sort and saved manual order", () => {
+    const migrated = migrateSidebarOrderState({
+      workspaceOrderByProject: { first: ["b", "a"], second: ["d", "c"] },
+      workspaceSortModeByProject: { first: "alphabetical", second: "activity" },
+      pinnedWorkspaceSortMode: "activity",
+    });
+    expect(migrated).toMatchObject({
+      workspaceOrderByProject: { first: ["b", "a"], second: ["d", "c"] },
+      workspaceSortModeByProject: { first: "alphabetical", second: "activity" },
+      pinnedWorkspaceSortMode: "activity",
+    });
+  });
+
+  it("keeps each project's mode and manual order while selecting another mode", () => {
+    useSidebarOrderStore.setState({ workspaceOrderByProject: {}, workspaceSortModeByProject: {} });
+    const store = useSidebarOrderStore.getState();
+    store.setWorkspaceOrder("first", ["b", "a"]);
+    store.setWorkspaceSortMode("first", "alphabetical");
+    store.setWorkspaceSortMode("second", "activity");
+    store.setWorkspaceSortMode("first", "manual");
+    expect(useSidebarOrderStore.getState().workspaceSortModeByProject).toEqual({
+      first: "manual",
+      second: "activity",
+    });
+    expect(store.getWorkspaceOrder("first")).toEqual(["b", "a"]);
+  });
+
+  it("preserves an automatic sort when reconciliation appends a new workspace", () => {
+    const store = useSidebarOrderStore.getState();
+    store.setWorkspaceSortMode("reconciled", "activity");
+    store.setWorkspaceOrder("reconciled", ["old", "new"]);
+    expect(useSidebarOrderStore.getState().workspaceSortModeByProject.reconciled).toBe("activity");
+  });
 });
 
 // A directory whose name ends in a space produces a view key that ends in a
@@ -77,6 +112,7 @@ describe("sidebar order keys that end in whitespace", () => {
       projectOrder: [],
       pinnedWorkspaceOrder: [],
       workspaceOrderByProject: {},
+      workspaceSortModeByProject: {},
     });
   });
 
@@ -95,6 +131,10 @@ describe("sidebar order keys that end in whitespace", () => {
       "srv-1:main",
     ]);
     expect(useSidebarOrderStore.getState().getWorkspaceOrder(PROJECT_KEY)).toEqual(["srv-1:main"]);
+    useSidebarOrderStore.getState().setWorkspaceSortMode(PROJECT_KEY, "activity");
+    expect(useSidebarOrderStore.getState().workspaceSortModeByProject[PROJECT_KEY]).toBe(
+      "activity",
+    );
   });
 
   it("settles the sidebar order reconcile instead of rewriting it forever", () => {

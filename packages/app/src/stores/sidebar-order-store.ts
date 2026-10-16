@@ -3,8 +3,9 @@ import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { z } from "zod";
 import { createValidatedPersistStorage } from "@/storage/validated-persist-storage";
+import type { SidebarWorkspaceSortMode } from "@/components/sidebar/workspace-sort";
 
-export type PinnedWorkspaceSortMode = "manual" | "alphabetical";
+export type PinnedWorkspaceSortMode = SidebarWorkspaceSortMode;
 
 interface SidebarOrderStoreState {
   projectOrder: string[];
@@ -12,6 +13,8 @@ interface SidebarOrderStoreState {
   pinnedWorkspaceSortMode: PinnedWorkspaceSortMode;
   setPinnedWorkspaceSortMode: (mode: PinnedWorkspaceSortMode) => void;
   workspaceOrderByProject: Record<string, string[]>;
+  workspaceSortModeByProject: Record<string, SidebarWorkspaceSortMode>;
+  setWorkspaceSortMode: (projectViewKey: string, mode: SidebarWorkspaceSortMode) => void;
   getProjectOrder: () => string[];
   setProjectOrder: (keys: string[]) => void;
   getPinnedWorkspaceOrder: () => string[];
@@ -25,15 +28,18 @@ interface SidebarOrderPersistedState {
   pinnedWorkspaceOrder?: string[];
   pinnedWorkspaceSortMode?: PinnedWorkspaceSortMode;
   workspaceOrderByProject?: Record<string, string[]>;
+  workspaceSortModeByProject?: Record<string, SidebarWorkspaceSortMode>;
   projectOrderByServerId?: Record<string, string[]>;
   workspaceOrderByServerAndProject?: Record<string, string[]>;
 }
 
+const WorkspaceSortModeSchema = z.enum(["manual", "alphabetical", "activity"]);
 const StringArrayRecordSchema = z.record(z.string(), z.array(z.string()));
 const SidebarOrderPersistedStateSchema = z.strictObject({
   projectOrder: z.array(z.string()).optional(),
   pinnedWorkspaceOrder: z.array(z.string()).optional(),
-  pinnedWorkspaceSortMode: z.enum(["manual", "alphabetical"]).optional(),
+  pinnedWorkspaceSortMode: WorkspaceSortModeSchema.optional(),
+  workspaceSortModeByProject: z.record(z.string(), WorkspaceSortModeSchema).optional(),
   workspaceOrderByProject: StringArrayRecordSchema.optional(),
   projectOrderByServerId: StringArrayRecordSchema.optional(),
   workspaceOrderByServerAndProject: StringArrayRecordSchema.optional(),
@@ -117,6 +123,7 @@ export function migrateSidebarOrderState(persistedState: unknown): {
   pinnedWorkspaceOrder: string[];
   pinnedWorkspaceSortMode: PinnedWorkspaceSortMode;
   workspaceOrderByProject: Record<string, string[]>;
+  workspaceSortModeByProject: Record<string, SidebarWorkspaceSortMode>;
 } {
   const result = SidebarOrderPersistedStateSchema.safeParse(persistedState);
   if (!result.success) {
@@ -125,6 +132,7 @@ export function migrateSidebarOrderState(persistedState: unknown): {
       pinnedWorkspaceOrder: [],
       pinnedWorkspaceSortMode: "manual",
       workspaceOrderByProject: {},
+      workspaceSortModeByProject: {},
     };
   }
   const state: SidebarOrderPersistedState = result.data;
@@ -160,6 +168,7 @@ export function migrateSidebarOrderState(persistedState: unknown): {
     pinnedWorkspaceOrder: normalizeKeys(state.pinnedWorkspaceOrder ?? []),
     pinnedWorkspaceSortMode: state.pinnedWorkspaceSortMode ?? "manual",
     workspaceOrderByProject,
+    workspaceSortModeByProject: state.workspaceSortModeByProject ?? {},
   };
 }
 
@@ -171,6 +180,16 @@ export const useSidebarOrderStore = create<SidebarOrderStoreState>()(
       pinnedWorkspaceSortMode: "manual",
       setPinnedWorkspaceSortMode: (mode) => set({ pinnedWorkspaceSortMode: mode }),
       workspaceOrderByProject: {},
+      workspaceSortModeByProject: {},
+      setWorkspaceSortMode: (projectViewKey, mode) => {
+        if (!projectViewKey.trim()) return;
+        set((state) => ({
+          workspaceSortModeByProject: {
+            ...state.workspaceSortModeByProject,
+            [projectViewKey]: mode,
+          },
+        }));
+      },
       getProjectOrder: () => get().projectOrder,
       setProjectOrder: (keys) => {
         set({ projectOrder: dedupeKeys(keys) });
@@ -201,6 +220,7 @@ export const useSidebarOrderStore = create<SidebarOrderStoreState>()(
         pinnedWorkspaceOrder: state.pinnedWorkspaceOrder,
         pinnedWorkspaceSortMode: state.pinnedWorkspaceSortMode,
         workspaceOrderByProject: state.workspaceOrderByProject,
+        workspaceSortModeByProject: state.workspaceSortModeByProject,
       }),
       version: 2,
       migrate: migrateSidebarOrderState,

@@ -1193,6 +1193,12 @@ export const ar: TranslationResources = {
       description: "غيّر عوامل تصفية الشريط الجانبي أو امسحها لعرض مساحات العمل.",
       clear: "مسح عوامل التصفية",
     },
+    workspaceSort: {
+      label: "ترتيب مساحات العمل",
+      manual: "يدوي",
+      alphabetical: "أ–ي",
+      activity: "آخر نشاط",
+    },
     pinned: {
       title: "المثبتة",
       sort: {

@@ -1201,6 +1201,12 @@ export const en = {
       description: "Change or clear the sidebar filters to see workspaces.",
       clear: "Clear filters",
     },
+    workspaceSort: {
+      label: "Sort workspaces",
+      manual: "Manual",
+      alphabetical: "A–Z",
+      activity: "Last Activity",
+    },
     pinned: {
       title: "Pinned",
       sort: {

@@ -12,7 +12,7 @@ import type {
 import type { SidebarGroupMode } from "@/stores/sidebar-view-store";
 import type { PinnedWorkspaceSortMode } from "@/stores/sidebar-order-store";
 import type { WorkspaceTitleSource } from "@/hooks/use-settings";
-import { resolveSidebarWorkspacePrimaryLabel } from "./sidebar-workspace-title";
+import { sortSidebarWorkspaces, type SidebarWorkspaceSortMode } from "./workspace-sort";
 import {
   resolveSidebarProjectIconTargets,
   type SidebarProjectIconTarget,
@@ -45,6 +45,7 @@ export interface SidebarProjectionInput {
   pinnedWorkspaceOrder: string[];
   pinnedWorkspaceSortMode?: PinnedWorkspaceSortMode;
   workspaceTitleSource?: WorkspaceTitleSource;
+  workspaceSortModeByProject?: Readonly<Record<string, SidebarWorkspaceSortMode>>;
   workspaceEntriesByKey: ReadonlyMap<string, SidebarWorkspaceEntry>;
   projectNamesByViewKey: Map<string, string>;
   groupMode: SidebarGroupMode;
@@ -60,22 +61,25 @@ export function buildSidebarProjection(input: SidebarProjectionInput): SidebarPr
     keys: input.pinnedKeys,
     pinnedWorkspaceOrder: input.pinnedWorkspaceOrder,
   });
-  if (input.pinnedWorkspaceSortMode === "alphabetical") {
-    const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
-    const label = (workspace: (typeof pinnedGroups.pinnedChats)[number]) => {
-      const entry = input.workspaceEntriesByKey.get(workspace.workspaceKey);
-      return entry
-        ? resolveSidebarWorkspacePrimaryLabel({
-            workspace: entry,
-            workspaceTitleSource: input.workspaceTitleSource ?? "title",
-          })
-        : workspace.name;
+  pinnedGroups.pinnedChats = sortSidebarWorkspaces({
+    workspaces: pinnedGroups.pinnedChats,
+    mode: input.pinnedWorkspaceSortMode ?? "manual",
+    workspaceTitleSource: input.workspaceTitleSource ?? "title",
+    workspaceEntriesByKey: input.workspaceEntriesByKey,
+  });
+  pinnedGroups.unpinnedProjects = pinnedGroups.unpinnedProjects.map((project) => {
+    const mode = input.workspaceSortModeByProject?.[project.viewKey] ?? "manual";
+    if (mode === "manual") return project;
+    return {
+      ...project,
+      workspaces: sortSidebarWorkspaces({
+        workspaces: project.workspaces,
+        mode,
+        workspaceTitleSource: input.workspaceTitleSource ?? "title",
+        workspaceEntriesByKey: input.workspaceEntriesByKey,
+      }),
     };
-    pinnedGroups.pinnedChats.sort(
-      (a, b) =>
-        collator.compare(label(a), label(b)) || a.workspaceKey.localeCompare(b.workspaceKey),
-    );
-  }
+  });
   const pinnedWorkspaceKeys = new Set(input.pinnedKeys.pinnedWorkspaceKeys);
   const unpinnedWorkspaces = Array.from(input.workspaceEntriesByKey.values()).filter(
     (workspace) => !pinnedWorkspaceKeys.has(workspace.workspaceKey),

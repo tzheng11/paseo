@@ -1221,6 +1221,12 @@ export const fr: TranslationResources = {
         "Modifiez ou effacez les filtres de la barre latérale pour afficher les espaces de travail.",
       clear: "Effacer les filtres",
     },
+    workspaceSort: {
+      label: "Trier les espaces de travail",
+      manual: "Manuel",
+      alphabetical: "A–Z",
+      activity: "Dernière activité",
+    },
     pinned: {
       title: "Épinglés",
       sort: {

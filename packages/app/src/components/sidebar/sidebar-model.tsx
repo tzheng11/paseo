@@ -76,6 +76,9 @@ export function SidebarModelProvider({
   const pinnedCollapsed = useSidebarCollapsedSectionsStore((state) => state.collapsedPinned);
   const pinnedWorkspaceOrder = useSidebarOrderStore((state) => state.pinnedWorkspaceOrder);
   const pinnedWorkspaceSortMode = useSidebarOrderStore((state) => state.pinnedWorkspaceSortMode);
+  const workspaceSortModeByProject = useSidebarOrderStore(
+    (state) => state.workspaceSortModeByProject,
+  );
   const toggleProjectCollapsed = useSidebarCollapsedSectionsStore(
     (state) => state.toggleProjectCollapsed,
   );
@@ -98,12 +101,15 @@ export function SidebarModelProvider({
     [projectFilters, list.projects],
   );
   const hasActiveProjectFilter = resolvedProjectFilters.length > 0;
-  // The project filter is deliberately absent from this gate. It reads `projectViewKey`, which
-  // lives on the project and the placement, so it can narrow the project list without hydrating
-  // anything; the label filter reads `labels`, which only exists on an entry. Hydration opens a
-  // live session-store subscription over every workspace on every visible host, so widening this
-  // for a filter that does not need it costs a retained-but-inactive sidebar real work.
-  const needsWorkspaceEntries = groupMode !== "project" || hasActiveLabelFilter;
+  // Label filters and automatic sorting read hydrated entries. Keep their projection current
+  // while the sidebar is hidden so keyboard navigation walks the order the user will see.
+  const hasAutomaticWorkspaceSort =
+    pinnedWorkspaceSortMode !== "manual" ||
+    list.projects.some(
+      (project) => (workspaceSortModeByProject[project.viewKey] ?? "manual") !== "manual",
+    );
+  const needsWorkspaceEntries =
+    groupMode !== "project" || hasActiveLabelFilter || hasAutomaticWorkspaceSort;
   const workspaceEntriesByKey = useSidebarWorkspaceEntries(
     list.workspacePlacements,
     active !== false || needsWorkspaceEntries,
@@ -159,6 +165,7 @@ export function SidebarModelProvider({
       pinnedKeys,
       pinnedWorkspaceOrder,
       pinnedWorkspaceSortMode,
+      workspaceSortModeByProject,
       workspaceTitleSource,
       workspaceEntriesByKey: filteredWorkspaceEntriesByKey,
       projectNamesByViewKey: list.projectNamesByViewKey,
@@ -178,6 +185,7 @@ export function SidebarModelProvider({
       pinnedKeys,
       pinnedWorkspaceOrder,
       pinnedWorkspaceSortMode,
+      workspaceSortModeByProject,
       workspaceTitleSource,
       filteredWorkspaceEntriesByKey,
       t,

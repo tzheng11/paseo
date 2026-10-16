@@ -1229,6 +1229,12 @@ export const es: TranslationResources = {
       description: "Cambia o borra los filtros de la barra lateral para ver espacios de trabajo.",
       clear: "Borrar filtros",
     },
+    workspaceSort: {
+      label: "Ordenar espacios de trabajo",
+      manual: "Manual",
+      alphabetical: "A–Z",
+      activity: "Última actividad",
+    },
     pinned: {
       title: "Anclados",
       sort: {

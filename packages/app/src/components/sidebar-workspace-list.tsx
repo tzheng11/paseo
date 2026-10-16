@@ -93,6 +93,7 @@ import {
 } from "@/components/sidebar/sidebar-workspace-menu";
 import { useLongPressDragInteraction } from "@/components/sidebar/use-long-press-drag-interaction";
 import { PinnedSectionHeader } from "@/components/sidebar/pinned-section-header";
+import { ProjectWorkspaceSortMenu } from "@/components/sidebar/workspace-sort-menu";
 import { SidebarGroupToggleRow } from "@/components/sidebar/sidebar-group-toggle-row";
 import { useLimitedSidebarGroup } from "@/components/sidebar/use-limited-sidebar-group";
 import {
@@ -425,6 +426,7 @@ function ProjectRowTrailingActions({
   const actionsVisible = isHovered || platformIsNative || isMobileBreakpoint;
   return (
     <View style={styles.projectTrailingActions}>
+      <ProjectWorkspaceSortMenu projectViewKey={projectViewKey} projectName={displayName} />
       {worktreeTarget ? (
         <NewWorktreeButton
           displayName={displayName}
@@ -1915,10 +1917,14 @@ export function SidebarWorkspaceList({
   const onToggleWorkspacePin = useSidebarWorkspacePinController();
   const getPinnedWorkspaceOrder = useSidebarOrderStore((state) => state.getPinnedWorkspaceOrder);
   const setPinnedWorkspaceOrder = useSidebarOrderStore((state) => state.setPinnedWorkspaceOrder);
+  const setPinnedWorkspaceSortMode = useSidebarOrderStore(
+    (state) => state.setPinnedWorkspaceSortMode,
+  );
   const handlePinnedWorkspaceReorder = useCallback(
     (reorderedWorkspaces: SidebarWorkspacePlacement[]) => {
       const reorderedWorkspaceKeys = reorderedWorkspaces.map((workspace) => workspace.workspaceKey);
       const currentOrder = getPinnedWorkspaceOrder();
+      setPinnedWorkspaceSortMode("manual");
       if (
         !hasVisibleOrderChanged({
           currentOrder,
@@ -1935,7 +1941,7 @@ export function SidebarWorkspaceList({
         }),
       );
     },
-    [getPinnedWorkspaceOrder, setPinnedWorkspaceOrder],
+    [getPinnedWorkspaceOrder, setPinnedWorkspaceOrder, setPinnedWorkspaceSortMode],
   );
   // One fetch, one map, every mode — project mode paints icons on its headers and status mode
   // paints them on each row, all keyed by `projectViewKey`. The targets come from the projection
@@ -2126,6 +2132,7 @@ function ProjectModeList({
   const setProjectOrder = useSidebarOrderStore((state) => state.setProjectOrder);
   const getWorkspaceOrder = useSidebarOrderStore((state) => state.getWorkspaceOrder);
   const setWorkspaceOrder = useSidebarOrderStore((state) => state.setWorkspaceOrder);
+  const setWorkspaceSortMode = useSidebarOrderStore((state) => state.setWorkspaceSortMode);
 
   const isWorkspaceRoute = useMemo(
     () => Boolean(pathname && parseHostWorkspaceRouteFromPathname(pathname)),
@@ -2227,6 +2234,7 @@ function ProjectModeList({
     (projectViewKey: string, reorderedWorkspaces: SidebarWorkspacePlacement[]) => {
       const reorderedWorkspaceKeys = reorderedWorkspaces.map((workspace) => workspace.workspaceKey);
       const currentWorkspaceOrder = getWorkspaceOrder(projectViewKey);
+      setWorkspaceSortMode(projectViewKey, "manual");
       if (
         !hasVisibleOrderChanged({
           currentOrder: currentWorkspaceOrder,
@@ -2244,7 +2252,7 @@ function ProjectModeList({
         }),
       );
     },
-    [getWorkspaceOrder, setWorkspaceOrder],
+    [getWorkspaceOrder, setWorkspaceOrder, setWorkspaceSortMode],
   );
 
   const handleWorktreeCreated = useCallback((workspaceId: string) => {
