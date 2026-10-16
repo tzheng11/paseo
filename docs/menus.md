@@ -39,6 +39,12 @@ surfaces. The header uses the same mutation controllers, canonical workspace ID 
 so it remains usable with the sidebar hidden or a project collapsed. File-manager availability and
 archive warnings follow the sidebar's existing platform and checkout rules.
 
+The sidebar uses `WorkspaceSortMenu` for Pinned and each project. Each list independently selects
+Manual, A–Z or Last Activity and persists the choice locally. Automatic sorting preserves the saved
+manual order; dragging switches only that list to Manual. Last Activity uses the newest valid
+non-archived agent activity snapshot in that workspace, including children, with missing activity
+last and deterministic ties. The sidebar projection owns both display and shortcut ordering.
+
 ## Selecting an item on iOS
 
 An item that closes the menu runs its action after a fixed grace period on iOS, not immediately:

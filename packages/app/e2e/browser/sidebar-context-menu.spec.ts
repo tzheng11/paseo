@@ -140,7 +140,7 @@ test.describe("Workspace header action parity", () => {
       const cancelled = page.waitForEvent("dialog");
       const cancelClick = headerAction(page, workspace.id, "archive").click();
       const dialog = await cancelled;
-      expect(dialog.message()).toContain("uncommitted");
+      expect(dialog.message()).toContain("Uncommitted changes");
       await dialog.dismiss();
       await cancelClick;
       await expect(row).toBeVisible();

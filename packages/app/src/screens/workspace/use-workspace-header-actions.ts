@@ -83,9 +83,9 @@ function useHeaderWorkspaceArchive(
     redirectIfArchivingActiveWorkspace({
       serverId,
       workspaceId,
-      activeWorkspaceSelection: { serverId, workspaceId: routeWorkspaceId },
+      activeWorkspaceSelection: { serverId, workspaceId },
     });
-  }, [routeWorkspaceId, serverId, workspaceId]);
+  }, [serverId, workspaceId]);
   const archive = useWorkspaceArchive({
     serverId,
     workspaceId,
