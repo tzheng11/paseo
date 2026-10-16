@@ -2,7 +2,7 @@ import type { PrHint } from "@/git/pr-hint";
 import { selectPrHintFromStatus } from "@/git/pr-hint";
 import { type HostProjectListItem } from "@/projects/host-project-model";
 import type { PendingCreateAttempt } from "@/stores/create-flow-store";
-import type { WorkspaceDescriptor } from "@/stores/session-store";
+import type { Agent, WorkspaceDescriptor } from "@/stores/session-store";
 import type {
   WorkspaceStructureHostPlacement,
   WorkspaceStructureProject,
@@ -46,6 +46,7 @@ export interface SidebarWorkspaceEntry extends SidebarStatusWorkspacePlacement {
   labels?: string[];
   // Checkout branch (null when not a git checkout or detached HEAD).
   currentBranch: string | null;
+  lastActivityAt?: Date | null;
   archivingAt: string | null;
   diffStat: { additions: number; deletions: number } | null;
   prHint: PrHint | null;
@@ -72,11 +73,13 @@ export interface SidebarWorkspacePlacementModel {
 
 export interface SidebarWorkspaceSession {
   serverId: string;
+  agents: ReadonlyMap<string, Agent>;
   workspaces: Map<string, WorkspaceDescriptor>;
   workspaceAgentActivity: Map<string, WorkspaceAgentActivity>;
 }
 
 interface SidebarWorkspaceSessionSource {
+  agents: ReadonlyMap<string, Agent>;
   workspaces: Map<string, WorkspaceDescriptor>;
   workspaceAgentActivity: Map<string, WorkspaceAgentActivity>;
 }
@@ -93,6 +96,7 @@ export function selectSidebarWorkspaceSessions(
     }
     selected.push({
       serverId,
+      agents: session.agents,
       workspaces: session.workspaces,
       workspaceAgentActivity: session.workspaceAgentActivity,
     });
@@ -115,6 +119,7 @@ export function areSidebarWorkspaceSessionsEqual(
       !rightSession ||
       leftSession.serverId !== rightSession.serverId ||
       leftSession.workspaces !== rightSession.workspaces ||
+      leftSession.agents !== rightSession.agents ||
       leftSession.workspaceAgentActivity !== rightSession.workspaceAgentActivity
     ) {
       return false;
@@ -150,6 +155,7 @@ export function createSidebarWorkspaceEntry(input: {
   projectViewKey?: string;
   pendingCreateAttempts?: Record<string, PendingCreateAttempt>;
   workspaceAgentActivity?: ReadonlyMap<string, WorkspaceAgentActivity>;
+  workspaceLastActivityAt?: ReadonlyMap<string, Date>;
 }): SidebarWorkspaceEntry {
   const projectViewKey = input.projectViewKey ?? input.workspace.projectId;
   const effectiveStatus = deriveEffectiveWorkspaceStatus(input);
@@ -171,6 +177,7 @@ export function createSidebarWorkspaceEntry(input: {
     pinnedAt: input.workspace.pinnedAt,
     labels: input.workspace.labels ?? EMPTY_WORKSPACE_LABELS,
     currentBranch: normalizeCurrentBranch(input.workspace.gitRuntime?.currentBranch),
+    lastActivityAt: input.workspaceLastActivityAt?.get(input.workspace.id) ?? null,
     statusBucket: effectiveStatus.status,
     statusEnteredAt: effectiveStatus.enteredAt,
     archivingAt: input.workspace.archivingAt,
@@ -364,6 +371,21 @@ function resolveStructuralWorkspaceIdentity(input: {
   };
 }
 
+// The status index retains same-bucket entry times; activity follows current agent snapshots.
+function buildWorkspaceLastActivityIndex(agents: ReadonlyMap<string, Agent>): Map<string, Date> {
+  const latestByWorkspaceId = new Map<string, Date>();
+  for (const agent of agents.values()) {
+    if (agent.archivedAt || !agent.workspaceId) continue;
+    const time = agent.lastActivityAt.getTime();
+    if (!Number.isFinite(time)) continue;
+    const previous = latestByWorkspaceId.get(agent.workspaceId);
+    if (!previous || time > previous.getTime()) {
+      latestByWorkspaceId.set(agent.workspaceId, agent.lastActivityAt);
+    }
+  }
+  return latestByWorkspaceId;
+}
+
 export function buildSidebarWorkspaceEntries(input: {
   placements: readonly SidebarWorkspacePlacement[];
   sessions: SidebarWorkspaceSession[];
@@ -376,6 +398,12 @@ export function buildSidebarWorkspaceEntries(input: {
 
   const sessionByServerId = new Map(input.sessions.map((session) => [session.serverId, session]));
   const entries = new Map<string, SidebarWorkspaceEntry>();
+  const lastActivityByServerId = new Map(
+    input.sessions.map((session) => [
+      session.serverId,
+      buildWorkspaceLastActivityIndex(session.agents),
+    ]),
+  );
 
   for (const placement of input.placements) {
     const session = sessionByServerId.get(placement.serverId);
@@ -393,6 +421,7 @@ export function buildSidebarWorkspaceEntries(input: {
       projectViewKey: placement.projectViewKey,
       pendingCreateAttempts: input.pendingCreateAttempts,
       workspaceAgentActivity: session.workspaceAgentActivity,
+      workspaceLastActivityAt: lastActivityByServerId.get(placement.serverId),
     });
     const previousEntry = input.previousEntries?.get(placement.workspaceKey);
     entries.set(
@@ -413,6 +442,9 @@ function areSidebarWorkspaceEntriesEqual(
   const keys = Object.keys(left) as Array<keyof SidebarWorkspaceEntry>;
   if (keys.length !== Object.keys(right).length) return false;
   return keys.every((key) => {
+    if (key === "lastActivityAt") {
+      return left.lastActivityAt?.getTime() === right.lastActivityAt?.getTime();
+    }
     if (key !== "prHint") return Object.is(left[key], right[key]);
     const leftHint = left.prHint;
     const rightHint = right.prHint;
