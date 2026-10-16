@@ -15,7 +15,7 @@ interface SidebarWorkspaceSortInput<T extends SidebarWorkspacePlacement> {
 }
 
 function activityTime(entry: SidebarWorkspaceEntry | undefined): number | null {
-  const time = entry?.lastActivityAt?.getTime();
+  const time = entry?.statusEnteredAt?.getTime();
   return time !== undefined && Number.isFinite(time) ? time : null;
 }
 
