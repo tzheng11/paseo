@@ -266,10 +266,10 @@ describe("buildSidebarProjection", () => {
     const newer = makeWorkspace("newer");
     const pinnedOlder = makeWorkspace("pinned-older");
     const pinnedNewer = makeWorkspace("pinned-newer");
-    older.entry.lastActivityAt = new Date("2026-10-16T10:00:00Z");
-    newer.entry.lastActivityAt = new Date("2026-10-16T11:00:00Z");
-    pinnedOlder.entry.lastActivityAt = new Date("2026-10-16T09:00:00Z");
-    pinnedNewer.entry.lastActivityAt = new Date("2026-10-16T12:00:00Z");
+    older.entry.statusEnteredAt = new Date("2026-10-16T10:00:00Z");
+    newer.entry.statusEnteredAt = new Date("2026-10-16T11:00:00Z");
+    pinnedOlder.entry.statusEnteredAt = new Date("2026-10-16T09:00:00Z");
+    pinnedNewer.entry.statusEnteredAt = new Date("2026-10-16T12:00:00Z");
     const workspaces = [older, newer, pinnedOlder, pinnedNewer];
     const input = {
       ...projectionInput(),
@@ -299,7 +299,7 @@ describe("buildSidebarProjection", () => {
     ).toEqual(["pinned-newer", "pinned-older", "newer", "older"]);
     input.workspaceEntriesByKey.set(older.entry.workspaceKey, {
       ...older.entry,
-      lastActivityAt: new Date("2026-10-16T13:00:00Z"),
+      statusEnteredAt: new Date("2026-10-16T13:00:00Z"),
     });
     const updated = buildSidebarProjection(input);
     expect(workspaceIds(updated.pinnedGroups.unpinnedProjects[0]!.workspaces)).toEqual([

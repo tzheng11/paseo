@@ -24,9 +24,8 @@ function workspace(input: {
     name: input.name ?? input.id,
     title: null,
     currentBranch: input.branch ?? null,
-    lastActivityAt: input.activityAt ?? null,
     statusBucket: "done",
-    statusEnteredAt: null,
+    statusEnteredAt: input.activityAt ?? null,
     archivingAt: null,
     diffStat: null,
     prHint: null,
@@ -87,11 +86,9 @@ describe("sortSidebarWorkspaces", () => {
     ).toEqual(["two", "one"]);
   });
 
-  it("sorts the newest activity first, independently of status entry time", () => {
+  it("sorts the newest displayed workspace timestamp first", () => {
     const recent = workspace({ id: "recent", activityAt: new Date(3_000) });
-    recent.statusEnteredAt = new Date(0);
     const older = workspace({ id: "older", activityAt: new Date(1_000) });
-    older.statusEnteredAt = new Date(10_000);
     const workspaces = Object.freeze([older, recent]);
     expect(
       sortSidebarWorkspaces({
@@ -155,11 +152,31 @@ describe("sortSidebarWorkspaces", () => {
       "second",
       "first",
     ]);
-    const nextEntries = entries([{ ...first, lastActivityAt: new Date(3_000) }, second]);
+    const nextEntries = entries([{ ...first, statusEnteredAt: new Date(3_000) }, second]);
     expect(
       sortSidebarWorkspaces({ ...input, workspaceEntriesByKey: nextEntries }).map(
         (entry) => entry.workspaceId,
       ),
     ).toEqual(["first", "second"]);
+  });
+  it("orders the workspace timestamps shown to the user rather than agent metadata freshness", () => {
+    const recent = {
+      ...workspace({ id: "z-recent", activityAt: new Date(30_000) }),
+      lastActivityAt: new Date(1_000),
+    };
+    const middle = workspace({ id: "m-empty", activityAt: new Date(20_000) });
+    const old = {
+      ...workspace({ id: "a-old", activityAt: new Date(10_000) }),
+      lastActivityAt: new Date(50_000),
+    };
+    const workspaces = [old, middle, recent];
+    expect(
+      sortSidebarWorkspaces({
+        workspaces,
+        mode: "activity",
+        workspaceTitleSource: "title",
+        workspaceEntriesByKey: entries(workspaces),
+      }).map((entry) => entry.workspaceId),
+    ).toEqual(["z-recent", "m-empty", "a-old"]);
   });
 });

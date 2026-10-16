@@ -3,8 +3,6 @@ import type { Agent, WorkspaceDescriptor } from "@/stores/session-store";
 import type { WorkspaceStructureProject } from "@/projects/workspace-structure";
 import { buildWorkspaceAgentActivityIndex } from "@/utils/workspace-agent-activity";
 import {
-  areSidebarWorkspaceSessionsEqual,
-  selectSidebarWorkspaceSessions,
   appendMissingOrderKeys,
   applyStoredOrdering,
   buildSidebarWorkspaceEntries,
@@ -323,7 +321,6 @@ describe("shared sidebar workspace model", () => {
       sessions: [
         {
           serverId: "host-a",
-          agents: new Map(),
           workspaceAgentActivity: new Map(),
           workspaces: new Map([
             [
@@ -340,7 +337,6 @@ describe("shared sidebar workspace model", () => {
         },
         {
           serverId: "host-b",
-          agents: new Map(),
           workspaceAgentActivity: new Map(),
           workspaces: new Map([
             [
@@ -428,7 +424,6 @@ describe("shared sidebar workspace model", () => {
       sessions: [
         {
           serverId: "srv",
-          agents: new Map(),
           workspaceAgentActivity: new Map(),
           workspaces: new Map([
             ["one", one],
@@ -442,7 +437,6 @@ describe("shared sidebar workspace model", () => {
       sessions: [
         {
           serverId: "srv",
-          agents: new Map(),
           workspaceAgentActivity: new Map(),
           workspaces: new Map([
             ["one", one],
@@ -467,7 +461,6 @@ describe("shared sidebar workspace model", () => {
       sessions: [
         {
           serverId: "srv",
-          agents: new Map(),
           workspaceAgentActivity: new Map(),
           workspaces: new Map([
             [
@@ -715,7 +708,7 @@ function agent(input: {
     createdAt: new Date(0),
     updatedAt: input.updatedAt ?? new Date(1_000),
     lastUserMessageAt: null,
-    lastActivityAt: input.updatedAt ?? new Date(1_000),
+    lastActivityAt: new Date(1_000),
     capabilities: {} as Agent["capabilities"],
     currentModeId: null,
     availableModes: [],
@@ -947,149 +940,5 @@ describe("deriveProjectStatusBucket", () => {
         },
       }),
     ).toBe("done");
-  });
-});
-
-describe("sidebar workspace last activity", () => {
-  it("aggregates all active agents by exact workspace and host identity", () => {
-    const descriptor = projectWorkspace("shared-id", "running");
-    const root = agent({
-      id: "root",
-      workspaceId: "shared-id",
-      status: "running",
-      updatedAt: new Date(1_000),
-    });
-    const child = agent({
-      id: "child",
-      workspaceId: "shared-id",
-      parentAgentId: "root",
-      status: "running",
-      updatedAt: new Date(4_000),
-    });
-    const archived = agent({
-      id: "archived",
-      workspaceId: "shared-id",
-      status: "idle",
-      archivedAt: new Date(6_000),
-      updatedAt: new Date(6_000),
-    });
-    const invalid = agent({
-      id: "invalid",
-      workspaceId: "shared-id",
-      status: "idle",
-      updatedAt: new Date("invalid"),
-    });
-    const otherWorkspace = agent({
-      id: "elsewhere",
-      workspaceId: "elsewhere",
-      status: "running",
-      updatedAt: new Date(8_000),
-    });
-    const localAgents = new Map(
-      [root, child, archived, invalid, otherWorkspace].map((entry) => [entry.id, entry]),
-    );
-    const remoteAgent = { ...root, serverId: "other-host", lastActivityAt: new Date(2_000) };
-    const sessions = [
-      {
-        serverId: "srv",
-        workspaces: new Map([[descriptor.id, descriptor]]),
-        agents: localAgents,
-        workspaceAgentActivity: buildWorkspaceAgentActivityIndex(localAgents),
-      },
-      {
-        serverId: "other-host",
-        workspaces: new Map([[descriptor.id, descriptor]]),
-        agents: new Map([[remoteAgent.id, remoteAgent]]),
-        workspaceAgentActivity: new Map(),
-      },
-    ];
-    const result = buildSidebarWorkspaceEntries({
-      placements: [
-        workspacePlacement({ workspaceId: descriptor.id }),
-        workspacePlacement({ serverId: "other-host", workspaceId: descriptor.id }),
-      ],
-      sessions,
-    });
-    expect(result.get("srv:shared-id")?.lastActivityAt).toEqual(new Date(4_000));
-    expect(result.get("other-host:shared-id")?.lastActivityAt).toEqual(new Date(2_000));
-  });
-
-  it("advances activity on same-status agent updates without changing status entry time", () => {
-    const descriptor = { ...projectWorkspace("one", "running"), statusEnteredAt: new Date(500) };
-    const initialAgent = agent({
-      id: "agent",
-      workspaceId: "one",
-      status: "running",
-      updatedAt: new Date(1_000),
-    });
-    const agents = new Map([[initialAgent.id, initialAgent]]);
-    const initialSession = {
-      workspaces: new Map([[descriptor.id, descriptor]]),
-      agents,
-      workspaceAgentActivity: buildWorkspaceAgentActivityIndex(agents),
-    };
-    const beforeSessions = selectSidebarWorkspaceSessions({ srv: initialSession }, ["srv"]);
-    const placements = [workspacePlacement({ workspaceId: descriptor.id })];
-    const before = buildSidebarWorkspaceEntries({ placements, sessions: beforeSessions });
-    const nextAgent = {
-      ...initialAgent,
-      updatedAt: new Date(3_000),
-      lastActivityAt: new Date(3_000),
-    };
-    const nextAgents = new Map([[nextAgent.id, nextAgent]]);
-    const afterSession = {
-      ...initialSession,
-      agents: nextAgents,
-      workspaceAgentActivity: buildWorkspaceAgentActivityIndex(
-        nextAgents,
-        initialSession.workspaceAgentActivity,
-      ),
-    };
-    const afterSessions = selectSidebarWorkspaceSessions({ srv: afterSession }, ["srv"]);
-    expect(afterSession.workspaceAgentActivity).toBe(initialSession.workspaceAgentActivity);
-    expect(areSidebarWorkspaceSessionsEqual(beforeSessions, afterSessions)).toBe(false);
-    const after = buildSidebarWorkspaceEntries({
-      placements,
-      sessions: afterSessions,
-      previousEntries: before,
-    });
-    expect(before.get("srv:one")?.lastActivityAt).toEqual(new Date(1_000));
-    expect(after.get("srv:one")?.lastActivityAt).toEqual(new Date(3_000));
-    expect(after.get("srv:one")?.statusEnteredAt).toEqual(new Date(500));
-    expect(after.get("srv:one")).not.toBe(before.get("srv:one"));
-  });
-
-  it("keeps unknown activity null and preserves rows for unchanged timestamps", () => {
-    const descriptor = projectWorkspace("one", "done");
-    const placements = [workspacePlacement({ workspaceId: descriptor.id })];
-    const initialSession = {
-      serverId: "srv",
-      workspaces: new Map([[descriptor.id, descriptor]]),
-      agents: new Map<string, Agent>(),
-      workspaceAgentActivity: new Map(),
-    };
-    const empty = buildSidebarWorkspaceEntries({ placements, sessions: [initialSession] });
-    expect(empty.get("srv:one")?.lastActivityAt).toBeNull();
-    const initialAgent = agent({
-      id: "agent",
-      workspaceId: "one",
-      status: "idle",
-      updatedAt: new Date(1_000),
-    });
-    const session = { ...initialSession, agents: new Map([[initialAgent.id, initialAgent]]) };
-    const before = buildSidebarWorkspaceEntries({ placements, sessions: [session] });
-    const after = buildSidebarWorkspaceEntries({
-      placements,
-      previousEntries: before,
-      sessions: [
-        {
-          ...session,
-          agents: new Map([
-            [initialAgent.id, { ...initialAgent, lastActivityAt: new Date(1_000) }],
-          ]),
-        },
-      ],
-    });
-    expect(after.get("srv:one")).toBe(before.get("srv:one"));
   });
 });

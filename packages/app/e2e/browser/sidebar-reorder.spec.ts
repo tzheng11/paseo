@@ -1,5 +1,6 @@
-import type { Locator } from "@playwright/test";
+import type { Locator, Page } from "@playwright/test";
 import { expect, test } from "../support/fixtures";
+import { daemonWsRoutePattern } from "../support/helpers/daemon-port";
 import { gotoAppShell } from "../support/helpers/app";
 import { projectEquivalenceViewKey } from "../support/helpers/project-view-key";
 import { getServerId } from "../support/helpers/server-id";
@@ -301,6 +302,112 @@ test("Last Activity follows live agent activity in project and Pinned lists", as
     await expect(pinnedSort).toContainText("Last Activity");
     await expect(projectSort).toContainText("Last Activity");
     await expect.poll(() => rowTestIds(rows)).toEqual([zetaId, alphaId]);
+  } finally {
+    await project.cleanup();
+  }
+});
+
+function rewriteWorkspaceTimes(value: unknown, times: ReadonlyMap<string, string>): unknown {
+  if (Array.isArray(value)) return value.map((item) => rewriteWorkspaceTimes(item, times));
+  if (!value || typeof value !== "object") return value;
+  const original = value as Record<string, unknown>;
+  const rewritten: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(original))
+    rewritten[key] = rewriteWorkspaceTimes(child, times);
+  if (typeof original.id === "string" && times.has(original.id) && "statusEnteredAt" in original)
+    rewritten.statusEnteredAt = times.get(original.id);
+  return rewritten;
+}
+
+async function workspaceTimestampFixture(page: Page, times: ReadonlyMap<string, string>) {
+  await page.routeWebSocket(daemonWsRoutePattern(), (browser) => {
+    const server = browser.connectToServer();
+    browser.onMessage((message) => server.send(message));
+    server.onMessage((message) => {
+      const raw = typeof message === "string" ? message : message.toString("utf8");
+      browser.send(JSON.stringify(rewriteWorkspaceTimes(JSON.parse(raw), times)));
+    });
+  });
+}
+
+async function enableSidebarTimestamps(page: Page) {
+  await page.getByLabel("Display preferences", { exact: true }).click();
+  await page.getByTestId("sidebar-display-show").click();
+  const option = page.getByTestId("sidebar-workspace-trailing-timestamp");
+  if ((await option.getAttribute("aria-checked")) !== "true") await option.click();
+  await page.keyboard.press("Escape");
+}
+
+async function displayedWorkspaceAges(rows: Locator) {
+  return rows.evaluateAll((elements) =>
+    elements.map(
+      (element) =>
+        element.querySelector('[data-testid="sidebar-workspace-timestamp"]')?.textContent,
+    ),
+  );
+}
+
+test("Last Activity matches the displayed workspace ages despite fresh agent metadata", async ({
+  page,
+}, testInfo) => {
+  test.setTimeout(120_000);
+  const project = await seedWorkspace({
+    title: "A · old workspace, fresh metadata",
+    repoPrefix: "workspace-clock-sort-",
+  });
+  try {
+    const recent = await project.client.createWorkspace({
+      source: { kind: "directory", path: project.repoPath, projectId: project.projectId },
+      title: "Z · most recent workspace",
+    });
+    const middle = await project.client.createWorkspace({
+      source: { kind: "directory", path: project.repoPath, projectId: project.projectId },
+      title: "M · middle workspace",
+    });
+    if (!recent.workspace || !middle.workspace) throw new Error("Missing timestamp fixtures");
+    await project.client.createAgent({
+      provider: "mock",
+      cwd: project.repoPath,
+      workspaceId: project.workspaceId,
+      title: "Fresh metadata on old workspace",
+      model: "e2e-fast-stream",
+      modeId: "load-test",
+    });
+    const now = Date.now();
+    await page.clock.setFixedTime(new Date(now));
+    await workspaceTimestampFixture(
+      page,
+      new Map([
+        [project.workspaceId, new Date(now - 2 * 86_400_000).toISOString()],
+        [middle.workspace.id, new Date(now - 2 * 3_600_000).toISOString()],
+        [recent.workspace.id, new Date(now - 10_000).toISOString()],
+      ]),
+    );
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await gotoAppShell(page);
+    await waitForSidebarHydration(page);
+    await enableSidebarTimestamps(page);
+    const key = (id: string) => `sidebar-workspace-row-${getServerId()}:${id}`;
+    const ids = [key(recent.workspace.id), key(middle.workspace.id), key(project.workspaceId)];
+    const rows = page.locator(ids.map((id) => `[data-testid="${id}"]`).join(","));
+    const sortId = `sidebar-project-sort-${projectEquivalenceViewKey(project.projectKey)}`;
+    await page.getByTestId(sortId).click();
+    await page.getByTestId(`${sortId}-activity`).click();
+    await expect.poll(() => rowTestIds(rows)).toEqual(ids);
+    await expect.poll(() => displayedWorkspaceAges(rows)).toEqual(["now", "2h", "2d"]);
+    for (const id of [project.workspaceId, middle.workspace.id, recent.workspace.id])
+      await project.client.setWorkspacePinned(id, true);
+    await page.getByTestId("sidebar-pinned-sort").click();
+    await page.getByTestId("sidebar-pinned-sort-activity").click();
+    await expect.poll(() => rowTestIds(rows)).toEqual(ids);
+    await expect.poll(() => displayedWorkspaceAges(rows)).toEqual(["now", "2h", "2d"]);
+    await page.reload();
+    await waitForSidebarHydration(page);
+    await expect(page.getByTestId("sidebar-pinned-sort")).toContainText("Last Activity");
+    await expect.poll(() => rowTestIds(rows)).toEqual(ids);
+    await expect.poll(() => displayedWorkspaceAges(rows)).toEqual(["now", "2h", "2d"]);
+    await page.mouse.move(1100, 100);
+    await page.screenshot({ path: testInfo.outputPath("last-activity-visible-age-order.png") });
   } finally {
     await project.cleanup();
   }
