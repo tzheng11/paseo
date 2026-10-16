@@ -33,7 +33,11 @@ component with `isMobile` branches inside it. The workspace header menu is the e
 (`packages/app/src/screens/workspace/workspace-header-menu.tsx`): compact has no tab strip, so it
 carries new-tab actions, while wide leaves those to the strip's `+` menu and lists workspace
 actions only. Items both surfaces share live in one component that each menu renders, from the same
-callbacks, so the two can't drift.
+callbacks, so the two can't drift. Workspace actions shared with the sidebar (rename, read state,
+pin, labels, file manager and archive) render `workspace/workspace-menu-items.tsx` on all three
+surfaces. The header uses the same mutation controllers, canonical workspace ID and label pages,
+so it remains usable with the sidebar hidden or a project collapsed. File-manager availability and
+archive warnings follow the sidebar's existing platform and checkout rules.
 
 ## Selecting an item on iOS
 
