@@ -4411,6 +4411,38 @@ describe("HostRuntimeStore initial connection hint bootstrap", () => {
     store.syncHosts([]);
   });
 
+  it("uses the normal connection budget for a slow self-hosted initial connection", async () => {
+    const seenEndpoints: string[] = [];
+    const store = new HostRuntimeStore({
+      deps: {
+        createClient: () => new FakeDaemonClient() as unknown as DaemonClient,
+        connectToDaemon: async ({ connection, timeoutMs }) => {
+          if (connection.type !== "directTcp") throw new Error("Expected TCP");
+          seenEndpoints.push(connection.endpoint);
+          // A reverse proxy and a busy daemon can exceed the optimistic
+          // localhost probe's 2.5 seconds while fitting the normal budget.
+          if (timeoutMs !== undefined && timeoutMs < 4_000) {
+            throw new Error("Timed out before the self-hosted daemon replied");
+          }
+          return {
+            client: makeConnectedProbeClient(5) as unknown as DaemonClient,
+            serverId: "srv_self_hosted",
+            hostname: "self-hosted daemon",
+          };
+        },
+        getClientId: async () => "cid_self_hosted",
+        readInitialConnectionHint: () => ({ listen: "private.example:443", useTls: true }),
+      },
+      storage: createMemoryHostRuntimeStorage(),
+    });
+
+    await store.boot();
+
+    expect(store.getHosts().map((host) => host.serverId)).toEqual(["srv_self_hosted"]);
+    expect(seenEndpoints).toEqual(["private.example:443"]);
+    store.syncHosts([]);
+  });
+
   it("does not infer window.location.host when no explicit hint is present", async () => {
     const seenProbes: { endpoint: string; useTls?: boolean }[] = [];
     const firstProbe = createDeferred<void>();

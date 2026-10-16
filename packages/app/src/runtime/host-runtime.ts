@@ -1746,7 +1746,6 @@ export class HostRuntimeStore {
     try {
       await this.probeAndUpsertConnection({
         connection: connectionWithHint,
-        timeoutMs: DEFAULT_LOCALHOST_BOOTSTRAP_TIMEOUT_MS,
       });
       return true;
     } catch (error) {
