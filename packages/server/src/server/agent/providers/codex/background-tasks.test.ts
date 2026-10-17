@@ -30,6 +30,8 @@ test("modern command completion requires actual exit status and clears matching 
   work.item("thread:exec", { processId: "73", status: "inProgress" }, false);
   work.output("thread:exec", "Process running with session id 73");
   work.interaction("thread:poll", "73");
+  work.interaction(null, "73");
+  work.interaction("thread:late-poll", "73");
   expect(work.active).toBe(false);
   work.item("thread:exec", { processId: "74", status: "inProgress" }, false);
   expect(work.active).toBe(true);

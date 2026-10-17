@@ -34,7 +34,11 @@ export class CodexBackgroundTasks {
       return;
     }
     const alias = key ?? `process:${processId}`;
-    if (this.completed.get(alias)?.has(processId)) return;
+    if (
+      this.completed.get(alias)?.has(processId) ||
+      this.completed.get(`process:${processId}`)?.has(processId)
+    )
+      return;
     const previous = this.jobs.get(alias);
     if (previous && previous !== processId) this.jobs.set(`process:${previous}`, previous);
     this.jobs.set(alias, processId);
@@ -76,6 +80,8 @@ export class CodexBackgroundTasks {
 
   private confirmExit(key: string | null, exited: string | null): void {
     if (exited) {
+      // Terminal-interaction mirrors can have no call ID or a new polling alias.
+      this.markCompleted(`process:${exited}`, exited);
       for (const [alias, id] of this.jobs)
         if (id === exited) {
           this.jobs.delete(alias);
