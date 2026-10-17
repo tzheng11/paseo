@@ -13,7 +13,7 @@ import { resolveCreateAgentTitles } from "../agent/create-agent-title.js";
 import { type BoundCreateAgentCommand, formatProviderModel } from "../agent/create-agent/create.js";
 import type { PersistedWorkspaceRecord } from "../workspace-registry.js";
 import type { CreatePaseoWorktreeWorkflowResult } from "../worktree-session.js";
-import { ScheduleStore } from "./store.js";
+import { ScheduleStore, countCompletedRuns } from "./store.js";
 import { computeNextRunAt, validateScheduleCadence } from "./cron.js";
 import type {
   CreateScheduleInput,
@@ -121,10 +121,6 @@ function normalizeMaxRuns(value: number | null | undefined): number | null {
     throw new Error("maxRuns must be a positive integer");
   }
   return value;
-}
-
-function countCompletedRuns(schedule: StoredSchedule): number {
-  return schedule.runs.filter((run) => run.status !== "running").length;
 }
 
 function shouldArchiveScheduleRunWorkspace(input: {
@@ -610,7 +606,9 @@ export class ScheduleService {
       let updated = { ...current };
       let dirty = false;
 
-      const runningIndex = updated.runs.findIndex((run) => run.status === "running");
+      const runningIndex = updated.runs.findIndex(
+        (run) => run.skipReason === undefined && run.status === "running",
+      );
       const claimedSlot =
         runningIndex !== -1 && updated.nextRunAt === null
           ? updated.runs[runningIndex].scheduledFor
@@ -638,7 +636,7 @@ export class ScheduleService {
           endedAt: now.toISOString(),
           error: "Daemon restarted before the scheduled run completed",
         };
-        updated = { ...updated, runs };
+        updated = { ...updated, completedRunCount: countCompletedRuns(updated) + 1, runs };
         dirty = true;
       }
 
@@ -776,7 +774,7 @@ export class ScheduleService {
       if (manual && schedule.status === "completed") {
         throw new Error(`Schedule ${scheduleId} is already completed`);
       }
-      if (schedule.runs.some((run) => run.status === "running")) {
+      if (schedule.runs.some((run) => run.skipReason === undefined && run.status === "running")) {
         if (manual) {
           throw new Error(`Schedule ${scheduleId} is already running`);
         }
@@ -836,8 +834,12 @@ export class ScheduleService {
             }
           : run,
       );
+      const newlyCompleted =
+        finishedRun.skipReason === undefined && finishedRun.status === "running";
+      const completedRunCount = countCompletedRuns(schedule) + (newlyCompleted ? 1 : 0);
       let updated: StoredSchedule = {
         ...schedule,
+        completedRunCount,
         runs: completedRuns,
         lastRunAt: now.toISOString(),
         updatedAt: now.toISOString(),

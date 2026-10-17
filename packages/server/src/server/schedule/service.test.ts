@@ -39,7 +39,11 @@ import {
   type ScheduleServiceOptions,
 } from "./service.js";
 import { ScheduleStore } from "./store.js";
-import type { ScheduleExecutionResult, StoredSchedule } from "@getpaseo/protocol/schedule/types";
+import type {
+  ScheduleExecutionResult,
+  ScheduleRun,
+  StoredSchedule,
+} from "@getpaseo/protocol/schedule/types";
 
 interface ScheduleServiceInternals {
   executeSchedule(schedule: StoredSchedule, runId: string): Promise<ScheduleExecutionResult>;
@@ -313,6 +317,208 @@ describe("ScheduleService", () => {
     // ENOTEMPTY races when AgentManager flushes a snapshot mid-cleanup.
     await agentStorage.flush();
     await rm(tempDir, { recursive: true, force: true });
+  });
+
+  test.each([null, 2, 250])(
+    "DOTS2-S0-CAP#history · bounds mixed persisted history with maxRuns=%s on startup",
+    async (maxRuns) => {
+      const service = createScheduleService({
+        paseoHome: tempDir,
+        logger: createTestLogger(),
+        agentManager: new AgentManager({ logger: createTestLogger() }),
+        agentStorage,
+        providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+        now: () => now,
+        runner: async () => ({ agentId: null, output: "ok" }),
+      });
+      const created = await service.create({
+        prompt: "history cap",
+        cadence: { type: "every", everyMs: 60_000 },
+        runOnCreate: false,
+        maxRuns,
+        target: { type: "new-agent", config: { provider: "claude", cwd: tempDir } },
+      });
+      const history: ScheduleRun[] = Array.from(
+        { length: 260 },
+        (_, index): ScheduleRun => ({
+          id: `real-${index}`,
+          scheduledFor: new Date(now.getTime() - (260 - index) * 60_000).toISOString(),
+          startedAt: now.toISOString(),
+          endedAt: now.toISOString(),
+          status: "succeeded",
+          agentId: null,
+          output: "ok",
+          error: null,
+        }),
+      ).flatMap((run, index) => [
+        run,
+        { ...run, id: `skip-${index}`, status: "failed", skipReason: "agent busy" },
+      ]);
+      await writeFile(
+        join(tempDir, "schedules", `${created.id}.json`),
+        JSON.stringify({ ...created, runs: history }),
+      );
+      await service.start();
+      await service.stop();
+      const reloaded = await new ScheduleStore(join(tempDir, "schedules"), createTestLogger()).get(
+        created.id,
+      );
+      const realLimit = Math.max(200, maxRuns ?? 0);
+      const expected = history.filter((run) =>
+        run.skipReason === undefined
+          ? Number(run.id.slice(5)) >= 260 - realLimit
+          : Number(run.id.slice(5)) >= 210,
+      );
+      expect(reloaded?.runs).toEqual(expected);
+    },
+  );
+
+  test.each([2, 250])("skips do not count toward maxRuns=%s", async (maxRuns) => {
+    let executions = 0;
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: new AgentManager({ logger: createTestLogger() }),
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+      runner: async () => {
+        executions += 1;
+        return { agentId: null, output: "ok" };
+      },
+    });
+    const created = await service.create({
+      prompt: "real maxRuns",
+      cadence: { type: "every", everyMs: 60_000 },
+      maxRuns,
+      target: { type: "new-agent", config: { provider: "claude", cwd: tempDir } },
+    });
+    const real: ScheduleRun[] = Array.from(
+      { length: maxRuns - 1 },
+      (_, index): ScheduleRun => ({
+        id: `real-${index}`,
+        scheduledFor: now.toISOString(),
+        startedAt: now.toISOString(),
+        endedAt: now.toISOString(),
+        status: "succeeded",
+        agentId: null,
+        output: "ok",
+        error: null,
+      }),
+    );
+    const skips = Array.from({ length: 60 }, (_, index) => ({
+      ...real[0],
+      id: `skip-${index}`,
+      status: "failed",
+      skipReason: "agent busy",
+    }));
+    await writeFile(
+      join(tempDir, "schedules", `${created.id}.json`),
+      JSON.stringify({ ...created, runs: [...real, ...skips] }),
+    );
+    await service.tick();
+    const inspected = await service.inspect(created.id);
+    expect(executions).toBe(1);
+    expect(inspected.status).toBe("completed");
+    expect(inspected.runs.filter((run) => run.skipReason === undefined)).toHaveLength(maxRuns);
+    expect(inspected.runs.filter((run) => run.skipReason !== undefined)).toHaveLength(50);
+    now = new Date(now.getTime() + 60_000);
+    await service.tick();
+    expect(executions).toBe(1);
+  });
+
+  test("bounds legacy history without skipReason on every appended run", async () => {
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: new AgentManager({ logger: createTestLogger() }),
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+      runner: async () => ({ agentId: null, output: "new run" }),
+    });
+    const created = await service.create({
+      prompt: "legacy history",
+      cadence: { type: "every", everyMs: 60_000 },
+      target: { type: "new-agent", config: { provider: "claude", cwd: tempDir } },
+    });
+    const history: ScheduleRun[] = Array.from(
+      { length: 201 },
+      (_, index): ScheduleRun => ({
+        id: `real-${index}`,
+        scheduledFor: now.toISOString(),
+        startedAt: now.toISOString(),
+        endedAt: now.toISOString(),
+        status: "succeeded",
+        agentId: null,
+        output: "ok",
+        error: null,
+      }),
+    );
+    await writeFile(
+      join(tempDir, "schedules", `${created.id}.json`),
+      JSON.stringify({ ...created, runs: history }),
+    );
+    await service.tick();
+    now = new Date(now.getTime() + 60_000);
+    await service.tick();
+    const inspected = await service.inspect(created.id);
+    expect(inspected.runs).toHaveLength(200);
+    expect(inspected.runs.slice(0, -2)).toEqual(history.slice(3));
+    expect(inspected.runs.slice(-2).map((run) => run.output)).toEqual(["new run", "new run"]);
+    expect(
+      await new ScheduleStore(join(tempDir, "schedules"), createTestLogger()).get(created.id),
+    ).toEqual(inspected);
+  });
+
+  test("keeps lifetime real-run counts when maxRuns increases after history was capped", async () => {
+    let executions = 0;
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: new AgentManager({ logger: createTestLogger() }),
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+      runner: async () => {
+        executions += 1;
+        return { agentId: null, output: "ok" };
+      },
+    });
+    const created = await service.create({
+      prompt: "lifetime count",
+      cadence: { type: "every", everyMs: 60_000 },
+      runOnCreate: false,
+      target: { type: "new-agent", config: { provider: "claude", cwd: tempDir } },
+    });
+    const history: ScheduleRun[] = Array.from(
+      { length: 250 },
+      (_, index): ScheduleRun => ({
+        id: `real-${index}`,
+        scheduledFor: now.toISOString(),
+        startedAt: now.toISOString(),
+        endedAt: now.toISOString(),
+        status: "succeeded",
+        agentId: null,
+        output: "ok",
+        error: null,
+      }),
+    );
+    await writeFile(
+      join(tempDir, "schedules", `${created.id}.json`),
+      JSON.stringify({ ...created, runs: history }),
+    );
+    await service.start();
+    await service.stop();
+    expect((await service.inspect(created.id)).runs).toHaveLength(200);
+    await service.update({ id: created.id, maxRuns: 251 });
+    now = new Date("2026-01-01T00:01:00.000Z");
+    await service.tick();
+    expect(executions).toBe(1);
+    expect((await service.inspect(created.id)).status).toBe("completed");
+    now = new Date("2026-01-01T00:02:00.000Z");
+    await service.tick();
+    expect(executions).toBe(1);
   });
 
   test("ticks due schedules and records run history on disk", async () => {
