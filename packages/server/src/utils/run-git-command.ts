@@ -212,6 +212,11 @@ function snapshotGitCommandMetricsState(state: GitCommandMetricsState): GitComma
   };
 }
 
+/** Live Git limiter load, read without resetting the periodic runtime metrics. */
+export function getGitSchedulerLoad(): { active: number; pending: number } {
+  return { active: gitProcessScheduler.activeCount, pending: gitProcessScheduler.pendingCount };
+}
+
 export function snapshotGitCommandRuntimeMetrics(): GitCommandRuntimeMetricsSnapshot {
   return {
     ...gitRuntimeMetrics.snapshotAndReset({

@@ -11,7 +11,11 @@ import {
 import type { DaemonWebSocketRuntimeDiagnosticSnapshot } from "./diagnostics.js";
 import type { ProviderAvailability } from "../../agent/agent-manager.js";
 import type { HubRelationshipManagement } from "../../hub/relationship-controller.js";
-import type { SessionOutboundMessage } from "../../messages.js";
+import type {
+  AgentSnapshotPayload,
+  SessionOutboundMessage,
+  WorkspaceDescriptorPayload,
+} from "../../messages.js";
 import type { DaemonConfigReloadResult } from "../../daemon-config-store.js";
 
 const tempDirs: string[] = [];
@@ -44,6 +48,8 @@ function makeSubsystem(overrides: {
   getWebSocketRuntimeMetrics?: () => DaemonWebSocketRuntimeDiagnosticSnapshot | null;
   hubRelationships?: HubRelationshipManagement;
   reloadConfig?: () => DaemonConfigReloadResult;
+  listVisibleAgents?: () => Promise<AgentSnapshotPayload[]>;
+  listVisibleWorkspaces?: () => Promise<WorkspaceDescriptorPayload[]>;
 }) {
   const emitted: SessionOutboundMessage[] = [];
   const restartIntents: Parameters<DaemonSessionHost["emitLifecycleIntent"]>[0][] = [];
@@ -63,6 +69,8 @@ function makeSubsystem(overrides: {
     listProjects: async () => [],
     listWorkspaces: async () => [],
     listProviderAvailability: overrides.listProviderAvailability ?? (async () => []),
+    listVisibleAgents: overrides.listVisibleAgents ?? (async () => []),
+    listVisibleWorkspaces: overrides.listVisibleWorkspaces ?? (async () => []),
     getWebSocketRuntimeMetrics: overrides.getWebSocketRuntimeMetrics,
     hubRelationships: overrides.hubRelationships,
     reloadConfig:
@@ -523,5 +531,65 @@ describe("DaemonSession", () => {
       "Checkout diff: targets=6, subscriptions=7, watchers=8, fallbackRefreshTargets=9",
     );
     expect(message.payload.diagnostic).toContain("Agent lifecycle: idle=8, running=2");
+  });
+
+  test("host stats count the visible lists and read this machine's CPU and memory", async () => {
+    const { subsystem, emitted } = makeSubsystem({
+      listVisibleAgents: async () =>
+        [
+          { status: "running" },
+          { status: "idle" },
+          { status: "running" },
+        ] as AgentSnapshotPayload[],
+      listVisibleWorkspaces: async () =>
+        [{ status: "running" }, { status: "done" }] as WorkspaceDescriptorPayload[],
+    });
+
+    await subsystem.handleGetHostStatsRequest({
+      type: "daemon.get_host_stats.request",
+      requestId: "h-1",
+    });
+
+    expect(emitted).toHaveLength(1);
+    const message = emitted[0];
+    if (message.type !== "daemon.get_host_stats.response") {
+      throw new Error(`expected host stats response, got ${message.type}`);
+    }
+    const { stats } = message.payload;
+    expect(message.payload.requestId).toBe("h-1");
+    expect(stats.agents).toEqual({ total: 3, running: 2 });
+    expect(stats.workspaces).toEqual({ total: 2, running: 1 });
+    expect(stats.cpu.cores).toBeGreaterThan(0);
+    expect(stats.cpu.idlePercent).toBeGreaterThanOrEqual(0);
+    expect(stats.cpu.idlePercent).toBeLessThanOrEqual(100);
+    expect(stats.memory.totalBytes).toBeGreaterThan(0);
+    expect(stats.memory.usedBytes).toBeGreaterThan(0);
+    expect(stats.memory.usedBytes).toBeLessThanOrEqual(stats.memory.totalBytes);
+    expect(stats.git.pending).toBeGreaterThanOrEqual(0);
+  });
+
+  test("host stats failures return a correlated RPC error", async () => {
+    const { subsystem, emitted } = makeSubsystem({
+      listVisibleAgents: async () => {
+        throw new Error("agent storage unreadable");
+      },
+    });
+
+    await subsystem.handleGetHostStatsRequest({
+      type: "daemon.get_host_stats.request",
+      requestId: "h-2",
+    });
+
+    expect(emitted).toEqual([
+      {
+        type: "rpc_error",
+        payload: {
+          requestId: "h-2",
+          requestType: "daemon.get_host_stats.request",
+          error: "agent storage unreadable",
+          code: "handler_error",
+        },
+      },
+    ]);
   });
 });
