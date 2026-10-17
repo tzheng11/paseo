@@ -1,5 +1,7 @@
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import { resolveAgent } from "../../utils/agents.js";
 import { Command } from "commander";
-import { connectToDaemon, resolveAgentId } from "../../utils/client.js";
+import { connectToDaemon } from "../../utils/client.js";
 import type {
   CommandOptions,
   SingleResult,
@@ -38,6 +40,57 @@ export interface AgentArchiveOptions extends CommandOptions {
 
 export type AgentArchiveCommandResult = SingleResult<AgentArchiveResult>;
 
+export async function executeAgentArchive(
+  client: Pick<DaemonClient, "fetchAgent" | "fetchAgents" | "archiveAgent">,
+  agentIdArg: string,
+  options: Pick<AgentArchiveOptions, "force">,
+): Promise<AgentArchiveCommandResult> {
+  const agent = await resolveAgent(client, agentIdArg);
+  if (!agent) {
+    const error: CommandError = {
+      code: "AGENT_NOT_FOUND",
+      message: `Agent not found: ${agentIdArg}`,
+      details: 'Use "paseo ls" to list available agents',
+    };
+    throw error;
+  }
+  const agentId = agent.id;
+
+  // Check if agent is already archived
+  if (agent.archivedAt) {
+    const error: CommandError = {
+      code: "AGENT_ALREADY_ARCHIVED",
+      message: `Agent ${agentId.slice(0, 7)} is already archived`,
+      details: `Archived at: ${agent.archivedAt}`,
+    };
+    throw error;
+  }
+
+  // Check if agent is running and reject unless --force is set
+  if (agent.status === "running" && !options.force) {
+    const error: CommandError = {
+      code: "AGENT_RUNNING",
+      message: `Agent ${agentId.slice(0, 7)} is currently running`,
+      details:
+        "Use --force to archive a running agent (it will interrupt the active run), or stop it first with: paseo agent stop. Use paseo agent delete to hard-delete it.",
+    };
+    throw error;
+  }
+
+  // Archive the agent
+  const result = await client.archiveAgent(agentId);
+
+  return {
+    type: "single",
+    data: {
+      agentId,
+      status: "archived",
+      archivedAt: result.archivedAt,
+    },
+    schema: archiveSchema,
+  };
+}
+
 export async function runArchiveCommand(
   agentIdArg: string,
   options: AgentArchiveOptions,
@@ -56,57 +109,9 @@ export async function runArchiveCommand(
   const client = await connectToDaemon({ target: options.daemonTarget });
 
   try {
-    const agentsPayload = await client.fetchAgents({ filter: { includeArchived: true } });
-    const agents = agentsPayload.entries.map((entry) => entry.agent);
-    const agentId = resolveAgentId(agentIdArg, agents);
-    if (!agentId) {
-      const error: CommandError = {
-        code: "AGENT_NOT_FOUND",
-        message: `Agent not found: ${agentIdArg}`,
-        details: 'Use "paseo ls" to list available agents',
-      };
-      throw error;
-    }
-    const agent = agents.find((entry) => entry.id === agentId);
-    if (!agent) {
-      throw new Error(`Resolved agent missing from fetched agents: ${agentId}`);
-    }
-
-    // Check if agent is already archived
-    if (agent.archivedAt) {
-      const error: CommandError = {
-        code: "AGENT_ALREADY_ARCHIVED",
-        message: `Agent ${agentId.slice(0, 7)} is already archived`,
-        details: `Archived at: ${agent.archivedAt}`,
-      };
-      throw error;
-    }
-
-    // Check if agent is running and reject unless --force is set
-    if (agent.status === "running" && !options.force) {
-      const error: CommandError = {
-        code: "AGENT_RUNNING",
-        message: `Agent ${agentId.slice(0, 7)} is currently running`,
-        details:
-          "Use --force to archive a running agent (it will interrupt the active run), or stop it first with: paseo agent stop. Use paseo agent delete to hard-delete it.",
-      };
-      throw error;
-    }
-
-    // Archive the agent
-    const result = await client.archiveAgent(agentId);
-
+    const result = await executeAgentArchive(client, agentIdArg, options);
     await client.close();
-
-    return {
-      type: "single",
-      data: {
-        agentId,
-        status: "archived",
-        archivedAt: result.archivedAt,
-      },
-      schema: archiveSchema,
-    };
+    return result;
   } catch (err) {
     await client.close().catch(() => {});
 
