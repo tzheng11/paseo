@@ -5,9 +5,40 @@ import type { Logger } from "pino";
 import {
   StoredScheduleSchema,
   type ScheduleTarget,
+  type ScheduleRun,
   type StoredSchedule,
 } from "@getpaseo/protocol/schedule/types";
 import { writeJsonFileAtomic } from "../atomic-file.js";
+
+export function countCompletedRuns(schedule: StoredSchedule): number {
+  return (
+    schedule.completedRunCount ??
+    schedule.runs.filter((run) => run.skipReason === undefined && run.status !== "running").length
+  );
+}
+
+function capRunHistory(schedule: StoredSchedule): StoredSchedule {
+  let realRemaining = Math.max(200, schedule.maxRuns ?? 0);
+  let skipsRemaining = 50;
+  const retained: ScheduleRun[] = [];
+  for (let index = schedule.runs.length - 1; index >= 0; index--) {
+    const run = schedule.runs[index];
+    if (run.skipReason !== undefined) {
+      if (skipsRemaining === 0) continue;
+      skipsRemaining -= 1;
+    } else {
+      if (realRemaining === 0) continue;
+      realRemaining -= 1;
+    }
+    retained.push(run);
+  }
+  if (retained.length === schedule.runs.length) return schedule;
+  return {
+    ...schedule,
+    completedRunCount: countCompletedRuns(schedule),
+    runs: retained.toReversed(),
+  };
+}
 
 function generateScheduleId(): string {
   return randomBytes(4).toString("hex");
@@ -162,8 +193,7 @@ export class ScheduleStore {
 
   async create(schedule: Omit<StoredSchedule, "id">): Promise<StoredSchedule> {
     const created = StoredScheduleSchema.parse({ ...schedule, id: generateScheduleId() });
-    await this.write(created);
-    return created;
+    return this.write(created);
   }
 
   async update(id: string, updater: ScheduleUpdater): Promise<StoredSchedule | null> {
@@ -172,7 +202,7 @@ export class ScheduleStore {
       if (!current) {
         return null;
       }
-      const next = await updater(current);
+      const next = capRunHistory(await updater(current));
       if (next === current) {
         return current;
       }
@@ -180,8 +210,7 @@ export class ScheduleStore {
         throw new Error(`Schedule update cannot change id: ${id}`);
       }
       const updated = StoredScheduleSchema.parse(next);
-      await this.write(updated);
-      return updated;
+      return this.write(updated);
     });
   }
 
@@ -204,8 +233,7 @@ export class ScheduleStore {
           if (!matchesNameAndTarget(created, name, target)) {
             throw new Error("Created schedule does not match requested identity");
           }
-          await this.write(created);
-          return created;
+          return this.write(created);
         }
 
         const updated = await this.updateMatchedSchedule(existing.id, name, target, options.update);
@@ -216,9 +244,11 @@ export class ScheduleStore {
     });
   }
 
-  private async write(schedule: StoredSchedule): Promise<void> {
+  private async write(schedule: StoredSchedule): Promise<StoredSchedule> {
+    const retained = capRunHistory(schedule);
     await this.ensureDir();
-    await writeJsonFileAtomic(this.filePath(schedule.id), schedule);
+    await writeJsonFileAtomic(this.filePath(retained.id), retained);
+    return retained;
   }
 
   async delete(id: string): Promise<void> {
@@ -278,8 +308,7 @@ export class ScheduleStore {
       if (!matchesNameAndTarget(updated, name, target)) {
         throw new Error("Updated schedule does not match requested identity");
       }
-      await this.write(updated);
-      return updated;
+      return this.write(updated);
     });
   }
 }

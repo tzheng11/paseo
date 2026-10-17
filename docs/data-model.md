@@ -399,24 +399,31 @@ Paseo uses these paths under the configured OpenAI base URL:
 
 **Path:** `$PASEO_HOME/schedules/{id}.json`
 
-One file per schedule. ID is 8 hex characters.
+One file per schedule. ID is 8 hex characters. Writes retain the newest
+`max(200, maxRuns)` real runs and, separately, the newest 50 skip records. Startup
+recovery also bounds existing files. Records with `skipReason` do not count toward
+`maxRuns` or as failures. No scheduler path produces skips yet; the metadata is
+reserved for the heartbeat hook. `completedRunCount` preserves the lifetime count
+of real completions when older history is removed or `maxRuns` changes. For old
+files, infer it from the full history before the first trim.
 
-| Field       | Type                                  | Description                      |
-| ----------- | ------------------------------------- | -------------------------------- |
-| `id`        | `string`                              | 8-char hex ID                    |
-| `name`      | `string?`                             | Human-readable name              |
-| `prompt`    | `string`                              | The prompt to send               |
-| `cadence`   | `ScheduleCadence`                     | Timing (see below)               |
-| `target`    | `ScheduleTarget`                      | What to run (see below)          |
-| `status`    | `"active" \| "paused" \| "completed"` | Current state                    |
-| `createdAt` | `string` (ISO 8601)                   |                                  |
-| `updatedAt` | `string` (ISO 8601)                   |                                  |
-| `nextRunAt` | `string?` (ISO 8601)                  | Next scheduled execution         |
-| `lastRunAt` | `string?` (ISO 8601)                  | Last execution time              |
-| `pausedAt`  | `string?` (ISO 8601)                  | When paused                      |
-| `expiresAt` | `string?` (ISO 8601)                  | Auto-expire time                 |
-| `maxRuns`   | `number?`                             | Max executions before completing |
-| `runs`      | `ScheduleRun[]`                       | Execution history                |
+| Field               | Type                                  | Description                                       |
+| ------------------- | ------------------------------------- | ------------------------------------------------- |
+| `id`                | `string`                              | 8-char hex ID                                     |
+| `name`              | `string?`                             | Human-readable name                               |
+| `prompt`            | `string`                              | The prompt to send                                |
+| `cadence`           | `ScheduleCadence`                     | Timing (see below)                                |
+| `target`            | `ScheduleTarget`                      | What to run (see below)                           |
+| `status`            | `"active" \| "paused" \| "completed"` | Current state                                     |
+| `createdAt`         | `string` (ISO 8601)                   |                                                   |
+| `updatedAt`         | `string` (ISO 8601)                   |                                                   |
+| `nextRunAt`         | `string?` (ISO 8601)                  | Next scheduled execution                          |
+| `lastRunAt`         | `string?` (ISO 8601)                  | Last execution time                               |
+| `pausedAt`          | `string?` (ISO 8601)                  | When paused                                       |
+| `expiresAt`         | `string?` (ISO 8601)                  | Auto-expire time                                  |
+| `maxRuns`           | `number?`                             | Max executions before completing                  |
+| `runs`              | `ScheduleRun[]`                       | Execution history                                 |
+| `completedRunCount` | `number?`                             | Lifetime real completions; inferred for old files |
 
 ### Nested: ScheduleCadence (discriminated union on `type`)
 
@@ -430,16 +437,17 @@ One file per schedule. ID is 8 hex characters.
 
 ### Nested: ScheduleRun
 
-| Field          | Type                                   | Description             |
-| -------------- | -------------------------------------- | ----------------------- |
-| `id`           | `string`                               | Run ID                  |
-| `scheduledFor` | `string` (ISO 8601)                    | Intended execution time |
-| `startedAt`    | `string` (ISO 8601)                    |                         |
-| `endedAt`      | `string?` (ISO 8601)                   |                         |
-| `status`       | `"running" \| "succeeded" \| "failed"` |                         |
-| `agentId`      | `string?` (UUID)                       | Agent used for this run |
-| `output`       | `string?`                              | Agent output text       |
-| `error`        | `string?`                              | Error message if failed |
+| Field          | Type                                   | Description                        |
+| -------------- | -------------------------------------- | ---------------------------------- |
+| `id`           | `string`                               | Run ID                             |
+| `scheduledFor` | `string` (ISO 8601)                    | Intended execution time            |
+| `startedAt`    | `string` (ISO 8601)                    |                                    |
+| `endedAt`      | `string?` (ISO 8601)                   |                                    |
+| `status`       | `"running" \| "succeeded" \| "failed"` |                                    |
+| `agentId`      | `string?` (UUID)                       | Agent used for this run            |
+| `output`       | `string?`                              | Agent output text                  |
+| `error`        | `string?`                              | Error message if failed            |
+| `skipReason`   | `string?`                              | Skip metadata; absent on real runs |
 
 ---
 
