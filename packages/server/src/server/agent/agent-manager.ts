@@ -5315,6 +5315,8 @@ export class AgentManager {
       flags.shouldNotifyWaiters = false;
       return;
     }
+    // A provider-owned follow-up supersedes the failed task even without a new user prompt.
+    if (agent.quotaTurnCheckpoint) this.invalidateQuotaRecovery(agent.id);
     this.runs.trackAutonomousRun(agent.id, eventTurnId ?? null);
     if (eventTurnId) {
       this.openActiveTurn(agent, eventTurnId, new Date());

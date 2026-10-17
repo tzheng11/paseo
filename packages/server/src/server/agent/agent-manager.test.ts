@@ -13219,3 +13219,32 @@ test("quota recovery yields to a newer message still queued in asynchronous prom
     await f.cleanup();
   }
 });
+
+test("quota recovery never continues a failure superseded by native autonomous progress", async () => {
+  const f = await quotaRecoveryFixture();
+  try {
+    await f.fail();
+    f.sessions[0].pushEvent({
+      type: "turn_started",
+      provider: "claude",
+      turnId: "autonomous-progress",
+    });
+    await waitForQuota(() => expect(f.manager.getAgent(f.agent.id)?.lifecycle).toBe("running"));
+    expect(f.manager.getAgent(f.agent.id)?.quotaTurnCheckpoint).toBeUndefined();
+    f.sessions[0].pushEvent({
+      type: "turn_completed",
+      provider: "claude",
+      turnId: "autonomous-progress",
+    });
+    await waitForQuota(() => expect(f.manager.getAgent(f.agent.id)?.lifecycle).toBe("idle"));
+    await f.manager.flush();
+    expect((await f.storage.get(f.agent.id))?.quotaTurnCheckpoint).toBeUndefined();
+    expect((await f.reload("after-autonomous", await f.change()))?.continuation).toMatchObject({
+      status: "not_needed",
+      reasonCode: "NO_QUOTA_CHECKPOINT",
+    });
+    expect(f.prompts).toHaveLength(1);
+  } finally {
+    await f.cleanup();
+  }
+});
