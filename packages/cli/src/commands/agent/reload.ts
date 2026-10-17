@@ -1,8 +1,9 @@
+import { resolveAgent } from "../../utils/agents.js";
 import { Command } from "commander";
 import { z } from "zod";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { AgentReloadOperation } from "@getpaseo/protocol/messages";
-import { connectToDaemon, resolveAgentId } from "../../utils/client.js";
+import { connectToDaemon } from "../../utils/client.js";
 import type {
   CommandOptions,
   SingleResult,
@@ -103,7 +104,7 @@ export function parseAgentReloadRequest(
 
 export type AgentReloadClient = Pick<
   DaemonClient,
-  "fetchAgents" | "reloadAgentCredentials" | "reloadIdleAgent" | "refreshAgent"
+  "fetchAgent" | "fetchAgents" | "reloadAgentCredentials" | "reloadIdleAgent" | "refreshAgent"
 >;
 
 export async function executeAgentReload(
@@ -118,10 +119,8 @@ export async function executeAgentReload(
     return { type: "single", data: operation, schema: credentialReloadSchema };
   }
 
-  const agentsPayload = await client.fetchAgents({ filter: { includeArchived: true } });
-  const agents = agentsPayload.entries.map((entry) => entry.agent);
-  const agentId = resolveAgentId(request.agentIdArg, agents);
-  if (!agentId) {
+  const agent = await resolveAgent(client, request.agentIdArg);
+  if (!agent) {
     throw {
       code: "AGENT_NOT_FOUND",
       message: `Agent not found: ${request.agentIdArg}`,
@@ -129,6 +128,7 @@ export async function executeAgentReload(
     } satisfies CommandError;
   }
 
+  const agentId = agent.id;
   const refreshed = request.onlyIfIdle
     ? await client.reloadIdleAgent({ agentId })
     : await client.refreshAgent(agentId);

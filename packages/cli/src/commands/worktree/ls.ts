@@ -1,3 +1,5 @@
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import { fetchAllAgents } from "../../utils/agents.js";
 import type { Command } from "commander";
 import { basename } from "node:path";
 import { connectToDaemon } from "../../utils/client.js";
@@ -44,6 +46,45 @@ export interface WorktreeLsOptions extends CommandOptions {
   cwd?: string;
 }
 
+export async function executeWorktreeLs(
+  client: Pick<DaemonClient, "fetchAgents" | "getPaseoWorktreeList">,
+  cwd: string,
+): Promise<WorktreeLsResult> {
+  const agents = await fetchAllAgents(client, {
+    filter: { includeArchived: true },
+  });
+
+  // Get worktree list from daemon
+  const response = await client.getPaseoWorktreeList({ cwd });
+
+  if (response.error) {
+    const error: CommandError = {
+      code: "WORKTREE_LIST_FAILED",
+      message: `Failed to list worktrees: ${response.error.message}`,
+    };
+    throw error;
+  }
+
+  // Build a map of worktree paths to agent IDs
+  const worktreeAgentMap = new Map<string, string>();
+  for (const agent of agents) {
+    worktreeAgentMap.set(agent.cwd, agent.id.slice(0, 7));
+  }
+
+  const items: WorktreeListItem[] = response.worktrees.map((wt) => ({
+    name: extractWorktreeName(wt.worktreePath),
+    branch: wt.branchName ?? "-",
+    cwd: shortenPath(wt.worktreePath),
+    agent: worktreeAgentMap.get(wt.worktreePath) ?? "-",
+  }));
+
+  return {
+    type: "list",
+    data: items,
+    schema: worktreeLsSchema,
+  };
+}
+
 export async function runLsCommand(
   options: WorktreeLsOptions,
   _command: Command,
@@ -52,40 +93,9 @@ export async function runLsCommand(
   const client = await connectToDaemon({ target: options.daemonTarget });
 
   try {
-    const agentsPayload = await client.fetchAgents({ filter: { includeArchived: true } });
-    const agents = agentsPayload.entries.map((entry) => entry.agent);
-
-    // Get worktree list from daemon
-    const response = await client.getPaseoWorktreeList({ cwd });
-
+    const result = await executeWorktreeLs(client, cwd);
     await client.close();
-
-    if (response.error) {
-      const error: CommandError = {
-        code: "WORKTREE_LIST_FAILED",
-        message: `Failed to list worktrees: ${response.error.message}`,
-      };
-      throw error;
-    }
-
-    // Build a map of worktree paths to agent IDs
-    const worktreeAgentMap = new Map<string, string>();
-    for (const agent of agents) {
-      worktreeAgentMap.set(agent.cwd, agent.id.slice(0, 7));
-    }
-
-    const items: WorktreeListItem[] = response.worktrees.map((wt) => ({
-      name: extractWorktreeName(wt.worktreePath),
-      branch: wt.branchName ?? "-",
-      cwd: shortenPath(wt.worktreePath),
-      agent: worktreeAgentMap.get(wt.worktreePath) ?? "-",
-    }));
-
-    return {
-      type: "list",
-      data: items,
-      schema: worktreeLsSchema,
-    };
+    return result;
   } catch (err) {
     await client.close().catch(() => {});
 

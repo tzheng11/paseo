@@ -1,3 +1,4 @@
+import { fetchAllAgents } from "../../utils/agents.js";
 import type { Command } from "commander";
 import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 import { connectToDaemon } from "../../utils/client.js";
@@ -190,32 +191,7 @@ export async function runLsCommand(
 
     const labelFilters = parseLabelFilters(options.label);
     const fetchOptions = buildAgentLsFetchOptions(options);
-    let agents: AgentSnapshotPayload[] = [];
-    const seenCursors = new Set<string>();
-    let cursor: string | undefined;
-    while (true) {
-      const fetchPayload = await client.fetchAgents({
-        ...fetchOptions,
-        // Creation time stays stable when an agent updates between pages.
-        sort: [{ key: "created_at", direction: "desc" }],
-        page: { limit: 200, ...(cursor ? { cursor } : {}) },
-      });
-      agents.push(...fetchPayload.entries.map((entry) => entry.agent));
-      const pageInfo = fetchPayload.pageInfo;
-      if (!pageInfo || typeof pageInfo.hasMore !== "boolean") {
-        throw new Error("Invalid agent pagination metadata");
-      }
-      const nextCursor = pageInfo.nextCursor;
-      if (!pageInfo.hasMore) {
-        if (nextCursor !== null) throw new Error("Invalid agent pagination metadata");
-        break;
-      }
-      if (typeof nextCursor !== "string" || !nextCursor.trim() || seenCursors.has(nextCursor)) {
-        throw new Error("Invalid or repeated agent pagination cursor");
-      }
-      seenCursors.add(nextCursor);
-      cursor = nextCursor;
-    }
+    let agents = await fetchAllAgents(client, fetchOptions);
 
     // By default, exclude archived agents. `-a` includes them.
     if (!options.all) {

@@ -1,3 +1,6 @@
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
+import { fetchAllAgents } from "../../utils/agents.js";
 import { Command } from "commander";
 import { connectToDaemon } from "../../utils/client.js";
 import { isSameOrDescendantPath } from "../../utils/paths.js";
@@ -36,6 +39,75 @@ export interface AgentStopOptions extends CommandOptions {
 
 export type AgentStopResult = SingleResult<StopResult>;
 
+export async function executeAgentStop(
+  client: Pick<DaemonClient, "fetchAgent" | "fetchAgents" | "cancelAgent">,
+  id: string | undefined,
+  options: Pick<AgentStopOptions, "all" | "cwd">,
+): Promise<AgentStopResult> {
+  let agents: AgentSnapshotPayload[] = [];
+  if (options.all || options.cwd) {
+    agents = await fetchAllAgents(client, {
+      filter: { includeArchived: true },
+    });
+  }
+  const stoppedIds: string[] = [];
+
+  if (options.all) {
+    // Stop all agents (not archived)
+    agents = agents.filter((a) => !a.archivedAt);
+  } else if (options.cwd) {
+    // Stop agents in directory
+    agents = agents.filter((a) => {
+      if (a.archivedAt) return false;
+      return isSameOrDescendantPath(options.cwd!, a.cwd);
+    });
+  } else if (id) {
+    // Stop specific agent
+    const fetchResult = await client.fetchAgent({ agentId: id });
+    if (!fetchResult) {
+      const error: CommandError = {
+        code: "AGENT_NOT_FOUND",
+        message: `No agent found matching: ${id}`,
+        details: "Use `paseo ls` to list available agents",
+      };
+      throw error;
+    }
+    agents = [fetchResult.agent];
+  }
+
+  // Interrupt each running agent. Idle agents are a no-op.
+  const stopResults = await Promise.all(
+    agents.map(async (agent) => {
+      if (agent.status !== "running") return { ok: true as const, id: agent.id, stopped: false };
+      try {
+        await client.cancelAgent(agent.id);
+        return { ok: true as const, id: agent.id, stopped: true };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return { ok: false as const, id: agent.id, message };
+      }
+    }),
+  );
+  for (const result of stopResults) {
+    if (!result.ok) {
+      console.error(`Warning: Failed to stop agent ${result.id.slice(0, 7)}: ${result.message}`);
+      continue;
+    }
+    if (result.stopped) {
+      stoppedIds.push(result.id);
+    }
+  }
+
+  return {
+    type: "single",
+    data: {
+      stoppedCount: stoppedIds.length,
+      agentIds: stoppedIds,
+    },
+    schema: stopSchema,
+  };
+}
+
 export async function runStopCommand(
   id: string | undefined,
   options: AgentStopOptions,
@@ -54,66 +126,9 @@ export async function runStopCommand(
   const client = await connectToDaemon({ target: options.daemonTarget });
 
   try {
-    const fetchPayload = await client.fetchAgents({ filter: { includeArchived: true } });
-    let agents = fetchPayload.entries.map((entry) => entry.agent);
-    const stoppedIds: string[] = [];
-
-    if (options.all) {
-      // Stop all agents (not archived)
-      agents = agents.filter((a) => !a.archivedAt);
-    } else if (options.cwd) {
-      // Stop agents in directory
-      agents = agents.filter((a) => {
-        if (a.archivedAt) return false;
-        return isSameOrDescendantPath(options.cwd!, a.cwd);
-      });
-    } else if (id) {
-      // Stop specific agent
-      const fetchResult = await client.fetchAgent({ agentId: id });
-      if (!fetchResult) {
-        const error: CommandError = {
-          code: "AGENT_NOT_FOUND",
-          message: `No agent found matching: ${id}`,
-          details: "Use `paseo ls` to list available agents",
-        };
-        throw error;
-      }
-      agents = [fetchResult.agent];
-    }
-
-    // Interrupt each running agent. Idle agents are a no-op.
-    const stopResults = await Promise.all(
-      agents.map(async (agent) => {
-        if (agent.status !== "running") return { ok: true as const, id: agent.id, stopped: false };
-        try {
-          await client.cancelAgent(agent.id);
-          return { ok: true as const, id: agent.id, stopped: true };
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          return { ok: false as const, id: agent.id, message };
-        }
-      }),
-    );
-    for (const result of stopResults) {
-      if (!result.ok) {
-        console.error(`Warning: Failed to stop agent ${result.id.slice(0, 7)}: ${result.message}`);
-        continue;
-      }
-      if (result.stopped) {
-        stoppedIds.push(result.id);
-      }
-    }
-
+    const result = await executeAgentStop(client, id, options);
     await client.close();
-
-    return {
-      type: "single",
-      data: {
-        stoppedCount: stoppedIds.length,
-        agentIds: stoppedIds,
-      },
-      schema: stopSchema,
-    };
+    return result;
   } catch (err) {
     await client.close().catch(() => {});
     // Re-throw if it's already a CommandError
