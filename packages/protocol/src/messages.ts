@@ -1860,6 +1860,8 @@ export const ReloadIdleAgentRequestMessageSchema = RefreshAgentRequestMessageSch
   type: z.literal("agent.reload_idle.request"),
   operationId: z.string().optional(),
   preserveHistory: z.boolean().optional(),
+  credentialGeneration: z.string().min(1).max(512).optional(),
+  credentialChangedAt: z.string().datetime({ offset: true }).optional(),
 });
 
 export const GetAgentReloadOperationRequestMessageSchema = z.object({
@@ -3662,6 +3664,7 @@ export const ServerInfoStatusPayloadSchema = z
         creationLifecycle: z.boolean().optional(),
         boundedTimelineHistory: z.boolean().optional(),
         credentialReloadOperations: z.boolean().optional(),
+        quotaTurnRecovery: z.boolean().optional(),
         // COMPAT(hubAgentRpc): added in v0.8.0; remove gate after 2027-03-05.
         hubAgentRpc: z.boolean().optional(),
         // COMPAT(internalAgents): added in v0.9.0; remove gate after 2027-03-17.
@@ -3924,6 +3927,16 @@ export const AgentReloadOperationSchema = z.object({
   reasonCode: z.string().optional(),
   reason: z.string().optional(),
   retryable: z.boolean().optional(),
+  credentialGeneration: z.string().optional(),
+  credentialChangedAt: z.string().optional(),
+  continuation: z
+    .object({
+      status: z.enum(["not_needed", "submitted", "refused", "unknown"]),
+      failedTurnId: z.string().optional(),
+      messageId: z.string().optional(),
+      reasonCode: z.string().optional(),
+    })
+    .optional(),
 });
 export type AgentReloadOperation = z.infer<typeof AgentReloadOperationSchema>;
 

@@ -91,6 +91,9 @@ export function toStoredAgentRecord(
     features: normalizeFeatures(agent.features),
     persistence,
     lastError: agent.lastError ?? undefined,
+    credentialGeneration: agent.credentialGeneration,
+    credentialChangedAt: agent.credentialChangedAt,
+    quotaTurnCheckpoint: agent.quotaTurnCheckpoint,
     requiresAttention: agent.attention.requiresAttention,
     attentionReason: agent.attention.requiresAttention ? agent.attention.attentionReason : null,
     attentionTimestamp: agent.attention.requiresAttention

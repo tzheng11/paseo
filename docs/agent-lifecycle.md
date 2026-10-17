@@ -49,6 +49,26 @@ Unconfirmed child cleanup is also `unknown`; callers must hold it for inspection
 the runtime was not changed. Do not infer completion from the agent being idle or mint a new UUID
 to bypass an uncertain operation.
 
+### Quota-turn continuation
+
+Maintenance without a confirmed switch remains prompt-free. A caller with a proven successful
+account switch may provide the paired `--credential-generation` and `--credential-changed-at`
+values; this requires `quotaTurnRecovery` on the host. The timestamp comes from the same host's
+successful switch, not a credential file's modification time. Paseo does not inspect tokens or
+observe which login Claude uses for each request.
+
+Only a newly recorded, typed Claude quota failure is eligible. Earlier failures stored as text
+remain ineligible, and Codex maintenance does not infer quota failures from error prose. A newer
+message, cancellation, archive, or active native background work prevents continuation. An
+ordinary maintenance reload preserves the checkpoint so it cannot erase a later confirmed switch.
+A successful task or a nonquota terminal failure never arms recovery.
+
+Recovery submits one fixed instruction to continue preserved context and avoid repeating completed
+actions. It never replays the original task prompt. The timeline identifies it as automatic quota
+recovery. The failed turn and switch generation determine a durable message ID independently of
+the reload operation UUID; an uncertain delivery stays unknown across retries and restart. Keep
+both IDs and hold unknown outcomes for inspection rather than issuing another prompt.
+
 ## Runtime residency
 
 An unarchived agent may be `closed` without being deleted or archived. Closing releases its provider

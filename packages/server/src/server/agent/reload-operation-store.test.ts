@@ -132,3 +132,70 @@ test.each([
   await store.start("agent", "op", run);
   expect(run).toHaveBeenCalledTimes(1);
 });
+
+test("generation and confirmed time are durable intent and cannot be changed by replay", async () => {
+  const { store } = await fixture();
+  const change = { credentialGeneration: "B", credentialChangedAt: "2026-10-17T12:00:00.000Z" };
+  const run = vi.fn(async () => ({
+    status: "submitted" as const,
+    failedTurnId: "turn",
+    messageId: "quota-recovery-stable",
+  }));
+  await store.start("agent", "v2", run, change);
+  await vi.waitFor(async () =>
+    expect(await store.get("v2")).toMatchObject({
+      status: "completed",
+      ...change,
+      continuation: {
+        status: "submitted",
+        failedTurnId: "turn",
+        messageId: "quota-recovery-stable",
+      },
+    }),
+  );
+  expect(await store.start("agent", "v2", run, change)).toMatchObject({ status: "completed" });
+  await expect(store.start("agent", "v2", run)).rejects.toThrow("conflict");
+  await expect(
+    store.start("agent", "v2", run, { ...change, credentialGeneration: "C" }),
+  ).rejects.toThrow("conflict");
+  await expect(
+    store.start("agent", "v2", run, { ...change, credentialChangedAt: "2026-10-17T12:01:00.000Z" }),
+  ).rejects.toThrow("conflict");
+  expect(run).toHaveBeenCalledTimes(1);
+});
+
+test("unknown continuation and restarted generation intent preserve identity and never redispatch", async () => {
+  const { directory, store } = await fixture();
+  const change = { credentialGeneration: "B", credentialChangedAt: "2026-10-17T12:00:00.000Z" };
+  const run = vi.fn(async () => ({
+    status: "unknown" as const,
+    failedTurnId: "turn",
+    messageId: "quota-recovery-stable",
+  }));
+  await store.start("agent", "unknown", run, change);
+  await vi.waitFor(async () =>
+    expect(await store.get("unknown")).toMatchObject({
+      status: "unknown",
+      ...change,
+      reasonCode: "QUOTA_CONTINUATION_UNKNOWN",
+      retryable: false,
+    }),
+  );
+  const restarted = new ReloadOperationStore(directory, createTestLogger());
+  expect(await restarted.start("agent", "unknown", run, change)).toMatchObject({
+    status: "unknown",
+    ...change,
+  });
+  expect(run).toHaveBeenCalledTimes(1);
+  await writeFile(
+    receiptPath(directory, "pending-v2"),
+    JSON.stringify({ agentId: "agent", operationId: "pending-v2", status: "pending", ...change }),
+  );
+  const never = vi.fn();
+  expect(await restarted.start("agent", "pending-v2", never, change)).toMatchObject({
+    status: "unknown",
+    reasonCode: "DAEMON_RESTARTED",
+    ...change,
+  });
+  expect(never).not.toHaveBeenCalled();
+});

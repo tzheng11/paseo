@@ -122,3 +122,26 @@ describe("credential reload CLI", () => {
     expect(client.reloads).toEqual([]);
   });
 });
+
+test("quota recovery CLI carries a paired opaque generation and ISO confirmation time", async () => {
+  const change = {
+    credentialGeneration: "switch-B",
+    credentialChangedAt: "2026-10-17T12:00:00.000Z",
+  };
+  const client = new RecordingReloadClient();
+  const request = parseAgentReloadRequest(agentId, { ...maintenanceOptions, ...change });
+  expect(request).toEqual({ kind: "credentials", agentId, operationId, ...change });
+  await executeAgentReload(client, request);
+  expect(client.reloads).toEqual([{ agentId, operationId, ...change }]);
+});
+
+test.each([
+  { credentialGeneration: "switch-B" },
+  { credentialChangedAt: "2026-10-17T12:00:00.000Z" },
+  { credentialGeneration: "", credentialChangedAt: "2026-10-17T12:00:00.000Z" },
+  { credentialGeneration: "switch-B", credentialChangedAt: "yesterday" },
+])("quota recovery CLI refuses ambiguous credential change before dispatch: %j", (change) => {
+  expect(() => parseAgentReloadRequest(agentId, { ...maintenanceOptions, ...change })).toThrowError(
+    expect.objectContaining({ code: "INVALID_CREDENTIAL_CHANGE" }),
+  );
+});

@@ -1800,6 +1800,7 @@ export class VoiceAssistantWebSocketServer {
         ownedSubscriptions: true,
         idleAgentReload: true,
         credentialReloadOperations: true,
+        quotaTurnRecovery: true,
         agentRequestReceipts: true,
         workspaceRequestReceipts: true,
         creationLifecycle: true,

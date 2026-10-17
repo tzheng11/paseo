@@ -19,6 +19,7 @@ import {
   type ManagedAgent,
 } from "./agent-manager.js";
 import { AgentStorage } from "./agent-storage.js";
+import { MessageReceipts } from "../message-receipts/index.js";
 import { ReloadOperationStore } from "./reload-operation-store.js";
 import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 import { DiskAgentTimelineStore } from "./disk-agent-timeline-store.js";
@@ -26,7 +27,7 @@ import { AgentHistoryReplay } from "./agent-history-replay.js";
 import { toAgentPayload } from "./agent-projections.js";
 import { projectTimelineRows } from "./timeline-projection.js";
 import { getOpenAgentTabLabel, PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
-import { startAgentRun } from "./agent-prompt.js";
+import { startAgentRun, sendPromptToAgent } from "./agent-prompt.js";
 import { StaleProviderSessionError } from "./stale-provider-session-error.js";
 import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "./agent-loading.js";
 import type { StoredAgentRecord } from "./agent-storage.js";
@@ -12773,5 +12774,448 @@ test("idle-only maintenance preserves provider background shell work", async () 
     expect(close).not.toHaveBeenCalled();
   } finally {
     await manager.closeAgent(agent.id);
+  }
+});
+
+function waitForQuota<T>(callback: () => T) {
+  return vi.waitFor(callback, { timeout: 10_000, interval: 25 });
+}
+
+async function quotaRecoveryFixture() {
+  const workdir = mkdtempSync(join(tmpdir(), "quota-recovery-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const prompts: Array<{ prompt: AgentPromptInput; messageId?: string }> = [];
+  const sessions: TestAgentSession[] = [];
+  let quota = true;
+  let background = false;
+  let skipDispatchFence = false;
+  let beforeResume: (() => Promise<void>) | undefined;
+  let beforeSend: (() => Promise<void>) | undefined;
+  class QuotaSession extends TestAgentSession {
+    override readonly provider = "claude" as const;
+    override readonly id = "quota-native-session";
+    override async startTurn(prompt: AgentPromptInput = "", options?: AgentRunOptions) {
+      await beforeSend?.();
+      if (!skipDispatchFence) options?.beforeProviderSend?.();
+      const turnId = `quota-turn-${prompts.length + 1}`;
+      prompts.push({ prompt, messageId: options?.clientMessageId });
+      setTimeout(() => {
+        this.pushEvent({ type: "turn_started", provider: "claude", turnId });
+        this.pushEvent(
+          quota
+            ? {
+                type: "turn_failed",
+                provider: "claude",
+                turnId,
+                code: "provider_quota_exceeded",
+                error: "typed fixture quota",
+              }
+            : { type: "turn_completed", provider: "claude", turnId },
+        );
+      }, 0);
+      return { turnId };
+    }
+    hasActiveBackgroundTasks() {
+      return background;
+    }
+  }
+  class QuotaClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      const session = new QuotaSession(config);
+      sessions.push(session);
+      return session;
+    }
+    override async resumeSession(
+      _handle: AgentPersistenceHandle,
+      config?: Partial<AgentSessionConfig>,
+    ): Promise<AgentSession> {
+      await beforeResume?.();
+      return this.createSession({ provider: "claude", cwd: config?.cwd ?? workdir });
+    }
+  }
+  const client = new QuotaClient("claude");
+  const messages = new MessageReceipts(join(workdir, "messages"));
+  const manager = new AgentManager({
+    clients: { claude: client },
+    logger,
+    registry: storage,
+    reloadOperations: new ReloadOperationStore(join(workdir, "operations"), logger),
+    recoveryMessages: messages,
+  });
+  const agent = await manager.createAgent({ provider: "claude", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  const fail = async () => {
+    await expect(
+      manager.runAgent(agent.id, "Original tool-producing task; never replay this text"),
+    ).rejects.toThrow("typed fixture quota");
+    await waitForQuota(() => expect(manager.getAgent(agent.id)?.quotaTurnCheckpoint).toBeDefined());
+    quota = false;
+  };
+  const change = async () => {
+    const cp = manager.getAgent(agent.id)?.quotaTurnCheckpoint;
+    if (cp)
+      await waitForQuota(() => expect(Date.now()).toBeGreaterThan(Date.parse(cp.failedAt) + 2));
+    return {
+      credentialGeneration: `generation-${Date.now()}`,
+      credentialChangedAt: new Date(Date.now() - 1).toISOString(),
+    };
+  };
+  const reload = async (
+    operationId: string,
+    credentialChange?: Awaited<ReturnType<typeof change>>,
+  ) => {
+    await manager.reloadAgentCredentials(agent.id, operationId, credentialChange);
+    await waitForQuota(async () =>
+      expect((await manager.getReloadOperation(operationId))?.status).not.toBe("pending"),
+    );
+    return manager.getReloadOperation(operationId);
+  };
+  return {
+    manager,
+    client,
+    messages,
+    workdir,
+    storage,
+    agent,
+    prompts,
+    sessions,
+    fail,
+    reload,
+    change,
+    setSkipDispatchFence(value: boolean) {
+      skipDispatchFence = value;
+    },
+    setQuota(value: boolean) {
+      quota = value;
+    },
+    setBackground(value: boolean) {
+      background = value;
+    },
+    setBeforeResume(value: typeof beforeResume) {
+      beforeResume = value;
+    },
+    setBeforeSend(value: typeof beforeSend) {
+      beforeSend = value;
+    },
+    async cleanup() {
+      await manager.closeAgent(agent.id);
+      rmSync(workdir, { recursive: true, force: true });
+    },
+  };
+}
+
+test("quota recovery preserves checkpoint through ordinary maintenance then continues exact context once", async () => {
+  const f = await quotaRecoveryFixture();
+  try {
+    await f.fail();
+    const checkpoint = f.manager.getAgent(f.agent.id)?.quotaTurnCheckpoint;
+    const before = f.manager.getTimeline(f.agent.id);
+    const epoch = f.manager.getTimelineEpoch(f.agent.id);
+    expect(await f.reload("v1")).toMatchObject({ status: "completed" });
+    expect(f.prompts).toHaveLength(1);
+    expect(f.manager.getAgent(f.agent.id)?.quotaTurnCheckpoint).toEqual(checkpoint);
+    const change = await f.change();
+    const result = await f.reload("v2", change);
+    expect(result).toMatchObject({
+      status: "completed",
+      ...change,
+      continuation: {
+        status: "submitted",
+        failedTurnId: checkpoint?.turnId,
+        messageId: expect.stringMatching(/^quota-recovery-[a-f0-9]{64}$/),
+      },
+    });
+    expect(f.prompts).toHaveLength(2);
+    expect(JSON.stringify(f.prompts[1].prompt)).toContain("Automatic quota recovery");
+    expect(JSON.stringify(f.prompts[1].prompt)).not.toContain("Original tool-producing task");
+    expect(f.manager.getTimeline(f.agent.id).slice(0, before.length)).toEqual(before);
+    expect(f.manager.getTimelineEpoch(f.agent.id)).toBe(epoch);
+    expect(f.manager.getAgent(f.agent.id)?.persistence?.sessionId).toBe(checkpoint?.sessionId);
+    expect(await f.manager.reloadAgentCredentials(f.agent.id, "v2", change)).toEqual(result);
+    await waitForQuota(() => expect(f.manager.getAgent(f.agent.id)?.lifecycle).toBe("idle"));
+    expect((await f.reload("another-uuid-same-change", change))?.continuation).toMatchObject({
+      status: "not_needed",
+    });
+    expect(f.prompts).toHaveLength(2);
+    expect((await f.storage.get(f.agent.id))?.quotaTurnCheckpoint).toBeUndefined();
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("quota recovery without checkpoint or with same generation remains prompt-free", async () => {
+  const f = await quotaRecoveryFixture();
+  try {
+    expect((await f.reload("no-failure", await f.change()))?.continuation).toMatchObject({
+      status: "not_needed",
+      reasonCode: "NO_QUOTA_CHECKPOINT",
+    });
+    await f.fail();
+    const cp = f.manager.getAgent(f.agent.id)!.quotaTurnCheckpoint!;
+    expect(
+      (
+        await f.reload("unchanged", {
+          credentialGeneration: cp.credentialGeneration!,
+          credentialChangedAt: cp.credentialChangedAt!,
+        })
+      )?.continuation,
+    ).toMatchObject({ status: "not_needed", reasonCode: "CREDENTIAL_GENERATION_UNCHANGED" });
+    expect(f.prompts).toHaveLength(1);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test.each(["user", "stop", "archive"] as const)(
+  "quota recovery refuses %s racing provider replacement",
+  async (action) => {
+    const f = await quotaRecoveryFixture();
+    const proceed = deferred<void>();
+    try {
+      await f.fail();
+      const change = await f.change();
+      let resuming = false;
+      f.setBeforeResume(async () => {
+        resuming = true;
+        await proceed.promise;
+      });
+      await f.manager.reloadAgentCredentials(f.agent.id, "race", change);
+      await waitForQuota(() => expect(resuming).toBe(true));
+      let mutation: Promise<unknown> | undefined;
+      if (action === "user")
+        await expect(f.manager.runAgent(f.agent.id, "newer user message")).rejects.toMatchObject({
+          code: "agent_reload_in_progress",
+        });
+      if (action === "stop")
+        mutation = f.manager.cancelAgentRun(f.agent.id).catch((error: unknown) => {
+          expect(error).toBeInstanceOf(Error);
+          expect(String(error)).toMatch(/Unknown agent/);
+        });
+      if (action === "archive") mutation = f.manager.archiveAgent(f.agent.id);
+      proceed.resolve();
+      await mutation;
+      await waitForQuota(async () =>
+        expect(await f.manager.getReloadOperation("race")).toMatchObject({
+          status: "completed",
+          continuation: { status: "refused" },
+        }),
+      );
+      expect(f.prompts).toHaveLength(1);
+      expect((await f.storage.get(f.agent.id))?.quotaTurnCheckpoint).toBeUndefined();
+    } finally {
+      proceed.resolve();
+      await f.cleanup();
+    }
+  },
+);
+
+test("quota recovery refuses native background work before closing", async () => {
+  const f = await quotaRecoveryFixture();
+  try {
+    await f.fail();
+    f.setBackground(true);
+    expect(await f.reload("busy", await f.change())).toMatchObject({
+      status: "refused",
+      reasonCode: "AGENT_RELOAD_BUSY",
+    });
+    expect(f.sessions).toHaveLength(1);
+    expect(f.prompts).toHaveLength(1);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("quota recovery checks newer intent again at actual provider input boundary", async () => {
+  const f = await quotaRecoveryFixture();
+  const proceed = deferred<void>();
+  try {
+    await f.fail();
+    let starting = false;
+    f.setBeforeSend(async () => {
+      starting = true;
+      await proceed.promise;
+    });
+    await f.manager.reloadAgentCredentials(f.agent.id, "late-race", await f.change());
+    await waitForQuota(() => expect(starting).toBe(true));
+    await expect(f.manager.runAgent(f.agent.id, "new intent")).rejects.toMatchObject({
+      code: "agent_reload_in_progress",
+    });
+    proceed.resolve();
+    await waitForQuota(async () =>
+      expect(await f.manager.getReloadOperation("late-race")).toMatchObject({
+        status: "completed",
+        continuation: { status: "refused" },
+      }),
+    );
+    expect(f.prompts).toHaveLength(1);
+  } finally {
+    proceed.resolve();
+    await f.cleanup();
+  }
+});
+
+test("quota recovery checkpoint survives daemon shutdown and cold restoration", async () => {
+  const f = await quotaRecoveryFixture();
+  let restored: AgentManager | undefined;
+  try {
+    await f.fail();
+    const checkpoint = f.manager.getAgent(f.agent.id)!.quotaTurnCheckpoint!;
+    f.manager.prepareForShutdown();
+    await f.manager.closeAgent(f.agent.id);
+    await f.manager.flushForShutdown();
+    const record = (await f.storage.get(f.agent.id))!;
+    expect(record.quotaTurnCheckpoint).toEqual(checkpoint);
+    restored = new AgentManager({
+      clients: { claude: f.client },
+      logger,
+      registry: f.storage,
+      reloadOperations: new ReloadOperationStore(join(f.workdir, "operations"), logger),
+      recoveryMessages: new MessageReceipts(join(f.workdir, "messages")),
+    });
+    await restored.resumeAgentFromPersistence(
+      record.persistence!,
+      { provider: "claude", cwd: f.workdir },
+      f.agent.id,
+      undefined,
+      { purpose: "maintenance" },
+    );
+    expect(restored.getAgent(f.agent.id)?.quotaTurnCheckpoint).toEqual(checkpoint);
+    await restored.reloadAgentCredentials(f.agent.id, "cold-recovery", await f.change());
+    await waitForQuota(async () =>
+      expect(await restored!.getReloadOperation("cold-recovery")).toMatchObject({
+        status: "completed",
+        continuation: { status: "submitted" },
+      }),
+    );
+    expect(f.prompts).toHaveLength(2);
+  } finally {
+    await restored?.closeAgent(f.agent.id);
+    await f.cleanup();
+  }
+});
+
+test("quota recovery lost acknowledgement stays unknown and neither same nor fresh operation resends", async () => {
+  const f = await quotaRecoveryFixture();
+  try {
+    await f.fail();
+    const original = f.messages.send.bind(f.messages);
+    const delivery = vi.spyOn(f.messages, "send").mockImplementation(async (input) => {
+      await original(input);
+      throw new Error("Lost post-send acknowledgement");
+    });
+    const change = await f.change();
+    const result = await f.reload("lost-ack", change);
+    expect(result).toMatchObject({
+      status: "unknown",
+      reasonCode: "QUOTA_CONTINUATION_UNKNOWN",
+      ...change,
+      continuation: {
+        status: "unknown",
+        messageId: expect.any(String),
+        failedTurnId: expect.any(String),
+      },
+    });
+    expect(f.prompts).toHaveLength(2);
+    delivery.mockRestore();
+    expect(await f.manager.reloadAgentCredentials(f.agent.id, "lost-ack", change)).toEqual(result);
+    await waitForQuota(() => expect(f.manager.getAgent(f.agent.id)?.lifecycle).toBe("idle"));
+    expect((await f.reload("fresh-uuid-after-unknown", change))?.continuation).toMatchObject({
+      status: "not_needed",
+    });
+    expect(f.prompts).toHaveLength(2);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("quota recovery never rolls confirmed B baseline back to stale A before a later B failure", async () => {
+  const f = await quotaRecoveryFixture();
+  try {
+    const B = {
+      credentialGeneration: "B",
+      credentialChangedAt: new Date(Date.now() - 2000).toISOString(),
+    };
+    await f.reload("establish-B", B);
+    const A = {
+      credentialGeneration: "A",
+      credentialChangedAt: new Date(Date.now() - 3000).toISOString(),
+    };
+    expect((await f.reload("stale-A", A))?.continuation).toMatchObject({
+      status: "not_needed",
+      reasonCode: "CREDENTIAL_CHANGE_PRECEDES_BASELINE",
+    });
+    expect(f.manager.getAgent(f.agent.id)).toMatchObject(B);
+    expect(await f.storage.get(f.agent.id)).toMatchObject(B);
+    const future = {
+      credentialGeneration: "future",
+      credentialChangedAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+    expect((await f.reload("future", future))?.continuation).toMatchObject({
+      status: "not_needed",
+      reasonCode: "CREDENTIAL_CHANGE_UNCONFIRMED",
+    });
+    expect(f.manager.getAgent(f.agent.id)).toMatchObject(B);
+    await f.fail();
+    expect(f.manager.getAgent(f.agent.id)?.quotaTurnCheckpoint).toMatchObject(B);
+    expect((await f.reload("replay-B", B))?.continuation).toMatchObject({
+      status: "not_needed",
+      reasonCode: "CREDENTIAL_GENERATION_UNCHANGED",
+    });
+    expect(f.prompts).toHaveLength(1);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("quota recovery cannot acknowledge submitted without the actual provider dispatch fence", async () => {
+  const f = await quotaRecoveryFixture();
+  try {
+    await f.fail();
+    f.setSkipDispatchFence(true);
+    const operation = await f.reload("missing-native-dispatch", await f.change());
+    expect(operation).toMatchObject({
+      status: "unknown",
+      continuation: { status: "unknown" },
+      reasonCode: "QUOTA_CONTINUATION_UNKNOWN",
+    });
+    expect(operation?.continuation?.status).not.toBe("submitted");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("quota recovery yields to a newer message still queued in asynchronous prompt preparation", async () => {
+  const f = await quotaRecoveryFixture();
+  const proceed = deferred<void>();
+  try {
+    await f.fail();
+    let resuming = false;
+    f.setBeforeResume(async () => {
+      resuming = true;
+      await proceed.promise;
+    });
+    await f.manager.reloadAgentCredentials(f.agent.id, "queued-user", await f.change());
+    await waitForQuota(() => expect(resuming).toBe(true));
+    const user = sendPromptToAgent({
+      agentManager: f.manager,
+      agentStorage: f.storage,
+      agentId: f.agent.id,
+      prompt: "New queued user task",
+      logger,
+    });
+    proceed.resolve();
+    await user;
+    await waitForQuota(async () =>
+      expect(await f.manager.getReloadOperation("queued-user")).toMatchObject({
+        status: "completed",
+        continuation: { status: "refused" },
+      }),
+    );
+    await waitForQuota(() => expect(f.prompts).toHaveLength(2));
+    expect(f.prompts[1].prompt).toBe("New queued user task");
+  } finally {
+    proceed.resolve();
+    await f.cleanup();
   }
 });

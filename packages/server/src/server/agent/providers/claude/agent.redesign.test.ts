@@ -90,6 +90,206 @@ function createSessionWithLogger(logger: Logger) {
 
 const sdkQueryFactory = vi.fn();
 
+test("a quota result never completes a turn even when its SDK subtype is success", async () => {
+  const session = await createSession();
+  const internal = asInternals<{
+    activeForegroundTurnId: string | null;
+    translateMessageToEvents(message: unknown): AgentStreamEvent[];
+  }>(session);
+  internal.activeForegroundTurnId = "quota-turn";
+  try {
+    internal.translateMessageToEvents({
+      type: "assistant",
+      error: "rate_limit",
+      message: { content: [{ type: "text", text: "Session limit reached" }] },
+      parent_tool_use_id: null,
+      session_id: "session-quota",
+      uuid: "quota-assistant",
+    });
+    const events = internal.translateMessageToEvents({
+      type: "result",
+      subtype: "success",
+      is_error: true,
+      result: "Session limit reached",
+      usage: buildUsage(),
+      modelUsage: {},
+      session_id: "session-quota",
+      uuid: "quota-result",
+    });
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "turn_failed",
+        code: "provider_quota_exceeded",
+      }),
+    );
+    expect(events.some((event) => event.type === "turn_completed")).toBe(false);
+  } finally {
+    internal.activeForegroundTurnId = null;
+    await session.close();
+  }
+});
+
+test.each([
+  { signal: "none", isError: true, quota: false },
+  { signal: "allowed_warning", isError: true, quota: false },
+  { signal: "rejected", isError: true, quota: true },
+  { signal: "rejected", isError: false, quota: false },
+  { signal: "sidechain", isError: true, quota: false },
+  { signal: "unbound", isError: true, quota: false },
+])(
+  "Claude terminal classification uses typed current-turn quota only: %j",
+  async ({ signal, isError, quota }) => {
+    const session = await createSession();
+    const internal = asInternals<{
+      activeForegroundTurnId: string | null;
+      translateMessageToEvents(message: unknown): AgentStreamEvent[];
+    }>(session);
+    internal.activeForegroundTurnId = signal === "unbound" ? null : "typed-turn";
+    try {
+      if (signal === "rejected" || signal === "allowed_warning")
+        internal.translateMessageToEvents({
+          type: "rate_limit_event",
+          rate_limit_info: { status: signal },
+          uuid: "limit",
+          session_id: "session-typed",
+        });
+      if (signal === "sidechain" || signal === "unbound")
+        internal.translateMessageToEvents({
+          type: "assistant",
+          error: "rate_limit",
+          message: { content: [] },
+          parent_tool_use_id: signal === "sidechain" ? "child-tool" : null,
+          uuid: "assistant-limit",
+          session_id: "session-typed",
+        });
+      internal.activeForegroundTurnId = "typed-turn";
+      const events = internal.translateMessageToEvents({
+        type: "result",
+        subtype: "success",
+        is_error: isError,
+        result: "Quota-looking text is not a typed quota signal",
+        usage: buildUsage(),
+        modelUsage: {},
+        uuid: "result-typed",
+        session_id: "session-typed",
+      });
+      expect(events.some((event) => event.type === "turn_completed")).toBe(!isError);
+      expect(
+        events.some(
+          (event) => event.type === "turn_failed" && event.code === "provider_quota_exceeded",
+        ),
+      ).toBe(quota);
+      if (isError) expect(events.some((event) => event.type === "turn_failed")).toBe(true);
+      // A typed frame from the prior turn cannot arm the next result.
+      internal.activeForegroundTurnId = "next-turn";
+      const next = internal.translateMessageToEvents({
+        type: "result",
+        subtype: "success",
+        is_error: true,
+        result: "Other failure",
+        usage: buildUsage(),
+        modelUsage: {},
+        uuid: "result-next",
+        session_id: "session-typed",
+      });
+      expect(
+        next.some(
+          (event) => event.type === "turn_failed" && event.code === "provider_quota_exceeded",
+        ),
+      ).toBe(false);
+    } finally {
+      internal.activeForegroundTurnId = null;
+      await session.close();
+    }
+  },
+);
+
+test.each(["error_max_turns", "error_max_budget_usd", "recovered_execution_error"])(
+  "earlier quota signal does not relabel a later nonquota terminal outcome: %s",
+  async (outcome) => {
+    const session = await createSession();
+    const internal = asInternals<{
+      activeForegroundTurnId: string | null;
+      translateMessageToEvents(message: unknown): AgentStreamEvent[];
+    }>(session);
+    internal.activeForegroundTurnId = "prior-quota-candidate";
+    try {
+      internal.translateMessageToEvents({
+        type: "assistant",
+        error: "rate_limit",
+        message: { content: [] },
+        uuid: "quota",
+        session_id: "typed-session",
+      });
+      if (outcome === "recovered_execution_error")
+        internal.translateMessageToEvents({
+          type: "assistant",
+          message: { content: [{ type: "text", text: "Retry recovered" }] },
+          uuid: "recovery",
+          session_id: "typed-session",
+        });
+      const events = internal.translateMessageToEvents({
+        type: "result",
+        subtype: outcome === "recovered_execution_error" ? "error_during_execution" : outcome,
+        is_error: true,
+        errors: ["Typed nonquota terminal failure"],
+        usage: buildUsage(),
+        modelUsage: {},
+        uuid: "result",
+        session_id: "typed-session",
+      });
+      expect(events.some((event) => event.type === "turn_failed")).toBe(true);
+      expect(
+        events.some(
+          (event) => event.type === "turn_failed" && event.code === "provider_quota_exceeded",
+        ),
+      ).toBe(false);
+    } finally {
+      internal.activeForegroundTurnId = null;
+      await session.close();
+    }
+  },
+);
+
+test("Claude startup failure never reaches the guarded provider dispatch fence", async () => {
+  const session = await createSession();
+  const internal = asInternals<{ ensureQuery(): Promise<void> }>(session);
+  vi.spyOn(internal, "ensureQuery").mockRejectedValue(new Error("Fixture SDK startup unavailable"));
+  const fence = vi.fn();
+  await session.startTurn("Automatic quota recovery", { beforeProviderSend: fence });
+  expect(fence).not.toHaveBeenCalled();
+  await session.close();
+});
+
+test("guarded Claude input rechecks admission after SDK initialization and never pushes refused input", async () => {
+  const session = await createSession();
+  const push = vi.fn();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const internal = asInternals<{
+    ensureQuery(): Promise<void>;
+    input: { push(value: unknown): void } | null;
+  }>(session);
+  vi.spyOn(internal, "ensureQuery").mockImplementation(async () => {
+    await gate;
+    internal.input = { push };
+  });
+  const fence = vi.fn(() => {
+    throw Object.assign(new Error("newer user intent"), { code: "quota_recovery_superseded" });
+  });
+  const start = session.startTurn("Automatic quota recovery", { beforeProviderSend: fence });
+  const rejected = expect(start).rejects.toMatchObject({ code: "quota_recovery_superseded" });
+  expect(fence).not.toHaveBeenCalled();
+  release();
+  await rejected;
+  expect(fence).toHaveBeenCalledTimes(1);
+  expect(push).not.toHaveBeenCalled();
+  internal.input = null;
+  await session.close();
+});
+
 interface CapturedLog {
   level: "debug" | "info" | "warn" | "error";
   args: unknown[];

@@ -4766,7 +4766,18 @@ export class Session {
   ): Promise<void> {
     if (!msg.operationId || !msg.preserveHistory)
       throw new Error("Credential reload requires operationId and preserveHistory");
-    const operation = await this.agentManager.reloadAgentCredentials(msg.agentId, msg.operationId);
+    if (Boolean(msg.credentialGeneration) !== Boolean(msg.credentialChangedAt))
+      throw new Error("Credential generation and confirmed change time are required together");
+    const operation = await this.agentManager.reloadAgentCredentials(
+      msg.agentId,
+      msg.operationId,
+      msg.credentialGeneration && msg.credentialChangedAt
+        ? {
+            credentialGeneration: msg.credentialGeneration,
+            credentialChangedAt: msg.credentialChangedAt,
+          }
+        : undefined,
+    );
     this.emit({
       type: "agent.reload_idle.operation.response",
       payload: { requestId: msg.requestId, operation },

@@ -1,3 +1,4 @@
+import { MessageReceipts } from "./message-receipts/index.js";
 import type { PluginRegistries } from "@getpaseo/protocol/plugin-registry";
 import { describeHookWorkspace } from "./plugins/lifecycle/index.js";
 import express from "express";
@@ -949,6 +950,7 @@ export async function createPaseoDaemon(
     directory: path.join(config.paseoHome, "runtime", "timeline-cache"),
   });
   const agentManager = new AgentManager({
+    recoveryMessages: new MessageReceipts(path.join(config.paseoHome, "agent-requests")),
     reloadOperations: new ReloadOperationStore(
       path.join(config.paseoHome, "reload-operations"),
       logger,

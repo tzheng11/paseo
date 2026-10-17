@@ -3298,7 +3298,24 @@ export class DaemonClient {
   async reloadAgentCredentials(input: {
     agentId: string;
     operationId: string;
+    credentialGeneration?: string;
+    credentialChangedAt?: string;
   }): Promise<AgentReloadOperation> {
+    if (Boolean(input.credentialGeneration) !== Boolean(input.credentialChangedAt))
+      throw new Error("Credential generation and confirmed change time are required together");
+    // COMPAT(quotaTurnRecovery): added in v0.11.2; remove gate after 2027-04-17.
+    if (
+      input.credentialGeneration &&
+      this.lastServerInfoMessage?.features?.quotaTurnRecovery !== true
+    ) {
+      return {
+        ...input,
+        status: "refused",
+        reasonCode: "QUOTA_TURN_RECOVERY_UNSUPPORTED",
+        reason: "Update the host to recover quota-failed turns after credential rotation.",
+        retryable: true,
+      };
+    }
     // COMPAT(credentialReloadOperations): added in v0.11.2; remove gate after 2027-04-17.
     if (this.lastServerInfoMessage?.features?.credentialReloadOperations !== true) {
       return {
@@ -3316,6 +3333,12 @@ export class DaemonClient {
         type: "agent.reload_idle.request",
         agentId: input.agentId,
         operationId: input.operationId,
+        ...(input.credentialGeneration
+          ? {
+              credentialGeneration: input.credentialGeneration,
+              credentialChangedAt: input.credentialChangedAt,
+            }
+          : {}),
         preserveHistory: true,
         requestId,
       },

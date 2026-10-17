@@ -51,3 +51,40 @@ describe("credential reload wire compatibility", () => {
     expect(SessionOutboundMessageSchema.parse(response)).toEqual(response);
   });
 });
+
+test("quota recovery optional fields survive pure request schema and generated outbound validation", () => {
+  const intent = {
+    credentialGeneration: "opaque-generation",
+    credentialChangedAt: "2026-10-17T12:00:00.000Z",
+  };
+  const request = {
+    type: "agent.reload_idle.request",
+    agentId: "agent",
+    operationId: "operation",
+    requestId: "request",
+    preserveHistory: true,
+    ...intent,
+  };
+  expect(SessionInboundMessageSchema.parse(request)).toEqual(request);
+  const envelope = {
+    type: "session",
+    message: {
+      type: "agent.reload_idle.operation.response",
+      payload: {
+        requestId: "request",
+        operation: {
+          agentId: "agent",
+          operationId: "operation",
+          status: "completed",
+          ...intent,
+          continuation: {
+            status: "submitted",
+            failedTurnId: "typed-failed-turn",
+            messageId: "quota-recovery-stable",
+          },
+        },
+      },
+    },
+  };
+  expect(validateWSOutboundMessage(envelope)).toEqual({ success: true, data: envelope });
+});
