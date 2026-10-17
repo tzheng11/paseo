@@ -57,8 +57,9 @@ values; this requires `quotaTurnRecovery` on the host. The timestamp comes from 
 successful switch, not a credential file's modification time. Paseo does not inspect tokens or
 observe which login Claude uses for each request.
 
-Only a newly recorded, typed Claude quota failure is eligible. Earlier failures stored as text
-remain ineligible, and Codex maintenance does not infer quota failures from error prose. A newer
+Only newly recorded typed quota failures are eligible: Claude's rejected usage-limit outcome or
+Codex's terminal `usageLimitExceeded`. Earlier failures stored as text remain ineligible; transient
+Codex `rateLimitExceeded` and quota-looking prose do not arm recovery. A newer
 message, cancellation, archive, or active native background work prevents continuation. An
 ordinary maintenance reload preserves the checkpoint so it cannot erase a later confirmed switch.
 A successful task or a nonquota terminal failure never arms recovery.

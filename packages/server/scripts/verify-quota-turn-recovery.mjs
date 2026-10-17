@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// Compiled CLI -> daemon -> pinned Claude adapter with typed SDK fixtures. No models/auth.
+// Compiled CLI -> daemon -> actual Claude/Codex adapters with typed native fixtures. No models/auth.
 import assert from "node:assert/strict";
 import { once } from "node:events";
+import { createInterface } from "node:readline";
 import { spawn, execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -23,8 +24,115 @@ const load = (relative) => import(pathToFileURL(path.join(runtime, relative)).hr
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
+function fixtureCodexProvider() {
+  const journal = argument("--journal");
+  const send = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
+  let threadId;
+  const notify = (method, params) => send({ method, params });
+  process.on("message", (message) => {
+    if (message.action !== "background" || message.threadId !== threadId) return;
+    notify("codex/event/exec_command_begin", {
+      id: threadId,
+      msg: { type: "exec_command_begin", call_id: "fixture-local-job", command: ["sleep", "30"] },
+    });
+    notify("codex/event/exec_command_end", {
+      id: threadId,
+      msg: {
+        type: "exec_command_end",
+        call_id: "fixture-local-job",
+        command: ["sleep", "30"],
+        aggregated_output: "Process running with session id 4242",
+        exit_code: 0,
+      },
+    });
+  });
+  process.on("disconnect", () => process.exit(0));
+  createInterface({ input: process.stdin })
+    .on("line", (line) => {
+      const request = JSON.parse(line);
+      if (request.id === undefined) return;
+      let result = {};
+      switch (request.method) {
+        case "initialize":
+          result = { userAgent: "fixture/0.159.2" };
+          break;
+        case "model/list":
+          result = {
+            data: [{ id: "fixture-model", isDefault: true, defaultReasoningEffort: "medium" }],
+          };
+          break;
+        case "config/read":
+          result = { config: {} };
+          break;
+        case "skills/list":
+        case "collaborationMode/list":
+        case "thread/loaded/list":
+          result = { data: [] };
+          break;
+        case "thread/start":
+          threadId = randomUUID();
+          result = { thread: { id: threadId } };
+          break;
+        case "thread/resume":
+          threadId = request.params.threadId;
+          result = { thread: { id: threadId } };
+          break;
+        case "thread/read":
+          result = { thread: { id: threadId, historyMode: "paginated" } };
+          break;
+        case "thread/turns/list":
+        case "thread/items/list":
+          result = { data: [], nextCursor: null };
+          break;
+        case "turn/start": {
+          const turnId = randomUUID();
+          const previous = readFileSync(journal, "utf8")
+            .split("\n")
+            .filter(Boolean)
+            .map((entry) => JSON.parse(entry))
+            .filter((entry) => entry.kind === "prompt" && entry.sessionId === threadId);
+          const text = request.params.input.map((item) => item.text ?? "").join("\n");
+          appendFileSync(
+            journal,
+            `${JSON.stringify({ kind: "prompt", sessionId: threadId, text, turnId })}\n`,
+          );
+          result = { turn: { id: turnId } };
+          setTimeout(() => {
+            notify("turn/started", { threadId, turn: { id: turnId } });
+            notify("item/completed", {
+              threadId,
+              turnId,
+              item: {
+                type: "agentMessage",
+                id: randomUUID(),
+                text: previous.length ? "Continued preserved task" : "Usage limit reached",
+              },
+            });
+            notify("turn/completed", {
+              threadId,
+              turn: {
+                id: turnId,
+                status: previous.length ? "completed" : "failed",
+                error: previous.length
+                  ? null
+                  : { message: "Usage limit reached", codexErrorInfo: "usageLimitExceeded" },
+              },
+            });
+          }, 0);
+          break;
+        }
+        default:
+          break;
+      }
+      send({ id: request.id, result });
+    })
+    .on("close", () => process.exit(0));
+}
+
 async function fixtureDaemon() {
   const home = argument("--home");
+  const providerName = argument("--provider", "claude");
+  assert.ok(["claude", "codex"].includes(providerName));
   const port = Number(argument("--port", "0"));
   assert.notEqual(port, 6767);
   const require = createRequire(path.join(runtime, "packages/server/package.json"));
@@ -139,11 +247,30 @@ async function fixtureDaemon() {
     });
     return query;
   };
-  const provider = new ClaudeAgentClient({
-    logger,
-    queryFactory,
-    resolveBinary: async () => "/fixture/never-executed-claude",
-  });
+  let provider;
+  const codexChildren = [];
+  if (providerName === "claude") {
+    provider = new ClaudeAgentClient({
+      logger,
+      queryFactory,
+      resolveBinary: async () => "/fixture/never-executed-claude",
+    });
+  } else {
+    const { CodexAppServerAgentClient } = await load(
+      "packages/server/dist/server/server/agent/providers/codex-app-server-agent.js",
+    );
+    provider = new CodexAppServerAgentClient(logger);
+    provider.goalsEnabledPromise = Promise.resolve(false);
+    provider.autoReviewEnabledPromise = Promise.resolve(false);
+    provider.spawnAppServer = async () => {
+      const child = spawn(process.execPath, [script, "--fixture-codex", "--journal", journal], {
+        stdio: ["pipe", "pipe", "pipe", "ipc"],
+        env: process.env,
+      });
+      codexChildren.push(child);
+      return child;
+    };
+  }
   let holdResume = false;
   const originalResume = provider.resumeSession.bind(provider);
   provider.resumeSession = async (...args) => {
@@ -152,8 +279,8 @@ async function fixtureDaemon() {
   };
   provider.isAvailable = async () => true;
   provider.fetchCatalog = async () => ({
-    provider: "claude",
-    models: [{ provider: "claude", id: "fixture-model", label: "Fixture", isDefault: true }],
+    provider: providerName,
+    models: [{ provider: providerName, id: "fixture-model", label: "Fixture", isDefault: true }],
     modes: [],
   });
   provider.listImportableSessions = async () => [];
@@ -169,7 +296,7 @@ async function fixtureDaemon() {
       appBaseUrl: "https://app.paseo.sh",
       corsAllowedOrigins: [],
       hostnames: [],
-      agentClients: { claude: provider },
+      agentClients: { [providerName]: provider },
       pluginsEnabled: false,
       voiceLlmProvider: null,
     },
@@ -185,7 +312,15 @@ async function fixtureDaemon() {
       sessionId,
       lifecycle: agent?.lifecycle,
       checkpoint: agent?.quotaTurnCheckpoint,
-      prompts: states.get(sessionId)?.prompts ?? [],
+      prompts:
+        providerName === "claude"
+          ? (states.get(sessionId)?.prompts ?? [])
+          : readFileSync(journal, "utf8")
+              .split("\n")
+              .filter(Boolean)
+              .map((line) => JSON.parse(line))
+              .filter((entry) => entry.kind === "prompt" && entry.sessionId === sessionId)
+              .map((entry) => entry.text),
       epoch: daemon.agentManager.getTimelineEpoch(id),
       history: daemon.agentManager.getTimeline(id),
     };
@@ -196,7 +331,7 @@ async function fixtureDaemon() {
       let value;
       if (action === "create-quota") {
         const agent = await daemon.agentManager.createAgent(
-          { provider: "claude", cwd: home, model: "fixture-model" },
+          { provider: providerName, cwd: home, model: "fixture-model" },
           undefined,
           { workspaceId: undefined },
         );
@@ -215,8 +350,8 @@ async function fixtureDaemon() {
         )
           await pause(5);
         value = snapshot(agent.id);
-        assert.ok(value.checkpoint, "Pinned Claude adapter must arm typed checkpoint");
-        states.get(value.sessionId).quota = false;
+        assert.ok(value.checkpoint, "Actual provider adapter must arm typed checkpoint");
+        if (states.has(value.sessionId)) states.get(value.sessionId).quota = false;
       }
       if (action === "snapshot") value = snapshot(agentId);
       if (action === "hold-resume") {
@@ -229,19 +364,25 @@ async function fixtureDaemon() {
       }
       if (action === "background") {
         const sessionId = daemon.agentManager.getAgent(agentId).persistence.sessionId;
-        queries.get(sessionId).push({
-          type: "system",
-          subtype: "background_tasks_changed",
-          tasks: [
-            {
-              task_id: "local-job",
-              task_type: "local_bash",
-              description: "Owned fixture background work",
-            },
-          ],
-          uuid: randomUUID(),
-          session_id: sessionId,
-        });
+        if (providerName === "codex") {
+          codexChildren
+            .filter((child) => child.connected)
+            .forEach((child) => child.send({ action: "background", threadId: sessionId }));
+        } else {
+          queries.get(sessionId).push({
+            type: "system",
+            subtype: "background_tasks_changed",
+            tasks: [
+              {
+                task_id: "local-job",
+                task_type: "local_bash",
+                description: "Owned fixture background work",
+              },
+            ],
+            uuid: randomUUID(),
+            session_id: sessionId,
+          });
+        }
         for (
           let n = 0;
           n < 100 && !daemon.agentManager.getAgent(agentId)?.session.hasActiveBackgroundTasks();
@@ -302,6 +443,8 @@ function assertReceipt(receipt, agentId, operationId, change) {
 }
 
 async function runCanary() {
+  const providerName = argument("--provider", "claude");
+  assert.ok(["claude", "codex"].includes(providerName));
   const directory = await mkdtemp(path.join(tmpdir(), "paseo-quota-recovery-canary-"));
   const home = path.join(directory, "home");
   mkdirSync(path.join(home, "static"), { recursive: true });
@@ -333,7 +476,18 @@ async function runCanary() {
   const launch = () => {
     child = spawn(
       process.execPath,
-      [script, "--fixture-daemon", "--runtime-root", runtime, "--home", home, "--journal", journal],
+      [
+        script,
+        "--fixture-daemon",
+        "--runtime-root",
+        runtime,
+        "--home",
+        home,
+        "--journal",
+        journal,
+        "--provider",
+        providerName,
+      ],
       { stdio: ["ignore", "pipe", "pipe", "ipc"], env },
     );
     const current = child;
@@ -421,7 +575,13 @@ async function runCanary() {
       "packages/cli/dist/commands/agent/reload.js",
     ].map((file) => [file, digest(readFileSync(path.join(runtime, file)))]),
   );
-  const evidence = { runtime, directory, modelCalls: 0, artifactHashes: hashes };
+  const evidence = {
+    runtime,
+    directory,
+    provider: providerName,
+    modelCalls: 0,
+    artifactHashes: hashes,
+  };
   try {
     port = (await launch()).port;
     evidence.port = port;
@@ -536,5 +696,6 @@ async function runCanary() {
     }
   }
 }
-if (process.argv.includes("--fixture-daemon")) await fixtureDaemon();
+if (process.argv.includes("--fixture-codex")) fixtureCodexProvider();
+else if (process.argv.includes("--fixture-daemon")) await fixtureDaemon();
 else await runCanary();

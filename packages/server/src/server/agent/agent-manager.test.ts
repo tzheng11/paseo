@@ -12781,7 +12781,7 @@ function waitForQuota<T>(callback: () => T) {
   return vi.waitFor(callback, { timeout: 10_000, interval: 25 });
 }
 
-async function quotaRecoveryFixture() {
+async function quotaRecoveryFixture(provider: "claude" | "codex" = "claude") {
   const workdir = mkdtempSync(join(tmpdir(), "quota-recovery-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
   const prompts: Array<{ prompt: AgentPromptInput; messageId?: string }> = [];
@@ -12792,7 +12792,7 @@ async function quotaRecoveryFixture() {
   let beforeResume: (() => Promise<void>) | undefined;
   let beforeSend: (() => Promise<void>) | undefined;
   class QuotaSession extends TestAgentSession {
-    override readonly provider = "claude" as const;
+    override readonly provider = provider;
     override readonly id = "quota-native-session";
     override async startTurn(prompt: AgentPromptInput = "", options?: AgentRunOptions) {
       await beforeSend?.();
@@ -12800,17 +12800,17 @@ async function quotaRecoveryFixture() {
       const turnId = `quota-turn-${prompts.length + 1}`;
       prompts.push({ prompt, messageId: options?.clientMessageId });
       setTimeout(() => {
-        this.pushEvent({ type: "turn_started", provider: "claude", turnId });
+        this.pushEvent({ type: "turn_started", provider, turnId });
         this.pushEvent(
           quota
             ? {
                 type: "turn_failed",
-                provider: "claude",
+                provider,
                 turnId,
                 code: "provider_quota_exceeded",
                 error: "typed fixture quota",
               }
-            : { type: "turn_completed", provider: "claude", turnId },
+            : { type: "turn_completed", provider, turnId },
         );
       }, 0);
       return { turnId };
@@ -12830,19 +12830,19 @@ async function quotaRecoveryFixture() {
       config?: Partial<AgentSessionConfig>,
     ): Promise<AgentSession> {
       await beforeResume?.();
-      return this.createSession({ provider: "claude", cwd: config?.cwd ?? workdir });
+      return this.createSession({ provider, cwd: config?.cwd ?? workdir });
     }
   }
-  const client = new QuotaClient("claude");
+  const client = new QuotaClient(provider);
   const messages = new MessageReceipts(join(workdir, "messages"));
   const manager = new AgentManager({
-    clients: { claude: client },
+    clients: { [provider]: client },
     logger,
     registry: storage,
     reloadOperations: new ReloadOperationStore(join(workdir, "operations"), logger),
     recoveryMessages: messages,
   });
-  const agent = await manager.createAgent({ provider: "claude", cwd: workdir }, undefined, {
+  const agent = await manager.createAgent({ provider, cwd: workdir }, undefined, {
     workspaceId: undefined,
   });
   const fail = async () => {
@@ -13294,6 +13294,28 @@ test("quota recovery refuses autonomous progress during consumed-checkpoint pers
     expect(f.prompts).toHaveLength(1);
   } finally {
     proceed.resolve();
+    await f.cleanup();
+  }
+});
+
+test("quota recovery also preserves Codex context and submits one deterministic continuation", async () => {
+  const f = await quotaRecoveryFixture("codex");
+  try {
+    await f.fail();
+    const cp = f.manager.getAgent(f.agent.id)!.quotaTurnCheckpoint!;
+    const change = await f.change();
+    const result = await f.reload("codex-recovery", change);
+    expect(result).toMatchObject({
+      status: "completed",
+      continuation: { status: "submitted", failedTurnId: cp.turnId },
+    });
+    expect(f.prompts).toHaveLength(2);
+    expect(f.manager.getAgent(f.agent.id)?.persistence?.sessionId).toBe(cp.sessionId);
+    expect(await f.manager.reloadAgentCredentials(f.agent.id, "codex-recovery", change)).toEqual(
+      result,
+    );
+    expect(f.prompts).toHaveLength(2);
+  } finally {
     await f.cleanup();
   }
 });

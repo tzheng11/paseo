@@ -2382,6 +2382,7 @@ const TurnCompletedNotificationSchema = z
         error: z
           .object({
             message: z.string().optional(),
+            codexErrorInfo: z.unknown().optional(),
           })
           .passthrough()
           .nullable()
@@ -2671,6 +2672,7 @@ type ParsedCodexNotification =
       kind: "turn_completed";
       status: string;
       errorMessage: string | null;
+      quotaExceeded: boolean;
       threadId: string | null;
     }
   | {
@@ -2823,6 +2825,7 @@ const CodexNotificationSchema = z.union([
         kind: "turn_completed",
         status: params.turn.status,
         errorMessage: params.turn.error?.message ?? null,
+        quotaExceeded: params.turn.error?.codexErrorInfo === "usageLimitExceeded",
         threadId: params.threadId ?? null,
       }),
     ),
@@ -3247,6 +3250,7 @@ const CodexNotificationSchema = z.union([
         kind: "turn_completed",
         status: "interrupted",
         errorMessage: null,
+        quotaExceeded: false,
         threadId: getCodexEventThreadId(params),
       }),
     ),
@@ -3267,6 +3271,7 @@ const CodexNotificationSchema = z.union([
         kind: "turn_completed",
         status: "completed",
         errorMessage: null,
+        quotaExceeded: false,
         threadId: getCodexEventThreadId(params),
       }),
     ),
@@ -4704,6 +4709,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       if (pendingStart.cancelRequested) {
         throw new Error("Codex turn start was interrupted before reaching Codex");
       }
+      options?.beforeProviderSend?.();
       await this.client.request("turn/start", turnStart.params, TURN_START_TIMEOUT_MS);
       return { turnId };
     } catch (error) {
@@ -6629,6 +6635,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         type: "turn_failed",
         provider: CODEX_PROVIDER,
         error: parsed.errorMessage ?? "Codex turn failed",
+        ...(parsed.quotaExceeded ? { code: "provider_quota_exceeded" } : {}),
       });
     } else if (parsed.status === "interrupted") {
       this.dismissInterruptedAsyncQuestions();
