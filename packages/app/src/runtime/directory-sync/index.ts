@@ -39,6 +39,8 @@ type FetchAgentsPayload = Awaited<ReturnType<DaemonClient["fetchAgents"]>>;
 type FetchWorkspacesPayload = Awaited<ReturnType<DaemonClient["fetchWorkspaces"]>>;
 
 const PAGE_LIMIT = 200;
+const DEMAND_RETRY_DELAY_MS = 1_000;
+const MAX_DEMAND_RETRY_DELAY_MS = 30_000;
 const AGENT_SORT: NonNullable<FetchAgentsOptions["sort"]> = [
   { key: "updated_at", direction: "desc" },
 ];
@@ -131,6 +133,24 @@ export interface RefreshAgentDirectoryResult {
   subscriptionId: string | null;
 }
 
+interface DirectorySyncScheduler {
+  schedule(task: () => void, delayMs: number): () => void;
+}
+
+const directorySyncScheduler: DirectorySyncScheduler = {
+  schedule(task, delayMs) {
+    const timeout = setTimeout(task, delayMs);
+    return () => clearTimeout(timeout);
+  },
+};
+
+async function settleDirectoryRequests(requests: Promise<unknown>[]): Promise<void> {
+  // A failed branch must not let a retry overlap the other branch's pending request.
+  const results = await Promise.allSettled(requests);
+  const failed = results.find((result) => result.status === "rejected");
+  if (failed) throw failed.reason;
+}
+
 export class DirectorySync {
   private readonly agentTransactions = new DirectoryTransactionOwner<
     AgentSnapshot,
@@ -158,6 +178,11 @@ export class DirectorySync {
   private readonly routeDemandIds = new Set<string>();
   private readonly fullDemandSources = new Set<object>();
   private demandRefresh: Promise<void> | null = null;
+  private demandGeneration = 0;
+  private demandRetryGeneration = 0;
+  private demandRetryDelayMs = 0;
+  private cancelDemandRetry: (() => void) | null = null;
+  private disposed = false;
   private satisfiedDemandSource: DirectorySourceToken | null = null;
   private cursors: DirectoryCheckpoint = {};
 
@@ -170,6 +195,7 @@ export class DirectorySync {
       markAgentError: (error: string) => void;
     },
     private readonly checkpoints?: DirectoryCheckpointStorage,
+    private readonly scheduler: DirectorySyncScheduler = directorySyncScheduler,
   ) {
     const persist = (mutations: readonly DirectoryReplicaMutation[]) =>
       this.checkpoints?.commitDirectoryMutations(this.serverId, mutations);
@@ -229,6 +255,7 @@ export class DirectorySync {
   }
 
   dispose(): void {
+    this.disposed = true;
     this.flushAbortedTransactions();
     this.abortPendingSessionWaits();
     this.releaseSubscriptions();
@@ -238,6 +265,8 @@ export class DirectorySync {
   }
 
   private releaseSubscriptions(): void {
+    this.demandGeneration += 1;
+    this.resetDemandRetry();
     for (const subscription of [
       this.agentSubscription,
       this.workspaceSubscription,
@@ -295,13 +324,17 @@ export class DirectorySync {
   }
 
   private requestDemandRefresh(force = false): Promise<void> {
+    if (this.disposed || !this.hasDemand()) return Promise.resolve();
     if (this.demandRefresh) return this.demandRefresh;
-    if (!this.hasDemand()) return Promise.resolve();
-    if (!this.getOnlineConnection()) {
+    const connection = this.getOnlineConnection();
+    if (!connection) {
       return this.fullDemandSources.size > 0 ? this.loadCachedDirectory() : Promise.resolve();
     }
+    if (this.cancelDemandRetry && !force) return Promise.resolve();
+    this.cancelDemandRetryTimer();
     this.observeDirectoryEvents();
-    const source = this.connection.source;
+    const { client, source } = connection;
+    const demandGeneration = this.demandGeneration;
     if (
       !force &&
       this.satisfiedDemandSource?.clientGeneration === source.clientGeneration &&
@@ -309,30 +342,69 @@ export class DirectorySync {
     ) {
       return Promise.resolve();
     }
+    this.satisfiedDemandSource = null;
     const refresh =
       this.fullDemandSources.size > 0
         ? this.refreshAll()
-        : Promise.all([
+        : settleDirectoryRequests([
             this.refreshAgentsInternal({ subscribe: {} }, false),
             this.refreshWorkspacesInternal({ subscribe: true }, false),
-          ]).then(() => undefined);
+          ]);
+    let failed = false;
     this.demandRefresh = refresh
-      .then(() => {
-        this.satisfiedDemandSource = source;
-        return undefined;
-      })
+      .then(
+        () => {
+          if (
+            !this.disposed &&
+            this.hasDemand() &&
+            demandGeneration === this.demandGeneration &&
+            this.isCurrent(client, source)
+          ) {
+            this.satisfiedDemandSource = source;
+            this.resetDemandRetry();
+          }
+          return undefined;
+        },
+        (error: unknown) => {
+          failed = true;
+          throw error;
+        },
+      )
       .finally(() => {
         this.demandRefresh = null;
-        const current = this.connection.source;
-        if (
-          this.hasDemand() &&
-          (current.clientGeneration !== source.clientGeneration ||
-            current.connectionEpoch !== source.connectionEpoch)
-        ) {
+        if (this.disposed || !this.hasDemand() || !this.getOnlineConnection()) return;
+        const demandChanged = demandGeneration !== this.demandGeneration;
+        if (demandChanged || !this.isCurrent(client, source)) {
           void this.requestDemandRefresh().catch(() => undefined);
+        } else if (failed) {
+          this.scheduleDemandRetry(client, source);
         }
       });
     return this.demandRefresh;
+  }
+
+  private cancelDemandRetryTimer(): void {
+    this.demandRetryGeneration += 1;
+    this.cancelDemandRetry?.();
+    this.cancelDemandRetry = null;
+  }
+
+  private resetDemandRetry(): void {
+    this.cancelDemandRetryTimer();
+    this.demandRetryDelayMs = 0;
+  }
+
+  private scheduleDemandRetry(client: DaemonClient, source: DirectorySourceToken): void {
+    this.cancelDemandRetryTimer();
+    const generation = this.demandRetryGeneration;
+    const nextDelay = this.demandRetryDelayMs * 2 || DEMAND_RETRY_DELAY_MS;
+    this.demandRetryDelayMs = Math.min(nextDelay, MAX_DEMAND_RETRY_DELAY_MS);
+    this.cancelDemandRetry = this.scheduler.schedule(() => {
+      if (generation !== this.demandRetryGeneration) return;
+      this.cancelDemandRetry = null;
+      if (this.disposed || !this.hasDemand() || !this.isCurrent(client, source)) return;
+      void this.requestDemandRefresh().catch(() => undefined);
+    }, this.demandRetryDelayMs);
   }
 
   refreshDemand(): Promise<void> {
@@ -576,7 +648,7 @@ export class DirectorySync {
   }
 
   async refreshAll(): Promise<void> {
-    await Promise.all([
+    await settleDirectoryRequests([
       this.refreshAgents({ subscribe: {} }),
       this.refreshWorkspaces({ subscribe: true }),
     ]);

@@ -123,6 +123,15 @@ Cross-platform React Native app that connects to one or more daemons.
 - Timeline sync correctness is documented in [docs/timeline-sync.md](timeline-sync.md): live streams are for immediacy, `fetch_agent_timeline_request` is authoritative, and catch-up is paged but complete.
 - Voice features: dictation (STT) and voice agent (realtime)
 
+Browser host registrations normally live in that browser's storage. A private web deployment can
+declare `window.__PASEO_INITIAL_HOSTS__` before the app bundle to supply a shared host catalogue.
+The app validates the existing stored-host schema and registers those identities before connecting,
+so an offline daemon cannot disappear because discovery timed out. Catalogue order and managed
+connection routes are authoritative; browser-only hosts, saved credentials and host presentation
+remain local. Native and Electron clients do not consume the catalogue. Relay connection metadata
+belongs in private deployment material, never a public export. Browser theme, sidebar filters and
+manual ordering remain separate browser preferences.
+
 Consumers request directory or timeline data without choosing memory, cache, or network. The owner
 publishes an accepted cache hit and then reconciles it over the existing network path. A miss or an
 invalid row uses that same path. Offline demand still publishes an accepted cache hit and defers
