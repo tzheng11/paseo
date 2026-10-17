@@ -1,5 +1,5 @@
-import { EventEmitter } from "node:events";
-import type { ChildProcess } from "node:child_process";
+import { ChildProcess } from "node:child_process";
+import { PassThrough } from "node:stream";
 import type {
   Options,
   Query,
@@ -34,10 +34,19 @@ function createQueryMock(events: unknown[]): Query {
   } as Query;
 }
 
-function createChildProcessStub(): ChildProcess {
-  const child = new EventEmitter() as ChildProcess;
-  child.stderr = new EventEmitter() as ChildProcess["stderr"];
-  return child;
+class StubClaudeChild extends ChildProcess {
+  constructor() {
+    super();
+    this.stdin = new PassThrough();
+    this.stdout = new PassThrough();
+    this.stderr = new PassThrough();
+  }
+
+  override kill(signal?: NodeJS.Signals | number): boolean {
+    this.signalCode = typeof signal === "string" ? signal : "SIGTERM";
+    this.emit("exit", null, this.signalCode);
+    return true;
+  }
 }
 
 describe("Claude spawn override", () => {
@@ -73,7 +82,7 @@ describe("Claude spawn override", () => {
         },
       ]);
     });
-    const spawnSpy = vi.spyOn(spawnUtils, "spawnProcess").mockReturnValue(createChildProcessStub());
+    const spawnSpy = vi.spyOn(spawnUtils, "spawnProcess").mockReturnValue(new StubClaudeChild());
     const client = new ClaudeAgentClient({
       logger: createTestLogger(),
       queryFactory,

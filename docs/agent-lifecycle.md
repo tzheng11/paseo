@@ -21,6 +21,29 @@ the claim is held. Active permission requests and native subagents also prevent
 the reload. The client checks the host capability before sending the namespaced
 request; older hosts receive no reload request and require an update.
 
+Credential rotation additionally uses `--preserve-history --operation-id UUID`, gated by
+`credentialReloadOperations`. Rotation may revisit hundreds of long-lived Claude and Codex chats;
+replaying their native history into Paseo again can outlive a CLI acknowledgement and recreate a
+writer backlog. Maintenance retains Paseo's committed timeline. Codex resumes with metadata only,
+requiring its paginated-history protocol (0.159.2 or newer). Claude starts a fresh query and waits
+for control readiness without sending a prompt; daemon-side transcript hydration waits for an
+explicit history or rewind request, or the next user turn. Other providers fail closed.
+
+Idle-only reload also checks provider-owned background work. Claude's background shells do not
+appear in the subagent catalogue, so their process-level activity signal participates in admission.
+History and rewind still read real provider records when requested.
+
+An RPC timeout is not evidence that a reload failed. Callers persist an operation UUID before
+dispatch and reconcile it through `agent reload-status UUID`. Receipts under
+`PASEO_HOME/reload-operations` commit before any session closure and survive socket loss.
+Only `completed` confirms registration of the replacement. A missing receipt is `unknown` with
+`NOT_FOUND`; the exact same UUID may be submitted again because admission deduplicates before
+mutation. A pending receipt left by a daemon restart becomes persisted `unknown` with
+`DAEMON_RESTARTED` and must not be replayed. Unreadable or corrupt storage is an error, never absence.
+Unconfirmed child cleanup is also `unknown`; callers must hold it for inspection. Refusal means
+the runtime was not changed. Do not infer completion from the agent being idle or mint a new UUID
+to bypass an uncertain operation.
+
 ## Runtime residency
 
 An unarchived agent may be `closed` without being deleted or archived. Closing releases its provider

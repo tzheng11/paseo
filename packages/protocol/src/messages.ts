@@ -1853,6 +1853,14 @@ export const RefreshAgentRequestMessageSchema = z.object({
 // refresh that interrupts a newly started turn.
 export const ReloadIdleAgentRequestMessageSchema = RefreshAgentRequestMessageSchema.extend({
   type: z.literal("agent.reload_idle.request"),
+  operationId: z.string().optional(),
+  preserveHistory: z.boolean().optional(),
+});
+
+export const GetAgentReloadOperationRequestMessageSchema = z.object({
+  type: z.literal("agent.reload_idle.get_operation.request"),
+  operationId: z.string(),
+  requestId: z.string(),
 });
 
 export const CancelAgentRequestMessageSchema = z.object({
@@ -3346,6 +3354,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   ImportAgentRequestMessageSchema,
   RefreshAgentRequestMessageSchema,
   ReloadIdleAgentRequestMessageSchema,
+  GetAgentReloadOperationRequestMessageSchema,
   CancelAgentRequestMessageSchema,
   ShutdownServerRequestMessageSchema,
   RestartServerRequestMessageSchema,
@@ -3646,6 +3655,7 @@ export const ServerInfoStatusPayloadSchema = z
         workspaceRequestReceipts: z.boolean().optional(),
         creationLifecycle: z.boolean().optional(),
         boundedTimelineHistory: z.boolean().optional(),
+        credentialReloadOperations: z.boolean().optional(),
         // COMPAT(hubAgentRpc): added in v0.8.0; remove gate after 2027-03-05.
         hubAgentRpc: z.boolean().optional(),
         // COMPAT(internalAgents): added in v0.9.0; remove gate after 2027-03-17.
@@ -3897,6 +3907,34 @@ export const AgentRefreshedStatusPayloadSchema = z
 export const ReloadIdleAgentResponseMessageSchema = z.object({
   type: z.literal("agent.reload_idle.response"),
   payload: AgentRefreshedStatusPayloadSchema,
+});
+
+export const AgentReloadOperationSchema = z.object({
+  operationId: z.string(),
+  agentId: z.string(),
+  status: z.enum(["pending", "completed", "refused", "failed", "unknown"]),
+  reasonCode: z.string().optional(),
+  reason: z.string().optional(),
+  retryable: z.boolean().optional(),
+});
+export type AgentReloadOperation = z.infer<typeof AgentReloadOperationSchema>;
+
+// Credential maintenance uses a separate response so ordinary idle reloads keep
+// their timeline-bearing response unchanged.
+export const ReloadIdleAgentOperationResponseMessageSchema = z.object({
+  type: z.literal("agent.reload_idle.operation.response"),
+  payload: z.object({
+    requestId: z.string(),
+    operation: AgentReloadOperationSchema,
+  }),
+});
+
+export const GetAgentReloadOperationResponseMessageSchema = z.object({
+  type: z.literal("agent.reload_idle.get_operation.response"),
+  payload: z.object({
+    requestId: z.string(),
+    operation: AgentReloadOperationSchema.nullable(),
+  }),
 });
 
 export const RestartRequestedStatusPayloadSchema = z.object({
@@ -7081,6 +7119,8 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   AgentDetachResponseMessageSchema,
   AgentRewindResponseMessageSchema,
   ReloadIdleAgentResponseMessageSchema,
+  ReloadIdleAgentOperationResponseMessageSchema,
+  GetAgentReloadOperationResponseMessageSchema,
   UpdateAgentResponseMessageSchema,
   ProjectRenameResponseSchema,
   ProjectIconSetResponseSchema,

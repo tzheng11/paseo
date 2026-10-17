@@ -30,6 +30,7 @@ import type { ToolPolicy } from "@getpaseo/protocol/agent-types";
 import type { ProviderPaseoToolsPolicy } from "@getpaseo/protocol/provider-config";
 import { z } from "zod";
 import type { TerminalManager } from "../../terminal/terminal-manager.js";
+import type { ReloadOperationStore, ReloadOperation } from "./reload-operation-store.js";
 
 import {
   getAgentStreamEventTurnId,
@@ -148,6 +149,10 @@ const IDLE_RELOAD_ERRORS = {
     message: "Idle-only reload requires a loaded, unarchived idle agent",
   },
 } as const;
+
+function reloadResumeOptions(preserveHistory?: boolean): AgentResumeSessionOptions | undefined {
+  return preserveHistory ? { purpose: "maintenance" } : undefined;
+}
 
 export class AgentIdleReloadError extends Error {
   readonly code: string;
@@ -355,6 +360,7 @@ export interface CreateAgentOptions {
 }
 
 export interface AgentManagerOptions {
+  reloadOperations?: ReloadOperationStore;
   pluginLifecycle?: PluginLifecycle;
   /** An internal workspace makes every agent created inside it internal. */
   clients?: ProviderClientMap;
@@ -808,6 +814,7 @@ export interface RetiredInternalAgent {
 }
 
 export class AgentManager {
+  private readonly reloadOperations?: ReloadOperationStore;
   private readonly pluginLifecycle: PluginLifecycle | undefined;
   private readonly retiredInternalAgents = new Map<
     string,
@@ -858,6 +865,7 @@ export class AgentManager {
   private acceptingAgentRegistrations = true;
 
   constructor(options: AgentManagerOptions) {
+    this.reloadOperations = options.reloadOperations;
     this.timelineStore = options.timelineStore ?? new InMemoryAgentTimelineStore();
     this.pluginLifecycle = options.pluginLifecycle;
     this.idFactory = options.idFactory ?? (() => randomUUID());
@@ -1638,7 +1646,7 @@ export class AgentManager {
       undefined,
       {
         reason: "resume",
-        purpose,
+        purpose: purpose === "maintenance" ? "interactive" : purpose,
         workspaceId: options?.workspaceId ?? null,
       },
     );
@@ -1738,7 +1746,24 @@ export class AgentManager {
     }
   }
 
-  reloadIdleAgentSession(agentId: string): Promise<ManagedAgent> {
+  reloadAgentCredentials(agentId: string, operationId: string): Promise<ReloadOperation> {
+    if (!this.reloadOperations) throw new Error("Credential reload operation store is unavailable");
+    return this.reloadOperations.start(agentId, operationId, async () => {
+      const record = await this.registry?.get(agentId);
+      if (record?.archivedAt) throw new AgentIdleReloadError({ agentId, reason: "unavailable" });
+      await this.reloadIdleAgentSession(agentId, { preserveHistory: true });
+    });
+  }
+
+  getReloadOperation(operationId: string): Promise<ReloadOperation | null> {
+    if (!this.reloadOperations) throw new Error("Credential reload operation store is unavailable");
+    return this.reloadOperations.get(operationId);
+  }
+
+  reloadIdleAgentSession(
+    agentId: string,
+    options?: { preserveHistory?: boolean },
+  ): Promise<ManagedAgent> {
     if (this.idleReloads.has(agentId))
       return Promise.reject(new AgentIdleReloadError({ agentId, reason: "busy" }));
     return this.trackAgentRegistrationOperation(
@@ -1747,27 +1772,37 @@ export class AgentManager {
           throw new AgentIdleReloadError({ agentId, reason: "unavailable" });
         }
         const agent = this.requireSessionAgent(agentId);
-        const hasActiveRun = agent.lifecycle !== "idle" || this.hasInFlightRun(agentId);
+        if (options?.preserveHistory && !["codex", "claude"].includes(agent.provider)) {
+          throw new AgentIdleReloadError({ agentId, reason: "unavailable" });
+        }
+        const inactive =
+          agent.lifecycle === "idle" || (options?.preserveHistory && agent.lifecycle === "error");
+        const hasActiveRun =
+          !inactive || this.hasInFlightRun(agentId) || Boolean(agent.activeForegroundTurnId);
         const hasPendingPermission =
           agent.pendingPermissions.size > 0 || agent.inFlightPermissionResponses.size > 0;
         const hasRunningSubagent = this.providerSubagents
           .list(agentId)
           .some((child) => child.status === "running");
+        const hasBackgroundTasks = agent.session.hasActiveBackgroundTasks?.() === true;
         if (
           this.idleReloads.has(agentId) ||
           hasActiveRun ||
           hasPendingPermission ||
-          hasRunningSubagent
+          hasRunningSubagent ||
+          hasBackgroundTasks
         ) {
           return Promise.reject(new AgentIdleReloadError({ agentId, reason: "busy" }));
         }
         // Claim synchronously before any I/O. streamAgent checks the same claim.
         this.idleReloads.add(agentId);
         return this.reloadAgentSessionInternal(agentId, undefined, {
-          rehydrateFromDisk: true,
+          rehydrateFromDisk: !options?.preserveHistory,
+          preserveHistory: options?.preserveHistory,
         })
           .then(async (snapshot) => {
-            await this.hydrateTimelineFromProvider(agentId, { broadcast: true });
+            if (!options?.preserveHistory)
+              await this.hydrateTimelineFromProvider(agentId, { broadcast: true });
             return snapshot;
           })
           .finally(() => {
@@ -1786,7 +1821,7 @@ export class AgentManager {
   reloadAgentSession(
     agentId: string,
     overrides?: Partial<AgentSessionConfig>,
-    options?: { rehydrateFromDisk?: boolean },
+    options?: { rehydrateFromDisk?: boolean; preserveHistory?: boolean },
   ): Promise<ManagedAgent> {
     return this.trackAgentRegistrationOperation(
       this.runLifecycleMutation(agentId, () =>
@@ -1798,7 +1833,7 @@ export class AgentManager {
   private async reloadAgentSessionInternal(
     agentId: string,
     overrides?: Partial<AgentSessionConfig>,
-    options?: { rehydrateFromDisk?: boolean },
+    options: { rehydrateFromDisk?: boolean; preserveHistory?: boolean } = {},
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     let existing = this.requireSessionAgent(agentId);
@@ -1806,7 +1841,7 @@ export class AgentManager {
       await this.cancelAgentRunBefore(agentId, "reload");
       existing = this.requireSessionAgent(agentId);
     }
-    const rehydrateFromDisk = options?.rehydrateFromDisk ?? false;
+    const rehydrateFromDisk = options.rehydrateFromDisk ?? false;
     const preservedHistoryPrimed = existing.historyPrimed;
     const preservedLastUsage = existing.lastUsage;
     const preservedLastError = existing.lastError;
@@ -1846,7 +1881,7 @@ export class AgentManager {
     let handedToRegistration = false;
     try {
       // A persisted thread can have only one writer, even when its turn is idle.
-      await this.closeReloadedSession(existing.session, agentId);
+      await this.closeReloadedSession(existing.session, agentId, options.preserveHistory);
       await this.drainSessionEvents(agentId);
       this.cancelRunningProviderSubagents(agentId);
       closedExisting = this.prepareAgentForClosure(existing, "agent reloaded");
@@ -1855,7 +1890,12 @@ export class AgentManager {
 
       this.paseoToolPolicies.set(agentId, paseoToolPolicy);
       session = handle
-        ? await client.resumeSession(handle, providerLaunchConfig, launchContext)
+        ? await client.resumeSession(
+            handle,
+            providerLaunchConfig,
+            launchContext,
+            reloadResumeOptions(options.preserveHistory),
+          )
         : await client.createSession(providerLaunchConfig, launchContext);
       await this.requireExternalMcpSupport(session, storedConfig);
       this.assertAcceptingAgentRegistrations();
@@ -1883,6 +1923,7 @@ export class AgentManager {
         lastError: preservedLastError,
         attention: preservedAttention,
         restoring: true,
+        maintenanceReload: options.preserveHistory,
       });
     } catch (error) {
       if (closedExisting) {
@@ -1901,13 +1942,17 @@ export class AgentManager {
           this.paseoToolPolicies.delete(agentId);
         }
         if (session) {
-          await this.closeUnregisteredSession(session);
+          await this.closeUnregisteredSession(session, options.preserveHistory);
         }
       }
     }
   }
 
-  private async closeReloadedSession(session: AgentSession, agentId: string): Promise<void> {
+  private async closeReloadedSession(
+    session: AgentSession,
+    agentId: string,
+    maintenance = false,
+  ): Promise<void> {
     let operation = this.reloadedSessionCloses.get(session);
     if (!operation) {
       operation = session.close();
@@ -1924,9 +1969,18 @@ export class AgentManager {
           "Previous session close failed after refresh timeout",
         );
       },
+    }).catch((cause) => {
+      if (maintenance)
+        throw Object.assign(
+          new Error("Credential reload previous child cleanup could not be confirmed", { cause }),
+          { code: "reload_cleanup_unconfirmed" },
+        );
+      throw cause;
     });
     if (result === "timed_out") {
-      throw new Error("Timed out closing previous session during refresh");
+      const error = new Error("Timed out closing previous session during refresh");
+      if (maintenance) Object.assign(error, { code: "reload_cleanup_unconfirmed" });
+      throw error;
     }
   }
 
@@ -3807,6 +3861,7 @@ export class AgentManager {
       timelineNextSeq?: number;
       persistence?: AgentPersistenceHandle;
       historyPrimed?: boolean;
+      maintenanceReload?: boolean;
       lastUsage?: AgentUsage;
       lastError?: string;
       attention?: AttentionState;
@@ -3901,13 +3956,27 @@ export class AgentManager {
       this.subscribeToSession(managed);
       return { ...managed };
     } catch (error) {
-      if (!registered) {
-        await this.closeUnregisteredSession(session);
-      }
-      throw error;
+      return this.failRegistration(session, registered, Boolean(options?.maintenanceReload), error);
     } finally {
       await startupHistory?.close();
     }
+  }
+
+  private async failRegistration(
+    session: AgentSession,
+    registered: boolean,
+    maintenance: boolean,
+    error: unknown,
+  ): Promise<never> {
+    if (!registered) await this.closeUnregisteredSession(session, maintenance);
+    if (maintenance && registered)
+      throw Object.assign(
+        new Error("Credential reload registration outcome could not be confirmed", {
+          cause: error,
+        }),
+        { code: "reload_registration_unconfirmed" },
+      );
+    throw error;
   }
 
   private assertAcceptingAgentRegistrations(): void {
@@ -3922,10 +3991,18 @@ export class AgentManager {
     }
   }
 
-  private async closeUnregisteredSession(session: AgentSession): Promise<void> {
+  private async closeUnregisteredSession(
+    session: AgentSession,
+    requireConfirmed = false,
+  ): Promise<void> {
     try {
       await session.close();
     } catch (error) {
+      if (requireConfirmed)
+        throw Object.assign(
+          new Error("Credential reload child cleanup could not be confirmed", { cause: error }),
+          { code: "reload_cleanup_unconfirmed" },
+        );
       this.logger.warn({ err: error }, "Failed to close unregistered agent session");
     }
   }

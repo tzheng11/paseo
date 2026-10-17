@@ -643,7 +643,7 @@ export interface AgentCreateSessionOptions {
 }
 
 /** What a resumed session is for: driving the agent, or reading what it already did. */
-export type AgentResumePurpose = "interactive" | "history";
+export type AgentResumePurpose = "interactive" | "history" | "maintenance";
 
 /** Runtime-only intent for a persisted-session resume. Never persist this option. */
 export interface AgentResumeSessionOptions {
@@ -704,6 +704,8 @@ export interface AgentSession {
   getCurrentMode(): Promise<string | null>;
   setMode(modeId: string): Promise<void | AgentProviderNotice>;
   getPendingPermissions(): AgentPermissionRequest[];
+  /** Provider-owned background work that closing this runtime would terminate. */
+  hasActiveBackgroundTasks?(): boolean;
   respondToPermission(
     requestId: string,
     response: AgentPermissionResponse,

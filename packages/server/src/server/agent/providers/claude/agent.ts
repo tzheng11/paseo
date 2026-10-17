@@ -11,7 +11,6 @@ import {
   type PermissionMode,
   type PermissionResult,
   type PermissionUpdate,
-  type Query,
   type SDKMessage,
   type SDKPartialAssistantMessage,
   type SDKResultMessage,
@@ -46,6 +45,7 @@ import { parsePartialJsonObject } from "./partial-json.js";
 import { ClaudeSidechainTracker } from "./sidechain-tracker.js";
 import { readClaudeSubagentHandback } from "./subagent-handback.js";
 import { ClaudeTaskState } from "./task-state.js";
+import { ClaudeBackgroundTasks } from "./background-tasks.js";
 import {
   ClaudeTaskProtocolSource,
   type ClaudeHookObservationInput,
@@ -77,7 +77,12 @@ import {
 } from "./options.js";
 import { renderPromptAttachmentAsText } from "../../prompt-attachments.js";
 import { discoverClaudeModels } from "./model-discovery.js";
-import { claudeQuery, type ClaudeOptions, type ClaudeQueryFactory } from "./query.js";
+import {
+  claudeQuery,
+  type ClaudeOptions,
+  type ClaudeQuery,
+  type ClaudeQueryFactory,
+} from "./query.js";
 import {
   realClaudeRewindSdk,
   revertClaudeConversation,
@@ -114,6 +119,7 @@ import {
   type AgentPromptInput,
   type AgentRunOptions,
   type AgentRunResult,
+  type AgentResumeSessionOptions,
   type AgentSession,
   type AgentSessionConfig,
   type AgentSlashCommand,
@@ -145,8 +151,8 @@ import {
   type ResolvedProviderLaunch,
 } from "../../provider-launch-config.js";
 import { withTimeout } from "../../../../utils/promise-timeout.js";
-import { terminateWithTreeKill } from "../../../../utils/tree-kill.js";
-import { execCommand } from "../../../../utils/spawn.js";
+import { terminateWithTreeKill, type ProcessTerminator } from "../../../../utils/tree-kill.js";
+import { execCommand, spawnProcess } from "../../../../utils/spawn.js";
 import { composeSystemPromptParts } from "../../system-prompt.js";
 
 const fsPromises = promises;
@@ -418,6 +424,8 @@ interface ClaudeAgentClientOptions {
   logger: Logger;
   runtimeSettings?: ProviderRuntimeSettings;
   queryFactory?: ClaudeQueryFactory;
+  spawnProcess?: typeof spawnProcess;
+  terminateProcess?: ProcessTerminator;
   resolveBinary?: () => Promise<string>;
   resolveVersion?: (signal?: AbortSignal) => Promise<string>;
   rewindSdk?: ClaudeRewindSdk;
@@ -430,8 +438,11 @@ interface ClaudeAgentSessionOptions {
   agentId?: string;
   launchEnv?: Record<string, string>;
   persistSession?: boolean;
+  deferHistory?: boolean;
   logger: Logger;
   queryFactory?: ClaudeQueryFactory;
+  spawnProcess?: typeof spawnProcess;
+  terminateProcess?: ProcessTerminator;
   resolveBinary: () => Promise<string>;
   rewindSdk?: ClaudeRewindSdk;
 }
@@ -1524,6 +1535,8 @@ export class ClaudeAgentClient implements AgentClient {
   private readonly logger: Logger;
   private readonly runtimeSettings?: ProviderRuntimeSettings;
   private readonly queryFactory?: ClaudeQueryFactory;
+  private readonly spawnProcess: typeof spawnProcess;
+  private readonly terminateProcess: ProcessTerminator;
   private readonly resolveBinary: () => Promise<string>;
   private readonly resolveVersion: (signal?: AbortSignal) => Promise<string>;
   private readonly rewindSdk: ClaudeRewindSdk;
@@ -1534,6 +1547,8 @@ export class ClaudeAgentClient implements AgentClient {
     this.logger = options.logger.child({ module: "agent", provider: "claude" });
     this.runtimeSettings = options.runtimeSettings;
     this.queryFactory = options.queryFactory;
+    this.spawnProcess = options.spawnProcess ?? spawnProcess;
+    this.terminateProcess = options.terminateProcess ?? terminateWithTreeKill;
     this.resolveBinary = options.resolveBinary ?? (() => resolveClaudeBinary(this.runtimeSettings));
     this.resolveVersion =
       options.resolveVersion ??
@@ -1559,6 +1574,8 @@ export class ClaudeAgentClient implements AgentClient {
       persistSession: options?.persistSession,
       logger: this.logger,
       queryFactory: this.queryFactory,
+      spawnProcess: this.spawnProcess,
+      terminateProcess: this.terminateProcess,
       resolveBinary: this.resolveBinary,
       rewindSdk: this.rewindSdk,
     });
@@ -1568,6 +1585,7 @@ export class ClaudeAgentClient implements AgentClient {
     handle: AgentPersistenceHandle,
     overrides?: Partial<AgentSessionConfig>,
     launchContext?: AgentLaunchContext,
+    options?: AgentResumeSessionOptions,
   ): Promise<AgentSession> {
     const metadata = coerceSessionMetadata(handle.metadata);
     const merged: Partial<AgentSessionConfig> = { ...metadata, ...overrides };
@@ -1580,17 +1598,22 @@ export class ClaudeAgentClient implements AgentClient {
       cwd: merged.cwd,
     };
     const claudeConfig = this.assertConfig(mergedConfig);
-    return new ClaudeAgentSession(claudeConfig, {
+    const session = new ClaudeAgentSession(claudeConfig, {
       defaults: this.defaults,
       runtimeSettings: this.runtimeSettings,
       handle,
+      deferHistory: options?.purpose === "maintenance",
       agentId: launchContext?.agentId,
       launchEnv: launchContext?.env,
       logger: this.logger,
       queryFactory: this.queryFactory,
+      spawnProcess: this.spawnProcess,
+      terminateProcess: this.terminateProcess,
       resolveBinary: this.resolveBinary,
       rewindSdk: this.rewindSdk,
     });
+    if (options?.purpose === "maintenance") await session.initializeMaintenance();
+    return session;
   }
 
   async getCatalogCacheKey(_options: FetchCatalogOptions): Promise<string> {
@@ -2105,14 +2128,18 @@ class ClaudeAgentSession implements AgentSession {
   private readonly persistSession?: boolean;
   private readonly logger: Logger;
   private readonly queryFactory?: ClaudeQueryFactory;
+  private readonly spawnProcess: typeof spawnProcess;
+  private readonly terminateProcess: ProcessTerminator;
   private readonly resolveBinary: () => Promise<string>;
-  private query: Query | null = null;
+  private query: ClaudeQuery | null = null;
+  private queryAbortController: AbortController | null = null;
+  private deferredHistorySessionId: string | null = null;
   private readonly harnessEnvironment: Record<string, string>;
   private readonly usageSessionKey = randomUUID();
   private childProcess: ChildProcess | null = null;
   private input: AsyncMessageInput<SDKUserMessage> | null = null;
   /** The exact SDK query/input pair that owns the current foreground turn. */
-  private activeForegroundQuery: Query | null = null;
+  private activeForegroundQuery: ClaudeQuery | null = null;
   private activeForegroundInput: AsyncMessageInput<SDKUserMessage> | null = null;
   /**
    * Messages pushed into the live SDK input (steers, and a foreground turn's own prompt) whose
@@ -2138,6 +2165,7 @@ class ClaudeAgentSession implements AgentSession {
   private readonly subscribers = new Set<(event: AgentStreamEvent) => void>();
   private readonly timelineAssembler = new TimelineAssembler();
   private readonly taskState = new ClaudeTaskState();
+  private readonly backgroundTasks = new ClaudeBackgroundTasks();
   private readonly taskProtocolSource = new ClaudeTaskProtocolSource({
     getToolInput: (toolUseId) => this.toolUseCache.get(toolUseId)?.input ?? null,
     readWorkflowResult: readClaudeWorkflowResultFile,
@@ -2200,6 +2228,8 @@ class ClaudeAgentSession implements AgentSession {
     this.persistSession = options.persistSession;
     this.logger = options.logger.child({ agentId: this.agentId });
     this.queryFactory = options.queryFactory;
+    this.spawnProcess = options.spawnProcess ?? spawnProcess;
+    this.terminateProcess = options.terminateProcess ?? terminateWithTreeKill;
     this.resolveBinary = options.resolveBinary;
     this.rewindSdk = options.rewindSdk ?? realClaudeRewindSdk;
     this.contextUsage = new ClaudeContextUsageState(
@@ -2213,7 +2243,8 @@ class ClaudeAgentSession implements AgentSession {
       }
       this.claudeSessionId = handle.sessionId;
       this.persistence = handle;
-      this.loadPersistedHistory(handle.sessionId);
+      if (options.deferHistory) this.deferredHistorySessionId = handle.sessionId;
+      else this.loadPersistedHistory(handle.sessionId);
     } else {
       this.claudeSessionId = null;
       this.persistence = null;
@@ -2231,6 +2262,35 @@ class ClaudeAgentSession implements AgentSession {
     if (this.currentMode !== "plan") {
       this.planResumeMode = this.currentMode;
     }
+  }
+
+  async initializeMaintenance(): Promise<void> {
+    let startupSettled = false;
+    const startup = this.ensureQuery()
+      .then((query) => query.supportedCommands())
+      .finally(() => {
+        startupSettled = true;
+      });
+    try {
+      await withTimeout(startup, 30_000, "Claude credential reload startup exceeded 30000ms");
+      this.startQueryPump();
+    } catch (error) {
+      const startupUnconfirmed = !startupSettled && this.childProcess === null;
+      await this.close();
+      if (startupUnconfirmed) {
+        throw Object.assign(
+          new Error("Claude credential reload startup remains unconfirmed", { cause: error }),
+          {
+            code: "reload_startup_unconfirmed",
+          },
+        );
+      }
+      throw error;
+    }
+  }
+
+  hasActiveBackgroundTasks(): boolean {
+    return this.backgroundTasks.hasActive;
   }
 
   get id(): string | null {
@@ -2299,6 +2359,7 @@ class ClaudeAgentSession implements AgentSession {
     if (this.activeForegroundTurnId) {
       throw new Error("A foreground turn is already active");
     }
+    this.loadDeferredHistory();
 
     const slashCommand = this.resolveSlashCommandInvocation(prompt);
     if (slashCommand?.commandName === REWIND_COMMAND_NAME) {
@@ -2463,6 +2524,7 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+    this.loadDeferredHistory();
     if (
       !this.historyPending ||
       (this.persistedHistory.length === 0 && this.persistedProviderSubagentEvents.length === 0)
@@ -2599,7 +2661,7 @@ class ClaudeAgentSession implements AgentSession {
     await this.applyFastModeFeature(enabled);
   }
 
-  private async applyFastModeFeature(enabled: boolean, query?: Query): Promise<void> {
+  private async applyFastModeFeature(enabled: boolean, query?: ClaudeQuery): Promise<void> {
     this.config.featureValues = {
       ...this.config.featureValues,
       fast_mode: enabled,
@@ -2785,27 +2847,49 @@ class ClaudeAgentSession implements AgentSession {
     this.turnState = "idle";
     this.sidechainTracker.clear();
     this.taskProtocolSource.reset();
+    this.backgroundTasks.reset();
     this.input?.end();
-    this.query?.close?.();
-    await this.awaitWithTimeout(this.query?.interrupt?.(), "close query interrupt");
-    await this.awaitWithTimeout(this.query?.return?.(), "close query return");
+    this.queryAbortController?.abort();
+    try {
+      this.query?.close?.();
+    } catch (error) {
+      this.logger.warn({ err: error }, "Claude query close did not settle cleanly");
+    }
+    const query = this.query;
+    await this.awaitWithTimeout(
+      Promise.resolve().then(() => query?.interrupt?.()),
+      "close query interrupt",
+    );
+    await this.awaitWithTimeout(
+      Promise.resolve().then(() => query?.return?.()),
+      "close query return",
+    );
     this.query = null;
     this.input = null;
     // Terminate the entire process tree (claude + MCP children) to prevent
     // orphan accumulation. The SDK's internal cleanup may only kill the
     // direct child process.
     if (this.childProcess) {
-      const result = await terminateWithTreeKill(this.childProcess, {
-        gracefulTimeoutMs: 2_000,
-        forceTimeoutMs: 2_000,
-      });
-      if (result === "kill-timeout") {
-        this.logger.warn(
-          { pid: this.childProcess.pid, agentId: this.agentId },
-          "Claude process tree did not report exit after SIGKILL",
+      try {
+        const result = await withTimeout(
+          this.terminateProcess(this.childProcess, {
+            gracefulTimeoutMs: 2_000,
+            forceTimeoutMs: 2_000,
+          }),
+          5_000,
+          "Claude process cleanup exceeded 5000ms",
+        );
+        if (result === "kill-timeout")
+          throw new Error("Claude process did not report exit after SIGKILL");
+        this.childProcess = null;
+      } catch (error) {
+        throw Object.assign(
+          new Error("Claude child cleanup could not be confirmed", { cause: error }),
+          {
+            code: "reload_cleanup_unconfirmed",
+          },
         );
       }
-      this.childProcess = null;
     }
     if (this.persistSession === false && this.claudeSessionId) {
       // Claude Code currently ignores --no-session-persistence outside --print mode
@@ -2856,6 +2940,7 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   async revertConversation(input: { messageId: string }): Promise<void> {
+    this.loadDeferredHistory();
     const target = this.resolveConversationRewindTarget(input.messageId);
     if (target.kind === "fresh-session") {
       this.startFreshConversationSession();
@@ -3019,7 +3104,7 @@ class ClaudeAgentSession implements AgentSession {
     }
   }
 
-  private async ensureFreshQuery(): Promise<Query> {
+  private async ensureFreshQuery(): Promise<ClaudeQuery> {
     if (this.query) {
       this.queryRestartNeeded = true;
     }
@@ -3061,6 +3146,7 @@ class ClaudeAgentSession implements AgentSession {
     this.emittedUserMessageIds.clear();
     this.rewindTurnAnchors.length = 0;
     this.taskState.reset();
+    this.deferredHistorySessionId = null;
     this.loadPersistedHistory(sessionId);
     if (oldSessionId && oldSessionId !== sessionId) {
       this.dispatchEvents([
@@ -3082,6 +3168,7 @@ class ClaudeAgentSession implements AgentSession {
     const sessionId = randomUUID();
     this.claudeSessionId = sessionId;
     this.pendingFreshSessionId = sessionId;
+    this.deferredHistorySessionId = null;
     this.persistence = null;
     this.cachedRuntimeInfo = null;
     this.queryRestartNeeded = true;
@@ -3199,7 +3286,8 @@ class ClaudeAgentSession implements AgentSession {
     return { kind: "fresh-session" };
   }
 
-  private async ensureQuery(launchMode: PermissionMode = this.currentMode): Promise<Query> {
+  private async ensureQuery(launchMode: PermissionMode = this.currentMode): Promise<ClaudeQuery> {
+    if (this.closed) throw new Error("Claude session is closed");
     if (this.query && !this.queryRestartNeeded) {
       return this.query;
     }
@@ -3207,6 +3295,8 @@ class ClaudeAgentSession implements AgentSession {
     if (this.queryRestartNeeded && this.query) {
       const oldQuery = this.query;
       const oldInput = this.input;
+      const oldAbortController = this.queryAbortController;
+      this.queryAbortController = null;
       // Null out query/input BEFORE awaiting the old iterator's return so the
       // old pump sees this.query !== activeQuery and skips failActiveTurns.
       this.query = null;
@@ -3219,6 +3309,7 @@ class ClaudeAgentSession implements AgentSession {
       this.childProcess = null;
       if (retiredChild) this.failRunningRuntimeTasks();
       oldInput?.end();
+      oldAbortController?.abort();
       oldQuery.close?.();
       try {
         await oldQuery.return?.();
@@ -3229,7 +3320,7 @@ class ClaudeAgentSession implements AgentSession {
       // If we skip this, MCP children of the previous claude process can
       // survive as orphans when the session spawns a replacement query.
       if (retiredChild) {
-        await terminateWithTreeKill(retiredChild, {
+        await this.terminateProcess(retiredChild, {
           gracefulTimeoutMs: 2_000,
           forceTimeoutMs: 2_000,
         }).catch(() => {
@@ -3244,9 +3335,14 @@ class ClaudeAgentSession implements AgentSession {
 
     const input = createAsyncMessageInput<SDKUserMessage>();
     const options = await this.buildOptions(launchMode);
+    if (this.closed) {
+      input.end();
+      throw new Error("Claude session is closed");
+    }
+    this.queryAbortController = new AbortController();
+    options.abortController = this.queryAbortController;
     this.logger.debug({ options: summarizeClaudeOptionsForLog(options) }, "claude query");
     this.input = input;
-    // A fresh Claude process has no turn of its own in flight.
     this.mainTurnInFlight = false;
     this.query = claudeQuery(
       { prompt: input.iterable, options },
@@ -3254,7 +3350,12 @@ class ClaudeAgentSession implements AgentSession {
         runtimeSettings: this.runtimeSettings,
         launchEnv: this.launchEnv,
         queryFactory: this.queryFactory,
+        spawnProcess: this.spawnProcess,
         onChildProcess: (child) => {
+          // @anthropic-ai/claude-agent-sdk/sdk.d.ts (0.3.246),
+          // SDKBackgroundTasksChangedMessage: a newly spawned CLI starts empty.
+          // Reusing or reinitializing an existing query never resets membership.
+          if (this.childProcess !== child) this.backgroundTasks.reset();
           this.childProcess = child;
           child.once("exit", (code, signal) => this.handleRuntimeExit(child, code, signal));
         },
@@ -3268,6 +3369,7 @@ class ClaudeAgentSession implements AgentSession {
     // supportedCommands()/setPermissionMode() may execute immediately after
     // ensureQuery() (for listCommands()/setMode()), and sharing the same query
     // control plane can cause those calls to wait behind supportedModels().
+    if (this.closed) throw new Error("Claude session is closed");
     return this.query;
   }
 
@@ -3809,6 +3911,7 @@ class ClaudeAgentSession implements AgentSession {
       return;
     }
     this.childProcess = null;
+    this.backgroundTasks.reset();
     this.logger.warn(
       { agentId: this.agentId, pid: child.pid, code, signal },
       "Claude runtime exited unexpectedly",
@@ -3866,7 +3969,7 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   private async runQueryPump(): Promise<void> {
-    let activeQuery: Query;
+    let activeQuery: ClaudeQuery;
     try {
       activeQuery = await this.ensureQuery();
     } catch (error) {
@@ -3902,6 +4005,7 @@ class ClaudeAgentSession implements AgentSession {
     };
     const handlePumpedMessage = async (message: SDKMessage): Promise<boolean> => {
       logRawMessage(message);
+      this.backgroundTasks.observe(message);
       consecutiveInterruptAbortRecoveries = 0;
       if (await this.handleMissingResumedConversation(message, activeQuery)) {
         return true;
@@ -4123,7 +4227,7 @@ class ClaudeAgentSession implements AgentSession {
 
   private async handleMissingResumedConversation(
     message: SDKMessage,
-    activeQuery: Query,
+    activeQuery: ClaudeQuery,
   ): Promise<boolean> {
     const staleResumeError = this.readMissingResumedConversationError(message);
     if (!staleResumeError) {
@@ -4150,7 +4254,7 @@ class ClaudeAgentSession implements AgentSession {
     // Tree-kill for the same reason the restart path does: MCP children of the
     // retired claude process outlive it otherwise.
     if (retiredChild) {
-      await terminateWithTreeKill(retiredChild, {
+      await this.terminateProcess(retiredChild, {
         gracefulTimeoutMs: 2_000,
         forceTimeoutMs: 2_000,
       }).catch(() => {
@@ -4220,7 +4324,7 @@ class ClaudeAgentSession implements AgentSession {
    * resuming it. One already dequeued cannot be recalled, and does not need to be, since the
    * interrupt kills it. Returns whether Claude confirmed every message withdrawn.
    */
-  private async withdrawUnstartedMessages(query: Query): Promise<boolean> {
+  private async withdrawUnstartedMessages(query: ClaudeQuery): Promise<boolean> {
     const uuids = [...this.unstartedMessageUuids];
     this.unstartedMessageUuids.clear();
     this.permissionClearingSteerUuids.clear();
@@ -4228,7 +4332,7 @@ class ClaudeAgentSession implements AgentSession {
     // The SDK runtime supports this, but its public Query type has not caught up. Keep the
     // compatibility escape hatch inside the Claude adapter.
     const cancelAsyncMessage = (
-      query as Query & {
+      query as ClaudeQuery & {
         cancelAsyncMessage?: (uuid: string) => Promise<boolean>;
       }
     ).cancelAsyncMessage;
@@ -5059,6 +5163,12 @@ class ClaudeAgentSession implements AgentSession {
         resolution: { behavior: "deny", message: error.message },
       });
     }
+  }
+
+  private loadDeferredHistory(): void {
+    const sessionId = this.deferredHistorySessionId;
+    this.deferredHistorySessionId = null;
+    if (sessionId) this.loadPersistedHistory(sessionId);
   }
 
   private loadPersistedHistory(sessionId: string): void {

@@ -19,6 +19,7 @@ import {
   type ManagedAgent,
 } from "./agent-manager.js";
 import { AgentStorage } from "./agent-storage.js";
+import { ReloadOperationStore } from "./reload-operation-store.js";
 import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 import { DiskAgentTimelineStore } from "./disk-agent-timeline-store.js";
 import { AgentHistoryReplay } from "./agent-history-replay.js";
@@ -446,7 +447,7 @@ class EnvProbeAgentClient extends TestAgentClient {
 }
 
 class TestAgentSession implements AgentSession {
-  readonly provider = "codex" as const;
+  readonly provider: AgentProvider = "codex";
   readonly capabilities = TEST_CAPABILITIES;
   readonly id = randomUUID();
   private runtimeModel: string | null = null;
@@ -12549,5 +12550,228 @@ test("idle-only reload releases turn admission after history replay fails", asyn
     expect(manager.getTimeline(agent.id)).toEqual([{ type: "user_message", text: "after reload" }]);
   } finally {
     await fixture.cleanup();
+  }
+});
+
+test.each(["codex", "claude"] as const)(
+  "maintenance reload preserves %s committed history without provider replay",
+  async (provider) => {
+    const workdir = mkdtempSync(join(tmpdir(), "maintenance-reload-"));
+    const replay = vi.fn();
+    const resume = vi.fn();
+    class MaintenanceSession extends TestAgentSession {
+      override readonly provider = provider;
+      override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+        replay();
+        yield {
+          type: "timeline",
+          provider,
+          item: { type: "assistant_message", text: "unexpected replay" },
+        };
+        throw new Error("Maintenance must not replay history");
+      }
+    }
+    class MaintenanceClient extends TestAgentClient {
+      override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+        return new MaintenanceSession(config);
+      }
+      override async resumeSession(
+        _handle: AgentPersistenceHandle,
+        config?: Partial<AgentSessionConfig>,
+        _context?: AgentLaunchContext,
+        options?: AgentResumeSessionOptions,
+      ): Promise<AgentSession> {
+        resume(options);
+        return new MaintenanceSession({ provider, cwd: config?.cwd ?? workdir });
+      }
+    }
+    const manager = new AgentManager({
+      clients: { [provider]: new MaintenanceClient(provider) },
+      logger,
+    });
+    const agent = await manager.createAgent({ provider, cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    try {
+      await manager.appendTimelineItem(agent.id, {
+        type: "assistant_message",
+        text: "retained history",
+      });
+      const before = manager.getTimeline(agent.id);
+      const epoch = manager.getTimelineEpoch(agent.id);
+      await manager.reloadIdleAgentSession(agent.id, { preserveHistory: true });
+      expect(resume).toHaveBeenCalledWith({ purpose: "maintenance" });
+      expect(replay).not.toHaveBeenCalled();
+      expect(manager.getTimeline(agent.id)).toEqual(before);
+      expect(manager.getTimelineEpoch(agent.id)).toBe(epoch);
+      await manager.runAgent(agent.id, "continue working");
+      expect(manager.getAgent(agent.id)?.lifecycle).toBe("idle");
+      expect(replay).not.toHaveBeenCalled();
+    } finally {
+      await manager.closeAgent(agent.id);
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
+
+test("maintenance reload refuses native background children and pending permissions without closing", async () => {
+  const client = new SessionRecordingAgentClient();
+  const manager = new AgentManager({ clients: { codex: client }, logger });
+  const agent = await manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
+    workspaceId: undefined,
+  });
+  const session = client.sessions[0];
+  const close = vi.spyOn(session, "close");
+  try {
+    session.pushEvent({
+      type: "provider_subagent",
+      provider: "codex",
+      event: { type: "upsert", id: "child", status: "running" },
+    });
+    await vi.waitFor(() => expect(manager.listProviderSubagents(agent.id)).toHaveLength(1));
+    await expect(
+      manager.reloadIdleAgentSession(agent.id, { preserveHistory: true }),
+    ).rejects.toMatchObject({ code: "agent_reload_busy" });
+    session.pushEvent({
+      type: "provider_subagent",
+      provider: "codex",
+      event: { type: "upsert", id: "child", status: "completed" },
+    });
+    session.pushEvent({
+      type: "permission_requested",
+      provider: "codex",
+      request: { id: "permission", provider: "codex", kind: "tool", name: "Read file" },
+    });
+    await vi.waitFor(() => expect(manager.getAgent(agent.id)?.pendingPermissions.size).toBe(1));
+    await expect(
+      manager.reloadIdleAgentSession(agent.id, { preserveHistory: true }),
+    ).rejects.toMatchObject({ code: "agent_reload_busy" });
+    expect(close).not.toHaveBeenCalled();
+  } finally {
+    await manager.closeAgent(agent.id);
+  }
+});
+
+test("credential reload receipt stays pending through registration and lost ACK retries spawn once", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "credential-operation-"));
+  const started = deferred<void>();
+  const proceed = deferred<void>();
+  const resumed = vi.fn();
+  class CredentialClient extends TestAgentClient {
+    override async resumeSession(
+      _handle: AgentPersistenceHandle,
+      config?: Partial<AgentSessionConfig>,
+    ): Promise<AgentSession> {
+      resumed();
+      started.resolve();
+      await proceed.promise;
+      return new TestAgentSession({ provider: "codex", cwd: config?.cwd ?? workdir });
+    }
+  }
+  const manager = new AgentManager({
+    clients: { codex: new CredentialClient() },
+    logger,
+    registry: new AgentStorage(join(workdir, "agents"), logger),
+    reloadOperations: new ReloadOperationStore(join(workdir, "operations"), logger),
+  });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  try {
+    expect(await manager.reloadAgentCredentials(agent.id, "intent")).toMatchObject({
+      status: "pending",
+    });
+    await started.promise;
+    expect(await manager.getReloadOperation("intent")).toMatchObject({ status: "pending" });
+    expect(await manager.reloadAgentCredentials(agent.id, "intent")).toMatchObject({
+      status: "pending",
+    });
+    expect(resumed).toHaveBeenCalledTimes(1);
+    await expect(manager.runAgent(agent.id, "too soon")).rejects.toMatchObject({
+      code: "agent_reload_in_progress",
+    });
+    proceed.resolve();
+    await vi.waitFor(async () =>
+      expect(await manager.getReloadOperation("intent")).toMatchObject({
+        status: "completed",
+        agentId: agent.id,
+      }),
+    );
+    expect(manager.getAgent(agent.id)?.lifecycle).toBe("idle");
+    expect(await manager.reloadAgentCredentials(agent.id, "intent")).toMatchObject({
+      status: "completed",
+    });
+    expect(resumed).toHaveBeenCalledTimes(1);
+  } finally {
+    proceed.resolve();
+    await manager.closeAgent(agent.id);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("credential reload cannot replace a writer whose old close failed", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "credential-close-"));
+  const resumed = vi.fn();
+  class FailingCloseClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new (class extends TestAgentSession {
+        override async close(): Promise<void> {
+          throw new Error("old writer remains");
+        }
+      })(config);
+    }
+    override async resumeSession(): Promise<AgentSession> {
+      resumed();
+      throw new Error("must not resume");
+    }
+  }
+  const manager = new AgentManager({
+    clients: { codex: new FailingCloseClient() },
+    logger,
+    reloadOperations: new ReloadOperationStore(join(workdir, "operations"), logger),
+  });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  try {
+    await manager.reloadAgentCredentials(agent.id, "intent");
+    await vi.waitFor(async () =>
+      expect(await manager.getReloadOperation("intent")).toMatchObject({
+        status: "unknown",
+        reasonCode: "RELOAD_CLEANUP_UNCONFIRMED",
+      }),
+    );
+    await manager.reloadAgentCredentials(agent.id, "intent");
+    expect(resumed).not.toHaveBeenCalled();
+  } finally {
+    await manager.closeAgent(agent.id).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("idle-only maintenance preserves provider background shell work", async () => {
+  const session = new (class extends TestAgentSession {
+    hasActiveBackgroundTasks(): boolean {
+      return true;
+    }
+  })({ provider: "claude", cwd: process.cwd() });
+  const close = vi.spyOn(session, "close");
+  class BackgroundClient extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return session;
+    }
+  }
+  const manager = new AgentManager({ clients: { claude: new BackgroundClient("claude") }, logger });
+  const agent = await manager.createAgent({ provider: "claude", cwd: process.cwd() }, undefined, {
+    workspaceId: undefined,
+  });
+  try {
+    expect(manager.getAgent(agent.id)?.lifecycle).toBe("idle");
+    await expect(
+      manager.reloadIdleAgentSession(agent.id, { preserveHistory: true }),
+    ).rejects.toMatchObject({ code: "agent_reload_busy" });
+    expect(close).not.toHaveBeenCalled();
+  } finally {
+    await manager.closeAgent(agent.id);
   }
 });

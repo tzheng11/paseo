@@ -1892,6 +1892,128 @@ describe("Codex app-server provider", () => {
     },
   );
 
+  test("maintenance resume skips historical reads until explicitly requested and supports a turn", async () => {
+    const appServer = createFakeCodexAppServer({
+      initialize: () => ({ userAgent: "paseo/0.159.2" }),
+      "thread/resume": () => ({ thread: { id: "archived-thread-id" } }),
+      "thread/read": () => ({ thread: { historyMode: "paginated" } }),
+      "thread/turns/list": () => ({ data: [{ id: "turn-old" }], nextCursor: null }),
+      "thread/items/list": () => ({
+        data: [
+          {
+            turnId: "turn-old",
+            item: { type: "agentMessage", id: "old", text: "preserved history" },
+          },
+        ],
+        nextCursor: null,
+      }),
+    });
+    const provider = createProviderWithFakeAppServer(appServer);
+    const session = await provider.resumeSession(archivedThreadHandle(), undefined, undefined, {
+      purpose: "maintenance",
+    });
+    try {
+      expect(
+        appServer
+          .requests()
+          .filter((request) =>
+            ["thread/read", "thread/turns/list", "thread/items/list"].includes(
+              String(request.method),
+            ),
+          ),
+      ).toEqual([]);
+      expect(
+        appServer.requests().find((request) => request.method === "thread/resume")?.params,
+      ).toEqual({ threadId: "archived-thread-id", excludeTurns: true });
+      await session.startTurn("continue");
+      await appServer.waitForTurnStart();
+      appServer.startsTurn({ threadId: "archived-thread-id", turnId: "turn-new" });
+      appServer.completeTurn({ threadId: "archived-thread-id" });
+      expect(appServer.requests().filter((request) => request.method === "thread/read")).toEqual(
+        [],
+      );
+      const history: AgentStreamEvent[] = [];
+      for await (const event of session.streamHistory()) history.push(event);
+      expect(history).toContainEqual(
+        expect.objectContaining({
+          type: "timeline",
+          item: expect.objectContaining({ text: "preserved history" }),
+        }),
+      );
+      expect(appServer.requests().some((request) => request.method === "thread/items/list")).toBe(
+        true,
+      );
+      appServer.assertNoErrors();
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("maintenance startup deadline disposes the actual writer before rejecting", async () => {
+    const appServer = createFakeCodexAppServer({
+      initialize: () => ({ userAgent: "paseo/0.159.2" }),
+      "thread/resume": () => new Promise(() => {}),
+    });
+    const killed = vi.spyOn(appServer.child, "kill");
+    vi.useFakeTimers();
+    try {
+      const provider = createProviderWithFakeAppServer(appServer);
+      const connected = provider.resumeSession(archivedThreadHandle(), undefined, undefined, {
+        purpose: "maintenance",
+      });
+      const rejected = expect(connected).rejects.toThrow(/closed|startup exceeded/);
+      await appServer.waitForRequest("thread/resume");
+      await vi.advanceTimersByTimeAsync(30_000);
+      await rejected;
+      expect(killed).toHaveBeenCalled();
+      expect(
+        appServer.requests().filter((request) => request.method === "thread/resume"),
+      ).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test.each([false, true])(
+    "maintenance deadline bounds unresolved spawn and disposes a late child (%s)",
+    async (arrivesLate) => {
+      const appServer = createFakeCodexAppServer();
+      const killed = vi.spyOn(appServer.child, "kill");
+      const spawn = deferred<ChildProcessWithoutNullStreams>();
+      const session = new CodexAppServerAgentSession(
+        createConfig(),
+        archivedThreadHandle(),
+        createTestLogger(),
+        () => spawn.promise,
+        {},
+        false,
+        false,
+        false,
+        undefined,
+        "maintenance",
+      );
+      vi.useFakeTimers();
+      try {
+        const connecting = session.connect();
+        const rejected = expect(connecting).rejects.toMatchObject({
+          code: "reload_startup_unconfirmed",
+        });
+        await vi.advanceTimersByTimeAsync(30_000);
+        await rejected;
+        expect(killed).not.toHaveBeenCalled();
+        if (arrivesLate) {
+          spawn.resolve(appServer.child);
+          await vi.advanceTimersByTimeAsync(0);
+          expect(killed).toHaveBeenCalledTimes(1);
+          expect(appServer.requests()).toEqual([]);
+        }
+        await expect(session.connect()).rejects.toThrow("closed");
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
   test("pages archived Codex history without resuming or unarchiving it", async () => {
     const appServer = createFakeCodexAppServer({
       initialize: () => ({ userAgent: "paseo/0.159.2" }),

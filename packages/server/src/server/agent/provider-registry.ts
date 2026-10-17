@@ -504,6 +504,7 @@ export function wrapSessionProvider(provider: AgentProvider, inner: AgentSession
     getCurrentMode: () => inner.getCurrentMode(),
     setMode: (modeId) => inner.setMode(modeId),
     getPendingPermissions: () => inner.getPendingPermissions(),
+    hasActiveBackgroundTasks: inner.hasActiveBackgroundTasks?.bind(inner),
     respondToPermission: (requestId, response) => inner.respondToPermission(requestId, response),
     describePersistence: () => mapPersistenceHandle(provider, inner.describePersistence()),
     interrupt: () => inner.interrupt(),

@@ -102,7 +102,11 @@ import {
   type WorkspaceLabelService,
 } from "./workspace-labels/index.js";
 
-import { AgentManager, AgentRunCancellationError, AgentIdleReloadError } from "./agent/agent-manager.js";
+import {
+  AgentManager,
+  AgentRunCancellationError,
+  AgentIdleReloadError,
+} from "./agent/agent-manager.js";
 import { streamTimelinePromptIndex } from "./agent/timeline-prompt-index.js";
 import { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import type {
@@ -2641,8 +2645,13 @@ export class Session {
   ): Promise<void> | undefined {
     switch (msg.type) {
       case "refresh_agent_request":
-      case "agent.reload_idle.request":
         return this.handleRefreshAgentRequest(msg);
+      case "agent.reload_idle.request":
+        if (msg.operationId !== undefined || msg.preserveHistory !== undefined)
+          return this.handleCredentialReload(msg);
+        return this.handleRefreshAgentRequest(msg);
+      case "agent.reload_idle.get_operation.request":
+        return this.handleGetReloadOperation(msg);
       case "agent.rewind.request":
         return this.handleAgentRewindRequest(msg, source);
       default:
@@ -4743,6 +4752,28 @@ export class Session {
         },
       });
     }
+  }
+
+  private async handleCredentialReload(
+    msg: Extract<SessionInboundMessage, { type: "agent.reload_idle.request" }>,
+  ): Promise<void> {
+    if (!msg.operationId || !msg.preserveHistory)
+      throw new Error("Credential reload requires operationId and preserveHistory");
+    const operation = await this.agentManager.reloadAgentCredentials(msg.agentId, msg.operationId);
+    this.emit({
+      type: "agent.reload_idle.operation.response",
+      payload: { requestId: msg.requestId, operation },
+    });
+  }
+
+  private async handleGetReloadOperation(
+    msg: Extract<SessionInboundMessage, { type: "agent.reload_idle.get_operation.request" }>,
+  ): Promise<void> {
+    const operation = await this.agentManager.getReloadOperation(msg.operationId);
+    this.emit({
+      type: "agent.reload_idle.get_operation.response",
+      payload: { requestId: msg.requestId, operation },
+    });
   }
 
   private async handleCancelAgentRequest(agentId: string, requestId?: string): Promise<void> {

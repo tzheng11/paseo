@@ -106,6 +106,32 @@ from help, and print a warning to stderr. Use `--no-wait` in scripts. Workspace 
 selected separately with `workspace create --background`; this release does not repurpose
 `run --background`.
 
+## Reloading agents
+
+Restart an agent's provider process with `paseo agent reload <id-or-name>`. Add
+`--only-if-idle` to refuse the reload if the agent has active work. This requires a
+host that supports atomic idle-only reloads.
+
+For Claude or Codex credential maintenance, preserve the existing timeline and skip
+daemon-side provider history replay:
+
+```bash
+paseo agent reload <full-agent-uuid> --only-if-idle --preserve-history --operation-id <uuid> --json
+paseo agent reload-status <uuid> --json
+```
+
+All three maintenance flags are required together. Choose and save the operation
+UUID before sending the reload. The response contains `agentId`, `operationId`,
+and `status`: `pending`, `completed`, `refused`, `failed`, or `unknown`. It may also
+include `reasonCode`, `reason`, and `retryable`.
+
+`reload-status` only reads the durable operation record. An unknown operation
+returns `status: "unknown"` and `reasonCode: "NOT_FOUND"`, without an agent ID.
+A timeout or lost connection exits with an error; query the saved operation UUID
+before dispatching more work. A host without credential maintenance support
+returns a structured refusal to a reload request and an update error to a status
+query.
+
 ## Projects
 
 Register the current directory as a project, then list the projects known to the daemon:

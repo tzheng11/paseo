@@ -3640,6 +3640,10 @@ export class CodexAppServerAgentSession implements AgentSession {
   private unpairedCompactionItemCompletions = 0;
   private connectionState: "disconnected" | "history-ready" | "connected" = "disconnected";
   private connectionPromise: Promise<void> | null = null;
+  private readonly clientDisposals = new WeakMap<CodexAppServerClient, Promise<void>>();
+  private deferredHistory = false;
+  private deferredHistoryPromise: Promise<void> | null = null;
+  private startupTimedOut = false;
   private closed = false;
   private collaborationModes: Array<{
     name: string;
@@ -3678,7 +3682,9 @@ export class CodexAppServerAgentSession implements AgentSession {
     private readonly goalsEnabled: boolean = false,
     private readonly autoReviewEnabled: boolean = false,
     private readonly agentId?: string,
-    private readonly initialResumePurpose: "interactive" | "history" = "interactive",
+    private readonly initialResumePurpose: NonNullable<
+      AgentResumeSessionOptions["purpose"]
+    > = "interactive",
   ) {
     this.logger = logger.child({
       module: "agent",
@@ -3705,7 +3711,8 @@ export class CodexAppServerAgentSession implements AgentSession {
 
     if (this.resumeHandle?.sessionId) {
       this.currentThreadId = this.resumeHandle.sessionId;
-      this.historyPending = true;
+      this.deferredHistory = this.initialResumePurpose === "maintenance";
+      this.historyPending = !this.deferredHistory;
     }
   }
 
@@ -3738,15 +3745,66 @@ export class CodexAppServerAgentSession implements AgentSession {
     const connectionPromise = this.establishConnection();
     this.connectionPromise = connectionPromise;
     try {
-      await connectionPromise;
+      if (this.initialResumePurpose === "maintenance") {
+        await this.connectMaintenance(connectionPromise);
+      } else {
+        await connectionPromise;
+      }
     } finally {
       if (this.connectionPromise === connectionPromise) {
         this.connectionPromise = null;
       }
     }
+    if (this.startupTimedOut)
+      throw new Error("Credential reload provider startup exceeded 30000ms");
     if (this.closed) {
       throw this.createClosedError();
     }
+  }
+
+  private async connectMaintenance(connection: Promise<void>): Promise<void> {
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<void>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        this.startupTimedOut = true;
+        this.closed = true;
+        const client = this.client;
+        if (!client) {
+          // Spawn resolution may still produce a writer later. establishConnection
+          // disposes it before initialization; callers must hold this uncertain intent.
+          reject(
+            Object.assign(new Error("Credential reload spawn could not be confirmed"), {
+              code: "reload_startup_unconfirmed",
+            }),
+          );
+          return;
+        }
+        void this.disposeTransport(client).then(
+          () => reject(new Error("Credential reload provider startup exceeded 30000ms")),
+          (cause) =>
+            reject(
+              Object.assign(
+                new Error("Credential reload child cleanup could not be confirmed", { cause }),
+                { code: "reload_cleanup_unconfirmed" },
+              ),
+            ),
+        );
+      }, 30_000);
+    });
+    try {
+      await Promise.race([connection, deadline]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private disposeTransport(client: CodexAppServerClient): Promise<void> {
+    let disposal = this.clientDisposals.get(client);
+    if (!disposal) {
+      disposal = client.dispose();
+      this.clientDisposals.set(client, disposal);
+    }
+    return disposal;
   }
 
   private async establishConnection(): Promise<void> {
@@ -3757,8 +3815,18 @@ export class CodexAppServerAgentSession implements AgentSession {
     }
     const child = await this.spawnAppServer();
     const client = new CodexAppServerClient(child, this.logger, () => this.traceContext());
-    if (this.closed) {
-      await client.dispose();
+    if (this.closed || this.startupTimedOut) {
+      try {
+        await this.disposeTransport(client);
+      } catch (error) {
+        if (this.initialResumePurpose === "maintenance") {
+          throw Object.assign(
+            new Error("Credential reload child cleanup could not be confirmed", { cause: error }),
+            { code: "reload_cleanup_unconfirmed" },
+          );
+        }
+        throw error;
+      }
       throw this.createClosedError();
     }
     this.client = client;
@@ -3776,6 +3844,9 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.pagedHistoryAvailable =
         typeof initialized?.userAgent === "string" &&
         codexVersionAtLeast(initialized.userAgent, CODEX_PAGED_HISTORY_MIN_VERSION);
+      if (this.initialResumePurpose === "maintenance" && !this.pagedHistoryAvailable) {
+        throw new Error("Credential reload requires Codex paginated history support");
+      }
       client.notify("initialized", {});
 
       this.speedModels =
@@ -3787,7 +3858,7 @@ export class CodexAppServerAgentSession implements AgentSession {
 
       if (this.currentThreadId) {
         await this.ensureThreadLoaded();
-        await this.loadPersistedHistory(this.client);
+        if (!this.deferredHistory) await this.loadPersistedHistory(this.client);
         await this.applyDefaultModelAndThinking();
       }
 
@@ -3800,13 +3871,21 @@ export class CodexAppServerAgentSession implements AgentSession {
         if (this.client === client) {
           await this.disposeClient();
         } else {
-          await client.dispose();
+          await this.disposeTransport(client);
         }
       } catch (disposeError) {
         this.logger.warn(
           { err: disposeError, connectError: error },
           "Failed to dispose Codex app-server client after connection failure",
         );
+        if (this.initialResumePurpose === "maintenance") {
+          throw Object.assign(
+            new Error("Credential reload child cleanup could not be confirmed", {
+              cause: disposeError,
+            }),
+            { code: "reload_cleanup_unconfirmed" },
+          );
+        }
       }
       throw error;
     }
@@ -4761,6 +4840,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   }
 
   async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+    await this.ensureDeferredHistory();
     if (!this.historyPending && this.persistedProviderSubagentEvents.length === 0) return;
     const providerSubagents = this.persistedProviderSubagentEvents;
     this.persistedProviderSubagentEvents = [];
@@ -4788,6 +4868,7 @@ export class CodexAppServerAgentSession implements AgentSession {
 
   /** Full replay is explicit; window reads never consume this stream. */
   async *streamAllHistory(): AsyncGenerator<AgentStreamEvent> {
+    await this.ensureDeferredHistory();
     if (this.nativeHistorySource && this.currentThreadId) {
       for await (const entry of this.streamHistoryEntries()) yield entry.value;
       return;
@@ -4807,6 +4888,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   async *streamHistoryEntries(options?: {
     messagesOnly?: boolean;
   }): AsyncGenerator<HistoryWindowEntry<AgentStreamEvent>> {
+    await this.ensureDeferredHistory();
     if (this.nativeHistorySource) {
       const owned = await this.createHistoryReader();
       try {
@@ -4840,6 +4922,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     head: HistoryReadLimit;
     tail: HistoryReadLimit;
   }): Promise<HistoryWindows<AgentStreamEvent>> {
+    await this.ensureDeferredHistory();
     if (
       this.nativeHistoryWindows &&
       limits.head.events === DEFAULT_HISTORY_WINDOWS.head.events &&
@@ -4860,6 +4943,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     direction: "before" | "after";
     limit: HistoryReadLimit;
   }): Promise<HistoryPage<AgentStreamEvent>> {
+    await this.ensureDeferredHistory();
     if (this.nativeHistorySource)
       return this.withHistoryReader((client) => this.nativeHistorySource!.page(client, options));
     if (!this.persistedHistory) return { entries: [], oversized: [], nextCursor: null };
@@ -4876,6 +4960,20 @@ export class CodexAppServerAgentSession implements AgentSession {
     } finally {
       await client.dispose();
     }
+  }
+
+  private async ensureDeferredHistory(): Promise<void> {
+    if (!this.deferredHistory) return;
+    if (this.closed || !this.client) throw this.createClosedError();
+    this.deferredHistoryPromise ??= this.loadPersistedHistory(this.client)
+      .then(() => {
+        this.deferredHistory = false;
+        return undefined;
+      })
+      .finally(() => {
+        this.deferredHistoryPromise = null;
+      });
+    await this.deferredHistoryPromise;
   }
 
   private async createHistoryReader(): Promise<CodexAppServerClientLike> {
@@ -5258,6 +5356,7 @@ export class CodexAppServerAgentSession implements AgentSession {
 
   async revertConversation(input: { messageId: string }): Promise<void> {
     await this.connect();
+    await this.ensureDeferredHistory();
     if (!this.client) {
       throw new Error("Codex client is not initialized");
     }
@@ -5384,7 +5483,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.connectionState = "disconnected";
     this.currentTurnId = null;
     if (client) {
-      await client.dispose();
+      await this.disposeTransport(client);
     }
     this.client = null;
   }

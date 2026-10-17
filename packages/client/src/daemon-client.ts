@@ -32,6 +32,7 @@ import {
 import { validateWSOutboundMessage } from "@getpaseo/protocol/validation/ws-outbound";
 import type {
   AgentStreamEventPayload,
+  AgentReloadOperation,
   AgentSnapshotPayload,
   ProjectPlacementPayload,
   AgentPermissionResolvedMessage,
@@ -1001,6 +1002,15 @@ export class DaemonConnectionError extends Error {
   ) {
     super(message);
     this.name = "DaemonConnectionError";
+  }
+}
+
+export class CredentialReloadUnsupportedError extends Error {
+  readonly code = "UNSUPPORTED_HOST";
+
+  constructor() {
+    super("Update the host to reload agent credentials with durable operation status.");
+    this.name = "CredentialReloadUnsupportedError";
   }
 }
 
@@ -3281,6 +3291,51 @@ export class DaemonClient {
         return null;
       },
     });
+  }
+
+  async reloadAgentCredentials(input: {
+    agentId: string;
+    operationId: string;
+  }): Promise<AgentReloadOperation> {
+    // COMPAT(credentialReloadOperations): added in v0.11.2; remove gate after 2027-04-17.
+    if (this.lastServerInfoMessage?.features?.credentialReloadOperations !== true) {
+      return {
+        ...input,
+        status: "refused",
+        reasonCode: "UNSUPPORTED_HOST",
+        reason: "Update the host to reload agent credentials with durable operation status.",
+        retryable: true,
+      };
+    }
+    const requestId = this.createRequestId();
+    const payload = await this.sendCorrelatedSessionRequest({
+      requestId,
+      message: {
+        type: "agent.reload_idle.request",
+        agentId: input.agentId,
+        operationId: input.operationId,
+        preserveHistory: true,
+        requestId,
+      },
+      responseType: "agent.reload_idle.operation.response",
+    });
+    return payload.operation;
+  }
+
+  async getAgentReloadOperation(input: {
+    operationId: string;
+  }): Promise<AgentReloadOperation | null> {
+    // COMPAT(credentialReloadOperations): added in v0.11.2; remove gate after 2027-04-17.
+    if (this.lastServerInfoMessage?.features?.credentialReloadOperations !== true) {
+      throw new CredentialReloadUnsupportedError();
+    }
+    const requestId = this.createRequestId();
+    const payload = await this.sendCorrelatedSessionRequest({
+      requestId,
+      message: { type: "agent.reload_idle.get_operation.request", ...input, requestId },
+      responseType: "agent.reload_idle.get_operation.response",
+    });
+    return payload.operation;
   }
 
   async refreshAgent(agentId: string, requestId?: string): Promise<AgentRefreshedStatusPayload> {
