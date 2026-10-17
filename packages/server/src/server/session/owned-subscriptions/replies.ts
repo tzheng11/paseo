@@ -33,6 +33,7 @@ const exceptions = {
   terminals_changed: ["subscribe_terminals_request"],
   "usage.list_reports.update": ["usage.list_reports.request"],
   "daemon.update.progress": ["daemon.update.request"],
+  "agent.reload_idle.operation.response": ["agent.reload_idle.request"],
   // Transcription belongs to the explicitly retained voice operation, not a request ID.
   transcription_result: [],
   // This legacy requestId is a producer marker; checkout updates require event demand.

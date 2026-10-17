@@ -10,7 +10,12 @@ import { addSendOptions, runSendCommand } from "./send.js";
 import { addInspectOptions, runInspectCommand } from "./inspect.js";
 import { addWaitOptions, runWaitCommand } from "./wait.js";
 import { addAttachOptions, runAttachCommand } from "./attach.js";
-import { addReloadOptions, runReloadCommand } from "./reload.js";
+import { addReloadOptions, runReloadCommand, type AgentReloadData } from "./reload.js";
+import {
+  addReloadStatusOptions,
+  runReloadStatusCommand,
+  type AgentReloadStatus,
+} from "./reload-status.js";
 import { addImportOptions, runImportCommand } from "./import.js";
 import { runUpdateCommand } from "./update.js";
 import { runDetachCommand } from "./detach.js";
@@ -84,7 +89,11 @@ export function createAgentCommand(): Command {
   );
 
   addJsonAndDaemonHostOptions(addReloadOptions(agent.command("reload"))).action(
-    withOutput(runReloadCommand),
+    withOutput<AgentReloadData, [string]>(runReloadCommand),
+  );
+
+  addJsonAndDaemonHostOptions(addReloadStatusOptions(agent.command("reload-status"))).action(
+    withOutput<AgentReloadStatus, [string]>(runReloadStatusCommand),
   );
 
   addJsonAndDaemonHostOptions(

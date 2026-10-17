@@ -1798,6 +1798,8 @@ export class VoiceAssistantWebSocketServer {
         usageSources: true,
         workspaceFields: true,
         ownedSubscriptions: true,
+        idleAgentReload: true,
+        credentialReloadOperations: true,
         agentRequestReceipts: true,
         workspaceRequestReceipts: true,
         creationLifecycle: true,

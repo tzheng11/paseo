@@ -12,6 +12,43 @@ initializing → idle → running → idle (or error → closed)
 
 Each live agent in `AgentManager` carries a `lastStatus` of `initializing`, `idle`, `running`, or `error`. `closed` is the persisted, resumable state for an agent record that has no live provider runtime. State transitions persist to disk and stream to subscribed clients via WebSocket.
 
+## Idle-only reload
+
+`paseo agent reload UUID --only-if-idle` refuses a busy or unloaded agent instead
+of interrupting it. The host serializes lifecycle mutations and holds an idle
+claim until replacement registration and history replay finish; incoming turns must retry while
+the claim is held. Active permission requests and native subagents also prevent
+the reload. The client checks the host capability before sending the namespaced
+request; older hosts receive no reload request and require an update.
+
+Credential rotation additionally uses `--preserve-history --operation-id UUID`, gated by
+`credentialReloadOperations`. Rotation may revisit hundreds of long-lived Claude and Codex chats;
+replaying their native history into Paseo again can outlive a CLI acknowledgement and recreate a
+writer backlog. Maintenance retains Paseo's committed timeline. Codex resumes with metadata only,
+requiring its paginated-history protocol (0.159.2 or newer). Claude starts a fresh query and waits
+for control readiness without sending a prompt; daemon-side transcript hydration waits for an
+explicit history or rewind request, or the next user turn. Other providers fail closed.
+
+Idle-only reload also checks provider-owned background work. Claude's background shells do not
+appear in the subagent catalogue, so their process-level activity signal participates in admission.
+Codex tool completion can leave a native PTY running. Live command and terminal notifications
+retain that activity until a matching native exit is confirmed; missing exit information defers
+maintenance rather than guessing that the job finished. Historical process IDs are display data
+and do not claim ownership in a new runtime. Some provider versions do not report an autonomous
+PTY exit, so an unconfirmed live session remains held until a later interaction confirms exit.
+History and rewind still read real provider records when requested.
+
+An RPC timeout is not evidence that a reload failed. Callers persist an operation UUID before
+dispatch and reconcile it through `agent reload-status UUID`. Receipts under
+`PASEO_HOME/reload-operations` commit before any session closure and survive socket loss.
+Only `completed` confirms registration of the replacement. A missing receipt is `unknown` with
+`NOT_FOUND`; the exact same UUID may be submitted again because admission deduplicates before
+mutation. A pending receipt left by a daemon restart becomes persisted `unknown` with
+`DAEMON_RESTARTED` and must not be replayed. Unreadable or corrupt storage is an error, never absence.
+Unconfirmed child cleanup is also `unknown`; callers must hold it for inspection. Refusal means
+the runtime was not changed. Do not infer completion from the agent being idle or mint a new UUID
+to bypass an uncertain operation.
+
 ## Runtime residency
 
 An unarchived agent may be `closed` without being deleted or archived. Closing releases its provider

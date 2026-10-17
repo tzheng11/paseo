@@ -6,6 +6,7 @@ import { constants, existsSync, unlinkSync } from "fs";
 import { open, rm, stat } from "fs/promises";
 import { randomUUID } from "node:crypto";
 import { DiskAgentTimelineStore } from "./agent/disk-agent-timeline-store.js";
+import { ReloadOperationStore } from "./agent/reload-operation-store.js";
 import { getHostName } from "./host-name.js";
 import path from "node:path";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -948,6 +949,10 @@ export async function createPaseoDaemon(
     directory: path.join(config.paseoHome, "runtime", "timeline-cache"),
   });
   const agentManager = new AgentManager({
+    reloadOperations: new ReloadOperationStore(
+      path.join(config.paseoHome, "reload-operations"),
+      logger,
+    ),
     timelineStore,
     pluginLifecycle: pluginRuntime,
     clients: initialAgentManagerState.clients,
