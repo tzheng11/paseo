@@ -18,6 +18,9 @@ class RecordingReloadClient implements AgentReloadClient {
   operation: AgentReloadOperation | null = { agentId, operationId, status: "pending" };
   failure: Error | null = null;
 
+  async fetchAgent(): Promise<never> {
+    throw new Error("Credential reload must not fetch an agent");
+  }
   async fetchAgents(): Promise<never> {
     throw new Error("Credential reload must not list agents");
   }

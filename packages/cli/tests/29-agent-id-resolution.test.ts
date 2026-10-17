@@ -1,7 +1,7 @@
 #!/usr/bin/env npx tsx
 
 import assert from "node:assert";
-import { resolveAgentId } from "../src/utils/client.js";
+import { resolveAgentId } from "../src/utils/agents.js";
 
 console.log("=== Agent ID Resolution Tests ===\n");
 

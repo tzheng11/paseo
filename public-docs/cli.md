@@ -36,6 +36,8 @@ Agent listings follow every daemon page, including inventories larger than 200 a
 
 The listing is a traversal of the matching directory entries, not an atomic snapshot: agents created, removed, or changed while it runs can affect the result.
 
+`stop --all`, `stop --cwd`, `permit ls` and worktree agent associations also follow every page. Reload, archive and detach fetch full agent UUIDs directly; prefixes and titles search all pages, including archived agents. Ambiguous prefixes or titles are rejected. A missing full UUID never falls back to a title.
+
 ## Account usage
 
 Show account quotas and balances from the host's usage sources:

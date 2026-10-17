@@ -1,3 +1,5 @@
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import { fetchAllAgents } from "../../utils/agents.js";
 import type { Command } from "commander";
 import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
@@ -60,6 +62,15 @@ export interface PermitLsOptions extends CommandOptions {
   host?: string;
 }
 
+export async function executePermitLs(
+  client: Pick<DaemonClient, "fetchAgents">,
+): Promise<PermitLsResult> {
+  const agents = await fetchAllAgents(client, {
+    filter: { includeArchived: true },
+  });
+  return listPendingPermissions(agents);
+}
+
 export async function runLsCommand(
   options: PermitLsOptions,
   _command: Command,
@@ -67,11 +78,9 @@ export async function runLsCommand(
   const client = await connectToDaemon({ target: options.daemonTarget });
 
   try {
-    const agentsPayload = await client.fetchAgents({ filter: { includeArchived: true } });
-    const agents = agentsPayload.entries.map((entry) => entry.agent);
+    const result = await executePermitLs(client);
     await client.close();
-
-    return listPendingPermissions(agents);
+    return result;
   } catch (err) {
     await client.close().catch(() => {});
     const message = err instanceof Error ? err.message : String(err);
