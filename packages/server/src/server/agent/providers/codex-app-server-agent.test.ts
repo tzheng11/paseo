@@ -7717,3 +7717,97 @@ describe("Codex denied plan approvals", () => {
     });
   });
 });
+
+test.each([
+  { status: "failed", identity: "usageLimitExceeded", quota: true },
+  { status: "failed", identity: "rateLimitExceeded", quota: false },
+  { status: "failed", identity: "unauthorized", quota: false },
+  { status: "failed", identity: undefined, quota: false },
+  { status: "completed", identity: "usageLimitExceeded", quota: false },
+])("Codex typed terminal quota classification: %j", ({ status, identity, quota }) => {
+  const session = createSession();
+  const events: AgentStreamEvent[] = [];
+  session.subscribe((event) => events.push(event));
+  asInternals(session).handleNotification("turn/started", {
+    threadId: "test-thread",
+    turn: { id: "native-turn" },
+  });
+  asInternals(session).handleNotification("turn/completed", {
+    threadId: "test-thread",
+    turn: {
+      id: "native-turn",
+      status,
+      error: {
+        message: "Usage limit reached (message text alone is not evidence)",
+        codexErrorInfo: identity,
+      },
+    },
+  });
+  expect(
+    events.some(
+      (event) => event.type === "turn_failed" && event.code === "provider_quota_exceeded",
+    ),
+  ).toBe(quota);
+  expect(events.some((event) => event.type === "turn_completed")).toBe(status === "completed");
+});
+
+test("Codex guarded continuation checks actual turn/start dispatch after asynchronous preparation", async () => {
+  const session = createSession();
+  session.activeForegroundTurnId = null;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const request = vi.fn(async (method: string) => {
+    if (method === "thread/loaded/list") {
+      await gate;
+      return { data: ["test-thread"] };
+    }
+    if (method === "turn/start") return {};
+    throw new Error(`Unexpected request: ${method}`);
+  });
+  session.client = createStub<CodexClientLike>({ request });
+  const fence = vi.fn(() => {
+    throw Object.assign(new Error("superseded"), { code: "quota_recovery_superseded" });
+  });
+  const run = session.startTurn("Automatic quota recovery", { beforeProviderSend: fence });
+  const rejected = expect(run).rejects.toMatchObject({ code: "quota_recovery_superseded" });
+  expect(fence).not.toHaveBeenCalled();
+  release();
+  await rejected;
+  expect(fence).toHaveBeenCalledTimes(1);
+  expect(request.mock.calls.some(([method]) => method === "turn/start")).toBe(false);
+});
+
+test.each(["late-A", "missing-id", "foreign-thread"])(
+  "Codex quota identity refuses %s terminal evidence",
+  (scenario) => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const internal = asInternals(session);
+    internal.handleNotification("turn/started", {
+      threadId: "test-thread",
+      turn: { id: "native-A" },
+    });
+    internal.handleNotification("turn/started", {
+      threadId: "test-thread",
+      turn: { id: "native-B" },
+    });
+    internal.handleNotification("turn/completed", {
+      threadId: scenario === "foreign-thread" ? "unrelated-thread" : "test-thread",
+      turn: {
+        ...(scenario === "missing-id"
+          ? {}
+          : { id: scenario === "late-A" ? "native-A" : "native-B" }),
+        status: "failed",
+        error: { codexErrorInfo: "usageLimitExceeded", message: "Quota reached" },
+      },
+    });
+    expect(
+      events.some(
+        (event) => event.type === "turn_failed" && event.code === "provider_quota_exceeded",
+      ),
+    ).toBe(false);
+  },
+);

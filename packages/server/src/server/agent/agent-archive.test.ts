@@ -68,3 +68,15 @@ test("can stamp updatedAt to the archive timestamp", () => {
 
   expect(archived.updatedAt).toBe("2025-01-03T00:00:00.000Z");
 });
+
+test("archiving invalidates a persisted quota checkpoint", () => {
+  const archived = buildArchivedAgentRecord({
+    ...BASE_RECORD,
+    quotaTurnCheckpoint: {
+      turnId: "failed",
+      sessionId: "session",
+      failedAt: "2026-10-17T12:00:00Z",
+    },
+  });
+  expect(archived.quotaTurnCheckpoint).toBeUndefined();
+});

@@ -314,6 +314,7 @@ export async function sendPromptToAgent(
   params: SendPromptToAgentParams,
 ): Promise<{ disposition: PromptDispatchDisposition }> {
   const unarchive = params.unarchive ?? true;
+  await params.agentManager.invalidateQuotaRecoveryForMessage(params.agentId);
 
   const record = await params.agentStorage.get(params.agentId);
   let archivedAtToRestore: string | null = null;

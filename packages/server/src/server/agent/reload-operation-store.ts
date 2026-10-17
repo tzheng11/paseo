@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { CredentialChange } from "./quota-turn-recovery.js";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Logger } from "pino";
@@ -17,14 +18,24 @@ export class ReloadOperationStore {
     private readonly logger: Logger,
   ) {}
 
-  start(agentId: string, operationId: string, run: () => Promise<void>): Promise<ReloadOperation> {
+  start(
+    agentId: string,
+    operationId: string,
+    run: () => Promise<ReloadOperation["continuation"] | void>,
+    change?: CredentialChange,
+  ): Promise<ReloadOperation> {
     return this.serialize(async () => {
       const existing = await this.read(operationId);
       if (existing) {
-        if (existing.agentId !== agentId) throw new Error("reload_operation_conflict");
+        if (
+          existing.agentId !== agentId ||
+          existing.credentialGeneration !== change?.credentialGeneration ||
+          existing.credentialChangedAt !== change?.credentialChangedAt
+        )
+          throw new Error("reload_operation_conflict");
         return this.reconcile(existing);
       }
-      const operation: ReloadOperation = { operationId, agentId, status: "pending" };
+      const operation: ReloadOperation = { operationId, agentId, status: "pending", ...change };
       await this.write(operation);
       this.active.add(operationId);
       // Admission is committed before any provider can be closed. Completion writes
@@ -41,11 +52,21 @@ export class ReloadOperationStore {
     });
   }
 
-  private async complete(operation: ReloadOperation, run: () => Promise<void>): Promise<void> {
+  private async complete(
+    operation: ReloadOperation,
+    run: () => Promise<ReloadOperation["continuation"] | void>,
+  ): Promise<void> {
     let result: ReloadOperation;
     try {
-      await run();
-      result = { ...operation, status: "completed" };
+      const continuation = await run();
+      result = {
+        ...operation,
+        status: continuation?.status === "unknown" ? "unknown" : "completed",
+        ...(continuation ? { continuation } : {}),
+        ...(continuation?.status === "unknown"
+          ? { reasonCode: "QUOTA_CONTINUATION_UNKNOWN", retryable: false }
+          : {}),
+      };
     } catch (error) {
       const code = error instanceof Error && "code" in error ? error.code : null;
       const refused = code === "agent_reload_busy" || code === "agent_reload_unavailable";

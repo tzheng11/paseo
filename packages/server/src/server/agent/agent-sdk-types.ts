@@ -207,6 +207,8 @@ export interface AgentRunOptions {
   resumeFrom?: AgentPersistenceHandle;
   maxThinkingTokens?: number;
   clientMessageId?: string;
+  /** Internal admission fence, called immediately before a guarded provider input is sent. */
+  beforeProviderSend?: () => void;
 }
 
 export interface AgentSteerOptions extends AgentRunOptions {

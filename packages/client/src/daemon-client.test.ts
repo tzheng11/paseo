@@ -7735,3 +7735,75 @@ test("credential reload timeout rejects and never repeats the mutation", async (
     vi.useRealTimers();
   }
 });
+
+test("quota recovery refuses unsupported hosts before mutation and echoes paired intent", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "quota-old-host",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connection = client.connect();
+  mock.triggerOpen({ features: { credentialReloadOperations: true } });
+  await connection;
+  mock.sent.length = 0;
+  const input = {
+    agentId: "agent",
+    operationId: "operation",
+    credentialGeneration: "B",
+    credentialChangedAt: "2026-10-17T12:00:00.000Z",
+  };
+  await expect(client.reloadAgentCredentials(input)).resolves.toMatchObject({
+    ...input,
+    status: "refused",
+    reasonCode: "QUOTA_TURN_RECOVERY_UNSUPPORTED",
+  });
+  expect(mock.sent).toEqual([]);
+});
+
+test("quota recovery forwards the immutable intent and keeps completed continuation metadata", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "quota-new-host",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connection = client.connect();
+  mock.triggerOpen({ features: { credentialReloadOperations: true, quotaTurnRecovery: true } });
+  await connection;
+  mock.sent.length = 0;
+  const input = {
+    agentId: "agent",
+    operationId: "operation",
+    credentialGeneration: "B",
+    credentialChangedAt: "2026-10-17T12:00:00.000Z",
+  };
+  const result = client.reloadAgentCredentials(input);
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request).toMatchObject({
+    type: "agent.reload_idle.request",
+    ...input,
+    preserveHistory: true,
+  });
+  const operation = {
+    ...input,
+    status: "completed",
+    continuation: {
+      status: "submitted",
+      failedTurnId: "failed-turn",
+      messageId: "quota-recovery-deterministic",
+    },
+  };
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "agent.reload_idle.operation.response",
+      payload: { requestId: request.requestId, operation },
+    }),
+  );
+  await expect(result).resolves.toEqual(operation);
+  expect(mock.sent).toHaveLength(1);
+});

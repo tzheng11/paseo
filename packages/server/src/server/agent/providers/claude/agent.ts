@@ -2206,6 +2206,7 @@ class ClaudeAgentSession implements AgentSession {
    * cleared by the turn's result or an idle session state. See observeMainTurnBracket.
    */
   private mainTurnInFlight = false;
+  private quotaFailureTurnId: string | null = null;
   private foregroundHasVisibleActivity = false;
   private activeTurnHasAssistantText = false;
   private readonly contextUsage: ClaudeContextUsageState;
@@ -2382,11 +2383,13 @@ class ClaudeAgentSession implements AgentSession {
     this.activeForegroundTurnId = turnId;
     this.foregroundHasVisibleActivity = false;
     this.activeTurnHasAssistantText = false;
+    this.quotaFailureTurnId = null;
     this.contextUsage.beginTurn();
     this.transitionTurnState("foreground", "foreground turn started");
     this.clearRecentStderr();
     if (sdkUserMessageId) this.unstartedMessageUuids.add(sdkUserMessageId);
 
+    let admissionRefused = false;
     let cancelIssued = false;
     const requestCancel = () => {
       if (cancelIssued) {
@@ -2428,6 +2431,12 @@ class ClaudeAgentSession implements AgentSession {
       this.activeForegroundQuery = this.query;
       this.activeForegroundInput = this.input;
       this.startQueryPump();
+      try {
+        options?.beforeProviderSend?.();
+      } catch (error) {
+        admissionRefused = true;
+        throw error;
+      }
       this.input.push(sdkMessage);
       setTimeout(() => {
         if (this.activeForegroundTurnId === turnId) {
@@ -2439,6 +2448,7 @@ class ClaudeAgentSession implements AgentSession {
       this.finishForegroundTurn(
         this.buildTurnFailedEvent(error instanceof Error ? error.message : "Claude stream failed"),
       );
+      if (admissionRefused) throw error;
     }
 
     return { turnId };
@@ -4396,6 +4406,7 @@ class ClaudeAgentSession implements AgentSession {
     }
 
     this.forgetStartedMessage(message);
+    this.observeQuotaMessage(message);
 
     switch (message.type) {
       case "system":
@@ -4757,12 +4768,30 @@ class ClaudeAgentSession implements AgentSession {
     }
   }
 
+  private observeQuotaMessage(message: SDKMessage): void {
+    const turnId = this.activeForegroundTurnId ?? this.autonomousTurn?.id ?? null;
+    if (message.type === "assistant") {
+      // A successful retry or a different typed error supersedes an earlier quota candidate.
+      this.quotaFailureTurnId = message.error === "rate_limit" ? turnId : null;
+    } else if (
+      message.type === "rate_limit_event" &&
+      message.rate_limit_info.status === "rejected"
+    ) {
+      this.quotaFailureTurnId = turnId;
+    }
+  }
+
   private appendResultEvents(
     message: Extract<SDKMessage, { type: "result" }>,
     events: AgentStreamEvent[],
   ): void {
     const usage = this.convertUsage(message, message.modelUsage);
-    if (message.subtype === "success") {
+    const quotaFailure =
+      this.quotaFailureTurnId !== null &&
+      this.quotaFailureTurnId === (this.activeForegroundTurnId ?? this.autonomousTurn?.id) &&
+      (message.subtype === "success" || message.subtype === "error_during_execution");
+    this.quotaFailureTurnId = null;
+    if (message.subtype === "success" && message.is_error !== true) {
       events.push(...this.sidechainTracker.finishAll("completed"));
       // Built-in slash commands (e.g. /voice, /usage, "Unknown command: …")
       // run client-side in the Claude CLI with no model turn — output_tokens
@@ -4785,12 +4814,17 @@ class ClaudeAgentSession implements AgentSession {
       events.push({ type: "turn_completed", provider: "claude", usage });
       return;
     }
-    const errorMessage =
-      "errors" in message && Array.isArray(message.errors) && message.errors.length > 0
-        ? message.errors.join("\n")
-        : "Claude run failed";
+    let errorMessage = "Claude run failed";
+    if ("errors" in message && Array.isArray(message.errors) && message.errors.length > 0) {
+      errorMessage = message.errors.join("\n");
+    } else if ("result" in message && typeof message.result === "string" && message.result.trim()) {
+      errorMessage = message.result;
+    }
     events.push(...this.sidechainTracker.finishAll("failed"));
-    events.push(this.buildTurnFailedEvent(errorMessage));
+    events.push({
+      ...this.buildTurnFailedEvent(errorMessage),
+      ...(quotaFailure ? { code: "provider_quota_exceeded" } : {}),
+    });
   }
 
   private createClaudeSessionChangedNotice(

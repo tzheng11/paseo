@@ -1,3 +1,14 @@
+import type { MessageReceipts } from "../message-receipts/index.js";
+import { startAgentRun, type AgentRunController } from "./agent-prompt.js";
+import { prepareAgentMessage } from "./agent-messages/index.js";
+import {
+  quotaRecoveryRefusal,
+  credentialChangeIsStale,
+  quotaRecoveryMessageId,
+  QUOTA_CONTINUATION_PROMPT,
+  type QuotaTurnCheckpoint,
+  type CredentialChange,
+} from "./quota-turn-recovery.js";
 import {
   AgentHistoryReplay,
   DEFAULT_HISTORY_WINDOWS,
@@ -361,6 +372,7 @@ export interface CreateAgentOptions {
 
 export interface AgentManagerOptions {
   reloadOperations?: ReloadOperationStore;
+  recoveryMessages?: Pick<MessageReceipts, "send">;
   pluginLifecycle?: PluginLifecycle;
   /** An internal workspace makes every agent created inside it internal. */
   clients?: ProviderClientMap;
@@ -475,6 +487,10 @@ interface ManagedAgentBase {
   activeTurnStartedAt: Date | null;
   lastUsage?: AgentUsage;
   lastError?: string;
+  credentialGeneration?: string;
+  credentialChangedAt?: string;
+  quotaTurnCheckpoint?: QuotaTurnCheckpoint;
+  quotaTurnRevision?: number;
   attention: AttentionState;
   foregroundTurnWaiters: Set<ForegroundTurnWaiter>;
   finalizedForegroundTurnIds: Set<string>;
@@ -815,6 +831,8 @@ export interface RetiredInternalAgent {
 
 export class AgentManager {
   private readonly reloadOperations?: ReloadOperationStore;
+  private readonly recoveryMessages?: Pick<MessageReceipts, "send">;
+  private readonly quotaActivityRevisions = new Map<string, number>();
   private readonly pluginLifecycle: PluginLifecycle | undefined;
   private readonly retiredInternalAgents = new Map<
     string,
@@ -866,6 +884,7 @@ export class AgentManager {
 
   constructor(options: AgentManagerOptions) {
     this.reloadOperations = options.reloadOperations;
+    this.recoveryMessages = options.recoveryMessages;
     this.timelineStore = options.timelineStore ?? new InMemoryAgentTimelineStore();
     this.pluginLifecycle = options.pluginLifecycle;
     this.idFactory = options.idFactory ?? (() => randomUUID());
@@ -1661,6 +1680,9 @@ export class AgentManager {
     return this.registerSession(session, storedConfig, resolvedAgentId, {
       ...options,
       persistence: handle,
+      credentialGeneration: record?.credentialGeneration,
+      credentialChangedAt: record?.credentialChangedAt,
+      quotaTurnCheckpoint: record?.archivedAt ? undefined : record?.quotaTurnCheckpoint,
       restoring: true,
     });
   }
@@ -1746,13 +1768,203 @@ export class AgentManager {
     }
   }
 
-  reloadAgentCredentials(agentId: string, operationId: string): Promise<ReloadOperation> {
+  reloadAgentCredentials(
+    agentId: string,
+    operationId: string,
+    change?: CredentialChange,
+  ): Promise<ReloadOperation> {
     if (!this.reloadOperations) throw new Error("Credential reload operation store is unavailable");
-    return this.reloadOperations.start(agentId, operationId, async () => {
+    if (
+      change &&
+      (!change.credentialGeneration || !Number.isFinite(Date.parse(change.credentialChangedAt)))
+    )
+      throw new Error("Invalid credential change identity");
+    return this.reloadOperations.start(
+      agentId,
+      operationId,
+      async () => {
+        const record = await this.registry?.get(agentId);
+        if (record?.archivedAt) throw new AgentIdleReloadError({ agentId, reason: "unavailable" });
+        const checkpoint = this.getAgent(agentId)?.quotaTurnCheckpoint;
+        const revision = this.quotaActivityRevisions.get(agentId) ?? 0;
+        let continuation: ReloadOperation["continuation"];
+        await this.reloadIdleAgentSession(agentId, {
+          preserveHistory: true,
+          afterReload: change
+            ? async () => {
+                continuation = await this.continueQuotaTurn(agentId, checkpoint, change, revision);
+              }
+            : undefined,
+        });
+        return continuation;
+      },
+      change,
+    );
+  }
+
+  private invalidateQuotaRecovery(agentId: string): void {
+    this.quotaActivityRevisions.set(agentId, (this.quotaActivityRevisions.get(agentId) ?? 0) + 1);
+    const agent = this.agents.get(agentId);
+    if (agent) agent.quotaTurnCheckpoint = undefined;
+  }
+
+  /** Invalidate before async prompt preparation, including requests queued behind maintenance. */
+  async invalidateQuotaRecoveryForMessage(agentId: string): Promise<void> {
+    this.invalidateQuotaRecovery(agentId);
+    await this.runLifecycleMutation(agentId, async () => {
+      const agent = this.getAgent(agentId);
+      if (agent) {
+        await this.persistSnapshot(agent);
+        return;
+      }
       const record = await this.registry?.get(agentId);
-      if (record?.archivedAt) throw new AgentIdleReloadError({ agentId, reason: "unavailable" });
-      await this.reloadIdleAgentSession(agentId, { preserveHistory: true });
+      if (record?.quotaTurnCheckpoint)
+        await this.registry?.upsert({ ...record, quotaTurnCheckpoint: undefined });
     });
+  }
+
+  private readonly quotaContinuationGuards = new Map<string, () => void>();
+
+  private async continueQuotaTurn(
+    agentId: string,
+    checkpoint: QuotaTurnCheckpoint | undefined,
+    change: CredentialChange,
+    revision: number,
+  ): Promise<NonNullable<ReloadOperation["continuation"]>> {
+    const agent = this.requireSessionAgent(agentId);
+    const now = Date.now();
+    const stale = credentialChangeIsStale(agent, change);
+    const changedAt = Date.parse(change.credentialChangedAt);
+    // Refused/stale requests must never roll the session's confirmed baseline backwards.
+    if (!stale && changedAt <= now && agent.credentialGeneration !== change.credentialGeneration) {
+      agent.credentialGeneration = change.credentialGeneration;
+      agent.credentialChangedAt = change.credentialChangedAt;
+      await this.persistSnapshot(agent);
+    }
+    const reason = stale
+      ? "CREDENTIAL_CHANGE_PRECEDES_BASELINE"
+      : quotaRecoveryRefusal(checkpoint, change, now);
+    if (reason)
+      return {
+        status: "not_needed",
+        reasonCode: reason,
+        ...(checkpoint ? { failedTurnId: checkpoint.turnId } : {}),
+      };
+    if (!checkpoint || !this.recoveryMessages || !this.registry)
+      throw new Error("Durable quota recovery services are unavailable");
+    const messageId = quotaRecoveryMessageId(agentId, checkpoint, change);
+    const identity = { failedTurnId: checkpoint.turnId, messageId };
+    let consumed = false;
+    let dispatched = false;
+    let admissionOpen = true;
+    let admissionFailure: unknown;
+    const validate = (ownPending = false) => {
+      const current = this.requireSessionAgent(agentId);
+      if (
+        !admissionOpen ||
+        (this.quotaActivityRevisions.get(agentId) ?? 0) !== revision ||
+        current.persistence?.sessionId !== checkpoint.sessionId ||
+        (!consumed && current.quotaTurnCheckpoint?.turnId !== checkpoint.turnId)
+      )
+        throw Object.assign(new Error("Quota recovery was superseded"), {
+          code: "quota_recovery_superseded",
+        });
+      if (
+        current.activeTurnId ||
+        (!ownPending && this.hasInFlightRun(agentId)) ||
+        current.pendingPermissions.size ||
+        current.inFlightPermissionResponses.size ||
+        current.session.hasActiveBackgroundTasks?.() === true ||
+        this.providerSubagents.list(agentId).some((child) => child.status === "running")
+      )
+        throw new AgentIdleReloadError({ agentId, reason: "busy" });
+    };
+    const delivery = prepareAgentMessage(
+      QUOTA_CONTINUATION_PROMPT,
+      {
+        kind: "agent-message",
+        agentId,
+        title: "Automatic quota recovery",
+      },
+      messageId,
+    );
+    try {
+      await this.recoveryMessages.send({
+        agentId,
+        messageId,
+        request: { kind: "quota-recovery", checkpoint, ...change, prompt: delivery.prompt },
+        prepare: async () => {
+          validate();
+          agent.quotaTurnCheckpoint = undefined;
+          consumed = true;
+          await this.persistSnapshot(agent);
+          validate();
+        },
+        send: async () => {
+          validate();
+          const controller: AgentRunController = {
+            getAgent: this.getAgent.bind(this),
+            hasInFlightRun: this.hasInFlightRun.bind(this),
+            tryRunOutOfBand: () => false,
+            replaceAgentRun: async () => {
+              throw new Error("Quota recovery cannot replace a turn");
+            },
+            steerOrReplaceActiveTurn: async () => ({ status: "inactive" }),
+            reloadAgentSession: async () => {
+              throw new Error("Quota recovery cannot replay a stale delivery");
+            },
+            streamAgent: (id, prompt, options) => {
+              validate();
+              this.quotaContinuationGuards.set(id, () => validate(true));
+              return this.streamAgentInternal(id, prompt, options);
+            },
+          };
+          await startAgentRun(controller, agentId, delivery.prompt, this.logger, {
+            runOptions: {
+              clientMessageId: messageId,
+              beforeProviderSend: () => {
+                try {
+                  validate(true);
+                } catch (error) {
+                  admissionFailure = error;
+                  throw error;
+                }
+                dispatched = true;
+              },
+            },
+          });
+          await withTimeout(
+            this.waitForAgentRunStart(agentId),
+            30_000,
+            "Quota continuation startup unconfirmed",
+          );
+          if (!dispatched) throw new Error("Quota continuation input was not dispatched");
+        },
+      });
+      return { status: "submitted", ...identity };
+    } catch (error) {
+      admissionOpen = false;
+      agent.quotaTurnCheckpoint = undefined;
+      try {
+        await this.persistSnapshot(agent);
+      } catch (persistError) {
+        this.logger.error(
+          { err: persistError, agentId },
+          "Failed to persist quota continuation invalidation",
+        );
+      }
+      const failure = admissionFailure ?? error;
+      if (
+        !dispatched &&
+        failure instanceof Error &&
+        "code" in failure &&
+        (failure.code === "quota_recovery_superseded" || failure.code === "agent_reload_busy")
+      )
+        return { status: "refused", ...identity, reasonCode: "QUOTA_RECOVERY_SUPERSEDED_OR_BUSY" };
+      return { status: "unknown", ...identity, reasonCode: "QUOTA_CONTINUATION_UNKNOWN" };
+    } finally {
+      this.quotaContinuationGuards.delete(agentId);
+    }
   }
 
   getReloadOperation(operationId: string): Promise<ReloadOperation | null> {
@@ -1762,7 +1974,7 @@ export class AgentManager {
 
   reloadIdleAgentSession(
     agentId: string,
-    options?: { preserveHistory?: boolean },
+    options?: { preserveHistory?: boolean; afterReload?: () => Promise<void> },
   ): Promise<ManagedAgent> {
     if (this.idleReloads.has(agentId))
       return Promise.reject(new AgentIdleReloadError({ agentId, reason: "busy" }));
@@ -1803,6 +2015,7 @@ export class AgentManager {
           .then(async (snapshot) => {
             if (!options?.preserveHistory)
               await this.hydrateTimelineFromProvider(agentId, { broadcast: true });
+            await options?.afterReload?.();
             return snapshot;
           })
           .finally(() => {
@@ -1921,6 +2134,9 @@ export class AgentManager {
         historyPrimed: rehydrateFromDisk ? false : preservedHistoryPrimed,
         lastUsage: preservedLastUsage,
         lastError: preservedLastError,
+        credentialGeneration: existing.credentialGeneration,
+        credentialChangedAt: existing.credentialChangedAt,
+        quotaTurnCheckpoint: existing.quotaTurnCheckpoint,
         attention: preservedAttention,
         restoring: true,
         maintenanceReload: options.preserveHistory,
@@ -2051,6 +2267,7 @@ export class AgentManager {
   }
 
   closeAgent(agentId: string): Promise<void> {
+    if (this.acceptingAgentRegistrations) this.invalidateQuotaRecovery(agentId);
     const existing = this.inFlightAgentCloses.get(agentId);
     if (existing) {
       return existing;
@@ -2127,6 +2344,7 @@ export class AgentManager {
   }
 
   async archiveAgent(agentId: string): Promise<{ archivedAt: string }> {
+    this.invalidateQuotaRecovery(agentId);
     return this.runLifecycleMutation(agentId, () => this.archiveAgentUnlocked(agentId));
   }
 
@@ -2768,6 +2986,10 @@ export class AgentManager {
     if (!handler) {
       return false;
     }
+    this.invalidateQuotaRecovery(agentId);
+    void this.persistSnapshot(agent).catch((error) =>
+      this.logger.error({ err: error, agentId }, "Failed to persist quota checkpoint invalidation"),
+    );
     if (options?.clientMessageId) {
       this.recordSubmittedPrompt(agent, prompt, options.clientMessageId, "accepted");
       this.emitState(agent);
@@ -2846,6 +3068,9 @@ export class AgentManager {
   }): Promise<string> {
     const { agent, agentId, pendingRun, prompt, options } = params;
     try {
+      agent.quotaTurnRevision = this.quotaActivityRevisions.get(agentId) ?? 0;
+      await this.persistSnapshot(agent);
+      this.quotaContinuationGuards.get(agentId)?.();
       const result = await agent.session.startTurn(prompt, options);
       if (pendingRun.settled) {
         throw new Error(`Agent ${agentId} run was canceled before its turn started`);
@@ -2887,9 +3112,17 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
   ): AsyncGenerator<AgentStreamEvent> {
-    if (this.idleReloads.has(agentId)) {
+    this.invalidateQuotaRecovery(agentId);
+    if (this.idleReloads.has(agentId))
       throw new AgentIdleReloadError({ agentId, reason: "in_progress" });
-    }
+    return this.streamAgentInternal(agentId, prompt, options);
+  }
+
+  private streamAgentInternal(
+    agentId: string,
+    prompt: AgentPromptInput,
+    options?: AgentRunOptions,
+  ): AsyncGenerator<AgentStreamEvent> {
     const existingAgent = this.requireSessionAgent(agentId);
     this.logger.trace(
       {
@@ -3119,6 +3352,7 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentSteerOptions,
   ): Promise<SteerResult> {
+    this.invalidateQuotaRecovery(agentId);
     const agent = this.requireSessionAgent(agentId);
     const expectedTurnId = agent.activeForegroundTurnId ?? agent.activeTurnId;
     if (!expectedTurnId || !agent.session.steerActiveTurn) {
@@ -3147,6 +3381,7 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentSteerOptions,
   ): Promise<ActiveTurnSteerDispatchResult> {
+    this.invalidateQuotaRecovery(agentId);
     const agent = this.requireSessionAgent(agentId);
     const expectedTurnId = agent.activeForegroundTurnId ?? agent.activeTurnId;
     if (!expectedTurnId) {
@@ -3429,7 +3664,12 @@ export class AgentManager {
   }
 
   async cancelAgentRun(agentId: string): Promise<AgentRunCancellationResult> {
-    return this.runForegroundMutation(agentId, () => this.cancelAgentRunNow(agentId));
+    this.invalidateQuotaRecovery(agentId);
+    return this.runForegroundMutation(agentId, async () => {
+      const agent = this.getAgent(agentId);
+      if (agent) await this.persistSnapshot(agent);
+      return this.cancelAgentRunNow(agentId);
+    });
   }
 
   private async cancelAgentRunNow(agentId: string): Promise<AgentRunCancellationResult> {
@@ -3864,6 +4104,9 @@ export class AgentManager {
       maintenanceReload?: boolean;
       lastUsage?: AgentUsage;
       lastError?: string;
+      credentialGeneration?: string;
+      credentialChangedAt?: string;
+      quotaTurnCheckpoint?: QuotaTurnCheckpoint;
       attention?: AttentionState;
       /**
        * Bringing a known agent back, rather than starting a new one. Its timestamps and
@@ -4071,6 +4314,9 @@ export class AgentManager {
           historyPrimed?: boolean;
           lastUsage?: AgentUsage;
           lastError?: string;
+          credentialGeneration?: string;
+          credentialChangedAt?: string;
+          quotaTurnCheckpoint?: QuotaTurnCheckpoint;
           attention?: AttentionState;
           persistence?: AgentPersistenceHandle;
           workspaceId?: string;
@@ -4079,6 +4325,7 @@ export class AgentManager {
       | undefined;
   }): ActiveManagedAgent {
     const { resolvedAgentId, session, config, now, durableTimelineHasRows, options } = params;
+    const quotaState = options ?? {};
     return {
       id: resolvedAgentId,
       provider: config.provider,
@@ -4112,6 +4359,9 @@ export class AgentManager {
       lastUserMessageAt: options?.lastUserMessageAt ?? null,
       lastUsage: options?.lastUsage,
       lastError: options?.lastError,
+      credentialGeneration: quotaState.credentialGeneration,
+      credentialChangedAt: quotaState.credentialChangedAt,
+      quotaTurnCheckpoint: quotaState.quotaTurnCheckpoint,
       attention: resolveInitialAttention(options?.attention),
       internal: config.internal ?? false,
       labels: options?.labels ?? {},
@@ -4969,6 +5219,26 @@ export class AgentManager {
       agent.lifecycle = "error";
     }
     agent.lastError = event.error;
+    if (
+      isForegroundEvent &&
+      eventTurnId &&
+      event.code === "provider_quota_exceeded" &&
+      agent.persistence?.sessionId &&
+      agent.quotaTurnRevision === (this.quotaActivityRevisions.get(agent.id) ?? 0)
+    ) {
+      agent.quotaTurnCheckpoint = {
+        turnId: eventTurnId,
+        sessionId: agent.persistence.sessionId,
+        failedAt: new Date().toISOString(),
+        ...(agent.credentialGeneration
+          ? {
+              credentialGeneration: agent.credentialGeneration,
+              credentialChangedAt: agent.credentialChangedAt,
+            }
+          : {}),
+      };
+      await this.persistSnapshot(agent);
+    }
     await this.appendSystemErrorTimelineMessage(
       agent,
       event.provider,
@@ -5045,6 +5315,8 @@ export class AgentManager {
       flags.shouldNotifyWaiters = false;
       return;
     }
+    // A provider-owned follow-up supersedes the failed task even without a new user prompt.
+    this.invalidateQuotaRecovery(agent.id);
     this.runs.trackAutonomousRun(agent.id, eventTurnId ?? null);
     if (eventTurnId) {
       this.openActiveTurn(agent, eventTurnId, new Date());

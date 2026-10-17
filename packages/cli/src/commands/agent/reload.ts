@@ -35,7 +35,9 @@ export function addReloadOptions(cmd: Command): Command {
     .option(
       "--operation-id <uuid>",
       "Durable credential reload operation ID (requires a full agent ID)",
-    );
+    )
+    .option("--credential-generation <id>", "Opaque confirmed account-switch generation")
+    .option("--credential-changed-at <iso>", "Confirmed same-host account-switch time");
 }
 
 export interface AgentReloadOptions extends CommandOptions {
@@ -43,6 +45,8 @@ export interface AgentReloadOptions extends CommandOptions {
   onlyIfIdle?: boolean;
   preserveHistory?: boolean;
   operationId?: string;
+  credentialGeneration?: string;
+  credentialChangedAt?: string;
 }
 
 export type AgentReloadData = AgentReloadResult | AgentReloadOperation;
@@ -63,11 +67,24 @@ export const credentialReloadSchema: OutputSchema<AgentReloadOperation> = {
 
 export type AgentReloadRequest =
   | { kind: "ordinary"; agentIdArg: string; onlyIfIdle: boolean }
-  | { kind: "credentials"; agentId: string; operationId: string };
+  | {
+      kind: "credentials";
+      agentId: string;
+      operationId: string;
+      credentialGeneration?: string;
+      credentialChangedAt?: string;
+    };
 
 export function parseAgentReloadRequest(
   agentIdArg: string,
-  options: Pick<AgentReloadOptions, "onlyIfIdle" | "preserveHistory" | "operationId">,
+  options: Pick<
+    AgentReloadOptions,
+    | "onlyIfIdle"
+    | "preserveHistory"
+    | "operationId"
+    | "credentialGeneration"
+    | "credentialChangedAt"
+  >,
 ): AgentReloadRequest {
   if (!agentIdArg || agentIdArg.trim().length === 0) {
     throw {
@@ -77,7 +94,12 @@ export function parseAgentReloadRequest(
     } satisfies CommandError;
   }
 
-  if (options.preserveHistory || options.operationId !== undefined) {
+  if (
+    options.preserveHistory ||
+    options.operationId !== undefined ||
+    options.credentialGeneration !== undefined ||
+    options.credentialChangedAt !== undefined
+  ) {
     if (!options.onlyIfIdle || !options.preserveHistory || !options.operationId) {
       throw {
         code: "INVALID_RELOAD_OPTIONS",
@@ -97,7 +119,26 @@ export function parseAgentReloadRequest(
         message: "--operation-id must be a UUID",
       } satisfies CommandError;
     }
-    return { kind: "credentials", agentId: agentIdArg, operationId: options.operationId };
+    if (
+      (options.credentialGeneration !== undefined || options.credentialChangedAt !== undefined) &&
+      (!z.string().min(1).max(512).safeParse(options.credentialGeneration).success ||
+        !z.string().datetime({ offset: true }).safeParse(options.credentialChangedAt).success)
+    )
+      throw {
+        code: "INVALID_CREDENTIAL_CHANGE",
+        message: "Credential generation and ISO changed-at timestamp are required together",
+      } satisfies CommandError;
+    return {
+      kind: "credentials",
+      agentId: agentIdArg,
+      operationId: options.operationId,
+      ...(options.credentialGeneration
+        ? {
+            credentialGeneration: options.credentialGeneration,
+            credentialChangedAt: options.credentialChangedAt,
+          }
+        : {}),
+    };
   }
   return { kind: "ordinary", agentIdArg, onlyIfIdle: options.onlyIfIdle === true };
 }
@@ -115,6 +156,12 @@ export async function executeAgentReload(
     const operation = await client.reloadAgentCredentials({
       agentId: request.agentId,
       operationId: request.operationId,
+      ...(request.credentialGeneration
+        ? {
+            credentialGeneration: request.credentialGeneration,
+            credentialChangedAt: request.credentialChangedAt,
+          }
+        : {}),
     });
     return { type: "single", data: operation, schema: credentialReloadSchema };
   }
