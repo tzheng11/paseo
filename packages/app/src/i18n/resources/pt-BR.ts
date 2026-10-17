@@ -1574,6 +1574,42 @@ export const ptBR: TranslationResources = {
     },
   },
   openProject: {
+    hosts: {
+      title: "Hosts",
+      info: "Espaços de trabalho e agentes mostram ativos / total; ativo significa em execução agora. A CPU mostra a % ociosa. Próximo marca o host escolhido pela regra do /spawn: menos alertas e, depois, mais núcleos livres. Atualiza a cada 15 s.",
+      next: "Próximo",
+      columns: {
+        host: "Host",
+        workspaces: "Espaços de trabalho",
+        agents: "Agentes",
+        cpu: "CPU ociosa",
+        memory: "RAM",
+      },
+      status: {
+        connecting: "Conectando…",
+        offline: "Offline",
+        loading: "Carregando…",
+        unsupported: "Atualize este host para ver a carga",
+      },
+      cores_one: "de {{count}} núcleo",
+      cores_other: "de {{count}} núcleos",
+      memoryUsed: "{{used}} / {{total}} GB",
+      swap: "{{size}} GB de swap",
+      pressure: {
+        warn: "Pressão de memória",
+        critical: "Pressão de memória crítica",
+      },
+      warnings: {
+        swap: "Usando {{size}} GB de swap",
+        busy: "{{percent}}% ociosa",
+        gitQueue: "Fila do Git: {{count}}",
+      },
+      compact: {
+        workspaces: "{{active}}/{{total}} espaços de trabalho",
+        agents: "{{active}}/{{total}} agentes",
+        cpu: "{{percent}}% ociosa",
+      },
+    },
     tiles: {
       addProject: {
         title: "Adicionar um projeto",

@@ -1544,6 +1544,42 @@ export const ar: TranslationResources = {
     },
   },
   openProject: {
+    hosts: {
+      title: "المضيفون",
+      info: "تعرض مساحات العمل والوكلاء النشطة / الإجمالي؛ النشط يعني قيد التشغيل الآن. يعرض المعالج نسبة الخمول. تشير «التالي» إلى المضيف الذي تختاره قاعدة /spawn: أقل التحذيرات، ثم أكثر الأنوية الخاملة. يتم التحديث كل 15 ثانية.",
+      next: "التالي",
+      columns: {
+        host: "المضيف",
+        workspaces: "مساحات العمل",
+        agents: "الوكلاء",
+        cpu: "خمول المعالج",
+        memory: "الذاكرة",
+      },
+      status: {
+        connecting: "جارٍ الاتصال…",
+        offline: "غير متصل",
+        loading: "جارٍ التحميل…",
+        unsupported: "حدّث هذا المضيف لعرض حمله",
+      },
+      cores_one: "من {{count}} نواة",
+      cores_other: "من {{count}} أنوية",
+      memoryUsed: "{{used}} / {{total}} غيغابايت",
+      swap: "تبديل {{size}} غيغابايت",
+      pressure: {
+        warn: "ضغط على الذاكرة",
+        critical: "ضغط حرج على الذاكرة",
+      },
+      warnings: {
+        swap: "يستخدم {{size}} غيغابايت من التبديل",
+        busy: "خامل {{percent}}%",
+        gitQueue: "قائمة انتظار Git: {{count}}",
+      },
+      compact: {
+        workspaces: "{{active}}/{{total}} مساحات عمل",
+        agents: "{{active}}/{{total}} وكلاء",
+        cpu: "خامل {{percent}}%",
+      },
+    },
     tiles: {
       addProject: {
         title: "أضف مشروعًا",

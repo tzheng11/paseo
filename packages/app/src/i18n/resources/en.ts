@@ -1568,6 +1568,42 @@ export const en = {
     },
   },
   openProject: {
+    hosts: {
+      title: "Hosts",
+      info: "Workspaces and agents show active / total; active means running now. CPU shows % idle. Next marks the host the /spawn rule picks: fewest warnings, then the most idle cores. Refreshes every 15 s.",
+      next: "Next",
+      columns: {
+        host: "Host",
+        workspaces: "Workspaces",
+        agents: "Agents",
+        cpu: "CPU idle",
+        memory: "RAM",
+      },
+      status: {
+        connecting: "Connecting…",
+        offline: "Offline",
+        loading: "Loading…",
+        unsupported: "Update this host to see its load",
+      },
+      cores_one: "of {{count}} core",
+      cores_other: "of {{count}} cores",
+      memoryUsed: "{{used}} / {{total}} GB",
+      swap: "{{size}} GB swap",
+      pressure: {
+        warn: "Memory pressure",
+        critical: "Critical memory pressure",
+      },
+      warnings: {
+        swap: "Swapping {{size}} GB",
+        busy: "{{percent}}% idle",
+        gitQueue: "Git queue {{count}}",
+      },
+      compact: {
+        workspaces: "{{active}}/{{total}} workspaces",
+        agents: "{{active}}/{{total}} agents",
+        cpu: "{{percent}}% idle",
+      },
+    },
     tiles: {
       addProject: {
         title: "Add a project",

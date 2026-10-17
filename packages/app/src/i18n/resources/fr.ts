@@ -1583,6 +1583,42 @@ export const fr: TranslationResources = {
     },
   },
   openProject: {
+    hosts: {
+      title: "Hôtes",
+      info: "Les espaces de travail et les agents affichent actifs / total ; actif signifie en cours d'exécution. Le CPU affiche le % inactif. Suivant marque l'hôte choisi par la règle de /spawn : le moins d'alertes, puis le plus de cœurs libres. Actualisé toutes les 15 s.",
+      next: "Suivant",
+      columns: {
+        host: "Hôte",
+        workspaces: "Espaces de travail",
+        agents: "Agents",
+        cpu: "CPU libre",
+        memory: "RAM",
+      },
+      status: {
+        connecting: "Connexion…",
+        offline: "Hors ligne",
+        loading: "Chargement…",
+        unsupported: "Mettez à jour cet hôte pour voir sa charge",
+      },
+      cores_one: "sur {{count}} cœur",
+      cores_other: "sur {{count}} cœurs",
+      memoryUsed: "{{used}} / {{total}} Go",
+      swap: "{{size}} Go de swap",
+      pressure: {
+        warn: "Pression mémoire",
+        critical: "Pression mémoire critique",
+      },
+      warnings: {
+        swap: "Swap de {{size}} Go",
+        busy: "{{percent}} % libre",
+        gitQueue: "File Git : {{count}}",
+      },
+      compact: {
+        workspaces: "{{active}}/{{total}} espaces de travail",
+        agents: "{{active}}/{{total}} agents",
+        cpu: "{{percent}} % libre",
+      },
+    },
     tiles: {
       addProject: {
         title: "Ajouter un projet",

@@ -1560,6 +1560,42 @@ export const ja: TranslationResources = {
     },
   },
   openProject: {
+    hosts: {
+      title: "ホスト",
+      info: "ワークスペースとエージェントは稼働中 / 合計を表示します。稼働中は今実行中という意味です。CPU はアイドル率です。「次」は /spawn のルールで選ばれるホストを示します: 警告が最も少なく、次にアイドルコアが最も多いホスト。15 秒ごとに更新されます。",
+      next: "次",
+      columns: {
+        host: "ホスト",
+        workspaces: "ワークスペース",
+        agents: "エージェント",
+        cpu: "CPU アイドル",
+        memory: "メモリ",
+      },
+      status: {
+        connecting: "接続中…",
+        offline: "オフライン",
+        loading: "読み込み中…",
+        unsupported: "負荷を表示するにはこのホストを更新してください",
+      },
+      cores_one: "{{count}} コア中",
+      cores_other: "{{count}} コア中",
+      memoryUsed: "{{used}} / {{total}} GB",
+      swap: "スワップ {{size}} GB",
+      pressure: {
+        warn: "メモリ逼迫",
+        critical: "深刻なメモリ逼迫",
+      },
+      warnings: {
+        swap: "スワップ {{size}} GB",
+        busy: "アイドル {{percent}}%",
+        gitQueue: "Git キュー {{count}}",
+      },
+      compact: {
+        workspaces: "ワークスペース {{active}}/{{total}}",
+        agents: "エージェント {{active}}/{{total}}",
+        cpu: "アイドル {{percent}}%",
+      },
+    },
     tiles: {
       addProject: {
         title: "プロジェクトを追加",

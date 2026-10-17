@@ -1553,6 +1553,42 @@ export const ko: TranslationResources = {
     },
   },
   openProject: {
+    hosts: {
+      title: "호스트",
+      info: "워크스페이스와 에이전트는 활성 / 전체로 표시됩니다. 활성은 지금 실행 중이라는 뜻입니다. CPU는 유휴 비율입니다. '다음'은 /spawn 규칙이 고르는 호스트입니다: 경고가 가장 적고, 그다음 유휴 코어가 가장 많은 호스트. 15초마다 새로 고칩니다.",
+      next: "다음",
+      columns: {
+        host: "호스트",
+        workspaces: "워크스페이스",
+        agents: "에이전트",
+        cpu: "CPU 유휴",
+        memory: "메모리",
+      },
+      status: {
+        connecting: "연결 중…",
+        offline: "오프라인",
+        loading: "불러오는 중…",
+        unsupported: "부하를 보려면 이 호스트를 업데이트하세요",
+      },
+      cores_one: "코어 {{count}}개 중",
+      cores_other: "코어 {{count}}개 중",
+      memoryUsed: "{{used}} / {{total}} GB",
+      swap: "스왑 {{size}} GB",
+      pressure: {
+        warn: "메모리 압박",
+        critical: "심각한 메모리 압박",
+      },
+      warnings: {
+        swap: "스왑 {{size}} GB 사용 중",
+        busy: "유휴 {{percent}}%",
+        gitQueue: "Git 대기열 {{count}}",
+      },
+      compact: {
+        workspaces: "워크스페이스 {{active}}/{{total}}",
+        agents: "에이전트 {{active}}/{{total}}",
+        cpu: "유휴 {{percent}}%",
+      },
+    },
     tiles: {
       addProject: {
         title: "프로젝트 추가",

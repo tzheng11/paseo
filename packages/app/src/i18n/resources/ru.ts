@@ -1571,6 +1571,42 @@ export const ru: TranslationResources = {
     },
   },
   openProject: {
+    hosts: {
+      title: "Хосты",
+      info: "Для рабочих пространств и агентов показано активных / всего; активный значит работающий сейчас. CPU показывает % простоя. «Следующий» отмечает хост, который выбирает правило /spawn: меньше предупреждений, затем больше свободных ядер. Обновляется каждые 15 с.",
+      next: "Следующий",
+      columns: {
+        host: "Хост",
+        workspaces: "Рабочие пространства",
+        agents: "Агенты",
+        cpu: "CPU простаивает",
+        memory: "ОЗУ",
+      },
+      status: {
+        connecting: "Подключение…",
+        offline: "Не в сети",
+        loading: "Загрузка…",
+        unsupported: "Обновите этот хост, чтобы видеть нагрузку",
+      },
+      cores_one: "из {{count}} ядра",
+      cores_other: "из {{count}} ядер",
+      memoryUsed: "{{used}} / {{total}} ГБ",
+      swap: "Подкачка {{size}} ГБ",
+      pressure: {
+        warn: "Нехватка памяти",
+        critical: "Критическая нехватка памяти",
+      },
+      warnings: {
+        swap: "Подкачка {{size}} ГБ",
+        busy: "Простой {{percent}}%",
+        gitQueue: "Очередь Git: {{count}}",
+      },
+      compact: {
+        workspaces: "{{active}}/{{total}} рабочих пространств",
+        agents: "{{active}}/{{total}} агентов",
+        cpu: "Простой {{percent}}%",
+      },
+    },
     tiles: {
       addProject: {
         title: "Добавить проект",
