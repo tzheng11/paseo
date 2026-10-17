@@ -2673,6 +2673,7 @@ type ParsedCodexNotification =
       status: string;
       errorMessage: string | null;
       quotaExceeded: boolean;
+      nativeTurnId: string | null;
       threadId: string | null;
     }
   | {
@@ -2826,6 +2827,7 @@ const CodexNotificationSchema = z.union([
         status: params.turn.status,
         errorMessage: params.turn.error?.message ?? null,
         quotaExceeded: params.turn.error?.codexErrorInfo === "usageLimitExceeded",
+        nativeTurnId: params.turn.id ?? null,
         threadId: params.threadId ?? null,
       }),
     ),
@@ -3251,6 +3253,7 @@ const CodexNotificationSchema = z.union([
         status: "interrupted",
         errorMessage: null,
         quotaExceeded: false,
+        nativeTurnId: null,
         threadId: getCodexEventThreadId(params),
       }),
     ),
@@ -3272,6 +3275,7 @@ const CodexNotificationSchema = z.union([
         status: "completed",
         errorMessage: null,
         quotaExceeded: false,
+        nativeTurnId: null,
         threadId: getCodexEventThreadId(params),
       }),
     ),
@@ -6635,7 +6639,12 @@ export class CodexAppServerAgentSession implements AgentSession {
         type: "turn_failed",
         provider: CODEX_PROVIDER,
         error: parsed.errorMessage ?? "Codex turn failed",
-        ...(parsed.quotaExceeded ? { code: "provider_quota_exceeded" } : {}),
+        ...(parsed.quotaExceeded &&
+        parsed.nativeTurnId &&
+        parsed.nativeTurnId === this.currentTurnId &&
+        parsed.threadId === this.currentThreadId
+          ? { code: "provider_quota_exceeded" }
+          : {}),
       });
     } else if (parsed.status === "interrupted") {
       this.dismissInterruptedAsyncQuestions();
