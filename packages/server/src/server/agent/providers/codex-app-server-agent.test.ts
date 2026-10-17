@@ -1579,6 +1579,43 @@ describe("Codex app-server provider", () => {
     }
   });
 
+  test("native child-thread PTYs remain active after their foreground completes", async () => {
+    const session = createSession();
+    try {
+      asInternals(session).handleNotification("codex/event/exec_command_begin", {
+        id: "not-yet-registered-child-thread",
+        msg: { type: "exec_command_begin", call_id: "child-exec", command: ["sleep", "30"] },
+      });
+      asInternals(session).handleNotification("codex/event/exec_command_end", {
+        id: "not-yet-registered-child-thread",
+        msg: {
+          type: "exec_command_end",
+          call_id: "child-exec",
+          stdout: "Process running with session id 4343",
+          exit_code: 0,
+        },
+      });
+      asInternals(session).handleNotification("turn/completed", {
+        threadId: "not-yet-registered-child-thread",
+        turn: { id: "child-turn", status: "completed", items: [], error: null },
+      });
+      expect(session.hasActiveBackgroundTasks?.()).toBe(true);
+      asInternals(session).handleNotification("item/completed", {
+        threadId: "not-yet-registered-child-thread",
+        item: {
+          type: "commandExecution",
+          id: "child-exec",
+          processId: "4343",
+          status: "completed",
+          exitCode: 0,
+        },
+      });
+      expect(session.hasActiveBackgroundTasks?.()).toBe(false);
+    } finally {
+      await session.close();
+    }
+  });
+
   test("shows the exact bytes Codex writes into an existing terminal", async () => {
     const appServer = createFakeCodexAppServer();
     const session = new CodexAppServerAgentSession(

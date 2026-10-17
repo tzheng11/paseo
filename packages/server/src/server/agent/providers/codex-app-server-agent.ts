@@ -5881,7 +5881,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         );
         return;
       case "exec_command_completed":
-        this.backgroundTasks.finished(key(parsed.callId), parsed.output, parsed.exitCode);
+        this.backgroundTasks.legacyFinished(key(parsed.callId), parsed.output, parsed.exitCode);
         return;
       case "terminal_interaction":
         this.backgroundTasks.interaction(key(parsed.callId), parsed.processId);
