@@ -24,6 +24,18 @@ paseo stop <id>                      # Stop an agent
 paseo usage                          # Show account quotas and balances
 ```
 
+## Listing agents
+
+```bash
+paseo ls -g --json                  # All non-archived agents across directories
+paseo ls -g --background --json     # Also include background workspace agents
+paseo ls -a --json                  # Include archived and background agents
+```
+
+Agent listings follow every daemon page, including inventories larger than 200 agents. JSON output remains one array. If any page fails or its continuation is invalid, the command exits with status `1` and writes an error to stderr without emitting a partial array. A successful empty result is `[]`.
+
+The listing is a traversal of the matching directory entries, not an atomic snapshot: agents created, removed, or changed while it runs can affect the result.
+
 ## Account usage
 
 Show account quotas and balances from the host's usage sources:
@@ -205,12 +217,15 @@ Then list, use, rename, or archive it:
 
 ```bash
 paseo workspace ls
+paseo workspace ls --json                     # Includes pin metadata
 paseo workspace ls --background               # Also include background workspaces
 paseo run --workspace <workspace-id> "implement authentication"
 paseo workspace rename <workspace-id> "Auth rework"
 paseo workspace rename <workspace-id> --reset   # back to the branch or directory name
 paseo workspace archive <workspace-id>
 ```
+
+Workspace JSON rows include `pinnedAt` from the daemon: a timestamp means pinned, `null` means unpinned, and an omitted field means the host did not supply pin metadata. Do not treat an omitted field as unpinned. `--background` preserves the same metadata while including background workspaces.
 
 Add `--forge <name>` to PR checkout when Paseo cannot infer the forge from the source checkout. See [Git worktrees](/docs/worktrees) for setup hooks and services.
 

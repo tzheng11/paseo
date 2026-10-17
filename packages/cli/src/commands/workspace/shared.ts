@@ -8,6 +8,7 @@ export interface WorkspaceRow {
   isolation: "local" | "worktree";
   cwd: string;
   background: boolean;
+  pinnedAt?: string | null;
 }
 
 export const workspaceSchema: OutputSchema<WorkspaceRow> = {
@@ -38,5 +39,6 @@ export function toWorkspaceRow(workspace: WorkspaceDescriptorPayload): Workspace
     isolation: workspace.workspaceKind === "worktree" ? "worktree" : "local",
     cwd: workspace.workspaceDirectory,
     background: workspace.background === true,
+    pinnedAt: workspace.pinnedAt,
   };
 }
