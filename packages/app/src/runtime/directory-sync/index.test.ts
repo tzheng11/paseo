@@ -46,6 +46,8 @@ class FakeDirectoryClient {
   listProjectsCalls = 0;
   lastProjectOptions: unknown;
   projectResult: ProjectListResult | null = null;
+  workspaceResult: WorkspaceFetchResult | null = null;
+  projectFailures: Error[] = [];
   private pendingAgentFetch: Promise<AgentFetchResult> | null = null;
   private pendingWorkspaceFetch: Promise<WorkspaceFetchResult> | null = null;
   private pendingProjectFetch: Promise<ProjectListResult> | null = null;
@@ -118,6 +120,7 @@ class FakeDirectoryClient {
       this.pendingWorkspaceFetch = null;
       return pending;
     }
+    if (this.workspaceResult) return this.workspaceResult;
     return {
       requestId: "workspaces",
       entries: [],
@@ -129,6 +132,8 @@ class FakeDirectoryClient {
   async listProjects(options?: unknown): Promise<ProjectListResult> {
     this.listProjectsCalls += 1;
     this.lastProjectOptions = options;
+    const failure = this.projectFailures.shift();
+    if (failure) throw failure;
     if (this.pendingProjectFetch) {
       const pending = this.pendingProjectFetch;
       this.pendingProjectFetch = null;
@@ -186,11 +191,37 @@ class FakeDirectoryClient {
   }
 }
 
+interface ScheduledDirectoryTask {
+  task: () => void;
+  delayMs: number;
+}
+
+class FakeDirectoryScheduler {
+  private readonly tasks = new Set<ScheduledDirectoryTask>();
+
+  schedule(task: () => void, delayMs: number): () => void {
+    const scheduled = { task, delayMs };
+    this.tasks.add(scheduled);
+    return () => this.tasks.delete(scheduled);
+  }
+
+  get delays(): number[] {
+    return [...this.tasks].map(({ delayMs }) => delayMs);
+  }
+
+  runNext(): void {
+    const scheduled = [...this.tasks][0];
+    if (!scheduled) throw new Error("No directory retry is scheduled");
+    this.tasks.delete(scheduled);
+    scheduled.task();
+  }
+}
+
 const serverIds = new Set<string>();
 
 function createDirectory(
   serverId: string,
-  options?: { workspaceLabels?: boolean },
+  options?: { workspaceLabels?: boolean; scheduler?: FakeDirectoryScheduler },
 ): {
   client: FakeDirectoryClient;
   directory: DirectorySync;
@@ -198,12 +229,17 @@ function createDirectory(
   serverIds.add(serverId);
   const client = new FakeDirectoryClient();
   client.supportsWorkspaceLabels = options?.workspaceLabels === true;
-  const directory = new DirectorySync(serverId, {
-    onAgentStoppedRunning: () => undefined,
-    markAgentLoading: () => undefined,
-    markAgentReady: () => undefined,
-    markAgentError: () => undefined,
-  });
+  const directory = new DirectorySync(
+    serverId,
+    {
+      onAgentStoppedRunning: () => undefined,
+      markAgentLoading: () => undefined,
+      markAgentReady: () => undefined,
+      markAgentError: () => undefined,
+    },
+    undefined,
+    options?.scheduler,
+  );
   directory.connectionChanged({
     client: client as unknown as DaemonClient,
     status: "online",
@@ -264,6 +300,47 @@ function createWorkspaceEntry(id: string): WorkspaceFetchResult["entries"][numbe
   };
 }
 
+function initializeDirectorySession(serverId: string, client: FakeDirectoryClient): void {
+  const store = useSessionStore.getState();
+  store.initializeSession(serverId, client as unknown as DaemonClient, 1);
+  store.updateSessionServerInfo(serverId, {
+    serverId,
+    hostname: null,
+    version: "test",
+    features: { projectList: true },
+  });
+}
+
+interface StopDirectoryDemandInput {
+  directory: DirectorySync;
+  demand: object;
+}
+
+const directoryRetryStops = [
+  {
+    name: "offline",
+    stop({ directory }: StopDirectoryDemandInput) {
+      directory.connectionChanged({
+        client: null,
+        status: "offline",
+        source: { clientGeneration: 1, connectionEpoch: 1 },
+      });
+    },
+  },
+  {
+    name: "dispose",
+    stop({ directory }: StopDirectoryDemandInput) {
+      directory.dispose();
+    },
+  },
+  {
+    name: "end-demand",
+    stop({ directory, demand }: StopDirectoryDemandInput) {
+      directory.setDemand(demand, false);
+    },
+  },
+];
+
 afterEach(() => {
   for (const serverId of serverIds) useSessionStore.getState().clearSession(serverId);
   serverIds.clear();
@@ -271,6 +348,198 @@ afterEach(() => {
 });
 
 describe("DirectorySync session readiness", () => {
+  it("recovers a failed project baseline while the same host stays connected", async () => {
+    const serverId = "connected-directory-retry";
+    const scheduler = new FakeDirectoryScheduler();
+    const { client, directory } = createDirectory(serverId, { scheduler });
+    initializeDirectorySession(serverId, client);
+    const store = useSessionStore.getState();
+    client.projectFailures.push(new Error("Project list timed out"));
+    client.workspaceResult = {
+      requestId: "workspaces",
+      entries: [{ ...createWorkspaceEntry("recovered-chat"), projectId: "project-1" }],
+      emptyProjects: [],
+      pageInfo: { hasMore: false, nextCursor: null, prevCursor: null },
+    };
+    directory.setDemand({}, true);
+
+    await expect(directory.refreshDemand()).rejects.toThrow("Project list timed out");
+
+    expect(client.listProjectsCalls).toBe(1);
+    expect(client.fetchWorkspacesCalls).toBe(0);
+    expect(store.getSession(serverId)?.hasHydratedWorkspaces).toBe(false);
+    expect(scheduler.delays).toEqual([1_000]);
+
+    scheduler.runNext();
+    await directory.refreshDemand();
+
+    expect(client.listProjectsCalls).toBe(2);
+    expect(client.fetchWorkspacesCalls).toBe(1);
+    expect(store.getSession(serverId)?.hasHydratedWorkspaces).toBe(true);
+    expect([...(store.getSession(serverId)?.workspaces.keys() ?? [])]).toEqual(["recovered-chat"]);
+    expect(scheduler.delays).toEqual([]);
+    directory.dispose();
+  });
+
+  it("backs off repeated baseline failures and resets the delay after success", async () => {
+    const serverId = "directory-retry-backoff";
+    const scheduler = new FakeDirectoryScheduler();
+    const { client, directory } = createDirectory(serverId, { scheduler });
+    initializeDirectorySession(serverId, client);
+    const delays = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000];
+    client.projectFailures.push(...delays.map(() => new Error("Still unavailable")));
+    directory.setDemand({}, true);
+
+    for (const delay of delays) {
+      await expect(directory.refreshDemand()).rejects.toThrow("Still unavailable");
+      expect(scheduler.delays).toEqual([delay]);
+      scheduler.runNext();
+    }
+    await directory.refreshDemand();
+    expect(scheduler.delays).toEqual([]);
+
+    client.projectFailures.push(new Error("Another transient failure"));
+    await expect(directory.refreshDemand()).rejects.toThrow("Another transient failure");
+    expect(scheduler.delays).toEqual([1_000]);
+    scheduler.runNext();
+    await directory.refreshDemand();
+    expect(client.listProjectsCalls).toBe(10);
+    expect(scheduler.delays).toEqual([]);
+    directory.dispose();
+  });
+
+  it("waits for a pending sibling request before retrying a failed demand batch", async () => {
+    const serverId = "directory-retry-no-overlap";
+    const scheduler = new FakeDirectoryScheduler();
+    const { client, directory } = createDirectory(serverId, { scheduler });
+    initializeDirectorySession(serverId, client);
+    const completeAgents = client.holdAgentFetch();
+    client.projectFailures.push(new Error("Project list timed out"));
+    directory.setDemand({}, true);
+    const refresh = directory.refreshDemand();
+    const rejected = expect(refresh).rejects.toThrow("Project list timed out");
+    await expect.poll(() => client.listProjectsCalls).toBe(1);
+
+    expect(scheduler.delays).toEqual([]);
+    expect(directory.refreshDemand()).toBe(refresh);
+    expect(client.fetchAgentsCalls).toBe(1);
+    completeAgents({
+      requestId: "agents",
+      entries: [],
+      pageInfo: { hasMore: false, nextCursor: null, prevCursor: null },
+    });
+    await rejected;
+    expect(scheduler.delays).toEqual([1_000]);
+
+    scheduler.runNext();
+    await directory.refreshDemand();
+    expect(client.fetchAgentsCalls).toBe(2);
+    expect(client.listProjectsCalls).toBe(2);
+    expect(scheduler.delays).toEqual([]);
+    directory.dispose();
+  });
+
+  it.each(directoryRetryStops)(
+    "cancels a pending demand retry on $name",
+    async ({ name, stop }) => {
+      const serverId = `directory-retry-${name}`;
+      const scheduler = new FakeDirectoryScheduler();
+      const { client, directory } = createDirectory(serverId, { scheduler });
+      initializeDirectorySession(serverId, client);
+      client.projectFailures.push(new Error("Project list timed out"));
+      const demand = {};
+      directory.setDemand(demand, true);
+      await expect(directory.refreshDemand()).rejects.toThrow("Project list timed out");
+      expect(scheduler.delays).toEqual([1_000]);
+
+      stop({ directory, demand });
+
+      expect(scheduler.delays).toEqual([]);
+      await directory.refreshDemand();
+      expect(client.listProjectsCalls).toBe(1);
+      directory.dispose();
+    },
+  );
+
+  it("retries route-only demand and cancels its retry when the final route closes", async () => {
+    const serverId = "directory-retry-route-only";
+    const scheduler = new FakeDirectoryScheduler();
+    const { client, directory } = createDirectory(serverId, { scheduler });
+    initializeDirectorySession(serverId, client);
+    client.projectFailures.push(new Error("Project list timed out"));
+    directory.setAgentRouteDemand(["open-agent"]);
+
+    await expect(directory.refreshDemand()).rejects.toThrow("Project list timed out");
+    expect(scheduler.delays).toEqual([1_000]);
+    scheduler.runNext();
+    await directory.refreshDemand();
+    expect(client.listProjectsCalls).toBe(2);
+    expect(scheduler.delays).toEqual([]);
+
+    client.projectFailures.push(new Error("Project list timed out"));
+    await expect(directory.refreshDemand()).rejects.toThrow("Project list timed out");
+    expect(scheduler.delays).toEqual([1_000]);
+    directory.setAgentRouteDemand([]);
+
+    expect(scheduler.delays).toEqual([]);
+    await directory.refreshDemand();
+    expect(client.listProjectsCalls).toBe(3);
+    directory.dispose();
+  });
+
+  it("refreshes newly acquired demand after an older demand's in-flight request succeeds", async () => {
+    const serverId = "directory-demand-reacquired-in-flight";
+    const scheduler = new FakeDirectoryScheduler();
+    const { client, directory } = createDirectory(serverId, { scheduler });
+    initializeDirectorySession(serverId, client);
+    const completeWorkspaces = client.holdWorkspaceFetch();
+    const demand = {};
+    directory.setDemand(demand, true);
+    const firstRefresh = directory.refreshDemand();
+    await expect.poll(() => client.fetchWorkspacesCalls).toBe(1);
+
+    directory.setDemand(demand, false);
+    directory.setDemand({}, true);
+    completeWorkspaces({
+      requestId: "workspaces",
+      entries: [],
+      emptyProjects: [],
+      pageInfo: { hasMore: false, nextCursor: null, prevCursor: null },
+    });
+    await firstRefresh;
+    await directory.refreshDemand();
+
+    expect(client.listProjectsCalls).toBe(2);
+    expect(client.fetchWorkspacesCalls).toBe(2);
+    expect(scheduler.delays).toEqual([]);
+    directory.dispose();
+  });
+
+  it("does not schedule a late failure after demand ends during the request", async () => {
+    const serverId = "directory-retry-demand-ended-in-flight";
+    const scheduler = new FakeDirectoryScheduler();
+    const { client, directory } = createDirectory(serverId, { scheduler });
+    initializeDirectorySession(serverId, client);
+    const completeAgents = client.holdAgentFetch();
+    client.projectFailures.push(new Error("Project list timed out"));
+    const demand = {};
+    directory.setDemand(demand, true);
+    const rejected = expect(directory.refreshDemand()).rejects.toThrow("Project list timed out");
+    await expect.poll(() => client.listProjectsCalls).toBe(1);
+
+    directory.setDemand(demand, false);
+    completeAgents({
+      requestId: "agents",
+      entries: [],
+      pageInfo: { hasMore: false, nextCursor: null, prevCursor: null },
+    });
+    await rejected;
+
+    expect(scheduler.delays).toEqual([]);
+    expect(client.listProjectsCalls).toBe(1);
+    directory.dispose();
+  });
+
   it("restores the cached directory before network demand", async () => {
     const serverId = "offline-cached-directory";
     serverIds.add(serverId);

@@ -15,12 +15,28 @@ import { spawnProcess } from "../../../../utils/spawn.js";
 
 export type ClaudeOptions = Options;
 export type ClaudeQueryInput = Parameters<typeof query>[0] & { options: ClaudeOptions };
-export type ClaudeQueryFactory = (input: ClaudeQueryInput) => Query;
+export type ClaudeQuery = Pick<
+  Query,
+  | "next"
+  | "return"
+  | "throw"
+  | typeof Symbol.asyncIterator
+  | "interrupt"
+  | "close"
+  | "setPermissionMode"
+  | "setModel"
+  | "applyFlagSettings"
+  | "supportedCommands"
+  | "supportedModels"
+  | "rewindFiles"
+>;
+export type ClaudeQueryFactory = (input: ClaudeQueryInput) => ClaudeQuery;
 
 export interface ClaudeQueryContext {
   runtimeSettings?: ProviderRuntimeSettings;
   launchEnv?: Record<string, string>;
   queryFactory?: ClaudeQueryFactory;
+  spawnProcess?: typeof spawnProcess;
   /** Called with the spawned child process so the caller can tree-kill it on close. */
   onChildProcess?: (child: ChildProcess) => void;
 }
@@ -62,6 +78,9 @@ function applyRuntimeSettingsToClaudeOptions(
   return {
     ...options,
     spawnClaudeCodeProcess: (spawnOptions) => {
+      // The SDK's forwarded signal waits for its grace period. The owner signal
+      // fences a spawn requested after maintenance startup has already timed out.
+      options.abortController?.signal.throwIfAborted();
       const resolved = resolveClaudeSpawnCommand(spawnOptions, runtimeSettings);
       // When the SDK passes a default JS runtime ("node"/"bun"), replace it with
       // process.execPath — the actual node binary running the daemon. This avoids
@@ -84,7 +103,7 @@ function applyRuntimeSettingsToClaudeOptions(
         : null;
       const command = selfNodeCommand?.command ?? resolved.command;
       const args = selfNodeCommand?.args ?? resolved.args;
-      const child = spawnProcess(command, args, {
+      const child = (context.spawnProcess ?? spawnProcess)(command, args, {
         cwd: spawnOptions.cwd,
         ...(selfNodeCommand
           ? { env: selfNodeCommand.env, envMode: "internal" as const }
@@ -110,7 +129,10 @@ function applyRuntimeSettingsToClaudeOptions(
   };
 }
 
-export function claudeQuery(input: ClaudeQueryInput, context: ClaudeQueryContext = {}): Query {
+export function claudeQuery(
+  input: ClaudeQueryInput,
+  context: ClaudeQueryContext = {},
+): ClaudeQuery {
   const launchQuery = context.queryFactory ?? query;
   return launchQuery({
     ...input,

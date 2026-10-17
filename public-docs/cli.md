@@ -24,6 +24,18 @@ paseo stop <id>                      # Stop an agent
 paseo usage                          # Show account quotas and balances
 ```
 
+## Listing agents
+
+```bash
+paseo ls -g --json                  # All non-archived agents across directories
+paseo ls -g --background --json     # Also include background workspace agents
+paseo ls -a --json                  # Include archived and background agents
+```
+
+Agent listings follow every daemon page, including inventories larger than 200 agents. JSON output remains one array. If any page fails or its continuation is invalid, the command exits with status `1` and writes an error to stderr without emitting a partial array. A successful empty result is `[]`.
+
+The listing is a traversal of the matching directory entries, not an atomic snapshot: agents created, removed, or changed while it runs can affect the result.
+
 ## Account usage
 
 Show account quotas and balances from the host's usage sources:
@@ -106,6 +118,32 @@ from help, and print a warning to stderr. Use `--no-wait` in scripts. Workspace 
 selected separately with `workspace create --background`; this release does not repurpose
 `run --background`.
 
+## Reloading agents
+
+Restart an agent's provider process with `paseo agent reload <id-or-name>`. Add
+`--only-if-idle` to refuse the reload if the agent has active work. This requires a
+host that supports atomic idle-only reloads.
+
+For Claude or Codex credential maintenance, preserve the existing timeline and skip
+daemon-side provider history replay:
+
+```bash
+paseo agent reload <full-agent-uuid> --only-if-idle --preserve-history --operation-id <uuid> --json
+paseo agent reload-status <uuid> --json
+```
+
+All three maintenance flags are required together. Choose and save the operation
+UUID before sending the reload. The response contains `agentId`, `operationId`,
+and `status`: `pending`, `completed`, `refused`, `failed`, or `unknown`. It may also
+include `reasonCode`, `reason`, and `retryable`.
+
+`reload-status` only reads the durable operation record. An unknown operation
+returns `status: "unknown"` and `reasonCode: "NOT_FOUND"`, without an agent ID.
+A timeout or lost connection exits with an error; query the saved operation UUID
+before dispatching more work. A host without credential maintenance support
+returns a structured refusal to a reload request and an update error to a status
+query.
+
 ## Projects
 
 Register the current directory as a project, then list the projects known to the daemon:
@@ -179,12 +217,15 @@ Then list, use, rename, or archive it:
 
 ```bash
 paseo workspace ls
+paseo workspace ls --json                     # Includes pin metadata
 paseo workspace ls --background               # Also include background workspaces
 paseo run --workspace <workspace-id> "implement authentication"
 paseo workspace rename <workspace-id> "Auth rework"
 paseo workspace rename <workspace-id> --reset   # back to the branch or directory name
 paseo workspace archive <workspace-id>
 ```
+
+Workspace JSON rows include `pinnedAt` from the daemon: a timestamp means pinned, `null` means unpinned, and an omitted field means the host did not supply pin metadata. Do not treat an omitted field as unpinned. `--background` preserves the same metadata while including background workspaces.
 
 Add `--forge <name>` to PR checkout when Paseo cannot infer the forge from the source checkout. See [Git worktrees](/docs/worktrees) for setup hooks and services.
 

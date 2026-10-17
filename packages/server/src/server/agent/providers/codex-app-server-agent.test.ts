@@ -1,5 +1,6 @@
 import { describe, expect, test, vi } from "vitest";
 import { z } from "zod";
+import { AgentManager } from "../agent-manager.js";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { DatabaseSync } from "node:sqlite";
@@ -1529,6 +1530,92 @@ describe("Codex app-server provider", () => {
     }
   });
 
+  test("idle-only maintenance preserves a Codex PTY after its foreground turn completes", async () => {
+    const appServer = createFakeCodexAppServer();
+    const provider = createProviderWithFakeAppServer(appServer);
+    const manager = new AgentManager({ clients: { codex: provider }, logger: createTestLogger() });
+    const agent = await manager.createAgent(createConfig({ cwd: process.cwd() }), undefined, {
+      workspaceId: undefined,
+    });
+    const killed = vi.spyOn(appServer.child, "kill");
+    try {
+      const turn = manager.runAgent(agent.id, "fixture background command");
+      await appServer.waitForTurnStart();
+      appServer.startsTurn({ threadId: "thread-1", turnId: "native-turn" });
+      appServer.runsLegacyCommand({
+        threadId: "thread-1",
+        callId: "background-exec",
+        command: "sleep 30",
+        output: "Process running with session id 4242",
+      });
+      appServer.completeTurn({ threadId: "thread-1" });
+      await turn;
+      expect(manager.getAgent(agent.id)?.lifecycle).toBe("idle");
+      await expect(
+        manager.reloadIdleAgentSession(agent.id, { preserveHistory: true }),
+      ).rejects.toMatchObject({ code: "agent_reload_busy" });
+      expect(killed).not.toHaveBeenCalled();
+      appServer.child.stdout.write(
+        `${JSON.stringify({ method: "item/completed", params: { threadId: "thread-1", turnId: "native-turn", item: { type: "commandExecution", id: "background-exec", processId: "4242", command: "sleep 30", status: "completed", exitCode: 0 } } })}\n`,
+      );
+      await vi.waitFor(() =>
+        expect(manager.getAgent(agent.id)?.session?.hasActiveBackgroundTasks?.()).toBe(false),
+      );
+    } finally {
+      await manager.closeAgent(agent.id);
+    }
+  });
+
+  test("malformed native command lifecycle keeps background activity uncertain", async () => {
+    const session = createSession();
+    try {
+      asInternals(session).handleNotification("codex/event/exec_command_end", {
+        id: "test-thread",
+        msg: { type: "exec_command_end", call_id: "unknown-command", stdout: 123 },
+      });
+      expect(session.hasActiveBackgroundTasks?.()).toBe(true);
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("native child-thread PTYs remain active after their foreground completes", async () => {
+    const session = createSession();
+    try {
+      asInternals(session).handleNotification("codex/event/exec_command_begin", {
+        id: "not-yet-registered-child-thread",
+        msg: { type: "exec_command_begin", call_id: "child-exec", command: ["sleep", "30"] },
+      });
+      asInternals(session).handleNotification("codex/event/exec_command_end", {
+        id: "not-yet-registered-child-thread",
+        msg: {
+          type: "exec_command_end",
+          call_id: "child-exec",
+          stdout: "Process running with session id 4343",
+          exit_code: 0,
+        },
+      });
+      asInternals(session).handleNotification("turn/completed", {
+        threadId: "not-yet-registered-child-thread",
+        turn: { id: "child-turn", status: "completed", items: [], error: null },
+      });
+      expect(session.hasActiveBackgroundTasks?.()).toBe(true);
+      asInternals(session).handleNotification("item/completed", {
+        threadId: "not-yet-registered-child-thread",
+        item: {
+          type: "commandExecution",
+          id: "child-exec",
+          processId: "4343",
+          status: "completed",
+          exitCode: 0,
+        },
+      });
+      expect(session.hasActiveBackgroundTasks?.()).toBe(false);
+    } finally {
+      await session.close();
+    }
+  });
+
   test("shows the exact bytes Codex writes into an existing terminal", async () => {
     const appServer = createFakeCodexAppServer();
     const session = new CodexAppServerAgentSession(
@@ -1888,6 +1975,140 @@ describe("Codex app-server provider", () => {
         appServer.assertNoErrors();
       } finally {
         await session.close();
+      }
+    },
+  );
+
+  test("maintenance resume skips historical reads until explicitly requested and supports a turn", async () => {
+    const appServer = createFakeCodexAppServer({
+      initialize: () => ({ userAgent: "paseo/0.159.2" }),
+      "thread/resume": () => ({ thread: { id: "archived-thread-id" } }),
+      "thread/read": () => ({ thread: { historyMode: "paginated" } }),
+      "thread/turns/list": () => ({ data: [{ id: "turn-old" }], nextCursor: null }),
+      "thread/items/list": () => ({
+        data: [
+          {
+            turnId: "turn-old",
+            item: { type: "agentMessage", id: "old", text: "preserved history" },
+          },
+          {
+            turnId: "turn-old",
+            item: {
+              type: "commandExecution",
+              id: "historical-pty",
+              processId: "stale-process",
+              status: "completed",
+              command: "old shell",
+              exitCode: null,
+            },
+          },
+        ],
+        nextCursor: null,
+      }),
+    });
+    const provider = createProviderWithFakeAppServer(appServer);
+    const session = await provider.resumeSession(archivedThreadHandle(), undefined, undefined, {
+      purpose: "maintenance",
+    });
+    try {
+      expect(
+        appServer
+          .requests()
+          .filter((request) =>
+            ["thread/read", "thread/turns/list", "thread/items/list"].includes(
+              String(request.method),
+            ),
+          ),
+      ).toEqual([]);
+      expect(
+        appServer.requests().find((request) => request.method === "thread/resume")?.params,
+      ).toEqual({ threadId: "archived-thread-id", excludeTurns: true });
+      await session.startTurn("continue");
+      await appServer.waitForTurnStart();
+      appServer.startsTurn({ threadId: "archived-thread-id", turnId: "turn-new" });
+      appServer.completeTurn({ threadId: "archived-thread-id" });
+      expect(appServer.requests().filter((request) => request.method === "thread/read")).toEqual(
+        [],
+      );
+      const history: AgentStreamEvent[] = [];
+      for await (const event of session.streamHistory()) history.push(event);
+      expect(history).toContainEqual(
+        expect.objectContaining({
+          type: "timeline",
+          item: expect.objectContaining({ text: "preserved history" }),
+        }),
+      );
+      expect(appServer.requests().some((request) => request.method === "thread/items/list")).toBe(
+        true,
+      );
+      expect(session.hasActiveBackgroundTasks?.()).toBe(false);
+      appServer.assertNoErrors();
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("maintenance startup deadline disposes the actual writer before rejecting", async () => {
+    const appServer = createFakeCodexAppServer({
+      initialize: () => ({ userAgent: "paseo/0.159.2" }),
+      "thread/resume": () => new Promise(() => {}),
+    });
+    const killed = vi.spyOn(appServer.child, "kill");
+    vi.useFakeTimers();
+    try {
+      const provider = createProviderWithFakeAppServer(appServer);
+      const connected = provider.resumeSession(archivedThreadHandle(), undefined, undefined, {
+        purpose: "maintenance",
+      });
+      const rejected = expect(connected).rejects.toThrow(/closed|startup exceeded/);
+      await appServer.waitForRequest("thread/resume");
+      await vi.advanceTimersByTimeAsync(30_000);
+      await rejected;
+      expect(killed).toHaveBeenCalled();
+      expect(
+        appServer.requests().filter((request) => request.method === "thread/resume"),
+      ).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test.each([false, true])(
+    "maintenance deadline bounds unresolved spawn and disposes a late child (%s)",
+    async (arrivesLate) => {
+      const appServer = createFakeCodexAppServer();
+      const killed = vi.spyOn(appServer.child, "kill");
+      const spawn = deferred<ChildProcessWithoutNullStreams>();
+      const session = new CodexAppServerAgentSession(
+        createConfig(),
+        archivedThreadHandle(),
+        createTestLogger(),
+        () => spawn.promise,
+        {},
+        false,
+        false,
+        false,
+        undefined,
+        "maintenance",
+      );
+      vi.useFakeTimers();
+      try {
+        const connecting = session.connect();
+        const rejected = expect(connecting).rejects.toMatchObject({
+          code: "reload_startup_unconfirmed",
+        });
+        await vi.advanceTimersByTimeAsync(30_000);
+        await rejected;
+        expect(killed).not.toHaveBeenCalled();
+        if (arrivesLate) {
+          spawn.resolve(appServer.child);
+          await vi.advanceTimersByTimeAsync(0);
+          expect(killed).toHaveBeenCalledTimes(1);
+          expect(appServer.requests()).toEqual([]);
+        }
+        await expect(session.connect()).rejects.toThrow("closed");
+      } finally {
+        vi.useRealTimers();
       }
     },
   );

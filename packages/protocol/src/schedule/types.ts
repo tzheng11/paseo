@@ -48,6 +48,7 @@ export const ScheduleRunSchema = z.object({
   startedAt: z.string(),
   endedAt: z.string().nullable(),
   status: z.enum(["running", "succeeded", "failed"]),
+  skipReason: z.string().min(1).max(200).optional(),
   agentId: z.guid().nullable(),
   workspaceId: z.string().nullable().optional(),
   output: z.string().nullable(),
@@ -69,6 +70,7 @@ export const StoredScheduleSchema = z.object({
   pausedAt: z.string().nullable(),
   expiresAt: z.string().nullable(),
   maxRuns: z.number().int().positive().nullable(),
+  completedRunCount: z.number().int().nonnegative().optional(),
   runs: z.array(ScheduleRunSchema),
 });
 export type StoredSchedule = z.infer<typeof StoredScheduleSchema>;

@@ -449,6 +449,88 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
   return new Session(sessionOptions);
 }
 
+test("credential reload routes durable admission without ordinary history refresh", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const operation = { operationId: "intent", agentId: "agent", status: "pending" as const };
+  const reloadAgentCredentials = vi.fn(async () => operation);
+  const reloadAgentSession = vi.fn();
+  const session = createSessionForTest({
+    messages,
+    agentManager: { reloadAgentCredentials, reloadAgentSession },
+  });
+  await session.handleMessage({
+    type: "agent.reload_idle.request",
+    requestId: "reload",
+    agentId: "agent",
+    operationId: "intent",
+    preserveHistory: true,
+  });
+  expect(reloadAgentCredentials).toHaveBeenCalledWith("agent", "intent");
+  expect(reloadAgentSession).not.toHaveBeenCalled();
+  expect(messages).toContainEqual({
+    type: "agent.reload_idle.operation.response",
+    payload: { requestId: "reload", operation },
+  });
+});
+
+test("credential reload status reports authoritative absence and storage errors separately", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const getReloadOperation = vi
+    .fn()
+    .mockResolvedValueOnce(null)
+    .mockRejectedValueOnce(new Error("corrupt receipt"));
+  const session = createSessionForTest({ messages, agentManager: { getReloadOperation } });
+  await session.handleMessage({
+    type: "agent.reload_idle.get_operation.request",
+    requestId: "absent",
+    operationId: "intent",
+  });
+  expect(messages).toContainEqual({
+    type: "agent.reload_idle.get_operation.response",
+    payload: { requestId: "absent", operation: null },
+  });
+  await session.handleMessage({
+    type: "agent.reload_idle.get_operation.request",
+    requestId: "corrupt",
+    operationId: "intent",
+  });
+  expect(messages).toContainEqual(
+    expect.objectContaining({
+      type: "rpc_error",
+      payload: expect.objectContaining({ requestId: "corrupt" }),
+    }),
+  );
+  expect(messages).not.toContainEqual({
+    type: "agent.reload_idle.get_operation.response",
+    payload: { requestId: "corrupt", operation: null },
+  });
+});
+
+test("incomplete credential reload flags fail closed rather than invoking ordinary reload", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const reloadAgentCredentials = vi.fn();
+  const reloadIdleAgentSession = vi.fn();
+  const session = createSessionForTest({
+    messages,
+    agentManager: { reloadAgentCredentials, reloadIdleAgentSession },
+  });
+  await session.handleMessage({
+    type: "agent.reload_idle.request",
+    requestId: "invalid",
+    agentId: "agent",
+    operationId: "",
+    preserveHistory: false,
+  });
+  expect(reloadAgentCredentials).not.toHaveBeenCalled();
+  expect(reloadIdleAgentSession).not.toHaveBeenCalled();
+  expect(messages).toContainEqual(
+    expect.objectContaining({
+      type: "rpc_error",
+      payload: expect.objectContaining({ requestId: "invalid" }),
+    }),
+  );
+});
+
 test("routes host-scoped agent skills requests through the daemon owner", async () => {
   const messages: SessionOutboundMessage[] = [];
   const status = {

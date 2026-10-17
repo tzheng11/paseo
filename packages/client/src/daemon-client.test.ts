@@ -7527,3 +7527,211 @@ test.each([false, true])(
     await send;
   },
 );
+test("idle-only reload refuses an older host without sending a reload request", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "idle-reload-old-host",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connection = client.connect();
+  mock.triggerOpen();
+  await connection;
+  mock.sent.length = 0;
+  await expect(client.reloadIdleAgent({ agentId: "agent-1" })).rejects.toThrow("Update the host");
+  expect(mock.sent).toEqual([]);
+});
+
+test("idle-only reload uses the namespaced request and correlated response", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "idle-reload-new-host",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connection = client.connect();
+  mock.triggerOpen({ features: { idleAgentReload: true } });
+  await connection;
+  mock.sent.length = 0;
+  const result = client.reloadIdleAgent({ agentId: "agent-1", requestId: "idle-request" });
+  expect(parseSentFrame(mock.sent[0])).toEqual({
+    type: "agent.reload_idle.request",
+    agentId: "agent-1",
+    requestId: "idle-request",
+  });
+  const payload = {
+    status: "agent_refreshed",
+    agentId: "agent-1",
+    requestId: "idle-request",
+    timelineSize: 3,
+  };
+  mock.triggerMessage(wrapSessionMessage({ type: "agent.reload_idle.response", payload }));
+  await expect(result).resolves.toEqual(payload);
+});
+
+test("credential reload refuses an older host with operation identity and no mutation", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "credential-reload-old-host",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connection = client.connect();
+  mock.triggerOpen({ features: { idleAgentReload: true } });
+  await connection;
+  mock.sent.length = 0;
+
+  await expect(
+    client.reloadAgentCredentials({ agentId: "agent-1", operationId: "operation-1" }),
+  ).resolves.toEqual({
+    agentId: "agent-1",
+    operationId: "operation-1",
+    status: "refused",
+    reasonCode: "UNSUPPORTED_HOST",
+    reason: "Update the host to reload agent credentials with durable operation status.",
+    retryable: true,
+  });
+  await expect(
+    client.getAgentReloadOperation({ operationId: "operation-1" }),
+  ).rejects.toMatchObject({ code: "UNSUPPORTED_HOST" });
+  expect(mock.sent).toEqual([]);
+});
+
+test("credential reload preserves history and correlates a durable operation response", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "credential-reload-new-host",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connection = client.connect();
+  mock.triggerOpen({ features: { credentialReloadOperations: true } });
+  await connection;
+  mock.sent.length = 0;
+
+  const result = client.reloadAgentCredentials({ agentId: "agent-1", operationId: "operation-1" });
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request).toEqual({
+    type: "agent.reload_idle.request",
+    agentId: "agent-1",
+    operationId: "operation-1",
+    preserveHistory: true,
+    requestId: expect.any(String),
+  });
+  const operation = { agentId: "agent-1", operationId: "operation-1", status: "pending" };
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "agent.reload_idle.operation.response",
+      payload: { requestId: "unrelated", operation },
+    }),
+  );
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "agent.reload_idle.operation.response",
+      payload: { requestId: request.requestId, operation },
+    }),
+  );
+  await expect(result).resolves.toEqual(operation);
+  expect(mock.sent).toHaveLength(1);
+});
+
+test("credential reload status is a read-only lookup and preserves an unknown operation", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "credential-reload-status",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connection = client.connect();
+  mock.triggerOpen({ features: { credentialReloadOperations: true } });
+  await connection;
+  mock.sent.length = 0;
+
+  const lookup = client.getAgentReloadOperation({ operationId: "operation-1" });
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request).toEqual({
+    type: "agent.reload_idle.get_operation.request",
+    operationId: "operation-1",
+    requestId: expect.any(String),
+  });
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "agent.reload_idle.get_operation.response",
+      payload: { requestId: request.requestId, operation: null },
+    }),
+  );
+  await expect(lookup).resolves.toBeNull();
+  expect(mock.sent).toHaveLength(1);
+});
+
+test("credential reload lost acknowledgement rejects without resending or fabricating a receipt", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "credential-reload-lost-ack",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connection = client.connect();
+  mock.triggerOpen({ features: { credentialReloadOperations: true } });
+  await connection;
+  mock.sent.length = 0;
+
+  const reload = client.reloadAgentCredentials({ agentId: "agent-1", operationId: "operation-1" });
+  const rejected = expect(reload).rejects.toMatchObject({ code: "DAEMON_CONNECTION_LOST" });
+  mock.triggerClose();
+  await rejected;
+  expect(mock.sent).toHaveLength(1);
+});
+
+test("credential reload timeout rejects and never repeats the mutation", async () => {
+  vi.useFakeTimers();
+  try {
+    const mock = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "credential-reload-timeout",
+      transportFactory: () => mock.transport,
+      reconnect: { enabled: false },
+    });
+    clients.push(client);
+    const connection = client.connect();
+    mock.triggerOpen({ features: { credentialReloadOperations: true } });
+    await connection;
+    mock.sent.length = 0;
+
+    const reload = client.reloadAgentCredentials({
+      agentId: "agent-1",
+      operationId: "operation-1",
+    });
+    const rejected = expect(reload).rejects.toMatchObject({ code: "DAEMON_REQUEST_TIMEOUT" });
+    await vi.advanceTimersByTimeAsync(60_001);
+    await rejected;
+    const sessionFrames = mock.sent.filter(
+      (frame) =>
+        z.object({ type: z.literal("session") }).safeParse(JSON.parse(assertStr(frame))).success,
+    );
+    expect(sessionFrames.map(parseSentFrame)).toEqual([
+      {
+        type: "agent.reload_idle.request",
+        agentId: "agent-1",
+        operationId: "operation-1",
+        preserveHistory: true,
+        requestId: expect.any(String),
+      },
+    ]);
+  } finally {
+    vi.useRealTimers();
+  }
+});

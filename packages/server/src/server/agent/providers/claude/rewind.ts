@@ -29,7 +29,7 @@ export async function revertClaudeConversation(input: {
 }
 
 export async function revertClaudeFiles(input: {
-  query: Query;
+  query: Pick<Query, "rewindFiles">;
   messageId: string;
   resolveMessageId?: (messageId: string) => string | Promise<string>;
 }): Promise<void> {
@@ -42,7 +42,7 @@ export async function revertClaudeFiles(input: {
 
 export async function revertClaudeConversationAndFiles(input: {
   sdk: ClaudeRewindSdk;
-  query: Query;
+  query: Pick<Query, "rewindFiles">;
   sessionId: string | null;
   messageId: string;
   resolveMessageId?: (messageId: string) => string | Promise<string>;

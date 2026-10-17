@@ -27,6 +27,17 @@ describe("canonical CLI surface", () => {
     expect(nestedReload?.helpInformation()).toContain("--json");
   });
 
+  it("offers durable idle-only credential reloads and read-only operation status", () => {
+    const agent = createCli().commands.find((command) => command.name() === "agent");
+    const reload = agent?.commands.find((command) => command.name() === "reload");
+    const status = agent?.commands.find((command) => command.name() === "reload-status");
+    expect(reload?.helpInformation()).toContain("--only-if-idle");
+    expect(reload?.helpInformation()).toContain("--preserve-history");
+    expect(reload?.helpInformation()).toContain("--operation-id <uuid>");
+    expect(status?.helpInformation()).toContain("<operation-id>");
+    expect(status?.helpInformation()).toContain("--json");
+  });
+
   it("names explicit workspace creation without exposing older syntax", () => {
     const run = createCli().commands.find((command) => command.name() === "run");
     const help = run?.helpInformation();
