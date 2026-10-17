@@ -611,6 +611,10 @@ export class ScheduleService {
       let dirty = false;
 
       const runningIndex = updated.runs.findIndex((run) => run.status === "running");
+      const claimedSlot =
+        runningIndex !== -1 && updated.nextRunAt === null
+          ? updated.runs[runningIndex].scheduledFor
+          : null;
       if (runningIndex !== -1) {
         const runs = [...updated.runs];
         const runningRun = runs[runningIndex];
@@ -638,16 +642,21 @@ export class ScheduleService {
         dirty = true;
       }
 
+      const resumeFrom = updated.nextRunAt ?? claimedSlot;
       if (
         updated.status === "active" &&
-        updated.nextRunAt &&
-        new Date(updated.nextRunAt).getTime() <= now.getTime()
+        resumeFrom &&
+        (claimedSlot !== null || new Date(resumeFrom).getTime() <= now.getTime())
       ) {
-        let nextRunAt = computeNextRunAt(updated.cadence, new Date(updated.nextRunAt));
-        while (nextRunAt.getTime() <= now.getTime()) {
-          nextRunAt = computeNextRunAt(updated.cadence, nextRunAt);
+        if (shouldCompleteSchedule(updated, now)) {
+          updated = completeSchedule(updated, now);
+        } else {
+          let nextRunAt = computeNextRunAt(updated.cadence, new Date(resumeFrom));
+          while (nextRunAt.getTime() <= now.getTime()) {
+            nextRunAt = computeNextRunAt(updated.cadence, nextRunAt);
+          }
+          updated = { ...updated, nextRunAt: nextRunAt.toISOString() };
         }
-        updated = { ...updated, nextRunAt: nextRunAt.toISOString() };
         dirty = true;
       }
 
@@ -704,6 +713,12 @@ export class ScheduleService {
     options?: { manual?: boolean },
   ): Promise<void> {
     const manual = options?.manual === true;
+    if (this.runningScheduleIds.has(schedule.id)) {
+      if (manual) {
+        throw new Error(`Schedule ${schedule.id} is already running`);
+      }
+      return;
+    }
     this.runningScheduleIds.add(schedule.id);
     try {
       const runId = randomUUID();
@@ -717,7 +732,10 @@ export class ScheduleService {
         output: null,
         error: null,
       };
-      const scheduleWithRun = await this.appendRunningRun(schedule.id, runningRun);
+      const scheduleWithRun = await this.appendRunningRun(schedule.id, runningRun, manual);
+      if (!scheduleWithRun) {
+        return;
+      }
 
       try {
         const result = await this.runner(scheduleWithRun, runId);
@@ -751,13 +769,43 @@ export class ScheduleService {
   private async appendRunningRun(
     scheduleId: string,
     runningRun: ScheduleRun,
-  ): Promise<StoredSchedule> {
-    const updated = await this.store.update(scheduleId, (schedule) => ({
-      ...schedule,
-      updatedAt: runningRun.startedAt,
-      runs: [...schedule.runs, runningRun],
-    }));
-    return requireSchedule(updated, scheduleId);
+    manual: boolean,
+  ): Promise<StoredSchedule | null> {
+    let claimed = false;
+    const updated = await this.store.update(scheduleId, (schedule) => {
+      if (manual && schedule.status === "completed") {
+        throw new Error(`Schedule ${scheduleId} is already completed`);
+      }
+      if (schedule.runs.some((run) => run.status === "running")) {
+        if (manual) {
+          throw new Error(`Schedule ${scheduleId} is already running`);
+        }
+        return schedule;
+      }
+      const now = new Date(runningRun.startedAt);
+      if (!manual) {
+        // A tick can hold a stale listing while another tick finishes this slot.
+        // Claim real executions here; future skip receipts must not consume a slot.
+        if (
+          schedule.status !== "active" ||
+          schedule.nextRunAt !== runningRun.scheduledFor ||
+          shouldCompleteSchedule(schedule, now)
+        ) {
+          return schedule;
+        }
+      }
+      claimed = true;
+      // Clear the due slot with the run before dispatch. Computing the next slot
+      // waits until completion: a final cron run need not have another occurrence.
+      return {
+        ...schedule,
+        nextRunAt: manual ? schedule.nextRunAt : null,
+        updatedAt: runningRun.startedAt,
+        runs: [...schedule.runs, runningRun],
+      };
+    });
+    const schedule = requireSchedule(updated, scheduleId);
+    return claimed ? schedule : null;
   }
 
   private async finishRun(params: {
@@ -812,8 +860,7 @@ export class ScheduleService {
           nextRunAt: null,
         };
       } else {
-        // Duplicate fires of one slot must share its cadence anchor even after
-        // an earlier completion has advanced the schedule's nextRunAt.
+        // A long run skips missed slots using its original cadence anchor.
         const after = new Date(finishedRun.scheduledFor);
         let nextRunAt = computeNextRunAt(updated.cadence, after);
         while (nextRunAt.getTime() <= now.getTime()) {
