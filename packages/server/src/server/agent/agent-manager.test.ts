@@ -13248,3 +13248,52 @@ test("quota recovery never continues a failure superseded by native autonomous p
     await f.cleanup();
   }
 });
+
+test("quota recovery refuses autonomous progress during consumed-checkpoint persistence", async () => {
+  const f = await quotaRecoveryFixture();
+  const proceed = deferred<void>();
+  try {
+    await f.fail();
+    const change = await f.change();
+    let consumed = false;
+    const original = f.storage.applySnapshot.bind(f.storage);
+    vi.spyOn(f.storage, "applySnapshot").mockImplementation(async (record, options) => {
+      if (
+        !consumed &&
+        record.id === f.agent.id &&
+        record.credentialGeneration === change.credentialGeneration &&
+        !record.quotaTurnCheckpoint
+      ) {
+        consumed = true;
+        await proceed.promise;
+      }
+      await original(record, options);
+    });
+    await f.manager.reloadAgentCredentials(f.agent.id, "consumed-autonomous", change);
+    await waitForQuota(() => expect(consumed).toBe(true));
+    const session = f.sessions.at(-1)!;
+    session.pushEvent({
+      type: "turn_started",
+      provider: "claude",
+      turnId: "consumed-autonomous-progress",
+    });
+    await waitForQuota(() => expect(f.manager.getAgent(f.agent.id)?.lifecycle).toBe("running"));
+    session.pushEvent({
+      type: "turn_completed",
+      provider: "claude",
+      turnId: "consumed-autonomous-progress",
+    });
+    await waitForQuota(() => expect(f.manager.getAgent(f.agent.id)?.lifecycle).toBe("idle"));
+    proceed.resolve();
+    await waitForQuota(async () =>
+      expect(await f.manager.getReloadOperation("consumed-autonomous")).toMatchObject({
+        status: "completed",
+        continuation: { status: "refused" },
+      }),
+    );
+    expect(f.prompts).toHaveLength(1);
+  } finally {
+    proceed.resolve();
+    await f.cleanup();
+  }
+});
