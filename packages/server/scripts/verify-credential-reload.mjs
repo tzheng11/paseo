@@ -27,9 +27,45 @@ const hash = (value) => createHash("sha256").update(JSON.stringify(value)).diges
 function fixtureProvider() {
   const journal = argument("--journal");
   appendFileSync(journal, `${JSON.stringify({ kind: "spawn", pid: process.pid })}\n`);
+  process.on("exit", () =>
+    appendFileSync(journal, `${JSON.stringify({ kind: "exit", pid: process.pid })}\n`),
+  );
   const send = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
   let threadId = "fixture-thread";
   const notification = (method, params) => send({ method, params });
+  process.on("message", ({ action }) => {
+    if (action === "background") {
+      notification("codex/event/exec_command_begin", {
+        id: threadId,
+        msg: {
+          type: "exec_command_begin",
+          call_id: "fixture-background",
+          command: ["sleep", "30"],
+        },
+      });
+      notification("codex/event/exec_command_end", {
+        id: threadId,
+        msg: {
+          type: "exec_command_end",
+          call_id: "fixture-background",
+          command: ["sleep", "30"],
+          aggregated_output: "Process running with session id 4242",
+          exit_code: 0,
+        },
+      });
+    }
+    if (action === "finish-background")
+      notification("item/completed", {
+        threadId,
+        item: {
+          type: "commandExecution",
+          id: "fixture-background",
+          processId: "4242",
+          status: "completed",
+          exitCode: 0,
+        },
+      });
+  });
   createInterface({ input: process.stdin })
     .on("line", (line) => {
       const request = JSON.parse(line);
@@ -122,17 +158,19 @@ async function fixtureDaemon() {
   );
   const { CodexAppServerAgentClient } = await load(
     "packages/server/dist/server/server/agent/providers/codex-app-server-agent.js",
+    "packages/server/dist/server/server/agent/providers/codex/background-tasks.js",
   );
   const provider = new CodexAppServerAgentClient(logger);
   // Test injection replaces only executable launch and discovery; the actual adapter runs unchanged.
   provider.goalsEnabledPromise = Promise.resolve(false);
   provider.autoReviewEnabledPromise = Promise.resolve(false);
+  let providerChild;
   provider.spawnAppServer = async () =>
-    spawn(process.execPath, [script, "--fixture-provider", "--journal", journal], {
-      stdio: ["pipe", "pipe", "pipe"],
+    (providerChild = spawn(process.execPath, [script, "--fixture-provider", "--journal", journal], {
+      stdio: ["pipe", "pipe", "pipe", "ipc"],
       detached: process.platform !== "win32",
       env: process.env,
-    });
+    }));
   provider.isAvailable = async () => true;
   provider.fetchCatalog = async () => ({
     provider: "codex",
@@ -172,11 +210,14 @@ async function fixtureDaemon() {
       messageId: `fixture-${index}`,
     });
   }
+  const backgroundActive = () =>
+    daemon.agentManager.getAgent(agent.id)?.session?.hasActiveBackgroundTasks?.() === true;
   const snapshot = () => ({
     hash: hash(daemon.agentManager.getTimeline(agent.id)),
     epoch: daemon.agentManager.getTimelineEpoch(agent.id),
     timelineBytes: Buffer.byteLength(JSON.stringify(daemon.agentManager.getTimeline(agent.id))),
     lifecycle: daemon.agentManager.getAgent(agent.id)?.lifecycle,
+    backgroundActive: backgroundActive(),
   });
   process.send({
     ready: true,
@@ -196,6 +237,14 @@ async function fixtureDaemon() {
       if (request.action === "stop") {
         await daemon.agentManager.cancelAgentRun(agent.id);
         value = {};
+      }
+      if (request.action === "background" || request.action === "finish-background") {
+        providerChild.send({ action: request.action });
+        const expected = request.action === "background";
+        for (let attempt = 0; attempt < 200 && backgroundActive() !== expected; attempt++)
+          await pause(5);
+        value = snapshot();
+        assert.equal(value.backgroundActive, expected);
       }
       if (request.action === "shutdown") {
         await daemon.stop();
@@ -415,6 +464,34 @@ async function runCanary() {
     evidence.busyRefusal = refusal;
     evidence.busyWriterSpawns = spawns() - beforeBusy;
     await rpc("stop");
+    const background = await rpc("background");
+    assert.equal(background.lifecycle, "idle");
+    const backgroundOperation = randomUUID();
+    const beforeBackground = spawns();
+    const exitsBeforeBackground = events().filter((event) => event.kind === "exit").length;
+    await cli([
+      "agent",
+      "reload",
+      initial.agentId,
+      "--only-if-idle",
+      "--preserve-history",
+      "--operation-id",
+      backgroundOperation,
+    ]);
+    const backgroundRefusal = await cli(["agent", "reload-status", backgroundOperation]);
+    assert.equal(backgroundRefusal.status, "refused");
+    assert.equal(backgroundRefusal.reasonCode, "AGENT_RELOAD_BUSY");
+    assert.equal(spawns(), beforeBackground);
+    assert.equal(events().filter((event) => event.kind === "exit").length, exitsBeforeBackground);
+    const afterBackgroundExit = await rpc("finish-background");
+    assert.equal(afterBackgroundExit.backgroundActive, false);
+    evidence.nativePty = {
+      refusal: backgroundRefusal,
+      writerSpawns: spawns() - beforeBackground,
+      providerExits:
+        events().filter((event) => event.kind === "exit").length - exitsBeforeBackground,
+      confirmedExitClears: true,
+    };
     evidence.passed = true;
     writeFileSync(path.join(directory, "evidence.json"), `${JSON.stringify(evidence, null, 2)}\n`);
     console.log(JSON.stringify({ passed: true, evidence: path.join(directory, "evidence.json") }));

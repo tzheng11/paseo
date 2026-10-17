@@ -31,6 +31,11 @@ explicit history or rewind request, or the next user turn. Other providers fail 
 
 Idle-only reload also checks provider-owned background work. Claude's background shells do not
 appear in the subagent catalogue, so their process-level activity signal participates in admission.
+Codex tool completion can leave a native PTY running. Live command and terminal notifications
+retain that activity until a matching native exit is confirmed; missing exit information defers
+maintenance rather than guessing that the job finished. Historical process IDs are display data
+and do not claim ownership in a new runtime. Some provider versions do not report an autonomous
+PTY exit, so an unconfirmed live session remains held until a later interaction confirms exit.
 History and rewind still read real provider records when requested.
 
 An RPC timeout is not evidence that a reload failed. Callers persist an operation UUID before

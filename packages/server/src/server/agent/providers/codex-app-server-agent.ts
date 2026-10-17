@@ -50,6 +50,7 @@ import {
   type HistoryWindowEntry,
 } from "../agent-history-replay.js";
 import { CodexHistorySource } from "./codex/history-source.js";
+import { CodexBackgroundTasks } from "./codex/background-tasks.js";
 import { runProviderRefreshActivity } from "../provider-refresh-deadline.js";
 import type { Logger } from "pino";
 
@@ -3644,6 +3645,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   private deferredHistory = false;
   private deferredHistoryPromise: Promise<void> | null = null;
   private startupTimedOut = false;
+  private readonly backgroundTasks = new CodexBackgroundTasks();
   private closed = false;
   private collaborationModes: Array<{
     name: string;
@@ -4839,6 +4841,10 @@ export class CodexAppServerAgentSession implements AgentSession {
     };
   }
 
+  hasActiveBackgroundTasks(): boolean {
+    return this.backgroundTasks.active;
+  }
+
   async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
     await this.ensureDeferredHistory();
     if (!this.historyPending && this.persistedProviderSubagentEvents.length === 0) return;
@@ -5848,6 +5854,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     }
     const parsed = CodexNotificationSchema.parse({ method, params });
     this.traceParsedNotification(method, params, parsed);
+    this.observeBackgroundTasks(parsed);
     const route = this.resolveCodexThreadRoute(getCodexNotificationThreadId(parsed));
     if (route.kind === "pending_sub_agent") {
       this.bufferPendingSubAgentNotification(route.threadId, parsed);
@@ -5858,6 +5865,55 @@ export class CodexAppServerAgentSession implements AgentSession {
       return;
     }
     this.dispatchParsedNotification(parsed);
+  }
+
+  private observeBackgroundTasks(parsed: ParsedCodexNotification): void {
+    const threadId = getCodexNotificationThreadId(parsed) ?? "";
+    const key = (id: string | null | undefined) => (id ? `${threadId}:${id}` : null);
+    switch (parsed.kind) {
+      case "exec_command_started":
+        this.backgroundTasks.started(key(parsed.callId));
+        return;
+      case "exec_command_output_delta":
+        this.backgroundTasks.output(
+          key(parsed.callId),
+          decodeCodexOutputDeltaChunk(parsed.chunk ?? ""),
+        );
+        return;
+      case "exec_command_completed":
+        this.backgroundTasks.finished(key(parsed.callId), parsed.output, parsed.exitCode);
+        return;
+      case "terminal_interaction":
+        this.backgroundTasks.interaction(key(parsed.callId), parsed.processId);
+        return;
+      case "item_started":
+      case "item_completed":
+        if (normalizeCodexThreadItemType(parsed.item.type) === "commandExecution")
+          this.backgroundTasks.item(
+            key(parsed.item.id),
+            parsed.item,
+            parsed.kind === "item_completed",
+          );
+        return;
+      case "invalid_payload":
+        if (
+          [
+            "codex/event/exec_command_begin",
+            "codex/event/exec_command_end",
+            "codex/event/exec_command_output_delta",
+            "codex/event/terminal_interaction",
+            "item/commandExecution/terminalInteraction",
+            "item/started",
+            "item/completed",
+            "codex/event/item_started",
+            "codex/event/item_completed",
+          ].includes(parsed.method)
+        )
+          this.backgroundTasks.started(null);
+        return;
+      default:
+        return;
+    }
   }
 
   private dispatchSubAgentNotification(parsed: ParsedCodexNotification, callId: string): void {
