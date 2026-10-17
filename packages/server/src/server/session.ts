@@ -1069,6 +1069,11 @@ export class Session {
       }),
       listProviderAvailability: () => this.agentManager.listProviderAvailability(),
       listAgents: () => this.agentManager.listAgents(),
+      listVisibleAgents: () => this.listAgentPayloads(),
+      listVisibleWorkspaces: async () =>
+        Array.from(
+          (await this.workspaceDirectory.buildDescriptorMap({ includeGitData: false })).values(),
+        ).filter((workspace) => !workspace.background),
       listProjects: () => this.projectRegistry.list(),
       listWorkspaces: () => this.workspaceRegistry.list(),
       logger: this.sessionLogger,
@@ -2826,6 +2831,8 @@ export class Session {
         return this.daemonSession.handleGetStatusRequest(msg);
       case "daemon.get_pairing_offer.request":
         return this.daemonSession.handleGetPairingOfferRequest(msg);
+      case "daemon.get_host_stats.request":
+        return this.daemonSession.handleGetHostStatsRequest(msg);
       case "daemon.config.reload.request":
         this.daemonSession.handleConfigReloadRequest(msg);
         return undefined;

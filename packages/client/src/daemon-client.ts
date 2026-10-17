@@ -99,6 +99,7 @@ import type {
   ProviderUsageListResponseMessage,
   UsageReportEntry,
   DaemonGetStatusResponse,
+  DaemonGetHostStatsResponse,
   DaemonGetPairingOfferResponse,
   DaemonConfigReloadResponse,
   DiagnosticsResponse,
@@ -574,6 +575,7 @@ interface UsageListReportsPayload {
   reports: UsageReportEntry[];
 }
 type DaemonStatusPayload = DaemonGetStatusResponse["payload"];
+type HostStatsPayload = DaemonGetHostStatsResponse["payload"];
 type DaemonPairingOfferPayload = DaemonGetPairingOfferResponse["payload"];
 type DiagnosticsPayload = DiagnosticsResponse["payload"];
 type ReadProjectConfigPayload = Extract<
@@ -5274,6 +5276,18 @@ export class DaemonClient {
         type: "daemon.get_status.request",
       },
       responseType: "daemon.get_status.response",
+      timeout: options?.timeout,
+    });
+  }
+
+  async getHostStats(options?: DaemonStatusOptions): Promise<HostStatsPayload> {
+    if (!this.lastServerInfoMessage) throw new DaemonConnectionError("Transport not connected");
+    if (this.lastServerInfoMessage.features?.hostStats !== true) {
+      throw new Error("Update the host to read its load.");
+    }
+    return this.sendNamespacedCorrelatedSessionRequest<"daemon.get_host_stats.response">({
+      requestId: options?.requestId,
+      message: { type: "daemon.get_host_stats.request" },
       timeout: options?.timeout,
     });
   }

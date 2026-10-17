@@ -1,6 +1,11 @@
 import type pino from "pino";
 import type { ProviderAvailability } from "../../agent/agent-manager.js";
-import type { SessionInboundMessage, SessionOutboundMessage } from "../../messages.js";
+import type {
+  AgentSnapshotPayload,
+  SessionInboundMessage,
+  SessionOutboundMessage,
+  WorkspaceDescriptorPayload,
+} from "../../messages.js";
 import { getPidLockInfo } from "../../pid-lock.js";
 import { generateLocalPairingOffer } from "../../pairing-offer.js";
 import {
@@ -8,6 +13,7 @@ import {
   type DaemonWebSocketRuntimeDiagnosticSnapshot,
 } from "./diagnostics.js";
 import { DaemonSelfUpdateSessionController } from "./daemon-self-update-session-controller.js";
+import { collectHostStats } from "./host-stats.js";
 import type { ManagedAgent } from "../../agent/agent-manager.js";
 import type { PersistedProjectRecord, PersistedWorkspaceRecord } from "../../workspace-registry.js";
 import type { HubRelationshipManagement } from "../../hub/relationship-controller.js";
@@ -48,6 +54,10 @@ export interface DaemonSessionOptions {
   listProjects: () => Promise<PersistedProjectRecord[]>;
   listWorkspaces: () => Promise<PersistedWorkspaceRecord[]>;
   listProviderAvailability: () => Promise<ProviderAvailability[]>;
+  /** The agents `paseo ls -g` lists: not archived, internal or in a background workspace. */
+  listVisibleAgents: () => Promise<AgentSnapshotPayload[]>;
+  /** The workspaces the sidebar lists: not archived or background. */
+  listVisibleWorkspaces: () => Promise<WorkspaceDescriptorPayload[]>;
   getWebSocketRuntimeMetrics?: () => DaemonWebSocketRuntimeDiagnosticSnapshot | null;
   getObservationMetrics?: () => Record<string, number>;
   logger: pino.Logger;
@@ -73,6 +83,8 @@ export class DaemonSession {
   private readonly listProjects: () => Promise<PersistedProjectRecord[]>;
   private readonly listWorkspaces: () => Promise<PersistedWorkspaceRecord[]>;
   private readonly listProviderAvailability: () => Promise<ProviderAvailability[]>;
+  private readonly listVisibleAgents: () => Promise<AgentSnapshotPayload[]>;
+  private readonly listVisibleWorkspaces: () => Promise<WorkspaceDescriptorPayload[]>;
   private readonly getWebSocketRuntimeMetrics: () => DaemonWebSocketRuntimeDiagnosticSnapshot | null;
   private readonly getObservationMetrics: DaemonSessionOptions["getObservationMetrics"];
   private readonly logger: pino.Logger;
@@ -91,6 +103,8 @@ export class DaemonSession {
     this.listProjects = options.listProjects;
     this.listWorkspaces = options.listWorkspaces;
     this.listProviderAvailability = options.listProviderAvailability;
+    this.listVisibleAgents = options.listVisibleAgents;
+    this.listVisibleWorkspaces = options.listVisibleWorkspaces;
     this.getWebSocketRuntimeMetrics = options.getWebSocketRuntimeMetrics ?? (() => null);
     this.getObservationMetrics = options.getObservationMetrics;
     this.logger = options.logger;
@@ -305,6 +319,32 @@ export class DaemonSession {
           diagnostic: `Paseo diagnostics\n  Error: ${
             error instanceof Error ? error.message : String(error)
           }`,
+        },
+      });
+    }
+  }
+
+  async handleGetHostStatsRequest(
+    msg: Extract<SessionInboundMessage, { type: "daemon.get_host_stats.request" }>,
+  ): Promise<void> {
+    try {
+      const stats = await collectHostStats({
+        listAgents: this.listVisibleAgents,
+        listWorkspaces: this.listVisibleWorkspaces,
+      });
+      this.host.emit({
+        type: "daemon.get_host_stats.response",
+        payload: { requestId: msg.requestId, stats },
+      });
+    } catch (error) {
+      this.logger.error({ err: error }, "Failed to collect host stats");
+      this.host.emit({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: error instanceof Error ? error.message : String(error),
+          code: "handler_error",
         },
       });
     }

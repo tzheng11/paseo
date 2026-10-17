@@ -1527,6 +1527,42 @@ export const zhCN: TranslationResources = {
     },
   },
   openProject: {
+    hosts: {
+      title: "主机",
+      info: "工作区和代理显示为活跃 / 总数；活跃表示正在运行。CPU 显示空闲百分比。“下一个”标出 /spawn 规则会选择的主机：警告最少，其次空闲核心最多。每 15 秒刷新一次。",
+      next: "下一个",
+      columns: {
+        host: "主机",
+        workspaces: "工作区",
+        agents: "代理",
+        cpu: "CPU 空闲",
+        memory: "内存",
+      },
+      status: {
+        connecting: "正在连接…",
+        offline: "离线",
+        loading: "正在加载…",
+        unsupported: "更新此主机以查看其负载",
+      },
+      cores_one: "共 {{count}} 核",
+      cores_other: "共 {{count}} 核",
+      memoryUsed: "{{used}} / {{total}} GB",
+      swap: "交换 {{size}} GB",
+      pressure: {
+        warn: "内存压力",
+        critical: "内存压力严重",
+      },
+      warnings: {
+        swap: "正在使用 {{size}} GB 交换",
+        busy: "空闲 {{percent}}%",
+        gitQueue: "Git 队列 {{count}}",
+      },
+      compact: {
+        workspaces: "工作区 {{active}}/{{total}}",
+        agents: "代理 {{active}}/{{total}}",
+        cpu: "空闲 {{percent}}%",
+      },
+    },
     tiles: {
       addProject: {
         title: "添加 project",

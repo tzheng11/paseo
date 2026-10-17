@@ -1396,6 +1396,11 @@ export const DaemonGetStatusRequestSchema = z.object({
   requestId: z.string(),
 });
 
+export const DaemonGetHostStatsRequestSchema = z.object({
+  type: z.literal("daemon.get_host_stats.request"),
+  requestId: z.string(),
+});
+
 export const DaemonGetPairingOfferRequestSchema = z.object({
   type: z.literal("daemon.get_pairing_offer.request"),
   requestId: z.string(),
@@ -3304,6 +3309,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   SendAgentMessageRequestSchema,
   WaitForFinishRequestSchema,
   DaemonGetStatusRequestSchema,
+  DaemonGetHostStatsRequestSchema,
   DaemonGetPairingOfferRequestSchema,
   DaemonConfigReloadRequestSchema,
   HubManagementDaemonConnectRequestSchema,
@@ -3699,6 +3705,8 @@ export const ServerInfoStatusPayloadSchema = z
         forgeSearch: z.boolean().optional(),
         // COMPAT(daemonStatusRpc): added in v0.1.76, remove gate after 2026-11-18.
         daemonStatusRpc: z.boolean().optional(),
+        // COMPAT(hostStats): added in v0.11.3; remove gate after 2027-04-17.
+        hostStats: z.boolean().optional(),
         // COMPAT(daemonConfigReload): added in v0.4.0, remove gate after 2027-02-14.
         daemonConfigReload: z.boolean().optional(),
         // COMPAT(relayConfig): added in v0.2.6, remove gate after 2027-01-31.
@@ -5175,6 +5183,36 @@ export const DaemonGetStatusResponseSchema = z.object({
       ),
     })
     .passthrough(),
+});
+
+// Host load for routing new work: the daemon's own agent and workspace counts plus live
+// CPU and memory readings. Fields a platform cannot measure are null.
+export const HostStatsSchema = z.object({
+  collectedAt: z.string(),
+  agents: z.object({ total: z.number().int(), running: z.number().int() }),
+  workspaces: z.object({ total: z.number().int(), running: z.number().int() }),
+  cpu: z.object({
+    cores: z.number().int(),
+    idlePercent: z.number(),
+    sampleMs: z.number(),
+    loadAverage: z.array(z.number()),
+  }),
+  memory: z.object({
+    totalBytes: z.number(),
+    usedBytes: z.number(),
+    swapUsedBytes: z.number().nullable(),
+    // "normal" | "warn" | "critical" today; a string so a later level still parses.
+    pressure: z.string().nullable(),
+  }),
+  git: z.object({ active: z.number().int(), pending: z.number().int() }),
+});
+
+export const DaemonGetHostStatsResponseSchema = z.object({
+  type: z.literal("daemon.get_host_stats.response"),
+  payload: z.object({
+    requestId: z.string(),
+    stats: HostStatsSchema,
+  }),
 });
 
 export const HubRelationshipStatusSchema = z.object({
@@ -7100,6 +7138,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   SendAgentMessageResponseMessageSchema,
   SetVoiceModeResponseMessageSchema,
   DaemonGetStatusResponseSchema,
+  DaemonGetHostStatsResponseSchema,
   DaemonGetPairingOfferResponseSchema,
   DaemonConfigReloadResponseSchema,
   HubManagementDaemonConnectResponseSchema,
@@ -7359,6 +7398,8 @@ export type ListProviderFeaturesResponseMessage = z.infer<
 >;
 export type ListAvailableProvidersResponse = z.infer<typeof ListAvailableProvidersResponseSchema>;
 export type DaemonGetStatusResponse = z.infer<typeof DaemonGetStatusResponseSchema>;
+export type HostStats = z.infer<typeof HostStatsSchema>;
+export type DaemonGetHostStatsResponse = z.infer<typeof DaemonGetHostStatsResponseSchema>;
 export type DaemonGetPairingOfferResponse = z.infer<typeof DaemonGetPairingOfferResponseSchema>;
 export type DaemonConfigReloadResponse = z.infer<typeof DaemonConfigReloadResponseSchema>;
 export type DiagnosticsResponse = z.infer<typeof DiagnosticsResponseSchema>;
