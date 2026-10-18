@@ -6,6 +6,7 @@ import {
   ServerInfoStatusPayloadSchema,
   SessionOutboundMessageSchema,
   WSHelloMessageSchema,
+  WorkspaceDescriptorPayloadSchema,
   WorkspaceSetupSnapshotSchema,
   WorkspaceSetupProgressMessageSchema,
   AgentTimelineEntryPayloadSchema,
@@ -435,4 +436,52 @@ test("usage login errors are additive and older reports still parse", () => {
   expect(SessionOutboundMessageSchema.parse(oldMessage)).toEqual(oldMessage);
   expect(SessionOutboundMessageSchema.parse(newMessage)).toEqual(newMessage);
   expect(legacy.parse(newMessage)).toEqual(oldMessage);
+});
+
+test("3fdb71dd-7bc7-81fe-9280-c37f47c8e4b9@c0b2fb81314b#old-daemon optional superpin capability and descriptors remain compatible", () => {
+  const info = {
+    status: "server_info",
+    serverId: "server",
+    hostname: null,
+    version: null,
+    features: { workspacePinning: true },
+  };
+  const oldInfo = ServerInfoStatusPayloadSchema.parse(info);
+  expect(oldInfo.features?.workspaceSuperpinning === true).toBe(false);
+  const capable = { ...info, features: { ...info.features, workspaceSuperpinning: true } };
+  expect(ServerInfoStatusPayloadSchema.parse(capable).features?.workspaceSuperpinning).toBe(true);
+  const legacyFeatures = z.object({ workspacePinning: z.boolean().optional() });
+  expect(legacyFeatures.parse(capable.features)).toEqual(info.features);
+  const descriptor = {
+    id: "workspace",
+    projectId: "project",
+    projectDisplayName: "Project",
+    projectRootPath: "/tmp/project",
+    projectKind: "git",
+    workspaceKind: "local_checkout",
+    name: "Workspace",
+    status: "done",
+    activityAt: null,
+    scripts: [],
+    pinnedAt: null,
+  };
+  expect(WorkspaceDescriptorPayloadSchema.parse(descriptor).superpinnedAt).toBeUndefined();
+  const oldDescriptor = z.object({
+    id: z.string(),
+    projectId: z.string(),
+    projectDisplayName: z.string(),
+    projectRootPath: z.string(),
+    projectKind: z.string(),
+    workspaceKind: z.string(),
+    name: z.string(),
+    status: z.string(),
+    activityAt: z.string().nullable(),
+    pinnedAt: z.string().nullable().optional(),
+    scripts: z.array(z.unknown()),
+  });
+  for (const superpinnedAt of [null, "2026-10-18T00:00:00.000Z"]) {
+    const current = { ...descriptor, superpinnedAt };
+    expect(WorkspaceDescriptorPayloadSchema.parse(current).superpinnedAt).toBe(superpinnedAt);
+    expect(oldDescriptor.parse(current)).toEqual(oldDescriptor.parse(descriptor));
+  }
 });

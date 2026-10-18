@@ -9,6 +9,7 @@ export interface WorkspaceRow {
   cwd: string;
   background: boolean;
   pinnedAt?: string | null;
+  superpinnedAt?: string | null;
 }
 
 export const workspaceSchema: OutputSchema<WorkspaceRow> = {
@@ -40,5 +41,6 @@ export function toWorkspaceRow(workspace: WorkspaceDescriptorPayload): Workspace
     cwd: workspace.workspaceDirectory,
     background: workspace.background === true,
     pinnedAt: workspace.pinnedAt,
+    superpinnedAt: workspace.superpinnedAt,
   };
 }

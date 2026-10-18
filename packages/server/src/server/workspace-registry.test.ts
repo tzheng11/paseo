@@ -554,3 +554,107 @@ describe("workspace registries", () => {
     });
   });
 });
+
+describe("superpin persistence", () => {
+  let directory: string;
+  beforeEach(() => {
+    directory = mkdtempSync(path.join(os.tmpdir(), "superpin-registry-"));
+  });
+  afterEach(() => {
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  const base = {
+    workspaceId: "workspace",
+    projectId: "project",
+    cwd: "/tmp/repo",
+    kind: "directory" as const,
+    displayName: "Workspace",
+    archivedAt: null,
+    createdAt: "2026-10-18T00:00:00.000Z",
+    updatedAt: "2026-10-18T00:00:00.000Z",
+  };
+
+  test("3fdb71dd-7bc7-8193-83f6-cc37ba6c9dd9@0a9e62e2a465#registry-reload old records default null and orphaned superpins regain a pin", async () => {
+    const file = path.join(directory, "workspaces.json");
+    await writeJsonFileAtomic(file, [
+      base,
+      { ...base, workspaceId: "orphan", pinnedAt: null, superpinnedAt: "2026-10-18T01:00:00.000Z" },
+    ]);
+    const registry = new FileBackedWorkspaceRegistry(file, createTestLogger());
+    expect(await registry.get("workspace")).toMatchObject({ pinnedAt: null, superpinnedAt: null });
+    expect(await registry.get("orphan")).toMatchObject({
+      pinnedAt: "2026-10-18T01:00:00.000Z",
+      superpinnedAt: "2026-10-18T01:00:00.000Z",
+    });
+    await registry.update("workspace", (record) => ({
+      ...record,
+      pinnedAt: "2026-10-18T02:00:00.000Z",
+      superpinnedAt: "2026-10-18T03:00:00.000Z",
+    }));
+    const reloaded = new FileBackedWorkspaceRegistry(file, createTestLogger());
+    expect(await reloaded.list()).toEqual(await registry.list());
+  });
+
+  test("3fdb71dd-7bc7-8193-83f6-cc37ba6c9dd9@0a9e62e2a465#registry-reload orphan upserts publish the same normalized state they persist", async () => {
+    const file = path.join(directory, "workspaces.json");
+    const registry = new FileBackedWorkspaceRegistry(file, createTestLogger());
+    const published: unknown[] = [];
+    registry.subscribeToMutations((mutation) => {
+      published.push(mutation.workspace);
+    });
+    const time = "2026-10-18T01:00:00.000Z";
+    await registry.upsert({
+      ...createPersistedWorkspaceRecord(base),
+      pinnedAt: null,
+      superpinnedAt: time,
+    });
+    const reloaded = await new FileBackedWorkspaceRegistry(file, createTestLogger()).get(
+      "workspace",
+    );
+    expect(reloaded).toMatchObject({ pinnedAt: time, superpinnedAt: time });
+    expect(published).toEqual([reloaded]);
+  });
+
+  test("3fdb71dd7bc781d5b43fd310bea8633b@34667a09e7f5#concurrent competing superpin, re-pin and unpin commit whole records in order", async () => {
+    const writes: Array<{ pinnedAt: string | null; superpinnedAt: string | null }> = [];
+    const registry = new FileBackedWorkspaceRegistry(
+      path.join(directory, "workspaces.json"),
+      createTestLogger(),
+      {
+        writeRecords: async (file, records) => {
+          await writeJsonFileAtomic(file, records);
+          writes.push({ pinnedAt: records[0].pinnedAt, superpinnedAt: records[0].superpinnedAt });
+        },
+      },
+    );
+    await registry.upsert(createPersistedWorkspaceRecord(base));
+    writes.length = 0;
+    const priority = "2026-10-18T01:00:00.000Z";
+    const repin = "2026-10-18T02:00:00.000Z";
+    await Promise.all([
+      registry.update("workspace", (record) => ({
+        ...record,
+        pinnedAt: record.pinnedAt ?? priority,
+        superpinnedAt: priority,
+      })),
+      registry.update("workspace", (record) => ({ ...record, pinnedAt: repin })),
+      registry.update("workspace", (record) => ({
+        ...record,
+        pinnedAt: null,
+        superpinnedAt: null,
+      })),
+    ]);
+    expect(writes).toEqual([
+      { pinnedAt: priority, superpinnedAt: priority },
+      { pinnedAt: repin, superpinnedAt: priority },
+      { pinnedAt: null, superpinnedAt: null },
+    ]);
+    expect(
+      await new FileBackedWorkspaceRegistry(
+        path.join(directory, "workspaces.json"),
+        createTestLogger(),
+      ).get("workspace"),
+    ).toMatchObject(writes[2]);
+  });
+});

@@ -3171,6 +3171,23 @@ export class DaemonClient {
     return { pinnedAt: payload.pinnedAt };
   }
 
+  async setWorkspaceSuperpinned(
+    workspaceId: string,
+    superpinned: boolean,
+    requestId?: string,
+  ): Promise<{ pinnedAt: string | null; superpinnedAt: string | null }> {
+    if (this.lastServerInfoMessage?.features?.workspaceSuperpinning !== true) {
+      throw new Error("This host does not support workspace superpinning. Update the host.");
+    }
+    const payload = await this.sendCorrelatedSessionRequest({
+      requestId,
+      message: { type: "workspace.superpin.set.request", workspaceId, superpinned },
+      responseType: "workspace.superpin.set.response",
+    });
+    if (!payload.accepted) throw new Error(payload.error ?? "setWorkspaceSuperpinned rejected");
+    return { pinnedAt: payload.pinnedAt, superpinnedAt: payload.superpinnedAt };
+  }
+
   async inspectWorkspaceRecovery(
     workspaceId: string,
     requestId?: string,
