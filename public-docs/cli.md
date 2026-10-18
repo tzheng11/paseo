@@ -139,12 +139,32 @@ UUID before sending the reload. The response contains `agentId`, `operationId`,
 and `status`: `pending`, `completed`, `refused`, `failed`, or `unknown`. It may also
 include `reasonCode`, `reason`, and `retryable`.
 
-`reload-status` only reads the durable operation record. An unknown operation
+`reload-status` queries the durable operation record. An unknown operation
 returns `status: "unknown"` and `reasonCode: "NOT_FOUND"`, without an agent ID.
 A timeout or lost connection exits with an error; query the saved operation UUID
 before dispatching more work. A host without credential maintenance support
 returns a structured refusal to a reload request and an update error to a status
 query.
+
+For an existing `RELOAD_CLEANUP_UNCONFIRMED`, a local maintenance operator can settle cleanup
+without replaying the operation. First coordinate a quiescent window and stop the daemon and
+provider processes through their owners. The command performs no shutdown or signalling:
+
+```bash
+paseo agent reload-reconcile-cleanup <original-operation-uuid> --home <paseo-home> \
+  --agent-id <original-agent-uuid> --retired-worker-pid <captured-worker-pid> \
+  --expected-receipt-sha256 <original-file-hash> --launch-contract <inspection.json> --json
+```
+
+The inspection file requires `version: 1`, `configSha256` for the unchanged `config.json`,
+`builtinProviderLaunchesVerified: true`, `noRenamedOrMarkerLosingWrappers: true`, `inspectedBy`,
+and a source-bound `evidence` reference. It records an actual operator inspection; it does not
+certify arbitrary provider overrides. macOS is currently required. A live daemon, worker,
+provider root, incomplete census, changed receipt or unsupported uncertainty refuses settlement.
+The original UUID and credential-generation/time are preserved. The terminal result is
+`failed` with `retryable: true` and `RELOAD_CLEANUP_RECONCILED`, never a fabricated `completed`.
+A sidecar evidence file makes repeated reconciliation idempotent. Restart the matched daemon
+and read the original UUID back; a compatible Fleet reader then resumes its ordinary bounded queue.
 
 ## Projects
 

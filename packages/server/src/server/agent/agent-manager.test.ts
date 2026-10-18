@@ -20,7 +20,7 @@ import {
 } from "./agent-manager.js";
 import { AgentStorage } from "./agent-storage.js";
 import { MessageReceipts } from "../message-receipts/index.js";
-import { ReloadOperationStore } from "./reload-operation-store.js";
+import { ReloadOperationStore, type ReloadOperation } from "./reload-operation-store.js";
 import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 import { DiskAgentTimelineStore } from "./disk-agent-timeline-store.js";
 import { AgentHistoryReplay } from "./agent-history-replay.js";
@@ -1237,8 +1237,10 @@ test("unavailable steer interrupts once and starts one replacement turn", async 
   try {
     expect(session.interruptCount).toBe(1);
     expect(session.startCount).toBe(2);
-    expect(manager.getTimeline(agentId)).toContainEqual(
-      expect.objectContaining({ type: "user_message", clientMessageId: "replacement-client" }),
+    await vi.waitFor(() =>
+      expect(manager.getTimeline(agentId)).toContainEqual(
+        expect.objectContaining({ type: "user_message", clientMessageId: "replacement-client" }),
+      ),
     );
   } finally {
     await manager.closeAgent(agentId);
@@ -1444,15 +1446,17 @@ test("orders a concurrent replacement after a pending accepted steer", async () 
     await vi.waitFor(() => expect(session.startCount).toBe(2));
 
     expect(session.interruptCount).toBe(1);
-    expect(
-      manager
-        .fetchTimeline(agent.id, { limit: 0 })
-        .rows.filter((row) => row.item.type === "user_message")
-        .map((row) => row.item),
-    ).toMatchObject([
-      { text: "hello", clientMessageId: "hello-client" },
-      { text: "replacement", clientMessageId: "replacement-client" },
-    ]);
+    await vi.waitFor(() =>
+      expect(
+        manager
+          .fetchTimeline(agent.id, { limit: 0 })
+          .rows.filter((row) => row.item.type === "user_message")
+          .map((row) => row.item),
+      ).toMatchObject([
+        { text: "hello", clientMessageId: "hello-client" },
+        { text: "replacement", clientMessageId: "replacement-client" },
+      ]),
+    );
   } finally {
     release.resolve();
     if (agentId) await manager.closeAgent(agentId).catch(() => undefined);
@@ -12710,6 +12714,46 @@ test("credential reload receipt stays pending through registration and lost ACK 
   }
 });
 
+test("credential reload retains its idle claim past the ordinary close deadline and reconciles late success", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "credential-late-close-"));
+  const client = new HeldReloadCloseClient();
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    reloadOperations: new ReloadOperationStore(join(workdir, "operations"), logger),
+    rescueTimeouts: { reloadSessionCloseMs: 10 },
+  });
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.reloadAgentCredentials(agent.id, "late-close");
+    await client.waitForCloseToStart();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(await manager.getReloadOperation("late-close")).toMatchObject({ status: "pending" });
+    expect(await manager.reloadAgentCredentials(agent.id, "late-close")).toMatchObject({
+      status: "pending",
+    });
+    await expect(manager.runAgent(agent.id, "must wait")).rejects.toMatchObject({
+      code: "agent_reload_in_progress",
+    });
+    expect(client.originalSessionClosed).toBe(false);
+    client.finishClosing();
+    await vi.waitFor(async () =>
+      expect(await manager.getReloadOperation("late-close")).toMatchObject({ status: "completed" }),
+    );
+    expect(client.originalSessionClosed).toBe(true);
+    expect(manager.getAgent(agent.id)?.lifecycle).toBe("idle");
+    await manager.closeAgent(agent.id);
+  } finally {
+    client.finishClosing();
+    await storage.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("credential reload cannot replace a writer whose old close failed", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "credential-close-"));
   const resumed = vi.fn();
@@ -12744,8 +12788,90 @@ test("credential reload cannot replace a writer whose old close failed", async (
     );
     await manager.reloadAgentCredentials(agent.id, "intent");
     expect(resumed).not.toHaveBeenCalled();
+    await expect(
+      manager.runAgent(agent.id, "must not reuse uncertain writer"),
+    ).rejects.toMatchObject({ code: "agent_reload_in_progress" });
+    await expect(manager.reloadAgentSession(agent.id)).rejects.toMatchObject({
+      code: "agent_reload_in_progress",
+    });
   } finally {
     await manager.closeAgent(agent.id).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("unregistered replacement cleanup uncertainty blocks a later persistence resume before another spawn", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "credential-orphan-"));
+  const resumed = vi.fn();
+  const replacementStarted = deferred<void>();
+  const failStartup = deferred<void>();
+  class OrphanClient extends TestAgentClient {
+    override async resumeSession(): Promise<AgentSession> {
+      resumed();
+      replacementStarted.resolve();
+      await failStartup.promise;
+      throw Object.assign(new Error("Unregistered replacement writer cleanup failed"), {
+        code: "reload_cleanup_unconfirmed",
+      });
+    }
+  }
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const operations = new ReloadOperationStore(join(workdir, "operations"), logger);
+  const terminalWriteStarted = deferred<void>();
+  const finishTerminalWrite = deferred<void>();
+  const writer = operations as unknown as { write: (operation: ReloadOperation) => Promise<void> };
+  const write = writer.write.bind(operations);
+  vi.spyOn(writer, "write").mockImplementation(async (operation) => {
+    if (operation.status === "unknown") {
+      terminalWriteStarted.resolve();
+      await finishTerminalWrite.promise;
+    }
+    await write(operation);
+  });
+  const manager = new AgentManager({
+    clients: { codex: new OrphanClient() },
+    logger,
+    registry: storage,
+    reloadOperations: operations,
+  });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  try {
+    await manager.reloadAgentCredentials(agent.id, "orphan");
+    await replacementStarted.promise;
+    const queuedResume = manager
+      .resumeAgentFromPersistence(agent.persistence!, undefined, agent.id)
+      .then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+    failStartup.resolve();
+    await terminalWriteStarted.promise;
+    expect(await queuedResume).toMatchObject({ code: "agent_reload_in_progress" });
+    // The lifecycle claim has released, but terminal persistence is still waiting.
+    await expect(
+      manager.resumeAgentFromPersistence(agent.persistence!, undefined, agent.id),
+    ).rejects.toMatchObject({ code: "agent_reload_in_progress" });
+    expect(resumed).toHaveBeenCalledTimes(1);
+    finishTerminalWrite.resolve();
+    await vi.waitFor(async () =>
+      expect(await manager.getReloadOperation("orphan")).toMatchObject({
+        status: "unknown",
+        reasonCode: "RELOAD_CLEANUP_UNCONFIRMED",
+      }),
+    );
+    expect(resumed).toHaveBeenCalledTimes(1);
+    await expect(
+      manager.resumeAgentFromPersistence(agent.persistence!, undefined, agent.id),
+    ).rejects.toMatchObject({ code: "agent_reload_in_progress" });
+    expect(resumed).toHaveBeenCalledTimes(1);
+  } finally {
+    failStartup.resolve();
+    finishTerminalWrite.resolve();
+    await manager.getReloadOperation("orphan");
+    await manager.closeAgent(agent.id);
+    await storage.flush();
     rmSync(workdir, { recursive: true, force: true });
   }
 });

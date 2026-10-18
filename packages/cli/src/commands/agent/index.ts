@@ -1,3 +1,4 @@
+import { reloadReconcileCleanupCommand } from "./reload-reconcile-cleanup.js";
 import { Command } from "commander";
 import { runModeCommand } from "./mode.js";
 import { addArchiveOptions, runArchiveCommand } from "./archive.js";
@@ -73,6 +74,8 @@ export function createAgentCommand(): Command {
   addJsonAndDaemonHostOptions(addWaitOptions(agent.command("wait"))).action(
     withOutput(runWaitCommand),
   );
+
+  agent.addCommand(reloadReconcileCleanupCommand());
 
   // Advanced agent commands (less common operations)
   addJsonAndDaemonHostOptions(
