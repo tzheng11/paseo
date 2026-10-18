@@ -325,7 +325,7 @@ export function projectCommandCenterRows(
       offsets.push(offset);
       rowIndexByResultId.set(result.id, rows.length);
       rows.push({ kind: "result", key: result.id, result, height });
-      selectableResults.push(result);
+      if (!isCommandCenterResultDisabled(result)) selectableResults.push(result);
       offset += height;
     }
   }
@@ -353,4 +353,8 @@ export function moveActiveResultId(
   if (current < 0 && direction === "previous") start = 0;
   const next = (start + delta + results.length) % results.length;
   return results[next].id;
+}
+
+export function isCommandCenterResultDisabled(result: CommandCenterResult): boolean {
+  return result.kind === "contribution" && result.contribution.disabled === true;
 }

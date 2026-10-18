@@ -18,7 +18,13 @@ const foregroundMutedColorMapping = (theme: Theme) => ({
 export function PinnedSectionHeader({
   collapsed,
   onToggle,
+  title,
+  testID = "sidebar-pinned-section-header",
+  sortable = true,
 }: {
+  title?: string;
+  testID?: string;
+  sortable?: boolean;
   collapsed: boolean;
   onToggle: () => void;
 }) {
@@ -36,23 +42,25 @@ export function PinnedSectionHeader({
         accessibilityState={accessibilityState}
         onPress={onToggle}
         style={styles.header}
-        testID="sidebar-pinned-section-header"
+        testID={testID}
       >
         {({ hovered }) => (
           <>
-            <Text style={styles.title}>{t("sidebar.pinned.title")}</Text>
+            <Text style={styles.title}>{title ?? t("sidebar.pinned.title")}</Text>
             {hovered || isNative || isCompact ? (
               <Chevron size={12} uniProps={foregroundMutedColorMapping} />
             ) : null}
           </>
         )}
       </Pressable>
-      <WorkspaceSortMenu
-        mode={sortMode}
-        onSelect={setSortMode}
-        testID="sidebar-pinned-sort"
-        label={t("sidebar.pinned.sort.label")}
-      />
+      {sortable ? (
+        <WorkspaceSortMenu
+          mode={sortMode}
+          onSelect={setSortMode}
+          testID="sidebar-pinned-sort"
+          label={t("sidebar.pinned.sort.label")}
+        />
+      ) : null}
     </View>
   );
 }

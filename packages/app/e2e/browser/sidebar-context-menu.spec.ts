@@ -268,3 +268,48 @@ async function readWorkspace(workspace: Awaited<ReturnType<typeof seedWorkspace>
     (entry) => entry.id === workspace.workspaceId,
   );
 }
+
+for (const viewport of [
+  { width: 1440, height: 900 },
+  { width: 390, height: 844 },
+]) {
+  test.describe(`${viewport.width}px header Superpin`, () => {
+    test.use({ viewport });
+    test("3fdb71dd-7bc7-816a-bca8-cefc13498226@2467ee223467#header-menu promotes and removes priority from confirmed state", async ({
+      page,
+    }, info) => {
+      const seed = await seedWorkspace({ repoPrefix: "header-superpin-" });
+      try {
+        await gotoAppShell(page);
+        if (viewport.width < 600)
+          await page.getByRole("button", { name: "Open menu", exact: true }).click();
+        const workspaceRow = page.getByTestId(
+          `sidebar-workspace-row-${getServerId()}:${seed.workspaceId}`,
+        );
+        await expect(workspaceRow).toBeVisible({ timeout: 30_000 });
+        await workspaceRow.click();
+        await expect(page.getByTestId("workspace-header-title")).toBeVisible();
+        await openHeaderMenu(page);
+        await expect(headerAction(page, seed.workspaceId, "superpin")).toHaveText("Superpin");
+        await expect(headerAction(page, seed.workspaceId, "superpin")).toBeInViewport({ ratio: 1 });
+        await page.screenshot({ path: info.outputPath("header-superpin.png") });
+        await headerAction(page, seed.workspaceId, "superpin").click();
+        await expect
+          .poll(async () => (await readWorkspace(seed))?.superpinnedAt)
+          .toEqual(expect.any(String));
+        const accepted = await readWorkspace(seed);
+        await openHeaderMenu(page);
+        await expect(headerAction(page, seed.workspaceId, "superpin")).toHaveText(
+          "Remove superpin",
+        );
+        await expect(headerAction(page, seed.workspaceId, "superpin")).toBeInViewport({ ratio: 1 });
+        await page.screenshot({ path: info.outputPath("header-remove-superpin.png") });
+        await headerAction(page, seed.workspaceId, "superpin").click();
+        await expect.poll(async () => (await readWorkspace(seed))?.superpinnedAt).toBeNull();
+        expect((await readWorkspace(seed))?.pinnedAt).toBe(accepted?.pinnedAt);
+      } finally {
+        await seed.cleanup();
+      }
+    });
+  });
+}

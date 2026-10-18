@@ -1213,6 +1213,14 @@ export const ja: TranslationResources = {
       alphabetical: "A–Z",
       activity: "最終アクティビティ",
     },
+    superpinned: {
+      stateConfirmed: "ワークスペースの状態を確認しました。",
+      checkState: "結果が不明です。状態を確認",
+      title: "優先ピン留め",
+      action: "優先ピン留めする",
+      remove: "優先ピン留めを解除",
+      outcomeUnknown: "結果が不明です。次の変更の前にワークスペースの状態を確認しています。",
+    },
     pinned: {
       title: "固定済み",
       sort: {

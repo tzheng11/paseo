@@ -54,6 +54,7 @@ import { shortenPath } from "@/utils/shorten-path";
 import { useCommandCenterContributions } from "./provider";
 import { filterAndRankWorkspaces } from "./workspace-search";
 import {
+  isCommandCenterResultDisabled,
   buildContributionSections,
   filterAndRankBuiltInResults,
   joinSubtitleParts,
@@ -306,6 +307,7 @@ function useCommandCenterState(): CommandCenterState {
   const close = useCallback(() => setOpen(false), [setOpen]);
   const select = useCallback(
     (result: CommandCenterResult) => {
+      if (isCommandCenterResultDisabled(result)) return;
       setOpen(false);
       void result.run();
     },
@@ -386,6 +388,7 @@ interface ResultRowProps {
 }
 
 const ResultRow = memo(function ResultRow({ result, active, onSelect }: ResultRowProps) {
+  const disabled = isCommandCenterResultDisabled(result);
   const press = useCallback(() => onSelect(result), [onSelect, result]);
   const choice =
     result.kind === "contribution" && result.contribution.presentation.kind === "choice"
@@ -396,8 +399,8 @@ const ResultRow = memo(function ResultRow({ result, active, onSelect }: ResultRo
       ? [result.title, result.subtitle].filter(Boolean).join(" ")
       : choice?.path.join(" › ");
   const accessibilityState = useMemo(
-    () => (isNative && choice ? { selected: choice.selected } : undefined),
-    [choice],
+    () => ({ disabled, ...(isNative && choice ? { selected: choice.selected } : {}) }),
+    [choice, disabled],
   );
   const style = useCallback(
     ({ hovered, pressed }: PressableStateCallbackType & { hovered?: boolean }) => [
@@ -415,6 +418,7 @@ const ResultRow = memo(function ResultRow({ result, active, onSelect }: ResultRo
   return (
     <Pressable
       style={style}
+      disabled={disabled}
       onPress={press}
       accessibilityRole="button"
       accessibilityLabel={accessibilityLabel}

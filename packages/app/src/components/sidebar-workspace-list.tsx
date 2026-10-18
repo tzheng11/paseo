@@ -2046,6 +2046,14 @@ function SidebarGroupedModeList({
   dragGestureHostActive?: boolean;
 }) {
   const showShortcutBadges = useShowShortcutBadges();
+  const superpinnedWorkspaces = useMemo(
+    () =>
+      pinnedGroups.superpinnedChats.flatMap((workspace) => {
+        const entry = workspaceEntriesByKey.get(workspace.workspaceKey);
+        return entry ? [entry] : [];
+      }),
+    [pinnedGroups.superpinnedChats, workspaceEntriesByKey],
+  );
   const pinnedWorkspaces = useMemo(
     () =>
       pinnedGroups.pinnedChats.flatMap((workspace) => {
@@ -2059,6 +2067,7 @@ function SidebarGroupedModeList({
     <SidebarStatusWorkspaceList
       groups={workspaceGroups}
       pinnedWorkspaces={pinnedWorkspaces}
+      superpinnedWorkspaces={superpinnedWorkspaces}
       projectIconByProjectViewKey={projectIconByProjectViewKey}
       shortcutIndexByWorkspaceKey={_projectShortcutIndex}
       showShortcutBadges={showShortcutBadges}
@@ -2140,7 +2149,18 @@ function ProjectModeList({
   );
   const selectionEnabled = isWorkspaceRoute;
   const activeWorkspaceSelection = useActiveWorkspaceSelection();
-  const { pinnedChats, unpinnedProjects } = pinnedGroups;
+  const { t } = useTranslation();
+  const { pinnedChats, superpinnedChats, unpinnedProjects } = pinnedGroups;
+  const superpinnedCollapsed = useSidebarCollapsedSectionsStore((state) =>
+    state.collapsedWorkspaceGroupKeys.has("section:superpinned"),
+  );
+  const toggleWorkspaceGroupCollapsed = useSidebarCollapsedSectionsStore(
+    (state) => state.toggleWorkspaceGroupCollapsed,
+  );
+  const toggleSuperpinnedCollapsed = useCallback(
+    () => toggleWorkspaceGroupCollapsed("section:superpinned"),
+    [toggleWorkspaceGroupCollapsed],
+  );
   const {
     visibleItems: visiblePinnedChats,
     expanded: pinnedChatsExpanded,
@@ -2354,7 +2374,9 @@ function ProjectModeList({
       drag,
       isActive,
       dragHandleProps,
-    }: DraggableRenderItemInfo<SidebarWorkspacePlacement>) => {
+    }: Omit<DraggableRenderItemInfo<SidebarWorkspacePlacement>, "drag"> & {
+      drag?: () => void;
+    }) => {
       return (
         <MemoWorkspaceRowItem
           workspace={workspace}
@@ -2416,6 +2438,26 @@ function ProjectModeList({
 
   const content = (
     <>
+      {superpinnedChats.length > 0 ? (
+        <View style={styles.pinnedSection} testID="sidebar-superpinned-section">
+          <PinnedSectionHeader
+            title={t("sidebar.superpinned.title")}
+            testID="sidebar-superpinned-section-header"
+            sortable={false}
+            collapsed={superpinnedCollapsed}
+            onToggle={toggleSuperpinnedCollapsed}
+          />
+          {superpinnedCollapsed ? null : (
+            <View testID="sidebar-superpinned-list">
+              {superpinnedChats.map((item, index) => (
+                <View key={item.workspaceKey}>
+                  {renderPinnedChat({ item, index, isActive: false })}
+                </View>
+              ))}
+            </View>
+          )}
+        </View>
+      ) : null}
       {pinnedChats.length > 0 ? (
         <View style={styles.pinnedSection} testID="sidebar-pinned-section">
           <PinnedSectionHeader collapsed={pinnedCollapsed} onToggle={togglePinnedCollapsed} />

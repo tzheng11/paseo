@@ -1191,6 +1191,14 @@ export const zhCN: TranslationResources = {
       alphabetical: "A–Z",
       activity: "最近活动",
     },
+    superpinned: {
+      stateConfirmed: "已确认工作区状态。",
+      checkState: "结果未知。检查工作区状态",
+      title: "超级置顶",
+      action: "超级置顶",
+      remove: "取消超级置顶",
+      outcomeUnknown: "结果未知。正在确认工作区状态，然后才能再次更改。",
+    },
     pinned: {
       title: "已置顶",
       sort: {

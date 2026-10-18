@@ -1199,6 +1199,14 @@ export const ar: TranslationResources = {
       alphabetical: "أ–ي",
       activity: "آخر نشاط",
     },
+    superpinned: {
+      stateConfirmed: "تم تأكيد حالة مساحة العمل.",
+      checkState: "النتيجة غير معروفة. تحقق من حالة مساحة العمل",
+      title: "المثبتة بأولوية",
+      action: "تثبيت بأولوية",
+      remove: "إزالة التثبيت بأولوية",
+      outcomeUnknown: "النتيجة غير معروفة. جارٍ تأكيد حالة مساحة العمل قبل إجراء تغيير آخر.",
+    },
     pinned: {
       title: "المثبتة",
       sort: {

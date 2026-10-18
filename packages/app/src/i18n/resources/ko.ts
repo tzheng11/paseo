@@ -1206,6 +1206,14 @@ export const ko: TranslationResources = {
       alphabetical: "A–Z",
       activity: "최근 활동",
     },
+    superpinned: {
+      stateConfirmed: "작업 공간 상태를 확인했습니다.",
+      checkState: "결과를 알 수 없습니다. 상태 확인",
+      title: "우선 고정",
+      action: "우선 고정하기",
+      remove: "우선 고정 해제",
+      outcomeUnknown: "결과를 알 수 없습니다. 다음 변경 전에 작업 공간 상태를 확인하고 있습니다.",
+    },
     pinned: {
       title: "고정됨",
       sort: {

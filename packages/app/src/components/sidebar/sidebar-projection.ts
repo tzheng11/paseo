@@ -90,6 +90,8 @@ export function buildSidebarProjection(input: SidebarProjectionInput): SidebarPr
   const workspaceGroups = buildWorkspaceGroups(input, unpinnedWorkspaces);
 
   const sections: SidebarShortcutSection[] = [];
+  if (!input.collapsedWorkspaceGroupKeys.has("section:superpinned"))
+    sections.push({ workspaces: pinnedGroups.superpinnedChats });
   if (!input.pinnedCollapsed) {
     sections.push({ workspaces: pinnedGroups.pinnedChats });
   }

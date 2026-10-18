@@ -15,6 +15,8 @@ export interface SeedWorkspaceDescriptor {
   diffStat: { additions: number; deletions: number } | null;
   labels?: string[];
   fieldValues?: Record<string, string>;
+  pinnedAt?: string | null;
+  superpinnedAt?: string | null;
 }
 
 interface SeedProjectDescriptor {
@@ -53,6 +55,10 @@ export interface SeedDaemonClient {
     requestId?: string;
   }): Promise<{ value: string }>;
   setWorkspacePinned(workspaceId: string, pinned: boolean): Promise<{ pinnedAt: string | null }>;
+  setWorkspaceSuperpinned(
+    workspaceId: string,
+    superpinned: boolean,
+  ): Promise<{ pinnedAt: string | null; superpinnedAt: string | null }>;
   setWorkspaceTitle(workspaceId: string, title: string | null): Promise<{ title: string | null }>;
   clearWorkspaceAttention(workspaceId: string): Promise<void>;
   setWorkspaceLabel(input: {
