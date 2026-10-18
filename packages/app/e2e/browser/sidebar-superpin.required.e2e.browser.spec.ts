@@ -7,7 +7,6 @@ import {
   openSidebarDisplayPage,
   openMobileAgentSidebar,
   expectMobileAgentSidebarVisible,
-  closeMobileAgentSidebar,
   selectSidebarStatusGrouping,
 } from "../support/helpers/sidebar";
 import {
@@ -64,10 +63,12 @@ async function openWorkspace(page: Page, seed: SeededWorkspace) {
 }
 async function palette(page: Page, title: string) {
   if (narrow(page)) {
-    const box = await page.getByTestId("sidebar-close").boundingBox();
-    if (box && box.x >= 0) await closeMobileAgentSidebar(page);
+    // Compact web intentionally disables global shortcuts; selection still uses the keyboard.
+    await showSidebar(page);
+    await page.getByTestId("sidebar-search").click();
+  } else {
+    await page.keyboard.press("ControlOrMeta+K");
   }
-  await page.keyboard.press("ControlOrMeta+K");
   const panel = page.getByTestId("command-center-panel");
   await expect(panel).toBeVisible();
   const input = panel.getByTestId("command-center-input");
@@ -205,13 +206,15 @@ for (const viewport of [
             .getByRole("group", { name: seed.projectDisplayName, exact: true })
             .getByTestId(rowID(seed.workspaceId)),
         ).toHaveCount(1);
-        await rowAction(page, seed.workspaceId, "superpin");
-        await expect(top(page)).toBeVisible();
-        await openWorkspace(page, seed);
-        await page.keyboard.press("ControlOrMeta+Shift+P");
-        await expect.poll(() => readState(seed)).toEqual({ pinnedAt: null, superpinnedAt: null });
-        await showSidebar(page);
-        await expect(row(page, seed.workspaceId)).toHaveCount(1);
+        if (!narrow(page)) {
+          await rowAction(page, seed.workspaceId, "superpin");
+          await expect(top(page)).toBeVisible();
+          await openWorkspace(page, seed);
+          await page.keyboard.press("ControlOrMeta+Shift+P");
+          await expect.poll(() => readState(seed)).toEqual({ pinnedAt: null, superpinnedAt: null });
+          await showSidebar(page);
+          await expect(row(page, seed.workspaceId)).toHaveCount(1);
+        }
       } finally {
         await seed.cleanup();
         await ordinary.cleanup();
@@ -420,11 +423,15 @@ for (const viewport of [
           page.getByTestId(`sidebar-workspace-menu-superpin-${key(seed.workspaceId)}`),
         ).toHaveAttribute("aria-disabled", "true");
         await page.keyboard.press("Escape");
+        gate.holdNextClientRequest("fetch_workspaces_request");
         gate.restore();
-        await expect
-          .poll(() => gate.getClientRequestCount("fetch_workspaces_request"))
-          .toBeGreaterThan(1);
-        await rowAction(page, seed.workspaceId, "superpin");
+        await gate.waitForHeldClientRequest();
+        await openRowMenu(page, seed.workspaceId);
+        const retry = page.getByTestId(`sidebar-workspace-menu-superpin-${key(seed.workspaceId)}`);
+        await expect(retry).toHaveAttribute("aria-disabled", "true");
+        gate.releaseHeldClientRequest();
+        await expect(retry).not.toHaveAttribute("aria-disabled", "true");
+        await retry.click();
         await expect(top(page)).toBeVisible();
         expect(gate.getClientRequestCount(RPC)).toBe(2);
         expect((await readState(seed)).superpinnedAt).toEqual(expect.any(String));
@@ -470,7 +477,8 @@ async function assertOldHost(
   await capture(page, info, `${captureName}-command-center`);
   await page.keyboard.press("Escape");
   const before = await readState(seed);
-  await page.keyboard.press("ControlOrMeta+Shift+P");
+  if (narrow(page)) await rowAction(page, seed.workspaceId, "pin");
+  else await page.keyboard.press("ControlOrMeta+Shift+P");
   await expect
     .poll(async () => Boolean((await readState(seed)).pinnedAt))
     .toBe(before.pinnedAt == null);
