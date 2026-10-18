@@ -43,6 +43,15 @@ async function rowAction(page: Page, id: string, action: "superpin" | "pin") {
   await expect(item).toBeVisible();
   await item.click();
 }
+async function dismissOverlay(page: Page) {
+  const backdrop = page.getByRole("button", { name: "Bottom sheet backdrop", exact: true });
+  if (narrow(page) && (await backdrop.count()) > 0) {
+    await backdrop.click({ position: { x: 8, y: 8 } });
+    await expect(backdrop).toHaveCount(0);
+  } else {
+    await page.keyboard.press("Escape");
+  }
+}
 async function readState(seed: SeededWorkspace) {
   const workspace = (await seed.client.fetchWorkspaces()).entries.find(
     (w) => w.id === seed.workspaceId,
@@ -51,6 +60,17 @@ async function readState(seed: SeededWorkspace) {
   return { pinnedAt: workspace.pinnedAt, superpinnedAt: workspace.superpinnedAt };
 }
 async function capture(page: Page, info: TestInfo, name: string) {
+  if (
+    narrow(page) &&
+    [
+      "superpinned-project",
+      "superpinned-status",
+      "superpinned-cache-reopen",
+      "superpin-refused",
+    ].includes(name)
+  ) {
+    await expect(page.getByText("Workspace actions", { exact: true })).not.toBeInViewport();
+  }
   const viewport = page.viewportSize()!;
   await page.mouse.move(viewport.width - 10, viewport.height - 10);
   await expect(page.getByTestId("workspace-hover-card")).toHaveCount(0);
@@ -326,6 +346,12 @@ for (const viewport of [
         );
         await expect(top(page)).toHaveCount(0);
         expect(await readState(seed)).toEqual(before);
+        if (!narrow(page)) {
+          // Menu focus restoration may open a late hover card after the pointer has left.
+          await row(page, seed.workspaceId).hover();
+          await expect(page.getByTestId("workspace-hover-card")).toBeVisible();
+          await dismissOverlay(page);
+        }
         await capture(page, info, "superpin-refused");
         await rowAction(page, seed.workspaceId, "superpin");
         await expect(top(page)).toBeVisible();
@@ -353,7 +379,7 @@ for (const viewport of [
             const count = await page
               .getByTestId(`sidebar-workspace-menu-superpin-${key(seed.workspaceId)}`)
               .count();
-            await page.keyboard.press("Escape");
+            await dismissOverlay(page);
             return count;
           })
           .toBe(1);
@@ -422,7 +448,7 @@ for (const viewport of [
         await expect(
           page.getByTestId(`sidebar-workspace-menu-superpin-${key(seed.workspaceId)}`),
         ).toHaveAttribute("aria-disabled", "true");
-        await page.keyboard.press("Escape");
+        await dismissOverlay(page);
         gate.holdNextClientRequest("fetch_workspaces_request");
         gate.restore();
         await gate.waitForHeldClientRequest();
@@ -469,13 +495,13 @@ async function assertOldHost(
     ratio: 1,
   });
   await capture(page, info, `${captureName}-header`);
-  await page.keyboard.press("Escape");
+  await dismissOverlay(page);
   const command = await palette(page, "Superpin");
   await expect(
     command.panel.getByRole("button", { name: /^(Superpin|Remove superpin)$/ }),
   ).toHaveCount(0);
   await capture(page, info, `${captureName}-command-center`);
-  await page.keyboard.press("Escape");
+  await dismissOverlay(page);
   const before = await readState(seed);
   if (narrow(page)) await rowAction(page, seed.workspaceId, "pin");
   else await page.keyboard.press("ControlOrMeta+Shift+P");
