@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, test, vi } from "vitest";
 import { createTestLogger } from "../../test-utils/test-logger.js";
-import { ReloadOperationStore } from "./reload-operation-store.js";
+import {
+  ReloadOperationStore,
+  type ReloadOperation,
+  type ReloadWriterClaim,
+} from "./reload-operation-store.js";
 
 const directories: string[] = [];
 afterEach(async () => {
@@ -218,6 +222,51 @@ test("unresolved cleanup fences every new writer for that agent, including after
     code: "agent_reload_in_progress",
   });
   await expect(restarted.assertWriterAdmission("unrelated")).resolves.toBeUndefined();
+});
+
+test("only the owning callback claim passes admission, and it expires before terminal persistence", async () => {
+  const { store } = await fixture();
+  let claim!: ReloadWriterClaim;
+  let finish!: () => void;
+  let releaseWrite!: () => void;
+  let startedWrite!: () => void;
+  const running = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  const writing = new Promise<void>((resolve) => {
+    startedWrite = resolve;
+  });
+  const writeGate = new Promise<void>((resolve) => {
+    releaseWrite = resolve;
+  });
+  const writer = store as unknown as { write: (operation: ReloadOperation) => Promise<void> };
+  const write = writer.write.bind(store);
+  vi.spyOn(writer, "write").mockImplementation(async (operation) => {
+    if (operation.status === "unknown") {
+      startedWrite();
+      await writeGate;
+    }
+    await write(operation);
+  });
+  await store.start("agent", "owned", async (ownClaim) => {
+    claim = ownClaim;
+    await running;
+    throw Object.assign(new Error("orphan remains"), { code: "reload_cleanup_unconfirmed" });
+  });
+  try {
+    await expect(store.assertWriterAdmission("agent", claim)).resolves.toBeUndefined();
+    expect(() => store.assertWriterAdmissionSync("agent")).toThrow();
+    expect(() => store.assertWriterAdmissionSync("agent", Symbol("owned"))).toThrow();
+    await expect(store.assertWriterAdmission("unrelated")).resolves.toBeUndefined();
+    finish();
+    await writing;
+    expect(() => store.assertWriterAdmissionSync("agent", claim)).toThrow();
+    expect(() => store.assertWriterAdmissionSync("agent")).toThrow();
+  } finally {
+    finish();
+    releaseWrite();
+    await store.get("owned");
+  }
 });
 
 test("unknown continuation and restarted generation intent preserve identity and never redispatch", async () => {

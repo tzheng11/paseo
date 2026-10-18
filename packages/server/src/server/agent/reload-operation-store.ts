@@ -7,11 +7,14 @@ import { AgentReloadOperationSchema, type AgentReloadOperation } from "@getpaseo
 import { writeJsonFileAtomic } from "../atomic-file.js";
 
 export type ReloadOperation = AgentReloadOperation;
+export type ReloadWriterClaim = symbol;
 
 /** Durable receipts outlive sockets. A pending receipt from another process is never replayed. */
 export class ReloadOperationStore {
   private admission: Promise<unknown> = Promise.resolve();
   private readonly active = new Set<string>();
+  private readonly completions = new Map<string, Promise<void>>();
+  private readonly writerClaims = new Map<string, ReloadWriterClaim>();
   private readonly held = new Map<string, ReloadOperation>();
   private initialized?: Promise<void>;
   private ready = false;
@@ -25,7 +28,7 @@ export class ReloadOperationStore {
   start(
     agentId: string,
     operationId: string,
-    run: () => Promise<ReloadOperation["continuation"] | void>,
+    run: (claim: ReloadWriterClaim) => Promise<ReloadOperation["continuation"] | void>,
     change?: CredentialChange,
   ): Promise<ReloadOperation> {
     return this.serialize(async () => {
@@ -43,9 +46,9 @@ export class ReloadOperationStore {
       const operation: ReloadOperation = { operationId, agentId, status: "pending", ...change };
       await this.write(operation);
       this.active.add(operationId);
-      // Admission is committed before any provider can be closed. Completion writes
-      // its receipt before releasing the operation, even after the initiating socket leaves.
-      void this.complete(operation, run);
+      // Only the admitted callback may pass its held receipt's writer fence.
+      // Receipt ownership outlives that claim until terminal persistence finishes.
+      this.completions.set(operationId, this.complete(operation, run));
       return operation;
     });
   }
@@ -58,16 +61,28 @@ export class ReloadOperationStore {
     });
   }
 
-  async assertWriterAdmission(agentId: string): Promise<void> {
+  async assertWriterAdmission(agentId: string, claim?: ReloadWriterClaim): Promise<void> {
     await this.initialize();
+    this.assertWriterAdmissionSync(agentId, claim);
+  }
+
+  /** Called outside the lifecycle lane after queued message preparation has drained it. */
+  async waitForWriterAdmission(agentId: string): Promise<void> {
+    await this.initialize();
+    await Promise.all(
+      [...this.completions]
+        .filter(([id]) => this.held.get(id)?.agentId === agentId)
+        .map(([, completion]) => completion),
+    );
     this.assertWriterAdmissionSync(agentId);
   }
 
-  assertWriterAdmissionSync(agentId: string): void {
+  assertWriterAdmissionSync(agentId: string, claim?: ReloadWriterClaim): void {
     if (
       !this.ready ||
       [...this.held.values()].some(
-        (op) => op.agentId === agentId && !this.active.has(op.operationId),
+        (op) =>
+          op.agentId === agentId && (!claim || this.writerClaims.get(op.operationId) !== claim),
       )
     )
       throw Object.assign(
@@ -110,7 +125,7 @@ export class ReloadOperationStore {
 
   private async complete(
     operation: ReloadOperation,
-    run: () => Promise<ReloadOperation["continuation"] | void>,
+    run: (claim: ReloadWriterClaim) => Promise<ReloadOperation["continuation"] | void>,
   ): Promise<void> {
     // Bound the observable acknowledgement, not the provider's ownership. A late
     // success must still commit, and retries must not start a competing writer.
@@ -134,8 +149,10 @@ export class ReloadOperationStore {
     }, this.options.completionTimeoutMs ?? 45_000);
     timer.unref();
     let result: ReloadOperation;
+    const claim = Symbol(operation.operationId);
+    this.writerClaims.set(operation.operationId, claim);
     try {
-      const continuation = await run();
+      const continuation = await run(claim);
       result = {
         ...operation,
         status: continuation?.status === "unknown" ? "unknown" : "completed",
@@ -161,6 +178,8 @@ export class ReloadOperationStore {
         reasonCode: typeof code === "string" ? code.toUpperCase() : "RELOAD_FAILED",
         retryable: refused && code === "agent_reload_busy",
       };
+    } finally {
+      this.writerClaims.delete(operation.operationId);
     }
     try {
       await this.serialize(() => this.write(result));
@@ -174,6 +193,7 @@ export class ReloadOperationStore {
     } finally {
       clearTimeout(timer);
       this.active.delete(operation.operationId);
+      this.completions.delete(operation.operationId);
     }
   }
 

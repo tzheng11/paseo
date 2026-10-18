@@ -48,6 +48,9 @@ mutation. A pending receipt left by a daemon restart becomes persisted `unknown`
 A maintenance acknowledgement deadline does not abandon provider cleanup: the daemon retains
 its idle/lifecycle claim, and a late completion updates the same durable receipt. Unresolved
 writer ownership prevents new turns and provider admission for that agent, including after restart.
+Only the admitted maintenance callback carries an opaque writer claim; ordinary queued reload,
+resume and prompt paths cannot borrow it. The claim expires before terminal receipt persistence,
+while the receipt fence remains held until that write finishes.
 Unconfirmed child cleanup is also `unknown`; callers must hold it for inspection. Refusal means
 the runtime was not changed. Do not infer completion from the agent being idle or mint a new UUID
 to bypass an uncertain operation.

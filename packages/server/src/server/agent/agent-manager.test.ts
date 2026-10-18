@@ -20,7 +20,7 @@ import {
 } from "./agent-manager.js";
 import { AgentStorage } from "./agent-storage.js";
 import { MessageReceipts } from "../message-receipts/index.js";
-import { ReloadOperationStore } from "./reload-operation-store.js";
+import { ReloadOperationStore, type ReloadOperation } from "./reload-operation-store.js";
 import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 import { DiskAgentTimelineStore } from "./disk-agent-timeline-store.js";
 import { AgentHistoryReplay } from "./agent-history-replay.js";
@@ -12803,26 +12803,58 @@ test("credential reload cannot replace a writer whose old close failed", async (
 test("unregistered replacement cleanup uncertainty blocks a later persistence resume before another spawn", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "credential-orphan-"));
   const resumed = vi.fn();
+  const replacementStarted = deferred<void>();
+  const failStartup = deferred<void>();
   class OrphanClient extends TestAgentClient {
     override async resumeSession(): Promise<AgentSession> {
       resumed();
+      replacementStarted.resolve();
+      await failStartup.promise;
       throw Object.assign(new Error("Unregistered replacement writer cleanup failed"), {
         code: "reload_cleanup_unconfirmed",
       });
     }
   }
   const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const operations = new ReloadOperationStore(join(workdir, "operations"), logger);
+  const terminalWriteStarted = deferred<void>();
+  const finishTerminalWrite = deferred<void>();
+  const writer = operations as unknown as { write: (operation: ReloadOperation) => Promise<void> };
+  const write = writer.write.bind(operations);
+  vi.spyOn(writer, "write").mockImplementation(async (operation) => {
+    if (operation.status === "unknown") {
+      terminalWriteStarted.resolve();
+      await finishTerminalWrite.promise;
+    }
+    await write(operation);
+  });
   const manager = new AgentManager({
     clients: { codex: new OrphanClient() },
     logger,
     registry: storage,
-    reloadOperations: new ReloadOperationStore(join(workdir, "operations"), logger),
+    reloadOperations: operations,
   });
   const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
     workspaceId: undefined,
   });
   try {
     await manager.reloadAgentCredentials(agent.id, "orphan");
+    await replacementStarted.promise;
+    const queuedResume = manager
+      .resumeAgentFromPersistence(agent.persistence!, undefined, agent.id)
+      .then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+    failStartup.resolve();
+    await terminalWriteStarted.promise;
+    expect(await queuedResume).toMatchObject({ code: "agent_reload_in_progress" });
+    // The lifecycle claim has released, but terminal persistence is still waiting.
+    await expect(
+      manager.resumeAgentFromPersistence(agent.persistence!, undefined, agent.id),
+    ).rejects.toMatchObject({ code: "agent_reload_in_progress" });
+    expect(resumed).toHaveBeenCalledTimes(1);
+    finishTerminalWrite.resolve();
     await vi.waitFor(async () =>
       expect(await manager.getReloadOperation("orphan")).toMatchObject({
         status: "unknown",
@@ -12835,6 +12867,9 @@ test("unregistered replacement cleanup uncertainty blocks a later persistence re
     ).rejects.toMatchObject({ code: "agent_reload_in_progress" });
     expect(resumed).toHaveBeenCalledTimes(1);
   } finally {
+    failStartup.resolve();
+    finishTerminalWrite.resolve();
+    await manager.getReloadOperation("orphan");
     await manager.closeAgent(agent.id);
     await storage.flush();
     rmSync(workdir, { recursive: true, force: true });
