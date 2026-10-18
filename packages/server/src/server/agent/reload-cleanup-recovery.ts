@@ -1,9 +1,10 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { lstat, readFile } from "node:fs/promises";
+import { basename, isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
 import { AgentReloadOperationSchema, type AgentReloadOperation } from "@getpaseo/protocol/messages";
+import { z } from "zod";
 import { acquirePidLock, releasePidLock } from "../pid-lock.js";
 import { writeJsonFileAtomic } from "../atomic-file.js";
 
@@ -25,7 +26,10 @@ export interface CleanupProcess {
 }
 
 /** Raw command/environment text never leaves this parser or enters evidence/logs. */
-export function parseCleanupProcessCensus(output: string): CleanupProcess[] {
+export function parseCleanupProcessCensus(
+  output: string,
+  wrapperPaths: readonly string[] = [],
+): CleanupProcess[] {
   return output
     .split("\n")
     .filter((line) => line.trim())
@@ -51,7 +55,8 @@ export function parseCleanupProcessCensus(output: string): CleanupProcess[] {
           /(?:^|[/])(?:daemon-worker|supervisor-entrypoint(?:-impower)?)\.(?:js|ts)(?:\s|$)/.test(
             command,
           ),
-        providerWriter: provider,
+        providerWriter:
+          provider || wrapperPaths.some((path) => command.split(/\s+/).includes(path)),
       };
     });
 }
@@ -67,11 +72,12 @@ async function executeProcessCensus(): Promise<{ stdout: string; stderr: string 
 }
 export async function readCleanupProcessCensus(
   run: () => Promise<{ stdout: string; stderr: string }> = executeProcessCensus,
+  wrapperPaths: readonly string[] = [],
 ): Promise<CleanupProcess[]> {
   try {
     const { stdout, stderr } = await run();
     if (stderr.trim()) throw new Error("Process enumeration warning");
-    const rows = parseCleanupProcessCensus(stdout);
+    const rows = parseCleanupProcessCensus(stdout, wrapperPaths);
     if (!rows.some((p) => p.pid === process.pid)) throw new Error("Incomplete process census");
     return rows;
   } catch {
@@ -102,37 +108,118 @@ export function assertCleanupCensus(
       `Cleanup census is not quiescent (PIDs ${blockers.map((p) => p.pid).join(", ")}); no receipt changed`,
     );
 }
-const sha256 = (bytes: string) => createHash("sha256").update(bytes).digest("hex");
+const sha256 = (bytes: string | Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 
 /**
  * Local, offline settlement only. PID lock excludes daemon admission; absence of
- * every worker excludes late callbacks. All builtin native provider roots
- * must be gone. This operation never signals, loads, resumes, or prompts an agent.
+ * every worker excludes late callbacks. All builtin roots and inspected proxy
+ * processes must be gone. This operation never signals, loads, resumes, or prompts an agent.
  */
+const wrapperSchema = z.object({
+  provider: z.enum(["codex", "claude"]),
+  path: z.string().refine(isAbsolute).regex(/^\S+$/),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/),
+});
+const inspectionFields = {
+  configSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  builtinProviderLaunchesVerified: z.literal(true),
+  noRenamedOrMarkerLosingWrappers: z.literal(true),
+  inspectedBy: z.string().min(1),
+  evidence: z.string().min(1),
+};
+const launchContractSchema = z.discriminatedUnion("version", [
+  z.object({ ...inspectionFields, version: z.literal(1), inspectedWrappers: z.never().optional() }),
+  z.object({
+    ...inspectionFields,
+    version: z.literal(2),
+    inspectedWrappers: z.array(wrapperSchema).min(1).max(16),
+  }),
+]);
+type LaunchContract = z.infer<typeof launchContractSchema>;
+interface WrapperFile {
+  provider: "codex" | "claude";
+  path: string;
+  bytes: Buffer;
+}
+
+async function readInspectedWrappers(
+  contract: LaunchContract,
+  config: Record<string, unknown>,
+): Promise<WrapperFile[]> {
+  const providers = (
+    config.agents as { providers?: Record<string, { command?: unknown }> } | undefined
+  )?.providers;
+  const files: WrapperFile[] = [];
+  for (const wrapper of contract.inspectedWrappers ?? []) {
+    if (files.some((entry) => entry.path === wrapper.path))
+      throw new Error("Duplicate inspected wrapper");
+    const command = providers?.[wrapper.provider]?.command;
+    if (!Array.isArray(command) || command.length !== 1 || command[0] !== wrapper.path)
+      throw new Error("Inspected wrapper is not the configured single-path provider command");
+    const stat = await lstat(wrapper.path);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Wrapper must be a regular file");
+    const bytes = await readFile(wrapper.path);
+    if (sha256(bytes) !== wrapper.sha256) throw new Error("Wrapper changed since inspection");
+    files.push({ provider: wrapper.provider, path: wrapper.path, bytes });
+  }
+  return files;
+}
+
+function verifyConfiguredLaunches(config: Record<string, unknown>, wrappers: WrapperFile[]): void {
+  const providers = (
+    config.agents as
+      | { providers?: Record<string, { enabled?: boolean; command?: unknown }> }
+      | undefined
+  )?.providers;
+  for (const [provider, value] of Object.entries(providers ?? {})) {
+    if (value.enabled === false || value.command === undefined) continue;
+    const command = value.command;
+    if (
+      !Array.isArray(command) ||
+      !command.length ||
+      command.some((arg) => typeof arg !== "string")
+    )
+      throw new Error("Uninspected provider command; cleanup remains unknown");
+    if (!["codex", "claude"].includes(provider) || basename(command[0]) !== provider) {
+      if (!wrappers.some((entry) => entry.provider === provider && entry.path === command[0]))
+        throw new Error("Uninspected provider command; cleanup remains unknown");
+    }
+  }
+}
+
+async function verifyWrapperFilesUnchanged(files: WrapperFile[]): Promise<void> {
+  for (const entry of files) {
+    const stat = await lstat(entry.path);
+    if (
+      !stat.isFile() ||
+      stat.isSymbolicLink() ||
+      !(await readFile(entry.path)).equals(entry.bytes)
+    )
+      throw new Error("Wrapper changed during verification");
+  }
+}
+
 async function readLaunchContract(input: CleanupRecoveryInput) {
   const launchContractBytes = await readFile(input.launchContractFile, "utf8");
-  const launchContract = JSON.parse(launchContractBytes);
-  if (
-    launchContract.version !== 1 ||
-    launchContract.builtinProviderLaunchesVerified !== true ||
-    launchContract.noRenamedOrMarkerLosingWrappers !== true ||
-    typeof launchContract.inspectedBy !== "string" ||
-    !launchContract.inspectedBy ||
-    typeof launchContract.evidence !== "string" ||
-    !launchContract.evidence
-  )
+  const parsed = launchContractSchema.safeParse(JSON.parse(launchContractBytes));
+  if (!parsed.success)
     throw new Error(
-      "A source-bound builtin launch-contract inspection is required; custom wrappers are unsupported",
+      "A source-bound builtin launch-contract inspection is required; uninspected or renamed launches are unsupported",
     );
+  const launchContract = parsed.data;
   const configBytes = await readFile(join(input.home, "config.json"), "utf8");
   if (launchContract.configSha256 !== sha256(configBytes))
     throw new Error("Daemon configuration changed since launch-contract inspection");
-  return { launchContractBytes, launchContract, configBytes };
+  const config = JSON.parse(configBytes);
+  const wrapperFiles = await readInspectedWrappers(launchContract, config);
+  verifyConfiguredLaunches(config, wrapperFiles);
+  return { launchContractBytes, launchContract, configBytes, wrapperFiles };
 }
 
 async function reconcileStoppedReloadCleanupInternal(
   input: CleanupRecoveryInput,
-  observe: () => Promise<CleanupProcess[]> = readCleanupProcessCensus,
+  observe: (wrapperPaths: readonly string[]) => Promise<CleanupProcess[]> = (paths) =>
+    readCleanupProcessCensus(undefined, paths),
   verifyRetired: (pid: number) => void = assertGone,
 ): Promise<AgentReloadOperation> {
   if (
@@ -145,7 +232,8 @@ async function reconcileStoppedReloadCleanupInternal(
     throw new Error("Expected original receipt SHA256 is required");
   await acquirePidLock(input.home, null);
   try {
-    const { launchContractBytes, launchContract, configBytes } = await readLaunchContract(input);
+    const { launchContractBytes, launchContract, configBytes, wrapperFiles } =
+      await readLaunchContract(input);
     const file = join(input.home, "reload-operations", `${sha256(input.operationId)}.json`);
     const originalBytes = await readFile(file, "utf8");
     const original = AgentReloadOperationSchema.parse(JSON.parse(originalBytes));
@@ -172,9 +260,10 @@ async function reconcileStoppedReloadCleanupInternal(
         "Only an unknown cleanup receipt can be reconciled; continuation/startup uncertainty is retained",
       );
     verifyRetired(input.retiredWorkerPid);
-    const before = await observe();
+    const wrapperPaths = wrapperFiles.map((entry) => entry.path);
+    const before = await observe(wrapperPaths);
     assertCleanupCensus(before, input.agentId);
-    const after = await observe();
+    const after = await observe(wrapperPaths);
     assertCleanupCensus(after, input.agentId);
     verifyRetired(input.retiredWorkerPid);
     if ((await readFile(file, "utf8")) !== originalBytes)
@@ -184,6 +273,7 @@ async function reconcileStoppedReloadCleanupInternal(
       (await readFile(input.launchContractFile, "utf8")) !== launchContractBytes
     )
       throw new Error("Launch contract changed during verification");
+    await verifyWrapperFilesUnchanged(wrapperFiles);
     const result: AgentReloadOperation = {
       ...original,
       status: "failed",
@@ -216,7 +306,7 @@ async function reconcileStoppedReloadCleanupInternal(
 const recoveryHomes = new Set<string>();
 export async function reconcileStoppedReloadCleanup(
   input: CleanupRecoveryInput,
-  observe?: () => Promise<CleanupProcess[]>,
+  observe?: (wrapperPaths: readonly string[]) => Promise<CleanupProcess[]>,
   verifyRetired?: (pid: number) => void,
 ): Promise<AgentReloadOperation> {
   if (recoveryHomes.has(input.home))
