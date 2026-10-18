@@ -70,6 +70,40 @@ test("restart preserves an uncertain operation and cannot repeat its close", asy
   );
 });
 
+test("an acknowledgement deadline retains ownership and late completion reconciles its unknown receipt", async () => {
+  const { directory } = await fixture();
+  const store = new ReloadOperationStore(directory, createTestLogger(), {
+    completionTimeoutMs: 10,
+  });
+  let finish!: () => void;
+  const run = vi.fn(
+    () =>
+      new Promise<void>((resolve) => {
+        finish = resolve;
+      }),
+  );
+  const change = {
+    credentialGeneration: "original",
+    credentialChangedAt: "2026-10-17T12:00:00.000Z",
+  };
+  await store.start("agent", "late", run, change);
+  await vi.waitFor(async () =>
+    expect(await store.get("late")).toMatchObject({
+      status: "unknown",
+      reasonCode: "RELOAD_COMPLETION_UNCONFIRMED",
+      retryable: false,
+      ...change,
+    }),
+  );
+  await store.start("agent", "late", run, change);
+  expect(run).toHaveBeenCalledTimes(1);
+  finish();
+  await vi.waitFor(async () =>
+    expect(await store.get("late")).toMatchObject({ status: "completed", ...change }),
+  );
+  expect(run).toHaveBeenCalledTimes(1);
+});
+
 test("only absent receipts are NOT_FOUND; corrupt or mismatched receipts fail closed", async () => {
   const { directory, store } = await fixture();
   expect(await store.get("absent")).toBeNull();
@@ -162,6 +196,28 @@ test("generation and confirmed time are durable intent and cannot be changed by 
     store.start("agent", "v2", run, { ...change, credentialChangedAt: "2026-10-17T12:01:00.000Z" }),
   ).rejects.toThrow("conflict");
   expect(run).toHaveBeenCalledTimes(1);
+});
+
+test("unresolved cleanup fences every new writer for that agent, including after restart", async () => {
+  const { directory, store } = await fixture();
+  const run = async () => {
+    throw Object.assign(new Error("unregistered writer remains"), {
+      code: "reload_cleanup_unconfirmed",
+    });
+  };
+  await store.start("agent", "orphan", run);
+  await vi.waitFor(async () =>
+    expect(await store.get("orphan")).toMatchObject({ status: "unknown" }),
+  );
+  await expect(store.assertWriterAdmission("agent")).rejects.toMatchObject({
+    code: "agent_reload_in_progress",
+  });
+  await expect(store.assertWriterAdmission("unrelated")).resolves.toBeUndefined();
+  const restarted = new ReloadOperationStore(directory, createTestLogger());
+  await expect(restarted.assertWriterAdmission("agent")).rejects.toMatchObject({
+    code: "agent_reload_in_progress",
+  });
+  await expect(restarted.assertWriterAdmission("unrelated")).resolves.toBeUndefined();
 });
 
 test("unknown continuation and restarted generation intent preserve identity and never redispatch", async () => {

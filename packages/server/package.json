@@ -62,6 +62,11 @@
       "types": "./dist/server/server/agent/agent-response-loop.d.ts",
       "source": "./src/server/agent/agent-response-loop.ts",
       "default": "./dist/server/server/agent/agent-response-loop.js"
+    },
+    "./reload-cleanup-recovery": {
+      "types": "./dist/server/server/agent/reload-cleanup-recovery.d.ts",
+      "source": "./src/server/agent/reload-cleanup-recovery.ts",
+      "default": "./dist/server/server/agent/reload-cleanup-recovery.js"
     }
   },
   "publishConfig": {

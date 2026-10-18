@@ -2176,6 +2176,20 @@ export class AgentManager {
       // Keep pending closes across request timeouts; a retry must await the same release.
       void operation.catch(() => this.reloadedSessionCloses.delete(session));
     }
+    if (maintenance) {
+      // Durable maintenance has no socket deadline. Keep the lifecycle/idle claim
+      // until the actual provider releases its writer, including late success.
+      // The receipt store bounds acknowledgement without abandoning this work.
+      try {
+        await operation;
+      } catch (cause) {
+        throw Object.assign(
+          new Error("Credential reload previous child cleanup could not be confirmed", { cause }),
+          { code: "reload_cleanup_unconfirmed" },
+        );
+      }
+      return;
+    }
     const result = await this.waitWithTimeout({
       operation,
       timeoutMs: this.rescueTimeouts.reloadSessionCloseMs,
@@ -3123,6 +3137,7 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
   ): AsyncGenerator<AgentStreamEvent> {
+    this.reloadOperations?.assertWriterAdmissionSync(agentId);
     const existingAgent = this.requireSessionAgent(agentId);
     this.logger.trace(
       {
@@ -5992,6 +6007,7 @@ export class AgentManager {
       workspaceId?: string | null;
     },
   ): Promise<AgentLaunchContext> {
+    if (this.reloadOperations) await this.reloadOperations.assertWriterAdmission(agentId);
     if (this.pluginLifecycle) {
       const request: PluginSessionOpenRequest = {
         agentId,

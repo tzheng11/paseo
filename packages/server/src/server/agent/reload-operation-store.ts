@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { CredentialChange } from "./quota-turn-recovery.js";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { Logger } from "pino";
 import { AgentReloadOperationSchema, type AgentReloadOperation } from "@getpaseo/protocol/messages";
@@ -12,10 +12,14 @@ export type ReloadOperation = AgentReloadOperation;
 export class ReloadOperationStore {
   private admission: Promise<unknown> = Promise.resolve();
   private readonly active = new Set<string>();
+  private readonly held = new Map<string, ReloadOperation>();
+  private initialized?: Promise<void>;
+  private ready = false;
 
   constructor(
     private readonly directory: string,
     private readonly logger: Logger,
+    private readonly options: { completionTimeoutMs?: number } = {},
   ) {}
 
   start(
@@ -25,6 +29,7 @@ export class ReloadOperationStore {
     change?: CredentialChange,
   ): Promise<ReloadOperation> {
     return this.serialize(async () => {
+      await this.initialize();
       const existing = await this.read(operationId);
       if (existing) {
         if (
@@ -47,15 +52,87 @@ export class ReloadOperationStore {
 
   get(operationId: string): Promise<ReloadOperation | null> {
     return this.serialize(async () => {
+      await this.initialize();
       const operation = await this.read(operationId);
       return operation ? this.reconcile(operation) : null;
     });
+  }
+
+  async assertWriterAdmission(agentId: string): Promise<void> {
+    await this.initialize();
+    this.assertWriterAdmissionSync(agentId);
+  }
+
+  assertWriterAdmissionSync(agentId: string): void {
+    if (
+      !this.ready ||
+      [...this.held.values()].some(
+        (op) => op.agentId === agentId && !this.active.has(op.operationId),
+      )
+    )
+      throw Object.assign(
+        new Error(
+          "An unresolved credential reload owns this agent; reconcile its original receipt before starting a writer",
+        ),
+        { code: "agent_reload_in_progress" },
+      );
+  }
+
+  private initialize(): Promise<void> {
+    return (this.initialized ??= (async () => {
+      let files: string[];
+      try {
+        files = await readdir(this.directory);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") files = [];
+        else throw error;
+      }
+      for (const file of files.filter((name) => /^[a-f0-9]{64}\.json$/.test(name))) {
+        const operation = AgentReloadOperationSchema.parse(
+          JSON.parse(await readFile(join(this.directory, file), "utf8")),
+        );
+        if (this.path(operation.operationId) !== join(this.directory, file))
+          throw new Error("Reload receipt identity mismatch");
+        this.index(operation);
+      }
+      this.ready = true;
+    })());
+  }
+
+  private index(operation: ReloadOperation): void {
+    if (
+      operation.status === "pending" ||
+      (operation.status === "unknown" && operation.reasonCode !== "QUOTA_CONTINUATION_UNKNOWN")
+    )
+      this.held.set(operation.operationId, operation);
+    else this.held.delete(operation.operationId);
   }
 
   private async complete(
     operation: ReloadOperation,
     run: () => Promise<ReloadOperation["continuation"] | void>,
   ): Promise<void> {
+    // Bound the observable acknowledgement, not the provider's ownership. A late
+    // success must still commit, and retries must not start a competing writer.
+    const timer = setTimeout(() => {
+      void this.serialize(async () => {
+        const current = await this.read(operation.operationId);
+        if (!this.active.has(operation.operationId) || current?.status !== "pending") return;
+        await this.write({
+          ...operation,
+          status: "unknown",
+          reason: "reload_completion_unconfirmed",
+          reasonCode: "RELOAD_COMPLETION_UNCONFIRMED",
+          retryable: false,
+        });
+      }).catch((err) =>
+        this.logger.error(
+          { err, operationId: operation.operationId },
+          "Reload acknowledgement deadline persistence failed",
+        ),
+      );
+    }, this.options.completionTimeoutMs ?? 45_000);
+    timer.unref();
     let result: ReloadOperation;
     try {
       const continuation = await run();
@@ -95,6 +172,7 @@ export class ReloadOperationStore {
         "Reload receipt persistence failed",
       );
     } finally {
+      clearTimeout(timer);
       this.active.delete(operation.operationId);
     }
   }
@@ -126,8 +204,9 @@ export class ReloadOperationStore {
     }
   }
 
-  private write(operation: ReloadOperation): Promise<void> {
-    return writeJsonFileAtomic(this.path(operation.operationId), operation);
+  private async write(operation: ReloadOperation): Promise<void> {
+    await writeJsonFileAtomic(this.path(operation.operationId), operation);
+    this.index(operation);
   }
 
   private path(operationId: string): string {

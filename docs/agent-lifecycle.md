@@ -45,9 +45,30 @@ Only `completed` confirms registration of the replacement. A missing receipt is 
 `NOT_FOUND`; the exact same UUID may be submitted again because admission deduplicates before
 mutation. A pending receipt left by a daemon restart becomes persisted `unknown` with
 `DAEMON_RESTARTED` and must not be replayed. Unreadable or corrupt storage is an error, never absence.
+A maintenance acknowledgement deadline does not abandon provider cleanup: the daemon retains
+its idle/lifecycle claim, and a late completion updates the same durable receipt. Unresolved
+writer ownership prevents new turns and provider admission for that agent, including after restart.
 Unconfirmed child cleanup is also `unknown`; callers must hold it for inspection. Refusal means
 the runtime was not changed. Do not infer completion from the agent being idle or mint a new UUID
 to bypass an uncertain operation.
+
+### Offline cleanup reconciliation
+
+Legacy cleanup uncertainty has no phase or writer identity. It cannot be reclassified from
+idle, closed, archived, an old error string, or a daemon restart alone. Use the local
+[`agent reload-reconcile-cleanup`](../public-docs/cli.md) command only in a coordinated quiescent
+maintenance window. It holds the normal daemon PID lock, verifies the captured prior worker is
+gone, and rejects remaining Paseo workers and builtin provider roots. It never signals a process.
+
+The operator supplies an inspection record binding the unchanged daemon configuration to the
+verified builtin provider launch contract. Renamed binaries and custom wrappers are unsupported;
+do not attest their absence without inspecting the installed launch configuration and source.
+The command refuses failed, incomplete or ambiguous observations. It compares the original receipt
+bytes before committing and saves sanitized process evidence first. Cleanup settlement writes
+`failed`, `retryable: true`, `RELOAD_CLEANUP_RECONCILED`; it does not claim replacement registration
+or quota continuation. Original operation and credential identities stay intact. Fleet may defer
+that failed attempt and admit a new guarded intent through its normal queue; uncertain continuation,
+startup, registration and restarted-operation receipts remain held.
 
 ### Quota-turn continuation
 

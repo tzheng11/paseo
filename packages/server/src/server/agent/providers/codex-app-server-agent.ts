@@ -3814,6 +3814,9 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (!disposal) {
       disposal = client.dispose();
       this.clientDisposals.set(client, disposal);
+      // A timed-out kill is not permanent evidence of a live writer. Let close
+      // re-observe the same transport after its child eventually reports exit.
+      void disposal.catch(() => this.clientDisposals.delete(client));
     }
     return disposal;
   }
