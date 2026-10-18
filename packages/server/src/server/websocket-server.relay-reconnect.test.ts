@@ -1172,7 +1172,7 @@ describe("relay external socket reconnect behavior", () => {
     await server.close();
   });
 
-  test("advertises current features in initial server_info", async () => {
+  test("3fdb71dd-7bc7-81fe-9280-c37f47c8e4b9@c0b2fb81314b#old-daemon advertises current features in initial server_info", async () => {
     const server = createServer();
     const socket = new MockSocket();
 
@@ -1187,6 +1187,7 @@ describe("relay external socket reconnect behavior", () => {
     expect(serverInfo.features?.providersSnapshotCwd).toBe(true);
     expect(serverInfo.features?.pluginLogs).toBe(true);
     expect(serverInfo.features?.workspaceMarkUnread).toBe(true);
+    expect(serverInfo.features?.workspaceSuperpinning).toBe(true);
     expect(serverInfo.features?.["terminal-input-mode-replay"]).toBe(true);
     expect(serverInfo.features?.["terminal-size-ownership"]).toBe(true);
     expect(serverInfo.features?.agentTurnIdentity).toBeUndefined();

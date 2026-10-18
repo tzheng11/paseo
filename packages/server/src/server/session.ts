@@ -2967,6 +2967,12 @@ export class Session {
         return this.handleWorkspaceFieldValueSetRequest(msg);
       case "workspace.title.set.request":
         return this.handleWorkspaceTitleSetRequest(msg.workspaceId, msg.title, msg.requestId);
+      case "workspace.superpin.set.request":
+        return this.handleWorkspaceSuperpinSetRequest(
+          msg.workspaceId,
+          msg.superpinned,
+          msg.requestId,
+        );
       case "workspace.pin.set.request":
         return this.handleWorkspacePinSetRequest(msg.workspaceId, msg.pinned, msg.requestId);
       default:
@@ -3857,6 +3863,7 @@ export class Session {
       const updated = await this.workspaceRegistry.update(workspaceId, (existing) => ({
         ...existing,
         pinnedAt: nextPinnedAt,
+        superpinnedAt: pinned ? existing.superpinnedAt : null,
         updatedAt,
       }));
       if (!updated) {
@@ -3881,6 +3888,49 @@ export class Session {
       });
       emitResponse(false, null, getErrorMessageOr(error, "Failed to pin workspace"));
     }
+  }
+
+  private async handleWorkspaceSuperpinSetRequest(
+    workspaceId: string,
+    superpinned: boolean,
+    requestId: string,
+  ): Promise<void> {
+    const logContext = { workspaceId, superpinned, requestId };
+    this.sessionLogger.info(logContext, "session: workspace.superpin.set.request");
+    const emitResponse = (
+      accepted: boolean,
+      pinnedAt: string | null,
+      superpinnedAt: string | null,
+      error: string | null,
+    ) => {
+      this.emit({
+        type: "workspace.superpin.set.response",
+        payload: { requestId, workspaceId, accepted, pinnedAt, superpinnedAt, error },
+      });
+    };
+    let updated: PersistedWorkspaceRecord | null;
+    try {
+      const timestamp = new Date().toISOString();
+      updated = await this.workspaceRegistry.update(workspaceId, (existing) => ({
+        ...existing,
+        pinnedAt: superpinned ? (existing.pinnedAt ?? timestamp) : existing.pinnedAt,
+        superpinnedAt: superpinned ? timestamp : null,
+        updatedAt: timestamp,
+      }));
+    } catch (error) {
+      this.sessionLogger.error(
+        { ...logContext, err: error },
+        "session: workspace.superpin.set.request error",
+      );
+      emitResponse(false, null, null, getErrorMessageOr(error, "Failed to superpin workspace"));
+      return;
+    }
+    if (!updated) {
+      emitResponse(false, null, null, "Workspace not found");
+      return;
+    }
+    emitResponse(true, updated.pinnedAt, updated.superpinnedAt, null);
+    await this.emitWorkspaceUpdatesForWorkspaceIds([workspaceId]);
   }
 
   private async handleWorkspaceRecoveryInspectRequest(
@@ -5720,6 +5770,7 @@ export class Session {
       name: resolveWorkspaceDisplayName(workspace),
       title: workspace.title,
       pinnedAt: workspace.pinnedAt,
+      superpinnedAt: workspace.superpinnedAt,
       fieldValues: workspace.fieldValues ?? {},
       ...(workspace.labels && workspace.labels.length > 0 ? { labels: workspace.labels } : {}),
       background: workspace.background,
@@ -5815,6 +5866,7 @@ export class Session {
       }),
       title: result.workspace.title,
       pinnedAt: result.workspace.pinnedAt,
+      superpinnedAt: result.workspace.superpinnedAt,
       ...(result.workspace.labels && result.workspace.labels.length > 0
         ? { labels: result.workspace.labels }
         : {}),

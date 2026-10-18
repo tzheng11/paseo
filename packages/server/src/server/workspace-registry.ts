@@ -54,71 +54,83 @@ const PersistedProjectRecordSchema = z.object({
   archivedAt: z.string().nullable(),
 });
 
-const PersistedWorkspaceRecordSchema = z.object({
-  workspaceId: z.string(),
-  projectId: z.string(),
-  cwd: z.string(),
-  kind: z.enum(["local_checkout", "worktree", "directory"]),
-  displayName: z.string(),
-  // User-set title layered over the derived displayName. In Model B the title is
-  // the workspace identity; branch/directory are backing metadata. Reconciliation
-  // never touches this. Null means "use the derived displayName".
-  title: z
-    .string()
-    .nullable()
-    .optional()
-    .transform((value) => value ?? null),
-  // The worktree's git branch. Decoupled from displayName/title by construction:
-  // displayName holds the human name (title), branch holds the git branch. Only
-  // worktree workspaces carry a branch; directory/local_checkout leave it null.
-  branch: z
-    .string()
-    .nullable()
-    .optional()
-    .transform((value) => value ?? null),
-  // Exact checkout/worktree root backing cwd. This differs from cwd when the
-  // selected project is a subdirectory inside a repository. Persist it so
-  // archive and recovery do not need the directory to still exist in order to
-  // recover placement.
-  worktreeRoot: z.string().nullable().default(null),
-  // Comparison base preserved across worktree deletion and restore. New branch-off
-  // workspaces store the resolved ref (e.g. refs/remotes/upstream/main); legacy and
-  // PR checkout records may contain a bare branch name. Ordinary checkouts use null.
-  baseBranch: z
-    .string()
-    .nullable()
-    .optional()
-    .transform((value) => value ?? null),
-  isPaseoOwnedWorktree: z.boolean().default(false),
-  mainRepoRoot: z.string().nullable().default(null),
-  createdAt: z.string(),
-  updatedAt: z.string(),
-  archivedAt: z.string().nullable(),
-  // COMPAT(autoArchivedChangeRequestUrl): added in v0.2.6, remove optional parsing after 2027-01-31.
-  // Records the merged change request whose automatic archive was consumed.
-  autoArchivedChangeRequestUrl: z
-    .string()
-    .nullable()
-    .optional()
-    .transform((value) => value ?? null),
-  pinnedAt: z
-    .string()
-    .nullable()
-    .optional()
-    .transform((value) => value ?? null),
-  labels: z.array(z.string()).optional(),
-  // COMPAT(workspaceFields): old records have no values; remove optional after 2027-04-14.
-  fieldValues: z
-    .record(z.string(), z.string().max(MAX_WORKSPACE_FIELD_VALUE_LENGTH))
-    .refine(
-      (values) => workspaceFieldValuesByteLength(values) <= MAX_WORKSPACE_FIELD_VALUES_BYTES,
-      "Workspace fields exceed 32 KiB",
-    )
-    .optional(),
-  untrustedSource: UntrustedWorkspaceSourceSchema.optional(),
-  // Public discovery visibility. Contents retain their ordinary lifecycle.
-  background: z.boolean().optional().default(false),
-});
+const PersistedWorkspaceRecordSchema = z
+  .object({
+    workspaceId: z.string(),
+    projectId: z.string(),
+    cwd: z.string(),
+    kind: z.enum(["local_checkout", "worktree", "directory"]),
+    displayName: z.string(),
+    // User-set title layered over the derived displayName. In Model B the title is
+    // the workspace identity; branch/directory are backing metadata. Reconciliation
+    // never touches this. Null means "use the derived displayName".
+    title: z
+      .string()
+      .nullable()
+      .optional()
+      .transform((value) => value ?? null),
+    // The worktree's git branch. Decoupled from displayName/title by construction:
+    // displayName holds the human name (title), branch holds the git branch. Only
+    // worktree workspaces carry a branch; directory/local_checkout leave it null.
+    branch: z
+      .string()
+      .nullable()
+      .optional()
+      .transform((value) => value ?? null),
+    // Exact checkout/worktree root backing cwd. This differs from cwd when the
+    // selected project is a subdirectory inside a repository. Persist it so
+    // archive and recovery do not need the directory to still exist in order to
+    // recover placement.
+    worktreeRoot: z.string().nullable().default(null),
+    // Comparison base preserved across worktree deletion and restore. New branch-off
+    // workspaces store the resolved ref (e.g. refs/remotes/upstream/main); legacy and
+    // PR checkout records may contain a bare branch name. Ordinary checkouts use null.
+    baseBranch: z
+      .string()
+      .nullable()
+      .optional()
+      .transform((value) => value ?? null),
+    isPaseoOwnedWorktree: z.boolean().default(false),
+    mainRepoRoot: z.string().nullable().default(null),
+    createdAt: z.string(),
+    updatedAt: z.string(),
+    archivedAt: z.string().nullable(),
+    // COMPAT(autoArchivedChangeRequestUrl): added in v0.2.6, remove optional parsing after 2027-01-31.
+    // Records the merged change request whose automatic archive was consumed.
+    autoArchivedChangeRequestUrl: z
+      .string()
+      .nullable()
+      .optional()
+      .transform((value) => value ?? null),
+    pinnedAt: z
+      .string()
+      .nullable()
+      .optional()
+      .transform((value) => value ?? null),
+    // COMPAT(workspaceSuperpinning): old records default to null; retain until 2027-04-18.
+    superpinnedAt: z
+      .string()
+      .nullable()
+      .optional()
+      .transform((value) => value ?? null),
+    labels: z.array(z.string()).optional(),
+    // COMPAT(workspaceFields): old records have no values; remove optional after 2027-04-14.
+    fieldValues: z
+      .record(z.string(), z.string().max(MAX_WORKSPACE_FIELD_VALUE_LENGTH))
+      .refine(
+        (values) => workspaceFieldValuesByteLength(values) <= MAX_WORKSPACE_FIELD_VALUES_BYTES,
+        "Workspace fields exceed 32 KiB",
+      )
+      .optional(),
+    untrustedSource: UntrustedWorkspaceSourceSchema.optional(),
+    // Public discovery visibility. Contents retain their ordinary lifecycle.
+    background: z.boolean().optional().default(false),
+  })
+  .transform((record) => ({
+    ...record,
+    // Repair orphaned superpins on load and at every registry write boundary.
+    pinnedAt: record.pinnedAt ?? record.superpinnedAt,
+  }));
 
 export type PersistedProjectRecord = z.infer<typeof PersistedProjectRecordSchema>;
 export type PersistedWorkspaceRecord = z.infer<typeof PersistedWorkspaceRecordSchema>;
@@ -572,11 +584,12 @@ export class FileBackedWorkspaceRegistry
     record: PersistedWorkspaceRecord,
     context?: WorkspaceMutationContext,
   ): Promise<void> {
-    await super.upsert(record);
+    const workspace = PersistedWorkspaceRecordSchema.parse(record);
+    await super.upsert(workspace);
     await this.notifyMutation({
       kind: "upsert",
-      workspaceId: record.workspaceId,
-      workspace: record,
+      workspaceId: workspace.workspaceId,
+      workspace,
       ...(context?.expectsInitialAgent ? { expectsInitialAgent: true } : {}),
     });
   }
@@ -700,6 +713,7 @@ export function createPersistedWorkspaceRecord(input: {
   archivedAt?: string | null;
   autoArchivedChangeRequestUrl?: string | null;
   pinnedAt?: string | null;
+  superpinnedAt?: string | null;
   labels?: string[];
   untrustedSource?: UntrustedWorkspaceSource;
   background?: boolean;

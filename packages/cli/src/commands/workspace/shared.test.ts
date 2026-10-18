@@ -55,3 +55,26 @@ describe("workspace inventory output", () => {
     },
   );
 });
+
+it.each([null, "2026-10-18T00:00:00.000Z"])(
+  "3fdb71dd7bc781c9964de0b6101b4e61@e93b9847d6fd#cli-store CLI JSON preserves explicit superpin %s",
+  (superpinnedAt) => {
+    const descriptor = {
+      id: "workspace",
+      projectDisplayName: "Project",
+      name: "Workspace",
+      workspaceKind: "directory",
+      workspaceDirectory: "/tmp/project",
+      pinnedAt: "2026-10-17T00:00:00.000Z",
+      superpinnedAt,
+    } as WorkspaceDescriptorPayload;
+    const result = {
+      type: "list" as const,
+      data: [toWorkspaceRow(descriptor)],
+      schema: workspaceSchema,
+    };
+    expect(JSON.parse(render(result, { format: "json" }))).toEqual([
+      expect.objectContaining({ pinnedAt: descriptor.pinnedAt, superpinnedAt }),
+    ]);
+  },
+);

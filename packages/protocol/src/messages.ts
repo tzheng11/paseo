@@ -996,6 +996,13 @@ export const WorkspacePinSetRequestSchema = z.object({
   requestId: z.string(),
 });
 
+export const WorkspaceSuperpinSetRequestSchema = z.object({
+  type: z.literal("workspace.superpin.set.request"),
+  workspaceId: z.string(),
+  superpinned: z.boolean(),
+  requestId: z.string(),
+});
+
 export const WorkspaceLabelColorSchema = z.enum(WORKSPACE_LABEL_COLORS);
 export const WorkspaceLabelDefinitionSchema = z.object({
   name: z.string(),
@@ -2190,6 +2197,20 @@ export const WorkspacePinSetResponseSchema = z.object({
   payload: WorkspacePinSetResponsePayloadSchema,
 });
 
+export const WorkspaceSuperpinSetResponsePayloadSchema = z.object({
+  requestId: z.string(),
+  workspaceId: z.string(),
+  accepted: z.boolean(),
+  pinnedAt: z.string().nullable(),
+  superpinnedAt: z.string().nullable(),
+  error: z.string().nullable(),
+});
+
+export const WorkspaceSuperpinSetResponseSchema = z.object({
+  type: z.literal("workspace.superpin.set.response"),
+  payload: WorkspaceSuperpinSetResponsePayloadSchema,
+});
+
 export const WorkspaceRecoveryStateSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("recoverable"),
@@ -3300,6 +3321,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceTitleSetRequestSchema,
   WorkspaceFieldValueSetRequestSchema,
   WorkspacePinSetRequestSchema,
+  WorkspaceSuperpinSetRequestSchema,
   WorkspaceLabelListRequestSchema,
   WorkspaceLabelAssignmentSetRequestSchema,
   WorkspaceLabelUpdateRequestSchema,
@@ -3784,6 +3806,8 @@ export const ServerInfoStatusPayloadSchema = z
         providerSubagentNesting: z.boolean().optional(),
         // COMPAT(workspacePinning): added in v0.1.107, remove gate after 2027-01-12.
         workspacePinning: z.boolean().optional(),
+        // COMPAT(workspaceSuperpinning): added in v0.11.3; remove gate after 2027-04-18.
+        workspaceSuperpinning: z.boolean().optional(),
         // COMPAT(workspaceMarkUnread): added in v0.5.0, remove after 2027-08-20.
         workspaceMarkUnread: z.boolean().optional(),
         // COMPAT(hubRelationship): added in v0.1.X, drop the gate when floor >= v0.1.X.
@@ -4186,6 +4210,8 @@ export const WorkspaceDescriptorPayloadSchema = z
     // COMPAT(workspaceFields): added in v0.11.3; remove optional after 2027-04-14.
     fieldValues: z.record(z.string(), z.string()).optional(),
     pinnedAt: z.string().nullable().optional(),
+    // COMPAT(workspaceSuperpinning): old daemons omit this; remove optional after 2027-04-18.
+    superpinnedAt: z.string().nullable().optional(),
     // COMPAT(workspaceLabels): added in v0.5.0, remove optional after 2027-08-14.
     labels: z.array(z.string()).optional(),
     // Retained for wire parsing of older daemon descriptors.
@@ -7180,6 +7206,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceTitleSetResponseSchema,
   WorkspaceFieldValueSetResponseSchema,
   WorkspacePinSetResponseSchema,
+  WorkspaceSuperpinSetResponseSchema,
   WorkspaceRecoveryInspectResponseSchema,
   WorkspaceRecoveryRestoreResponseSchema,
   WaitForFinishResponseMessageSchema,
@@ -7855,3 +7882,9 @@ export function parseServerInfoStatusPayload(payload: unknown): ServerInfoStatus
   }
   return parsed.data;
 }
+
+export type WorkspaceSuperpinSetRequest = z.infer<typeof WorkspaceSuperpinSetRequestSchema>;
+export type WorkspaceSuperpinSetResponse = z.infer<typeof WorkspaceSuperpinSetResponseSchema>;
+export type WorkspaceSuperpinSetResponsePayload = z.infer<
+  typeof WorkspaceSuperpinSetResponsePayloadSchema
+>;

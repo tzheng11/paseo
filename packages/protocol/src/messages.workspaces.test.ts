@@ -1290,3 +1290,28 @@ describe("workspace message schemas", () => {
     expect(newDirectory.source.kind).toBe("directory");
   });
 });
+
+test("3fdb71dd-7bc7-81a5-9326-ed66ac77df7c@aeb84a4a9ae2#unpinned superpin request and correlated response preserve both timestamps", () => {
+  const request = {
+    type: "workspace.superpin.set.request",
+    workspaceId: "ws-1",
+    superpinned: true,
+    requestId: "superpin",
+  };
+  expect(SessionInboundMessageSchema.parse(request)).toEqual(request);
+  expect(SessionInboundMessageSchema.safeParse({ ...request, superpinned: "true" }).success).toBe(
+    false,
+  );
+  const response = {
+    type: "workspace.superpin.set.response",
+    payload: {
+      requestId: "superpin",
+      workspaceId: "ws-1",
+      accepted: true,
+      pinnedAt: "2026-10-18T00:00:00.000Z",
+      superpinnedAt: "2026-10-18T00:00:00.000Z",
+      error: null,
+    },
+  };
+  expect(SessionOutboundMessageSchema.parse(response)).toEqual(response);
+});

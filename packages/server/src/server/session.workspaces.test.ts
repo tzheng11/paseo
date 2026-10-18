@@ -8,6 +8,7 @@ import {
   mkdirSync,
   mkdtempSync,
   realpathSync,
+  readFileSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -21,6 +22,7 @@ import { z } from "zod";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import { createTestLogger } from "../test-utils/test-logger.js";
 import { Session } from "./session.js";
+import { writeJsonFileAtomic } from "./atomic-file.js";
 import type { SessionOptions } from "./session.js";
 import { OWNER_PERMISSIONS } from "./authorization/index.js";
 import type { AgentUpdatesService } from "./session/agent-updates/agent-updates-service.js";
@@ -555,6 +557,7 @@ class CreateAgentTestClient implements AgentClient {
 function createSessionForWorkspaceTests(
   options: {
     appVersion?: string | null;
+    permissions?: SessionOptions["permissions"];
     onMessage?: (message: SessionOutboundMessage) => void;
     onWorkspaceRecovered?: SessionOptions["onWorkspaceRecovered"];
     workspaceGitService?: ReturnType<typeof createNoopWorkspaceGitService>;
@@ -648,7 +651,7 @@ function createSessionForWorkspaceTests(
       messageReceipts: createMessageReceiptsStub(),
       creationService: createTestCreationService(),
       clientId: "test-client",
-      permissions: OWNER_PERMISSIONS,
+      permissions: options.permissions ?? OWNER_PERMISSIONS,
       appVersion: options.appVersion ?? null,
       onMessage: options.onMessage ?? vi.fn(),
       onWorkspaceRecovered: options.onWorkspaceRecovered,
@@ -8288,6 +8291,243 @@ test("workspace.pin.set.request stores the pin timestamp and emits an updated de
       pinnedAt: response?.payload.pinnedAt,
     },
   });
+});
+
+async function withSuperpinSession(
+  run: (fixture: {
+    session: TestSession;
+    registry: FileBackedWorkspaceRegistry;
+    emitted: SessionOutboundMessage[];
+    filePath: string;
+    diskAtAcceptance: unknown[];
+  }) => Promise<void>,
+  options: {
+    pinnedAt?: string | null;
+    superpinnedAt?: string | null;
+    permissions?: SessionOptions["permissions"];
+    failWrites?: boolean;
+  } = {},
+): Promise<void> {
+  const directory = mkdtempSync(path.join(tmpdir(), "session-superpin-"));
+  const filePath = path.join(directory, "workspaces.json");
+  let failWrites = false;
+  const registry = new FileBackedWorkspaceRegistry(filePath, createTestLogger(), {
+    writeRecords: async (file, records) => {
+      if (failWrites) throw new Error("fixture write refused");
+      await writeJsonFileAtomic(file, records);
+    },
+  });
+  const emitted: SessionOutboundMessage[] = [];
+  const diskAtAcceptance: unknown[] = [];
+  try {
+    await registry.upsert(
+      createPersistedWorkspaceRecord({
+        workspaceId: "ws-superpin",
+        projectId: "proj-superpin",
+        cwd: directory,
+        kind: "directory",
+        displayName: "Superpin fixture",
+        createdAt: "2026-10-18T00:00:00.000Z",
+        updatedAt: "2026-10-18T00:00:00.000Z",
+        pinnedAt: options.pinnedAt,
+        superpinnedAt: options.superpinnedAt,
+      }),
+    );
+    const session = createSessionForWorkspaceTests({
+      workspaceRegistry: registry,
+      paseoHome: directory,
+      permissions: options.permissions,
+      onMessage: (message) => {
+        if (message.type === "workspace.superpin.set.response" && message.payload.accepted) {
+          diskAtAcceptance.push(JSON.parse(readFileSync(filePath, "utf8")));
+        }
+        emitted.push(message);
+      },
+    });
+    await session.handleMessage({
+      type: "fetch_workspaces_request",
+      requestId: "subscribe-superpin",
+      subscribe: { subscriptionId: "superpin" },
+    });
+    emitted.length = 0;
+    failWrites = options.failWrites ?? false;
+    await run({ session, registry, emitted, filePath, diskAtAcceptance });
+  } finally {
+    vi.useRealTimers();
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+test.each([
+  ["3fdb71dd-7bc7-81a5-9326-ed66ac77df7c@aeb84a4a9ae2#unpinned", null],
+  ["3fdb71dd-7bc7-81a5-9326-ed66ac77df7c@aeb84a4a9ae2#already-pinned", "2026-10-17T00:00:00.000Z"],
+])("%s superpin persists both fields before its response and update", async (_key, pinnedAt) => {
+  await withSuperpinSession(
+    async ({ session, registry, emitted, filePath, diskAtAcceptance }) => {
+      await session.handleMessage({
+        type: "workspace.superpin.set.request",
+        workspaceId: "ws-superpin",
+        superpinned: true,
+        requestId: "superpin",
+      });
+      const response = findByType(emitted, "workspace.superpin.set.response");
+      expect(response?.payload).toMatchObject({
+        accepted: true,
+        error: null,
+        workspaceId: "ws-superpin",
+        requestId: "superpin",
+      });
+      expect(response?.payload.superpinnedAt).toEqual(expect.any(String));
+      const stored = await new FileBackedWorkspaceRegistry(filePath, createTestLogger()).get(
+        "ws-superpin",
+      );
+      expect(stored).toMatchObject({
+        pinnedAt: pinnedAt ?? response?.payload.superpinnedAt,
+        superpinnedAt: response?.payload.superpinnedAt,
+      });
+      expect(await registry.get("ws-superpin")).toEqual(stored);
+      expect(diskAtAcceptance).toEqual([[stored]]);
+      expect(findByType(emitted, "workspace_update")?.payload).toMatchObject({
+        kind: "upsert",
+        workspace: {
+          id: "ws-superpin",
+          pinnedAt: stored?.pinnedAt,
+          superpinnedAt: stored?.superpinnedAt,
+        },
+      });
+    },
+    { pinnedAt },
+  );
+});
+
+test.each([
+  [
+    "3fdb71dd-7bc7-81ea-9aa3-fc216379b35c@dbb8cee69f7e#remove",
+    "workspace.superpin.set.request",
+    "2026-10-17T00:00:00.000Z",
+  ],
+  ["3fdb71dd-7bc7-8115-aae9-d4ae7eebc644@3075d2001db6#unpin", "workspace.pin.set.request", null],
+])(
+  "%s removal has the specified pin state on independent readback",
+  async (_key, type, pinnedAt) => {
+    await withSuperpinSession(
+      async ({ session, emitted, filePath }) => {
+        await session.handleMessage({
+          type,
+          workspaceId: "ws-superpin",
+          pinned: false,
+          superpinned: false,
+          requestId: "remove",
+        });
+        const response = emitted.find(
+          (message) => message.type === type.replace("request", "response"),
+        );
+        expect(response).toMatchObject({ payload: { accepted: true, error: null } });
+        const stored = await new FileBackedWorkspaceRegistry(filePath, createTestLogger()).get(
+          "ws-superpin",
+        );
+        expect(stored).toMatchObject({ pinnedAt, superpinnedAt: null });
+        expect(findByType(emitted, "workspace_update")?.payload).toMatchObject({
+          workspace: { pinnedAt, superpinnedAt: null },
+        });
+      },
+      { pinnedAt: "2026-10-17T00:00:00.000Z", superpinnedAt: "2026-10-18T00:00:00.000Z" },
+    );
+  },
+);
+
+test("3fdb71dd7bc781d5b43fd310bea8633b@34667a09e7f5#repin-preserves re-pin preserves priority and accepted superpin refreshes it", async () => {
+  await withSuperpinSession(
+    async ({ session, registry }) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime("2026-10-19T00:00:00.000Z");
+      await session.handleMessage({
+        type: "workspace.pin.set.request",
+        workspaceId: "ws-superpin",
+        pinned: true,
+        requestId: "repin",
+      });
+      expect(await registry.get("ws-superpin")).toMatchObject({
+        pinnedAt: "2026-10-19T00:00:00.000Z",
+        superpinnedAt: "2026-10-18T00:00:00.000Z",
+      });
+      vi.setSystemTime("2026-10-20T00:00:00.000Z");
+      await session.handleMessage({
+        type: "workspace.superpin.set.request",
+        workspaceId: "ws-superpin",
+        superpinned: true,
+        requestId: "again",
+      });
+      expect(await registry.get("ws-superpin")).toMatchObject({
+        pinnedAt: "2026-10-19T00:00:00.000Z",
+        superpinnedAt: "2026-10-20T00:00:00.000Z",
+      });
+    },
+    { pinnedAt: "2026-10-17T00:00:00.000Z", superpinnedAt: "2026-10-18T00:00:00.000Z" },
+  );
+});
+
+test("3fdb71dd-7bc7-8140-810e-e7cd4f4539b5@999c2120aca7#denied workspace.manage is required and state stays confirmed", async () => {
+  await withSuperpinSession(
+    async ({ session, registry, emitted }) => {
+      const before = await registry.get("ws-superpin");
+      await session.handleMessage({
+        type: "workspace.superpin.set.request",
+        workspaceId: "ws-superpin",
+        superpinned: true,
+        requestId: "denied",
+      });
+      expect(findByType(emitted, "rpc_error")?.payload).toMatchObject({
+        requestId: "denied",
+        code: "access_denied",
+      });
+      expect(await registry.get("ws-superpin")).toEqual(before);
+      expect(findByType(emitted, "workspace_update")).toBeUndefined();
+    },
+    { permissions: ["workspace.read"] },
+  );
+});
+
+test("3fdb71dd-7bc7-8140-810e-e7cd4f4539b5@999c2120aca7#invalid missing workspace refuses without changing another record", async () => {
+  await withSuperpinSession(async ({ session, registry, emitted }) => {
+    const before = await registry.list();
+    await session.handleMessage({
+      type: "workspace.superpin.set.request",
+      workspaceId: "missing",
+      superpinned: true,
+      requestId: "missing",
+    });
+    expect(findByType(emitted, "workspace.superpin.set.response")?.payload).toMatchObject({
+      accepted: false,
+      error: "Workspace not found",
+    });
+    expect(await registry.list()).toEqual(before);
+    expect(findByType(emitted, "workspace_update")).toBeUndefined();
+  });
+});
+
+test("3fdb71dd-7bc7-8140-810e-e7cd4f4539b5@999c2120aca7#invalid persistence refusal emits no accepted state or update", async () => {
+  await withSuperpinSession(
+    async ({ session, registry, emitted, filePath }) => {
+      const before = await registry.get("ws-superpin");
+      await session.handleMessage({
+        type: "workspace.superpin.set.request",
+        workspaceId: "ws-superpin",
+        superpinned: true,
+        requestId: "failed-write",
+      });
+      expect(findByType(emitted, "workspace.superpin.set.response")?.payload).toMatchObject({
+        accepted: false,
+        error: "fixture write refused",
+      });
+      expect(await registry.get("ws-superpin")).toEqual(before);
+      expect(
+        await new FileBackedWorkspaceRegistry(filePath, createTestLogger()).get("ws-superpin"),
+      ).toEqual(before);
+      expect(findByType(emitted, "workspace_update")).toBeUndefined();
+    },
+    { failWrites: true },
+  );
 });
 
 test("workspace.title.set.request with whitespace-only title clears the title", async () => {

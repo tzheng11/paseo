@@ -7807,3 +7807,195 @@ test("quota recovery forwards the immutable intent and keeps completed continuat
   await expect(result).resolves.toEqual(operation);
   expect(mock.sent).toHaveLength(1);
 });
+
+async function createSuperpinClient(
+  features: Record<string, boolean> = { workspaceSuperpinning: true, workspaceMultiplicity: true },
+) {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "superpin",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connected = client.connect();
+  mock.triggerOpen({ features });
+  await connected;
+  return { client, mock };
+}
+
+const superpinDescriptor = {
+  id: "workspace",
+  projectId: "project",
+  projectDisplayName: "Project",
+  projectRootPath: "/tmp/project",
+  workspaceDirectory: "/tmp/project",
+  projectKind: "git",
+  workspaceKind: "local_checkout",
+  name: "Workspace",
+  status: "done",
+  activityAt: null,
+  scripts: [],
+  pinnedAt: "2026-10-17T00:00:00.000Z",
+};
+
+test.each([null, "2026-10-18T00:00:00.000Z"])(
+  "3fdb71dd7bc781c9964de0b6101b4e61@e93b9847d6fd#cli-store real client decode preserves explicit superpin %s",
+  async (superpinnedAt) => {
+    const { client, mock } = await createSuperpinClient();
+    const pending = client.fetchWorkspaces({ requestId: "read" });
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "fetch_workspaces_response",
+        payload: {
+          requestId: "read",
+          entries: [{ ...superpinDescriptor, superpinnedAt }],
+          pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+        },
+      }),
+    );
+    expect((await pending).entries[0]).toMatchObject({
+      superpinnedAt,
+      pinnedAt: superpinDescriptor.pinnedAt,
+    });
+    const mutation = client.setWorkspaceSuperpinned(
+      "workspace",
+      superpinnedAt !== null,
+      "mutation",
+    );
+    expect(parseSentFrame(mock.sent.at(-1)!)).toMatchObject({
+      type: "workspace.superpin.set.request",
+      workspaceId: "workspace",
+      superpinned: superpinnedAt !== null,
+      requestId: "mutation",
+    });
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "workspace.superpin.set.response",
+        payload: {
+          requestId: "mutation",
+          workspaceId: "workspace",
+          accepted: true,
+          pinnedAt: superpinDescriptor.pinnedAt,
+          superpinnedAt,
+          error: null,
+        },
+      }),
+    );
+    expect(await mutation).toEqual({ pinnedAt: superpinDescriptor.pinnedAt, superpinnedAt });
+  },
+);
+
+test("3fdb71dd-7bc7-81fe-9280-c37f47c8e4b9@c0b2fb81314b#old-daemon omitted fields decode and unsupported hosts send no mutation", async () => {
+  const { client, mock } = await createSuperpinClient({ workspacePinning: true });
+  const pending = client.fetchWorkspaces({ requestId: "legacy" });
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "fetch_workspaces_response",
+      payload: {
+        requestId: "legacy",
+        entries: [superpinDescriptor],
+        pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+      },
+    }),
+  );
+  expect((await pending).entries[0].superpinnedAt).toBeUndefined();
+  const count = mock.sent.length;
+  await expect(client.setWorkspaceSuperpinned("workspace", true)).rejects.toThrow(
+    "does not support workspace superpinning",
+  );
+  expect(mock.sent).toHaveLength(count);
+});
+
+test("3fdb71dd-7bc7-8140-810e-e7cd4f4539b5@999c2120aca7#denied superpin RPC errors and refusal reach the caller", async () => {
+  const { client, mock } = await createSuperpinClient();
+  const denied = client.setWorkspaceSuperpinned("workspace", true, "denied");
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "rpc_error",
+      payload: {
+        requestId: "denied",
+        requestType: "workspace.superpin.set.request",
+        code: "access_denied",
+        error: "Denied",
+      },
+    }),
+  );
+  await expect(denied).rejects.toThrow("Denied");
+  const refused = client.setWorkspaceSuperpinned("missing", true, "refused");
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "workspace.superpin.set.response",
+      payload: {
+        requestId: "refused",
+        workspaceId: "missing",
+        accepted: false,
+        pinnedAt: null,
+        superpinnedAt: null,
+        error: "Workspace not found",
+      },
+    }),
+  );
+  await expect(refused).rejects.toThrow("Workspace not found");
+});
+
+test("3fdb71dd-7bc7-8140-810e-e7cd4f4539b5@999c2120aca7#timeout lost response requires readback before a deliberate retry", async () => {
+  const { client, mock } = await createSuperpinClient();
+  vi.useFakeTimers();
+  try {
+    const lost = client.setWorkspaceSuperpinned("workspace", true, "lost");
+    const rejected = expect(lost).rejects.toThrow("Timeout waiting for message");
+    await vi.advanceTimersByTimeAsync(60_001);
+    await rejected;
+    expect(
+      mock.sent
+        .filter((frame) => JSON.parse(assertStr(frame)).type === "session")
+        .map((frame) => parseSentFrame(frame).type),
+    ).toEqual(["workspace.superpin.set.request"]);
+    // The daemon committed but its response was lost. Read its state before deciding to retry.
+    const priority = "2026-10-18T00:00:00.000Z";
+    const readback = client.fetchWorkspaces({ requestId: "reconcile" });
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "fetch_workspaces_response",
+        payload: {
+          requestId: "reconcile",
+          entries: [{ ...superpinDescriptor, superpinnedAt: priority }],
+          pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+        },
+      }),
+    );
+    expect((await readback).entries[0].superpinnedAt).toBe(priority);
+    const retry = client.setWorkspaceSuperpinned("workspace", true, "retry");
+    const refreshed = "2026-10-18T00:01:00.000Z";
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "workspace.superpin.set.response",
+        payload: {
+          requestId: "retry",
+          workspaceId: "workspace",
+          accepted: true,
+          pinnedAt: superpinDescriptor.pinnedAt,
+          superpinnedAt: refreshed,
+          error: null,
+        },
+      }),
+    );
+    expect(await retry).toEqual({
+      pinnedAt: superpinDescriptor.pinnedAt,
+      superpinnedAt: refreshed,
+    });
+    expect(
+      mock.sent
+        .filter((frame) => JSON.parse(assertStr(frame)).type === "session")
+        .map((frame) => parseSentFrame(frame).type),
+    ).toEqual([
+      "workspace.superpin.set.request",
+      "fetch_workspaces_request",
+      "workspace.superpin.set.request",
+    ]);
+  } finally {
+    vi.useRealTimers();
+  }
+});
