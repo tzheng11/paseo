@@ -356,6 +356,60 @@ describe("ReplicaCache", () => {
     });
   });
 
+  it.each([null, "2026-10-18T22:00:00.000Z"])(
+    "3fdb71dd7bc781c9964de0b6101b4e61@e93b9847d6fd#replica-cache retains %s across close/reopen",
+    async (superpinnedAt) => {
+      const storage = new MemoryStorage();
+      const writer = createCache(storage);
+      const baseline = directory({ workspaces: { generation: "g", afterSeq: 12 } });
+      baseline.workspaces.get("workspace-1")!.superpinnedAt = superpinnedAt;
+      commitDirectory(writer, SERVER_ID, baseline);
+      await writer.flush();
+      const reader = createCache(storage);
+      expect((await reader.readWorkspace(SERVER_ID, "workspace-1"))?.workspace.superpinnedAt).toBe(
+        superpinnedAt,
+      );
+      expect(
+        (await reader.readDirectory(SERVER_ID)).workspaces.get("workspace-1")?.superpinnedAt,
+      ).toBe(superpinnedAt);
+      expect((await reader.readDirectory(SERVER_ID)).checkpoint).toEqual(baseline.checkpoint);
+    },
+  );
+
+  it("3fdb71dd7bc781c9964de0b6101b4e61@e93b9847d6fd#replica-cache defaults old rows to null and refreshes version-1 workspace cursors", async () => {
+    const storage = new MemoryStorage();
+    const writer = createCache(storage);
+    const baseline = directory({
+      workspaces: { generation: "g", afterSeq: 12 },
+      agents: { generation: "g", afterSeq: 9 },
+    });
+    commitDirectory(writer, SERVER_ID, baseline);
+    await writer.flush();
+    for (const row of storage.rows.values()) {
+      if (row.kind === "workspace") {
+        const payload = JSON.parse(row.payload);
+        delete payload.superpinnedAt;
+        row.payload = JSON.stringify(payload);
+      }
+      if (row.kind === "checkpoint")
+        row.payload = JSON.stringify({
+          version: 1,
+          workspaceFieldsVersion: 1,
+          cursors: baseline.checkpoint,
+        });
+    }
+    const reader = createCache(storage);
+    const restored = await reader.readDirectory(SERVER_ID);
+    expect(restored.workspaces.get("workspace-1")?.superpinnedAt).toBeNull();
+    expect(restored.checkpoint).toEqual({ agents: baseline.checkpoint.agents });
+    baseline.workspaces.get("workspace-1")!.superpinnedAt = "2026-10-18T22:00:00.000Z";
+    reader.replaceDirectoryBaseline(SERVER_ID, baseline);
+    await reader.flush();
+    const reopened = await createCache(storage).readDirectory(SERVER_ID);
+    expect(reopened.workspaces.get("workspace-1")?.superpinnedAt).toBe("2026-10-18T22:00:00.000Z");
+    expect(reopened.checkpoint).toEqual(baseline.checkpoint);
+  });
+
   it("does nothing until an owner explicitly commits data", async () => {
     const storage = new MemoryStorage();
     const cache = createCache(storage);

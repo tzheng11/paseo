@@ -117,6 +117,7 @@ export interface WorkspaceDescriptor {
   name: string;
   title?: string | null;
   pinnedAt?: string | null;
+  superpinnedAt?: string | null;
   labels?: string[];
   fieldValues?: WorkspaceDescriptorPayload["fieldValues"];
   status: WorkspaceDescriptorPayload["status"];
@@ -156,6 +157,8 @@ export function normalizeWorkspaceDescriptor(
     name: payload.name,
     title: payload.title ?? null,
     pinnedAt: payload.pinnedAt ?? null,
+    // COMPAT(workspaceSuperpinning): older daemons omit the field.
+    superpinnedAt: payload.superpinnedAt ?? null,
     // COMPAT(workspaceLabels): old daemons omit assignments.
     labels: payload.labels ?? [],
     // COMPAT(workspaceFields): added in v0.11.3; remove fallback after 2027-04-14.
