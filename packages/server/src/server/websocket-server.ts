@@ -1,4 +1,6 @@
 import { WORKSPACE_FIELD_CATALOG_VERSION } from "@getpaseo/protocol/workspace-fields";
+import type { MainHostStore } from "./fleet/main-host-store.js";
+import type { MainHostProvenance } from "@getpaseo/protocol/fleet/main-host";
 import {
   withAgentHistoryReadMetrics,
   type AgentHistoryReadMetrics,
@@ -158,6 +160,7 @@ interface WebSocketConnectionIdentity {
 }
 
 interface WebSocketServerConfig {
+  mainHostStore?: MainHostStore;
   allowedOrigins?: Set<string>;
   hostnames?: HostnamesConfig;
   getAllowedOrigins?: () => Set<string>;
@@ -465,6 +468,8 @@ interface PluginSessionConnection extends SessionConnectionBase {
 type SessionConnection = ReconnectableSessionConnection | PluginSessionConnection;
 
 interface SocketSessionOptions {
+  principalId?: string;
+  clientType?: MainHostProvenance["clientType"];
   clientId: string;
   appVersion: string | null;
   clientCapabilities: Record<string, unknown> | null;
@@ -530,6 +535,8 @@ function requireWebSocketServices(params: {
  * WebSocket server that only accepts sockets + parses/forwards messages to the session layer.
  */
 export class VoiceAssistantWebSocketServer {
+  private readonly mainHostStore: MainHostStore | undefined;
+  private readonly releaseMainHost: (() => void) | undefined;
   private readonly logger: pino.Logger;
   private readonly wss: WebSocketServer;
   private readonly pendingConnections: Map<WebSocketLike, PendingConnection> = new Map();
@@ -667,6 +674,8 @@ export class VoiceAssistantWebSocketServer {
     orchestrationSkills?: SessionOptions["orchestrationSkills"],
     workspaceLabelService?: WorkspaceLabelService,
   ) {
+    this.mainHostStore = wsConfig.mainHostStore;
+    this.releaseMainHost = this.subscribeMainHost();
     this.logger = logger.child({ module: "websocket-server" });
     this.workspaceSetupRuntime = workspaceSetupRuntime;
     this.advertiseDaemonStatusRpc = wsConfig.daemonStatusRpc !== false;
@@ -1066,7 +1075,12 @@ export class VoiceAssistantWebSocketServer {
     }
   }
 
+  private subscribeMainHost(): (() => void) | undefined {
+    return this.mainHostStore?.subscribe(() => this.broadcastCapabilitiesUpdate());
+  }
+
   public async close(): Promise<void> {
+    this.releaseMainHost?.();
     this.prepareForShutdown();
     this.unsubscribeSpeechReadiness?.();
     this.unsubscribeSpeechReadiness = null;
@@ -1374,6 +1388,7 @@ export class VoiceAssistantWebSocketServer {
   }
 
   private createSessionConnection(params: {
+    clientType?: MainHostProvenance["clientType"];
     ws: WebSocketLike;
     clientId: string;
     appVersion: string | null;
@@ -1387,6 +1402,8 @@ export class VoiceAssistantWebSocketServer {
     let connection: SessionConnection | null = null;
 
     const session = this.createSocketSession({
+      principalId: admission.principalId,
+      clientType: params.clientType,
       clientId,
       appVersion,
       clientCapabilities,
@@ -1460,6 +1477,9 @@ export class VoiceAssistantWebSocketServer {
 
   private createSocketSession(options: SocketSessionOptions): Session {
     return new Session({
+      mainHostStore: this.mainHostStore,
+      principalId: options.principalId,
+      clientType: options.clientType,
       browserToolsBroker: this.browserToolsBroker,
       clientId: options.clientId,
       appVersion: options.appVersion,
@@ -1631,6 +1651,7 @@ export class VoiceAssistantWebSocketServer {
     const connection = this.createSessionConnection({
       ws,
       clientId,
+      clientType: message.clientType,
       appVersion: message.appVersion ?? null,
       clientCapabilities: message.capabilities ?? null,
       connectionLogger,
@@ -1784,6 +1805,7 @@ export class VoiceAssistantWebSocketServer {
 
   private buildServerInfoStatusPayload(session: Session): ServerInfoStatusPayload {
     return {
+      ...(this.mainHostStore ? { mainHost: this.mainHostStore.snapshot() } : {}),
       status: "server_info",
       protocolVersion: WS_PROTOCOL_VERSION,
       serverId: this.serverId,
@@ -1795,6 +1817,8 @@ export class VoiceAssistantWebSocketServer {
       desktopManaged: this.daemonRuntimeConfig?.desktopManaged === true,
       ...(this.serverCapabilities ? { capabilities: this.serverCapabilities } : {}),
       features: {
+        // COMPAT(mainHost): added in v0.11.3; remove gate after 2027-04-18.
+        mainHost: this.mainHostStore !== undefined,
         usageSources: true,
         workspaceFields: true,
         ownedSubscriptions: true,

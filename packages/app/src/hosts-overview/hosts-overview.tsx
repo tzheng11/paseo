@@ -3,6 +3,11 @@ import { useTranslation } from "react-i18next";
 import { Text, View } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
 import { HostStatusDot } from "@/components/host-status-dot";
+import {
+  MainHostBadge,
+  MainHostStatus,
+  MakeMainHostButton,
+} from "@/screens/settings/main-host-section";
 import { SettingsInfoTip } from "@/components/settings/headings/settings-info-tip";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { useIsCompactFormFactor } from "@/constants/layout";
@@ -38,6 +43,9 @@ export function HostsOverview() {
         </View>
       </View>
       <View style={settingsStyles.card}>
+        <View style={settingsStyles.row}>
+          <MainHostStatus />
+        </View>
         {isCompact ? null : <ColumnHeaders t={t} />}
         {rows.map((row, index) => (
           <HostRow key={row.serverId} row={row} isCompact={isCompact} isFirst={index === 0} />
@@ -98,6 +106,7 @@ function HostRow({
           {row.isNext ? (
             <StatusBadge label={t("openProject.hosts.next")} variant="success" size="xs" />
           ) : null}
+          <MainHostBadge serverId={row.serverId} />
         </View>
         {status ? (
           <Text style={state.kind === "failed" ? settingsStyles.rowError : settingsStyles.rowHint}>
@@ -108,6 +117,7 @@ function HostRow({
           <Text style={settingsStyles.rowHint}>{compactSummary(stats, t)}</Text>
         ) : null}
         {warnings ? <Text style={styles.warningText}>{warnings}</Text> : null}
+        <MakeMainHostButton serverId={row.serverId} />
       </View>
       {stats && !isCompact ? <StatsColumns stats={stats} t={t} /> : null}
     </View>

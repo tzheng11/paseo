@@ -21,6 +21,9 @@ import { lstat, mkdir, mkdtemp, rename, rm, stat } from "node:fs/promises";
 import { basename, join, resolve, sep } from "path";
 import { homedir } from "node:os";
 import { CLIENT_CAPS, type ClientCapability } from "@getpaseo/protocol/client-capabilities";
+import type { MainHostProvenance } from "@getpaseo/protocol/fleet/main-host";
+import type { MainHostStore } from "./fleet/main-host-store.js";
+import { FleetSession } from "./session/fleet/fleet-session.js";
 import { formatPluginSourceReference } from "@getpaseo/protocol/plugin-source-reference";
 import {
   serializeAgentStreamEvent,
@@ -447,6 +450,9 @@ const nodeSessionFileSystem: SessionFileSystem = {
 type AgentMcpTransportFactory = () => Promise<unknown>;
 
 export interface SessionOptions {
+  mainHostStore?: MainHostStore;
+  principalId?: string;
+  clientType?: MainHostProvenance["clientType"];
   browserToolsBroker?: BrowserToolsBroker | null;
   clientId: string;
   permissions: readonly DaemonPermission[];
@@ -802,6 +808,7 @@ export class Session {
   private readonly agentConfigSession: AgentConfigSession;
   private readonly projectConfigSession: ProjectConfigSession;
   private readonly daemonSession: DaemonSession;
+  private readonly fleetSession: FleetSession;
   private readonly hubExecutionController: HubExecutionController | null;
   private readonly workspaceScripts: WorkspaceScriptsService;
   private readonly messageReceipts: Pick<MessageReceipts, "send">;
@@ -871,6 +878,7 @@ export class Session {
     this.appVersion = appVersion ?? null;
     this.clientCapabilities = parseClientCapabilities(clientCapabilities);
     this.sessionId = uuidv4();
+    this.fleetSession = this.createFleetSession(options);
     this.onMessage = onMessage;
     this.onMessageToSource = onMessageToSource ?? null;
     this.onBinaryMessage = onBinaryMessage ?? null;
@@ -2304,10 +2312,27 @@ export class Session {
     }
   }
 
+  private createFleetSession(options: SessionOptions): FleetSession {
+    return new FleetSession(
+      options.mainHostStore,
+      {
+        principalId: options.principalId ?? "unknown",
+        clientType: options.clientType ?? "unknown",
+        clientId: this.clientId,
+        sessionId: this.sessionId,
+        serverId: options.serverId ?? "unknown",
+      },
+      (message) => this.emit(message),
+      () => this.clientCapabilities.has(CLIENT_CAPS.mainHost),
+    );
+  }
+
   private dispatchSubscriptionMessage(
     msg: SessionInboundMessage,
     source?: object,
   ): Promise<void> | undefined {
+    const fleet = this.fleetSession.dispatch(msg);
+    if (fleet) return fleet;
     if (msg.type === "browser.host.register.request") return this.registerBrowserHost(msg);
     if (msg.type === "browser.automation.execute.response") {
       if (source)

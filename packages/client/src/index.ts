@@ -1,4 +1,5 @@
 import type { OwnedSubscription } from "./connection/index.js";
+import { createFleetActions, type PaseoFleetActions } from "./fleet.js";
 export type { OwnedSubscription, SubscriptionObserver } from "./connection/index.js";
 import type { DaemonClientConfig } from "./daemon-client.js";
 import type { AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
@@ -487,6 +488,7 @@ export interface PaseoConfigActions {
 }
 
 export interface PaseoApi {
+  readonly fleet: PaseoFleetActions;
   dispose(): Promise<void>;
   observeEvents: DaemonClient["observeEvents"];
   readonly terminals: PaseoTerminalActions;
@@ -698,6 +700,7 @@ export function createPaseoApi(
 
   return {
     dispose,
+    fleet: createFleetActions(daemonClient),
     observeEvents,
     terminals,
     projects: {

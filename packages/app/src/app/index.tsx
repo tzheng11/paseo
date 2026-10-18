@@ -1,4 +1,5 @@
 import React from "react";
+import { isMainHostReadPending, useMainHost } from "@/hosts/use-main-host";
 import { Redirect, usePathname } from "expo-router";
 import { StartupSplashScreen } from "@/screens/startup-splash-screen";
 import { useEarliestOnlineHostServerId, useHostRuntimeBootstrapState } from "@/app/_layout";
@@ -17,6 +18,7 @@ import { shouldUseDesktopDaemon } from "@/desktop/daemon/desktop-daemon";
 const isDesktop = shouldUseDesktopDaemon();
 
 export default function Index() {
+  const { resolution: main, views } = useMainHost();
   const pathname = usePathname();
   const bootstrapState = useHostRuntimeBootstrapState();
   const anyOnlineHostServerId = useEarliestOnlineHostServerId();
@@ -33,6 +35,8 @@ export default function Index() {
   );
 
   const startupRoute = resolveStartupRoute({
+    mainHostServerId: main.mainHost,
+    mainHostLoading: isMainHostReadPending(views),
     route: { kind: "index", pathname },
     startupBlocker: bootstrapState.startupBlocker,
     hostRegistryStatus,

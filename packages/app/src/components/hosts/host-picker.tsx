@@ -4,6 +4,7 @@ import type { GestureResponderEvent } from "react-native";
 import { Plus, Server, Settings } from "lucide-react-native";
 import { StyleSheet, useUnistyles } from "react-native-unistyles";
 import { HostStatusDot } from "@/components/host-status-dot";
+import { MainHostBadge } from "@/screens/settings/main-host-section";
 import { Combobox, ComboboxItem, type ComboboxProps } from "@/components/ui/combobox";
 import { useLocalDaemonServerId } from "@/hooks/use-is-local-daemon";
 import { useHostRuntimeSnapshot, type ActiveConnection } from "@/runtime/host-runtime";
@@ -107,12 +108,21 @@ export function HostPickerOption({
     theme.iconSize.sm,
   ]);
 
+  const mainTrailingSlot = useMemo(
+    () => (
+      <View style={styles.mainTrailing}>
+        <MainHostBadge serverId={serverId} />
+        {trailingSlot}
+      </View>
+    ),
+    [serverId, trailingSlot],
+  );
   return (
     <ComboboxItem
       label={label}
       description={connectionLabel}
       leadingSlot={leadingSlot}
-      trailingSlot={trailingSlot}
+      trailingSlot={mainTrailingSlot}
       selected={selected}
       active={active}
       onPress={onPress}
@@ -319,6 +329,7 @@ export function HostPicker({
 }
 
 const styles = StyleSheet.create((theme) => ({
+  mainTrailing: { flexDirection: "row", alignItems: "center", gap: theme.spacing[2] },
   statusDotSlot: {
     width: theme.iconSize.sm,
     height: theme.iconSize.sm,

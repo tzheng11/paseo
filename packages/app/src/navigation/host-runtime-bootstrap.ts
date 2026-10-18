@@ -111,6 +111,8 @@ interface ResolveStartupRouteBaseInput {
 }
 
 export interface ResolveIndexStartupRouteInput extends ResolveStartupRouteBaseInput {
+  mainHostServerId?: string | null;
+  mainHostLoading?: boolean;
   route: IndexStartupRouteTarget;
   anyOnlineHostServerId: string | null;
   workspaceSelection: ActiveWorkspaceSelection | null;
@@ -196,6 +198,11 @@ function resolveReadyIndexStartupRoute(input: ResolveIndexStartupRouteInput): St
       kind: "redirect",
       href: buildHostRootRoute(input.workspaceSelection.serverId),
     };
+  }
+
+  if (input.mainHostLoading) return { kind: "splash" };
+  if (input.mainHostServerId && hostExists(input.hosts, input.mainHostServerId)) {
+    return { kind: "redirect", href: buildHostRootRoute(input.mainHostServerId) };
   }
 
   if (input.anyOnlineHostServerId) {

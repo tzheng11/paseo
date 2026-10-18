@@ -1,4 +1,5 @@
 import { supportsWorkspaceFields, WorkspaceFieldError } from "@getpaseo/protocol/workspace-fields";
+import type { MainHostSetInput, MainHostApplyInput } from "@getpaseo/protocol/fleet/main-host";
 import { legacyUsageIcon } from "./legacy-usage-icons.js";
 import { subscribeTimeline, type TimelineMessage } from "./timeline-subscription/index.js";
 import { ProviderSnapshotUpdates } from "./provider-snapshots/index.js";
@@ -1017,11 +1018,18 @@ export class CredentialReloadUnsupportedError extends Error {
 }
 
 class DaemonRpcError extends Error {
+  readonly mainHost: import("@getpaseo/protocol/fleet/main-host").MainHostState | undefined;
   readonly requestId: string;
   readonly requestType?: string;
   readonly code?: string;
 
-  constructor(params: { requestId: string; error: string; requestType?: string; code?: string }) {
+  constructor(params: {
+    requestId: string;
+    error: string;
+    requestType?: string;
+    code?: string;
+    mainHost?: import("@getpaseo/protocol/fleet/main-host").MainHostState;
+  }) {
     const parts = [params.error];
     if (params.requestType) parts.push(`requestType=${params.requestType}`);
     if (params.code) parts.push(`code=${params.code}`);
@@ -1030,6 +1038,7 @@ class DaemonRpcError extends Error {
     this.requestId = params.requestId;
     this.requestType = params.requestType;
     this.code = params.code;
+    this.mainHost = params.mainHost;
   }
 }
 
@@ -1942,6 +1951,7 @@ export class DaemonClient {
               error: msg.payload.error,
               requestType: msg.payload.requestType,
               code: msg.payload.code,
+              mainHost: msg.payload.mainHost,
             }),
           };
         }
@@ -5312,6 +5322,39 @@ export class DaemonClient {
       requestId: options?.requestId,
       message: { type: "daemon.get_host_stats.request" },
       timeout: options?.timeout,
+    });
+  }
+
+  private requireMainHost(): void {
+    if (!this.lastServerInfoMessage) throw new DaemonConnectionError("Transport not connected");
+    if (this.lastServerInfoMessage.features?.mainHost !== true) {
+      throw new Error("Update this host to use Main host. The previous setting is unchanged.");
+    }
+  }
+
+  async getMainHost(requestId?: string) {
+    this.requireMainHost();
+    return this.sendNamespacedCorrelatedSessionRequest<"fleet.main_host.get.response">({
+      requestId,
+      message: { type: "fleet.main_host.get.request" },
+    });
+  }
+
+  async setMainHost(input: MainHostSetInput) {
+    this.requireMainHost();
+    const { requestId, ...fields } = input;
+    return this.sendNamespacedCorrelatedSessionRequest<"fleet.main_host.set.response">({
+      requestId,
+      message: { type: "fleet.main_host.set.request", ...fields },
+    });
+  }
+
+  async applyMainHost(input: MainHostApplyInput) {
+    this.requireMainHost();
+    const { requestId, ...fields } = input;
+    return this.sendNamespacedCorrelatedSessionRequest<"fleet.main_host.apply.response">({
+      requestId,
+      message: { type: "fleet.main_host.apply.request", ...fields },
     });
   }
 
