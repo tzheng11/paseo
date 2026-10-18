@@ -64,8 +64,16 @@ maintenance window. It holds the normal daemon PID lock, verifies the captured p
 gone, and rejects remaining Paseo workers and builtin provider roots. It never signals a process.
 
 The operator supplies an inspection record binding the unchanged daemon configuration to the
-verified builtin provider launch contract. Renamed binaries and custom wrappers are unsupported;
-do not attest their absence without inspecting the installed launch configuration and source.
+verified builtin provider launch contract. Version 1 permits builtin-only launches. Version 2
+also permits inspected transparent proxies: each `inspectedWrappers` entry binds `provider`
+(`codex` or `claude`), an absolute whitespace-free regular-file `path`, and its `sha256` to that
+provider's exact single-path command override. Both proxies and detached builtin children must be
+absent; wrapper bytes and configuration are checked again before settlement. Version 1 rejects
+wrapper entries, so older utilities cannot silently ignore a version 2 contract. Symlinks,
+configured interpreter/shell prefixes, renamed binaries and uninspected launches remain unsupported.
+Inspection covers the incident's effective launch paths, not just today's configuration; retain
+uncertainty if those paths cannot be established. Do not change a host's launch configuration to
+make an inspection appear compatible.
 The command refuses failed, incomplete or ambiguous observations. It compares the original receipt
 bytes before committing and saves sanitized process evidence first. Cleanup settlement writes
 `failed`, `retryable: true`, `RELOAD_CLEANUP_RECONCILED`; it does not claim replacement registration

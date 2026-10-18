@@ -156,11 +156,17 @@ paseo agent reload-reconcile-cleanup <original-operation-uuid> --home <paseo-hom
   --expected-receipt-sha256 <original-file-hash> --launch-contract <inspection.json> --json
 ```
 
-The inspection file requires `version: 1`, `configSha256` for the unchanged `config.json`,
+The inspection file requires `version: 1` for builtin-only launches, `configSha256` for the unchanged `config.json`,
 `builtinProviderLaunchesVerified: true`, `noRenamedOrMarkerLosingWrappers: true`, `inspectedBy`,
 and a source-bound `evidence` reference. It records an actual operator inspection; it does not
-certify arbitrary provider overrides. macOS is currently required. A live daemon, worker,
-provider root, incomplete census, changed receipt or unsupported uncertainty refuses settlement.
+certify arbitrary provider overrides. An inspected transparent proxy requires `version: 2` and
+`inspectedWrappers: [{provider: "codex", path: "/absolute/frame-proxy.py", sha256: "<64 hex>"}]`.
+Each entry must match that provider's single-path command override and an unchanged regular file;
+symlink, relative, whitespace-containing, and configured interpreter/shell-prefix paths are refused.
+The inspection covers the incident's launch paths, including prior overrides. Both proxies and
+their detached native children must be absent. Older utilities reject version 2 instead of
+ignoring its wrapper evidence. macOS is currently required. A live daemon, worker, provider root
+or proxy, incomplete census, changed source/receipt or unsupported uncertainty refuses settlement.
 The original UUID and credential-generation/time are preserved. The terminal result is
 `failed` with `retryable: true` and `RELOAD_CLEANUP_RECONCILED`, never a fabricated `completed`.
 A sidecar evidence file makes repeated reconciliation idempotent. Restart the matched daemon

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, test, vi } from "vitest";
@@ -310,4 +310,132 @@ test("concurrent local callers cannot share one PID lock to reconcile twice", as
     status: "failed",
     reasonCode: "RELOAD_CLEANUP_RECONCILED",
   });
+});
+
+async function wrapperFixture() {
+  const f = await fixture();
+  const path = join(f.home, "frame-proxy.py");
+  const source = "# inspected transparent builtin-provider proxy fixture\n";
+  await writeFile(path, source);
+  const config = JSON.stringify({ agents: { providers: { codex: { command: [path] } } } });
+  await writeFile(join(f.home, "config.json"), config);
+  const contract = {
+    version: 2,
+    configSha256: sha256(config),
+    builtinProviderLaunchesVerified: true,
+    noRenamedOrMarkerLosingWrappers: true,
+    inspectedBy: "test-operator",
+    evidence: "inspected wrapper and incident launch paths",
+    inspectedWrappers: [{ provider: "codex", path, sha256: sha256(source) }],
+  };
+  await writeFile(f.input.launchContractFile, JSON.stringify(contract));
+  return { ...f, path, source, contract };
+}
+
+test("inspected wrappers and their detached builtin children both prevent settlement", async () => {
+  const f = await wrapperFixture();
+  for (const command of [
+    f.path + " app-server",
+    "/usr/bin/python3 " + f.path + " app-server",
+    "/bin/codex app-server",
+  ]) {
+    await expect(
+      reconcileStoppedReloadCleanup(
+        f.input,
+        async (paths) => parseCleanupProcessCensus(`40 1 ${command}`, paths),
+        gone,
+      ),
+    ).rejects.toThrow("not quiescent");
+    expect(await readFile(f.file, "utf8")).toBe(f.bytes);
+  }
+  expect(
+    parseCleanupProcessCensus(`40 1 /usr/bin/python3 ${f.path}.other app-server`, [f.path])[0]
+      ?.providerWriter,
+  ).toBe(false);
+  const result = await reconcileStoppedReloadCleanup(f.input, async () => [], gone);
+  expect(result).toMatchObject({
+    status: "failed",
+    retryable: true,
+    reasonCode: "RELOAD_CLEANUP_RECONCILED",
+  });
+  expect(
+    JSON.parse(await readFile(f.file + ".cleanup-reconciliation.json", "utf8")).launchContract,
+  ).toEqual(f.contract);
+});
+
+test("wrapper contract version, configured membership and source bytes fail closed", async () => {
+  const f = await wrapperFixture();
+  const observe = vi.fn(async () => []);
+  for (const changed of [
+    { ...f.contract, version: 1 },
+    { ...f.contract, inspectedWrappers: [] },
+    {
+      ...f.contract,
+      inspectedWrappers: [{ ...f.contract.inspectedWrappers[0], provider: "claude" }],
+    },
+    {
+      ...f.contract,
+      inspectedWrappers: [{ ...f.contract.inspectedWrappers[0], path: "relative.py" }],
+    },
+    {
+      ...f.contract,
+      inspectedWrappers: [{ ...f.contract.inspectedWrappers[0], sha256: "f".repeat(64) }],
+    },
+  ]) {
+    await writeFile(f.input.launchContractFile, JSON.stringify(changed));
+    await expect(reconcileStoppedReloadCleanup(f.input, observe, gone)).rejects.toThrow();
+    expect(await readFile(f.file, "utf8")).toBe(f.bytes);
+  }
+  expect(observe).not.toHaveBeenCalled();
+  await writeFile(f.input.launchContractFile, JSON.stringify(f.contract));
+  await expect(
+    reconcileStoppedReloadCleanup(
+      f.input,
+      async () => {
+        await writeFile(f.path, f.source + "# changed\n");
+        return [];
+      },
+      gone,
+    ),
+  ).rejects.toThrow("Wrapper changed");
+  expect(await readFile(f.file, "utf8")).toBe(f.bytes);
+});
+
+test("missing, symlinked and prefixed wrapper commands never satisfy inspection", async () => {
+  for (const kind of ["missing", "symlink", "prefix", "whitespace"]) {
+    const f = await wrapperFixture();
+    if (kind === "prefix") {
+      const config = JSON.stringify({
+        agents: { providers: { codex: { command: ["/usr/bin/python3", f.path] } } },
+      });
+      await writeFile(join(f.home, "config.json"), config);
+      await writeFile(
+        f.input.launchContractFile,
+        JSON.stringify({ ...f.contract, configSha256: sha256(config) }),
+      );
+    } else if (kind === "whitespace") {
+      const path = join(f.home, "frame proxy.py");
+      await writeFile(path, f.source);
+      const config = JSON.stringify({ agents: { providers: { codex: { command: [path] } } } });
+      await writeFile(join(f.home, "config.json"), config);
+      await writeFile(
+        f.input.launchContractFile,
+        JSON.stringify({
+          ...f.contract,
+          configSha256: sha256(config),
+          inspectedWrappers: [{ ...f.contract.inspectedWrappers[0], path }],
+        }),
+      );
+    } else {
+      await rm(f.path);
+      if (kind === "symlink") {
+        await writeFile(f.path + ".target", f.source);
+        await symlink(f.path + ".target", f.path);
+      }
+    }
+    const observe = vi.fn(async () => []);
+    await expect(reconcileStoppedReloadCleanup(f.input, observe, gone)).rejects.toThrow();
+    expect(observe).not.toHaveBeenCalled();
+    expect(await readFile(f.file, "utf8")).toBe(f.bytes);
+  }
 });
