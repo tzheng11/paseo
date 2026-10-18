@@ -61,7 +61,7 @@ Legacy cleanup uncertainty has no phase or writer identity. It cannot be reclass
 idle, closed, archived, an old error string, or a daemon restart alone. Use the local
 [`agent reload-reconcile-cleanup`](../public-docs/cli.md) command only in a coordinated quiescent
 maintenance window. It holds the normal daemon PID lock, verifies the captured prior worker is
-gone, and rejects remaining Paseo workers and builtin provider roots. It never signals a process.
+gone, and rejects remaining attributable or unidentified writers. It never signals a process.
 
 The operator supplies an inspection record binding the unchanged daemon configuration to the
 verified builtin provider launch contract. Version 1 permits builtin-only launches. Version 2
@@ -74,6 +74,25 @@ configured interpreter/shell prefixes, renamed binaries and uninspected launches
 Inspection covers the incident's effective launch paths, not just today's configuration; retain
 uncertainty if those paths cannot be established. Do not change a host's launch configuration to
 make an inspection appear compatible.
+
+Version 3 can retain positively unrelated processes. Its `foreignOwnership` evidence binds the
+original operation, agent and receipt hash to a frozen process forest. The utility re-observes
+kernel PID/UID/birth identities and executable file identities, complete ancestry, and either a
+strictly verified signed app anchor or a launchd/PID-lock/source/config binding to a different
+daemon home. Unreaped zombies use their OS-reported terminal state; they have no executable or
+open files. New descendants, changed identities/ownership, reparented providers, target markers
+and observed access to the protected native session all refuse. The same read-only
+`readInspectedCleanupCensus` predicate is available to maintenance preflight, drain and rollback;
+none of those phases may apply a separate PID/path exclusion list. This macOS observation requires
+system Python 3, libproc, codesign, launchctl and lsof; unavailable/incomplete proof refuses.
+
+This proves retirement of writers attributable to the historical admitted reload, including
+unregistered replacements and older-generation survivors. The captured retiring tree must be
+absent and cannot overlap the foreign forest. Original callbacks cannot remain live. A different
+home or signed app establishes provenance, not native-storage isolation; signature/file identity
+does not certify arbitrary loaded memory. The receipt does not promise global future native-session
+exclusivity. External effect/owner drain and maintenance admission remain separate obligations.
+Do not infer historical ownership from receipt timestamps, archive metadata or a restart alone.
 The command refuses failed, incomplete or ambiguous observations. It compares the original receipt
 bytes before committing and saves sanitized process evidence first. Cleanup settlement writes
 `failed`, `retryable: true`, `RELOAD_CLEANUP_RECONCILED`; it does not claim replacement registration

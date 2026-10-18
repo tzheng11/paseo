@@ -10,6 +10,7 @@ import {
   parseCleanupProcessCensus,
   reconcileStoppedReloadCleanup,
 } from "./reload-cleanup-recovery.js";
+import type { ForeignCleanupOwnership } from "./reload-process-ownership.js";
 const directories: string[] = [];
 afterEach(async () => {
   await Promise.all(directories.splice(0).map((p) => rm(p, { recursive: true, force: true })));
@@ -60,6 +61,115 @@ async function fixture(reasonCode = "RELOAD_CLEANUP_UNCONFIRMED") {
   };
 }
 const gone = () => {};
+async function foreignFixture() {
+  const f = await fixture();
+  const foreign: ForeignCleanupOwnership = {
+    binding: {
+      home: f.home,
+      operationId: f.input.operationId,
+      agentId: f.input.agentId,
+      expectedReceiptSha256: f.input.expectedReceiptSha256,
+    },
+    bootUuid: "fixture-boot",
+    owners: [
+      {
+        kind: "signedApp",
+        pid: 10,
+        bundlePath: "/signed.app",
+        teamIdentifier: "team",
+        identifier: "app",
+      },
+    ],
+    ownerProofs: ["b".repeat(64)],
+    processes: [10, 11].map((pid) => ({
+      pid,
+      ppid: pid === 10 ? 1 : 10,
+      uid: 501,
+      startedAtUsec: String(pid),
+      state: "live",
+      executable: "/signed/app",
+      device: "1",
+      inode: String(pid),
+    })),
+    protectedAgentRecord: {
+      path: join(f.home, "agents/cwd/original-agent.json"),
+      bindingSha256: "c".repeat(64),
+      provider: "codex",
+      nativeSessionId: "11111111-1111-4111-8111-111111111111",
+    },
+    protectedFiles: [
+      {
+        path: "/native/11111111-1111-4111-8111-111111111111.jsonl",
+        device: "1",
+        inode: "99",
+      },
+    ],
+  };
+  const old = JSON.parse(await readFile(f.input.launchContractFile, "utf8"));
+  await writeFile(
+    f.input.launchContractFile,
+    JSON.stringify({ ...old, version: 3, inspectedWrappers: [], foreignOwnership: foreign }),
+  );
+  const rows = foreign.processes.map((p) => ({
+    pid: p.pid,
+    ppid: p.ppid,
+    worker: false,
+    providerWriter: p.pid === 11,
+  }));
+  return { ...f, foreign, rows };
+}
+test("v3 settles the original receipt with positively verified foreign trees left alive", async () => {
+  const f = await foreignFixture();
+  const verify = vi.fn(async () => structuredClone(f.foreign));
+  const observe = vi.fn(async () => f.rows);
+  const result = await reconcileStoppedReloadCleanup(f.input, observe, gone, verify);
+  expect(result).toEqual({
+    ...f.original,
+    status: "failed",
+    retryable: true,
+    reasonCode: "RELOAD_CLEANUP_RECONCILED",
+    reason:
+      "Previous cleanup is settled; replacement was not acknowledged. A new guarded attempt is permitted.",
+  });
+  expect(verify).toHaveBeenCalledTimes(4);
+  const saved = JSON.parse(await readFile(`${f.file}.cleanup-reconciliation.json`, "utf8"));
+  expect(saved.foreignPids).toEqual([10, 11]);
+  expect(saved.launchContract.foreignOwnership).toEqual(f.foreign);
+  const repeat = vi.fn(async () => {
+    throw new Error("no repeated observations");
+  });
+  expect(await reconcileStoppedReloadCleanup(f.input, repeat, gone, repeat)).toEqual(result);
+  expect(repeat).not.toHaveBeenCalled();
+});
+test.each(["unmatched orphan", "protected marker", "native handle", "new child", "PID reuse"])(
+  "v3 refuses %s without settling the receipt",
+  async (kind) => {
+    const f = await foreignFixture();
+    let calls = 0;
+    const observe = async () => {
+      calls++;
+      if (kind === "unmatched orphan")
+        return [...f.rows, { pid: 40, ppid: 1, worker: false, providerWriter: true }];
+      if (kind === "protected marker")
+        return [f.rows[0]!, { ...f.rows[1]!, agentId: f.input.agentId }];
+      if (kind === "native handle")
+        return [
+          f.rows[0]!,
+          { ...f.rows[1]!, nativeSessionIds: [f.foreign.protectedAgentRecord.nativeSessionId] },
+        ];
+      if (kind === "new child" && calls > 1)
+        return [...f.rows, { pid: 12, ppid: 11, worker: false, providerWriter: true }];
+      return f.rows;
+    };
+    const verify = async () => {
+      const actual = structuredClone(f.foreign);
+      if (kind === "PID reuse") actual.processes[1]!.startedAtUsec = "999";
+      return actual;
+    };
+    await expect(reconcileStoppedReloadCleanup(f.input, observe, gone, verify)).rejects.toThrow();
+    expect(await readFile(f.file, "utf8")).toBe(f.bytes);
+  },
+);
 test("offline recovery preserves original intent and records failure, never fabricated completion or continuation", async () => {
   const f = await fixture();
   const observe = vi.fn(async () => []);

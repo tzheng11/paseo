@@ -7,6 +7,12 @@ import { AgentReloadOperationSchema, type AgentReloadOperation } from "@getpaseo
 import { z } from "zod";
 import { acquirePidLock, releasePidLock } from "../pid-lock.js";
 import { writeJsonFileAtomic } from "../atomic-file.js";
+import {
+  assertForeignCleanupOwnership,
+  foreignCleanupOwnershipSchema,
+  observeForeignCleanupOwnership,
+  type ForeignCleanupOwnership,
+} from "./reload-process-ownership.js";
 
 const execute = promisify(execFile);
 export interface CleanupRecoveryInput {
@@ -23,6 +29,7 @@ export interface CleanupProcess {
   agentId?: string;
   worker: boolean;
   providerWriter: boolean;
+  nativeSessionIds?: string[];
 }
 
 /** Raw command/environment text never leaves this parser or enters evidence/logs. */
@@ -40,13 +47,16 @@ export function parseCleanupProcessCensus(
       const markers = [...command.matchAll(/(?:^|\s)PASEO_AGENT_ID=([^\s]+)/g)].map((m) => m[1]!);
       if (new Set(markers).size > 1) throw new Error("Conflicting process ownership markers");
       const agentId = markers[0];
+      const nativeSessionIds = [
+        ...command.matchAll(/(?:--session-id|--resume)\s+([0-9a-f-]{36})(?:\s|$)/g),
+      ].map((m) => m[1]!);
       const executable = command.split(/\s/, 1)[0]!;
       const provider =
         /(?:^|[/])(?:codex|claude)$/.test(executable) ||
         /[/](?:claude[/]versions[/]|(?:@anthropic-ai[/]claude-code|@openai[/]codex)[/])/.test(
           command,
         );
-      return {
+      const row: CleanupProcess = {
         pid: Number(match[1]),
         ppid: Number(match[2]),
         agentId,
@@ -58,6 +68,8 @@ export function parseCleanupProcessCensus(
         providerWriter:
           provider || wrapperPaths.some((path) => command.split(/\s+/).includes(path)),
       };
+      if (nativeSessionIds.length) row.nativeSessionIds = nativeSessionIds;
+      return row;
     });
 }
 
@@ -134,6 +146,12 @@ const launchContractSchema = z.discriminatedUnion("version", [
     version: z.literal(2),
     inspectedWrappers: z.array(wrapperSchema).min(1).max(16),
   }),
+  z.object({
+    ...inspectionFields,
+    version: z.literal(3),
+    inspectedWrappers: z.array(wrapperSchema).max(16),
+    foreignOwnership: foreignCleanupOwnershipSchema,
+  }),
 ]);
 type LaunchContract = z.infer<typeof launchContractSchema>;
 interface WrapperFile {
@@ -199,7 +217,7 @@ async function verifyWrapperFilesUnchanged(files: WrapperFile[]): Promise<void> 
   }
 }
 
-async function readLaunchContract(input: CleanupRecoveryInput) {
+async function readLaunchContract(input: CleanupObservationInput) {
   const launchContractBytes = await readFile(input.launchContractFile, "utf8");
   const parsed = launchContractSchema.safeParse(JSON.parse(launchContractBytes));
   if (!parsed.success)
@@ -216,12 +234,81 @@ async function readLaunchContract(input: CleanupRecoveryInput) {
   return { launchContractBytes, launchContract, configBytes, wrapperFiles };
 }
 
-async function reconcileStoppedReloadCleanupInternal(
+type CleanupObservationInput = Omit<CleanupRecoveryInput, "retiredWorkerPid">;
+type ObserveForeign = (
+  input: CleanupObservationInput,
+  frozen: ForeignCleanupOwnership,
+  rows: CleanupProcess[],
+) => Promise<ForeignCleanupOwnership>;
+const observeForeign: ObserveForeign = (input, frozen, rows) =>
+  observeForeignCleanupOwnership(
+    input,
+    frozen.owners,
+    frozen.protectedAgentRecord.path,
+    frozen.protectedFiles.map((f) => f.path),
+    rows,
+  );
+
+async function checkedCensus(
+  input: CleanupObservationInput,
+  contract: LaunchContract,
+  observe: (paths: readonly string[]) => Promise<CleanupProcess[]>,
+  verifyForeign: ObserveForeign,
+): Promise<{ rows: CleanupProcess[]; foreignPids: number[] }> {
+  const paths = (contract.inspectedWrappers ?? []).map((w) => w.path);
+  const rows = await observe(paths);
+  if (contract.version !== 3) return { rows, foreignPids: [] };
+  const actual = await verifyForeign(input, contract.foreignOwnership, rows);
+  const foreign = assertForeignCleanupOwnership(contract.foreignOwnership, actual, rows, input);
+  // Signature/home/file checks can be slow. Re-enumerate the complete process set
+  // afterwards, rather than combining an old forest with newer anchor facts.
+  const current = await observe(paths);
+  assertForeignCleanupOwnership(contract.foreignOwnership, actual, current, input);
+  const confirmed = await verifyForeign(input, contract.foreignOwnership, current);
+  assertForeignCleanupOwnership(contract.foreignOwnership, confirmed, current, input);
+  const final = await observe(paths);
+  assertForeignCleanupOwnership(contract.foreignOwnership, confirmed, final, input);
+  return { rows: final, foreignPids: [...foreign] };
+}
+
+/** Pure shared predicate for the operator's preflight, drain and rollback. */
+export async function readInspectedCleanupCensus(
+  input: CleanupObservationInput,
+): Promise<{ rows: CleanupProcess[]; foreignPids: number[] }> {
+  const { launchContract } = await readLaunchContract(input);
+  return checkedCensus(
+    input,
+    launchContract,
+    (paths) => readCleanupProcessCensus(undefined, paths),
+    observeForeign,
+  );
+}
+
+function assertInspectedCensus(
+  snapshot: { rows: CleanupProcess[]; foreignPids: number[] },
   input: CleanupRecoveryInput,
-  observe: (wrapperPaths: readonly string[]) => Promise<CleanupProcess[]> = (paths) =>
-    readCleanupProcessCensus(undefined, paths),
-  verifyRetired: (pid: number) => void = assertGone,
-): Promise<AgentReloadOperation> {
+  contract: LaunchContract,
+): void {
+  const nativeId =
+    contract.version === 3
+      ? contract.foreignOwnership.protectedAgentRecord.nativeSessionId
+      : undefined;
+  const foreign = new Set(snapshot.foreignPids);
+  // Exact target markers always win, even inside a positively foreign tree.
+  for (const row of snapshot.rows) {
+    if (
+      contract.version === 3 &&
+      (row.agentId === input.agentId || (nativeId && row.nativeSessionIds?.includes(nativeId)))
+    )
+      throw new Error("Protected agent/session writer remains; cleanup is unconfirmed");
+  }
+  assertCleanupCensus(
+    snapshot.rows.filter((row) => !foreign.has(row.pid)),
+    input.agentId,
+  );
+}
+
+function validateRecoveryInput(input: CleanupRecoveryInput): void {
   if (
     !Number.isInteger(input.retiredWorkerPid) ||
     input.retiredWorkerPid <= 1 ||
@@ -230,6 +317,16 @@ async function reconcileStoppedReloadCleanupInternal(
     throw new Error("A captured retired worker PID is required");
   if (!/^[a-f0-9]{64}$/.test(input.expectedReceiptSha256))
     throw new Error("Expected original receipt SHA256 is required");
+}
+
+async function reconcileStoppedReloadCleanupInternal(
+  input: CleanupRecoveryInput,
+  observe: (wrapperPaths: readonly string[]) => Promise<CleanupProcess[]> = (paths) =>
+    readCleanupProcessCensus(undefined, paths),
+  verifyRetired: (pid: number) => void = assertGone,
+  verifyForeign: ObserveForeign = observeForeign,
+): Promise<AgentReloadOperation> {
+  validateRecoveryInput(input);
   await acquirePidLock(input.home, null);
   try {
     const { launchContractBytes, launchContract, configBytes, wrapperFiles } =
@@ -260,11 +357,12 @@ async function reconcileStoppedReloadCleanupInternal(
         "Only an unknown cleanup receipt can be reconciled; continuation/startup uncertainty is retained",
       );
     verifyRetired(input.retiredWorkerPid);
-    const wrapperPaths = wrapperFiles.map((entry) => entry.path);
-    const before = await observe(wrapperPaths);
-    assertCleanupCensus(before, input.agentId);
-    const after = await observe(wrapperPaths);
-    assertCleanupCensus(after, input.agentId);
+    const first = await checkedCensus(input, launchContract, observe, verifyForeign);
+    assertInspectedCensus(first, input, launchContract);
+    const second = await checkedCensus(input, launchContract, observe, verifyForeign);
+    assertInspectedCensus(second, input, launchContract);
+    const before = first.rows;
+    const after = second.rows;
     verifyRetired(input.retiredWorkerPid);
     if ((await readFile(file, "utf8")) !== originalBytes)
       throw new Error("Reload receipt changed during verification");
@@ -295,6 +393,7 @@ async function reconcileStoppedReloadCleanupInternal(
       after,
       launchContract,
       launchContractSha256: sha256(launchContractBytes),
+      ...(launchContract.version === 3 ? { foreignPids: second.foreignPids } : {}),
     });
     await writeJsonFileAtomic(file, result);
     return result;
@@ -308,12 +407,18 @@ export async function reconcileStoppedReloadCleanup(
   input: CleanupRecoveryInput,
   observe?: (wrapperPaths: readonly string[]) => Promise<CleanupProcess[]>,
   verifyRetired?: (pid: number) => void,
+  verifyForeign?: ObserveForeign,
 ): Promise<AgentReloadOperation> {
   if (recoveryHomes.has(input.home))
     throw new Error("Cleanup reconciliation is already in progress for this home");
   recoveryHomes.add(input.home);
   try {
-    return await reconcileStoppedReloadCleanupInternal(input, observe, verifyRetired);
+    return await reconcileStoppedReloadCleanupInternal(
+      input,
+      observe,
+      verifyRetired,
+      verifyForeign,
+    );
   } finally {
     recoveryHomes.delete(input.home);
   }

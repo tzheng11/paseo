@@ -167,6 +167,11 @@ The inspection covers the incident's launch paths, including prior overrides. Bo
 their detached native children must be absent. Older utilities reject version 2 instead of
 ignoring its wrapper evidence. macOS is currently required. A live daemon, worker, provider root
 or proxy, incomplete census, changed source/receipt or unsupported uncertainty refuses settlement.
+Version 3 permits verified unrelated signed-app or separate-daemon forests through the
+[historical ownership inspection](../docs/agent-lifecycle.md#offline-cleanup-reconciliation).
+Its frozen OS evidence is rechecked by the same predicate in preflight, drain, settlement and
+rollback; it does not waive historical writer retirement or certify future session exclusivity.
+Earlier utilities reject version 3.
 The original UUID and credential-generation/time are preserved. The terminal result is
 `failed` with `retryable: true` and `RELOAD_CLEANUP_RECONCILED`, never a fabricated `completed`.
 A sidecar evidence file makes repeated reconciliation idempotent. Restart the matched daemon
