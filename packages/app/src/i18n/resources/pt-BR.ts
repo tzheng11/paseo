@@ -1225,6 +1225,15 @@ export const ptBR: TranslationResources = {
       alphabetical: "A–Z",
       activity: "Última atividade",
     },
+    superpinned: {
+      stateConfirmed: "Estado do espaço de trabalho confirmado.",
+      checkState: "Resultado desconhecido. Verificar estado",
+      title: "Fixados prioritários",
+      action: "Fixar com prioridade",
+      remove: "Remover prioridade",
+      outcomeUnknown:
+        "Resultado desconhecido. Confirmando o estado do espaço de trabalho antes de outra alteração.",
+    },
     pinned: {
       title: "Fixados",
       sort: {

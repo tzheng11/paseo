@@ -55,6 +55,8 @@ export interface WorkspaceCommandCenterLabels {
   copyBranchName: string;
   pin: string;
   unpin: string;
+  superpin: string;
+  removeSuperpin: string;
   showSetup: string;
   labelsGroup: string;
 }
@@ -124,6 +126,8 @@ export interface WorkspaceCommandCenterSource {
   /** Null on a non-git workspace, or before gitRuntime resolves. Omits Copy branch name. */
   currentBranch: string | null;
   isPinned: boolean;
+  pinDisabled?: boolean;
+  superpin?: { isSuperpinned: boolean; disabled: boolean; run(): void };
   /**
    * The host's label catalog, each entry told whether the current workspace carries it. Null
    * before the catalog has loaded — omits the whole group rather than showing it empty.
@@ -588,8 +592,8 @@ export function buildWorkspaceCommandCenterContributions(
   }
 
   if (source.capabilities.canPin) {
-    contributions.push(
-      buildWorkspaceAction({
+    contributions.push({
+      ...buildWorkspaceAction({
         source,
         id: "workspace:pin",
         rank: 20,
@@ -600,7 +604,29 @@ export function buildWorkspaceCommandCenterContributions(
         action: { id: "workspace.pin", scope: "sidebar" },
         visibility: "always",
       }),
-    );
+      disabled: source.pinDisabled,
+    });
+  }
+
+  if (source.superpin) {
+    contributions.push({
+      id: "workspace:superpin",
+      group: "workspace",
+      groupRank: -1,
+      rank: 20.5,
+      keywords: ["superpin", "priority", "remove superpin"],
+      visibility: "always",
+      disabled: source.superpin.disabled,
+      run: source.superpin.run,
+      presentation: {
+        kind: "action",
+        title: source.superpin.isSuperpinned
+          ? source.labels.removeSuperpin
+          : source.labels.superpin,
+        sectionTitle: source.labels.section,
+        icon: source.icons.pin,
+      },
+    });
   }
 
   contributions.push(

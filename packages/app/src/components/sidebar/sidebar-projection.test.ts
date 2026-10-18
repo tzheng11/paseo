@@ -78,6 +78,7 @@ function projectionInput(options?: {
     projects: [makeProject([pinned.placement, unpinned.placement])],
     pinnedKeys: {
       pinnedWorkspaceKeys: [pinned.placement.workspaceKey],
+      superpinnedAtByKey: {},
       pinnedAtByKey: { [pinned.placement.workspaceKey]: "2026-07-12T12:00:00.000Z" },
     },
     pinnedWorkspaceOrder: [],
@@ -104,7 +105,7 @@ function twoProjectInput(groupMode: "project" | "status") {
   return {
     ...projectionInput({ groupMode }),
     projects: [makeProject([first.placement]), makeProject([second.placement], "other-project")],
-    pinnedKeys: { pinnedWorkspaceKeys: [], pinnedAtByKey: {} },
+    pinnedKeys: { pinnedWorkspaceKeys: [], superpinnedAtByKey: {}, pinnedAtByKey: {} },
     workspaceEntriesByKey: new Map([
       [first.entry.workspaceKey, first.entry],
       [second.entry.workspaceKey, second.entry],
@@ -128,6 +129,7 @@ describe("buildSidebarProjection", () => {
         projects: [makeProject(workspaces.map((workspace) => workspace.placement))],
         pinnedKeys: {
           pinnedWorkspaceKeys: workspaces.map((workspace) => workspace.placement.workspaceKey),
+          superpinnedAtByKey: {},
           pinnedAtByKey: {},
         },
         pinnedWorkspaceOrder: workspaces.map((workspace) => workspace.placement.workspaceKey),
@@ -170,6 +172,7 @@ describe("buildSidebarProjection", () => {
       projects: [makeProject([first.placement, second.placement])],
       pinnedKeys: {
         pinnedWorkspaceKeys: [first.placement.workspaceKey, second.placement.workspaceKey],
+        superpinnedAtByKey: {},
         pinnedAtByKey: {},
       },
       workspaceEntriesByKey: new Map(
@@ -243,7 +246,7 @@ describe("buildSidebarProjection", () => {
     const input = {
       ...projectionInput(),
       projects: [makeProject([first.placement, second.placement])],
-      pinnedKeys: { pinnedWorkspaceKeys: [], pinnedAtByKey: {} },
+      pinnedKeys: { pinnedWorkspaceKeys: [], superpinnedAtByKey: {}, pinnedAtByKey: {} },
       workspaceEntriesByKey: new Map(
         [first, second].map(({ entry }) => [entry.workspaceKey, entry]),
       ),
@@ -279,6 +282,7 @@ describe("buildSidebarProjection", () => {
           pinnedOlder.placement.workspaceKey,
           pinnedNewer.placement.workspaceKey,
         ],
+        superpinnedAtByKey: {},
         pinnedAtByKey: {},
       },
       workspaceEntriesByKey: new Map(workspaces.map(({ entry }) => [entry.workspaceKey, entry])),
@@ -374,3 +378,31 @@ describe("buildSidebarProjection", () => {
     ]);
   });
 });
+
+it.each(["project", "status"] as const)(
+  "3fdb71dd7bc781c9964de0b6101b4e61@e93b9847d6fd#status-list projects one priority row before ordinary pins in %s mode",
+  (groupMode) => {
+    const input = projectionInput({ groupMode });
+    const priority = makeWorkspace("priority", "running");
+    priority.entry.pinnedAt = "2026-10-18T21:00:00Z";
+    priority.entry.superpinnedAt = "2026-10-18T22:00:00Z";
+    input.projects[0]!.workspaces.push(priority.placement);
+    input.workspaceEntriesByKey.set(priority.entry.workspaceKey, priority.entry);
+    input.pinnedKeys.pinnedWorkspaceKeys.push(priority.entry.workspaceKey);
+    input.pinnedKeys.superpinnedAtByKey = {
+      [priority.entry.workspaceKey]: priority.entry.superpinnedAt,
+    };
+    const projected = buildSidebarProjection(input);
+    expect(workspaceIds(projected.pinnedGroups.superpinnedChats)).toEqual(["priority"]);
+    expect(workspaceIds(projected.pinnedGroups.pinnedChats)).toEqual(["pinned"]);
+    expect(
+      projected.pinnedGroups.unpinnedProjects.flatMap((p) => workspaceIds(p.workspaces)),
+    ).toEqual(["unpinned"]);
+    expect(
+      projected.workspaceGroups.flatMap((g) => g.rows).filter((w) => w.workspaceId === "priority"),
+    ).toEqual([]);
+    expect(input.workspaceEntriesByKey.get(priority.entry.workspaceKey)?.superpinnedAt).toBe(
+      "2026-10-18T22:00:00Z",
+    );
+  },
+);

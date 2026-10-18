@@ -115,6 +115,7 @@ function statusWorkspaceKeyExtractor(workspace: SidebarWorkspaceEntry): string {
 interface StatusWorkspaceListProps {
   groups: SidebarWorkspaceGroup[];
   pinnedWorkspaces: SidebarWorkspaceEntry[];
+  superpinnedWorkspaces: SidebarWorkspaceEntry[];
   projectIconByProjectViewKey: ReadonlyMap<string, string | null>;
   shortcutIndexByWorkspaceKey: Map<string, number>;
   showShortcutBadges: boolean;
@@ -133,6 +134,7 @@ interface StatusWorkspaceListProps {
 export function SidebarStatusWorkspaceList({
   groups,
   pinnedWorkspaces,
+  superpinnedWorkspaces,
   projectIconByProjectViewKey,
   shortcutIndexByWorkspaceKey,
   showShortcutBadges,
@@ -146,6 +148,17 @@ export function SidebarStatusWorkspaceList({
   parentGestureRef,
   dragGestureHostActive,
 }: StatusWorkspaceListProps) {
+  const { t } = useTranslation();
+  const superpinnedCollapsed = useSidebarCollapsedSectionsStore((state) =>
+    state.collapsedWorkspaceGroupKeys.has("section:superpinned"),
+  );
+  const toggleWorkspaceGroupCollapsed = useSidebarCollapsedSectionsStore(
+    (state) => state.toggleWorkspaceGroupCollapsed,
+  );
+  const toggleSuperpinnedCollapsed = useCallback(
+    () => toggleWorkspaceGroupCollapsed("section:superpinned"),
+    [toggleWorkspaceGroupCollapsed],
+  );
   const collapsedWorkspaceGroupKeys = useSidebarCollapsedSectionsStore(
     (state) => state.collapsedWorkspaceGroupKeys,
   );
@@ -169,7 +182,7 @@ export function SidebarStatusWorkspaceList({
       drag,
       isActive,
       dragHandleProps,
-    }: DraggableRenderItemInfo<SidebarWorkspaceEntry>) => (
+    }: Omit<DraggableRenderItemInfo<SidebarWorkspaceEntry>, "drag"> & { drag?: () => void }) => (
       <StatusWorkspaceRow
         workspace={workspace}
         {...buildStatusRowProjectPresentation({
@@ -200,6 +213,26 @@ export function SidebarStatusWorkspaceList({
   );
   const content = (
     <>
+      {superpinnedWorkspaces.length > 0 ? (
+        <View style={styles.pinnedSection} testID="sidebar-superpinned-section">
+          <PinnedSectionHeader
+            title={t("sidebar.superpinned.title")}
+            testID="sidebar-superpinned-section-header"
+            sortable={false}
+            collapsed={superpinnedCollapsed}
+            onToggle={toggleSuperpinnedCollapsed}
+          />
+          {superpinnedCollapsed ? null : (
+            <View testID="sidebar-superpinned-list">
+              {superpinnedWorkspaces.map((item, index) => (
+                <View key={item.workspaceKey}>
+                  {renderPinnedWorkspace({ item, index, isActive: false })}
+                </View>
+              ))}
+            </View>
+          )}
+        </View>
+      ) : null}
       {pinnedWorkspaces.length > 0 ? (
         <View style={styles.pinnedSection} testID="sidebar-pinned-section">
           <PinnedSectionHeader collapsed={pinnedCollapsed} onToggle={togglePinnedCollapsed} />

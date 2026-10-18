@@ -1227,6 +1227,15 @@ export const fr: TranslationResources = {
       alphabetical: "A–Z",
       activity: "Dernière activité",
     },
+    superpinned: {
+      stateConfirmed: "État de l’espace de travail confirmé.",
+      checkState: "Résultat inconnu. Vérifier l’état",
+      title: "Épinglés prioritaires",
+      action: "Épingler en priorité",
+      remove: "Retirer la priorité",
+      outcomeUnknown:
+        "Résultat inconnu. Vérification de l’état de l’espace de travail avant une autre modification.",
+    },
     pinned: {
       title: "Épinglés",
       sort: {

@@ -30,6 +30,7 @@ export function useGlobalWorkspacePinAction() {
   const fields = useWorkspaceFields(serverId, routeWorkspaceId, (workspace) => ({
     id: workspace.id,
     pinnedAt: workspace.pinnedAt ?? null,
+    superpinnedAt: workspace.superpinnedAt ?? null,
   }));
   const canPin = useHostFeature(serverId, "workspacePinning");
   const togglePin = useSidebarWorkspacePinController();
@@ -50,6 +51,7 @@ export function useGlobalWorkspacePinAction() {
       workspaceId: fields.id,
       workspaceKey,
       pinnedAt: fields.pinnedAt,
+      superpinnedAt: fields.superpinnedAt,
     });
     return true;
   }, [canPin, fields, serverId, togglePin]);

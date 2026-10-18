@@ -309,6 +309,7 @@ const StoredWorkspaceSchema = z.strictObject({
   name: z.string(),
   title: z.string().nullable(),
   pinnedAt: z.string().nullable(),
+  superpinnedAt: z.string().nullable().optional(),
   // Optional because entries written before labels existed have none. A cached workspace that
   // dropped them painted its row without its chips and stayed that way: the directory cursor is
   // current on reconnect, so the daemon has nothing newer to send back.
@@ -383,12 +384,12 @@ const DirectoryCheckpointSchema = z.strictObject({
 // Revalidate directory contents once without evicting cached rows or timelines.
 const StoredDirectoryCheckpointSchema = z.strictObject({
   version: z.literal(1),
-  workspaceFieldsVersion: z.literal(1).optional(),
+  workspaceFieldsVersion: z.union([z.literal(1), z.literal(2)]).optional(),
   cursors: DirectoryCheckpointSchema,
 });
 
 function serializeDirectoryCheckpoint(cursors: DirectoryCheckpoint) {
-  return { version: 1 as const, workspaceFieldsVersion: 1 as const, cursors };
+  return { version: 1 as const, workspaceFieldsVersion: 2 as const, cursors };
 }
 
 function deserializeDirectoryCheckpoint(payload: string): DirectoryCheckpoint {
@@ -397,7 +398,8 @@ function deserializeDirectoryCheckpoint(payload: string): DirectoryCheckpoint {
   // COMPAT(workspaceFieldCache): added in v0.11.3; remove after 2027-04-15.
   // Earlier workspace rows omitted Info values. Refresh that baseline even when
   // its cursor is current, preserving other cached directories and timelines.
-  if (stored.workspaceFieldsVersion === undefined) delete cursors.workspaces;
+  // COMPAT(workspaceSuperpinCache): older rows omitted superpinnedAt while their cursor stayed current.
+  if (stored.workspaceFieldsVersion !== 2) delete cursors.workspaces;
   return cursors;
 }
 
@@ -709,6 +711,7 @@ function serializeWorkspace(workspace: WorkspaceDescriptor): StoredWorkspace {
     name: workspace.name,
     title: workspace.title ?? null,
     pinnedAt: workspace.pinnedAt ?? null,
+    superpinnedAt: workspace.superpinnedAt ?? null,
     labels: workspace.labels,
     fieldValues: workspace.fieldValues ?? {},
     status: workspace.status,

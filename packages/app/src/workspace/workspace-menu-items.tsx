@@ -1,4 +1,10 @@
-import { useMemo, type ComponentProps, type PropsWithChildren, type ReactNode } from "react";
+import {
+  useCallback,
+  useMemo,
+  type ComponentProps,
+  type PropsWithChildren,
+  type ReactNode,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { withUnistyles } from "react-native-unistyles";
 import { Archive, Circle, CircleCheck, Copy, Pencil, Pin, PinOff, Tag } from "lucide-react-native";
@@ -9,6 +15,14 @@ import { ContextMenuItem } from "@/components/ui/context-menu";
 import { Shortcut } from "@/components/ui/shortcut";
 import { OpenInFileManagerMenuItem } from "@/workspace/open-in-file-manager/menu-item";
 import { WORKSPACE_LABEL_PAGE_ID } from "@/workspace-labels/picker";
+
+import {
+  useSidebarWorkspaceSuperpinController,
+  useWorkspacePinPending,
+} from "@/hooks/use-sidebar-workspace-pin";
+import { useHostFeatureAvailability } from "@/runtime/host-features";
+import { useHostRuntimeIsConnected } from "@/runtime/host-runtime";
+import { useWorkspaceFields } from "@/stores/session-store-hooks";
 
 const foregroundMutedColorMapping = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
 const ThemedCopy = withUnistyles(Copy);
@@ -87,6 +101,7 @@ export function WorkspaceMenuItems({
   openInFileManagerPath,
 }: WorkspaceMenuItemsProps & { surface: MenuSurface }): ReactNode {
   const { t } = useTranslation();
+  const pinPending = useWorkspacePinPending(workspaceKey);
   const archiveTrailing = useMemo(
     () => (archiveShortcutKeys ? <Shortcut chord={archiveShortcutKeys} /> : null),
     [archiveShortcutKeys],
@@ -154,9 +169,20 @@ export function WorkspaceMenuItems({
           testID={`${testIDPrefix}-pin-${workspaceKey}`}
           leading={isPinned ? unpinLeadingIcon : pinLeadingIcon}
           onSelect={onTogglePin}
+          disabled={pinPending}
+          status={pinPending ? "pending" : "idle"}
         >
           {isPinned ? t("sidebar.workspace.actions.unpin") : t("sidebar.workspace.actions.pin")}
         </WorkspaceMenuItem>
+      ) : null}
+      {serverId && workspaceId ? (
+        <WorkspaceSuperpinMenuItem
+          surface={surface}
+          serverId={serverId}
+          workspaceId={workspaceId}
+          workspaceKey={workspaceKey}
+          testIDPrefix={testIDPrefix}
+        />
       ) : null}
       {serverId && workspaceId ? (
         <DropdownMenuSubTrigger
@@ -186,5 +212,53 @@ export function WorkspaceMenuItems({
         </WorkspaceMenuItem>
       ) : null}
     </>
+  );
+}
+
+function WorkspaceSuperpinMenuItem({
+  surface,
+  serverId,
+  workspaceId,
+  workspaceKey,
+  testIDPrefix,
+}: {
+  surface: MenuSurface;
+  serverId: string;
+  workspaceId: string;
+  workspaceKey: string;
+  testIDPrefix: string;
+}) {
+  const { t } = useTranslation();
+  const canSuperpin = useHostFeatureAvailability(serverId, "workspaceSuperpinning");
+  const connected = useHostRuntimeIsConnected(serverId);
+  const pending = useWorkspacePinPending(workspaceKey);
+  const fields = useWorkspaceFields(serverId, workspaceId, (workspace) => ({
+    id: workspace.id,
+    pinnedAt: workspace.pinnedAt ?? null,
+    superpinnedAt: workspace.superpinnedAt ?? null,
+  }));
+  const toggle = useSidebarWorkspaceSuperpinController();
+  const onSelect = useCallback(() => {
+    if (fields)
+      toggle({
+        serverId,
+        workspaceId: fields.id,
+        workspaceKey,
+        pinnedAt: fields.pinnedAt,
+        superpinnedAt: fields.superpinnedAt,
+      });
+  }, [fields, serverId, workspaceKey, toggle]);
+  if (canSuperpin === false || !fields) return null;
+  return (
+    <WorkspaceMenuItem
+      surface={surface}
+      testID={`${testIDPrefix}-superpin-${workspaceKey}`}
+      leading={pinLeadingIcon}
+      disabled={!connected || canSuperpin !== true || pending}
+      status={pending ? "pending" : "idle"}
+      onSelect={onSelect}
+    >
+      {fields.superpinnedAt ? t("sidebar.superpinned.remove") : t("sidebar.superpinned.action")}
+    </WorkspaceMenuItem>
   );
 }

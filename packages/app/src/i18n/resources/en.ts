@@ -1207,6 +1207,14 @@ export const en = {
       alphabetical: "A–Z",
       activity: "Last Activity",
     },
+    superpinned: {
+      stateConfirmed: "Workspace state confirmed.",
+      checkState: "Outcome unknown. Check workspace state",
+      title: "Superpinned",
+      action: "Superpin",
+      remove: "Remove superpin",
+      outcomeUnknown: "Outcome unknown. Confirming workspace state before another change.",
+    },
     pinned: {
       title: "Pinned",
       sort: {

@@ -33,7 +33,12 @@ import { useWorkspaceClipboardActions } from "@/hooks/use-workspace-clipboard-ac
 import { useToast } from "@/contexts/toast-context";
 import { type ShortcutOverrides } from "@/keyboard/keyboard-shortcuts";
 import { useKeyboardActionDispatcher } from "@/keyboard/keyboard-action-dispatcher-context";
-import { useHostFeature } from "@/runtime/host-features";
+import {
+  useSidebarWorkspaceSuperpinController,
+  useWorkspacePinPending,
+} from "@/hooks/use-sidebar-workspace-pin";
+import { useHostRuntimeIsConnected } from "@/runtime/host-runtime";
+import { useHostFeature, useHostFeatureAvailability } from "@/runtime/host-features";
 import { useActiveWorkspaceSelection } from "@/stores/navigation-active-workspace-store";
 import { useWorkspaceDirectory, useWorkspaceFields } from "@/stores/session-store-hooks";
 import {
@@ -59,6 +64,7 @@ import {
   buildWorkspaceCommandCenterContributions,
   type WorkspaceCommandCenterLabelChoice,
   type WorkspaceCommandCenterShortcuts,
+  type WorkspaceCommandCenterSource,
 } from "./workspace-contributions";
 import { resolveWorkspaceCommandCenterShortcuts } from "./workspace-shortcuts";
 
@@ -188,6 +194,7 @@ export function useWorkspaceCommandCenterActions(): void {
     workspaceDirectory: workspace.workspaceDirectory ?? null,
     currentBranch: workspace.gitRuntime?.currentBranch ?? null,
     pinnedAt: workspace.pinnedAt ?? null,
+    superpinnedAt: workspace.superpinnedAt ?? null,
     labels: workspace.labels ?? [],
   }));
   const cwd = useWorkspaceDirectory(serverId, workspaceId);
@@ -195,6 +202,7 @@ export function useWorkspaceCommandCenterActions(): void {
   const isPinned = fields?.pinnedAt != null;
   const isCompact = useIsCompactFormFactor();
   const canPin = useHostFeature(serverId, "workspacePinning");
+  const pinCommand = useWorkspaceSuperpinCommand(serverId, workspaceKey, fields);
   const persistenceKey =
     serverId && fields
       ? buildWorkspaceTabPersistenceKey({ serverId, workspaceId: fields.id })
@@ -275,6 +283,8 @@ export function useWorkspaceCommandCenterActions(): void {
           copyBranchName: t("workspace.header.actions.copyBranchName"),
           pin: t("sidebar.workspace.actions.pin"),
           unpin: t("sidebar.workspace.actions.unpin"),
+          superpin: t("sidebar.superpinned.action"),
+          removeSuperpin: t("sidebar.superpinned.remove"),
           showSetup: t("workspace.header.actions.showSetup"),
           labelsGroup: t("workspaceLabels.title"),
         },
@@ -295,6 +305,7 @@ export function useWorkspaceCommandCenterActions(): void {
         activeTabCount: focusedTabs.length,
         currentBranch,
         isPinned,
+        ...pinCommand,
         labelCatalog,
         dispatch: (action) => {
           clearCommandCenterFocusRestoreElement();
@@ -309,6 +320,7 @@ export function useWorkspaceCommandCenterActions(): void {
       activeTabIndex,
       activeTabKind,
       canPin,
+      pinCommand,
       canShowSetup,
       copyBranchName,
       copyPath,
@@ -337,4 +349,44 @@ export function useWorkspaceCommandCenterActions(): void {
 export function CommandCenterWorkspaceActions() {
   useWorkspaceCommandCenterActions();
   return null;
+}
+
+interface WorkspacePinCommandFields {
+  id: string;
+  pinnedAt: string | null;
+  superpinnedAt: string | null;
+}
+function useWorkspaceSuperpinCommand(
+  serverId: string | null,
+  workspaceKey: string | null,
+  fields: WorkspacePinCommandFields | null,
+): Pick<WorkspaceCommandCenterSource, "pinDisabled" | "superpin"> {
+  const capable = useHostFeatureAvailability(serverId, "workspaceSuperpinning");
+  const connected = useHostRuntimeIsConnected(serverId ?? "");
+  const pending = useWorkspacePinPending(workspaceKey ?? "");
+  const toggle = useSidebarWorkspaceSuperpinController();
+  const run = useCallback(() => {
+    if (!serverId || !fields || !connected || !capable || pending) return;
+    toggle({
+      serverId,
+      workspaceId: fields.id,
+      workspaceKey: `${serverId}:${fields.id}`,
+      pinnedAt: fields.pinnedAt,
+      superpinnedAt: fields.superpinnedAt,
+    });
+  }, [serverId, fields, connected, capable, pending, toggle]);
+  return useMemo(
+    () => ({
+      pinDisabled: !connected || pending,
+      superpin:
+        capable !== false
+          ? {
+              isSuperpinned: fields?.superpinnedAt != null,
+              disabled: !connected || capable !== true || pending,
+              run,
+            }
+          : undefined,
+    }),
+    [connected, pending, capable, fields?.superpinnedAt, run],
+  );
 }

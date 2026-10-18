@@ -276,3 +276,37 @@ test.describe("Pin workspace shortcut", () => {
     }
   });
 });
+
+// Global shortcuts are intentionally available only on non-compact web.
+for (const viewport of [{ width: 1440, height: 900 }]) {
+  test.describe(`${viewport.width}px Superpinned shortcut`, () => {
+    test.use({ viewport });
+    test("3fdb71dd-7bc7-816a-bca8-cefc13498226@2467ee223467#global-pin-shortcut clears both states and returns one row to its project", async ({
+      page,
+    }) => {
+      const seed = await seedWorkspace({ repoPrefix: "superpin-shortcut-" });
+      try {
+        await seed.client.setWorkspaceSuperpinned(seed.workspaceId, true);
+        await gotoAppShell(page);
+        await expect(page.getByTestId("sidebar-superpinned-section")).toBeVisible({
+          timeout: 30_000,
+        });
+        await openWorkspace(page, seed.workspaceId);
+        await page.keyboard.press(PIN_SHORTCUT);
+        await expect.poll(() => readPinFields(seed)).toEqual({ pin: null, superpin: null });
+        await expect(page.getByTestId("sidebar-superpinned-section")).toHaveCount(0);
+        await expect(pinnedSection(page)).toHaveCount(0);
+        await expect(workspaceRow(page, seed.workspaceId)).toHaveCount(1);
+      } finally {
+        await seed.cleanup();
+      }
+    });
+  });
+}
+
+async function readPinFields(seed: SeededWorkspace) {
+  const workspace = (await seed.client.fetchWorkspaces()).entries.find(
+    (w) => w.id === seed.workspaceId,
+  );
+  return { pin: workspace?.pinnedAt, superpin: workspace?.superpinnedAt };
+}

@@ -450,6 +450,41 @@ describe("message submission ordering", () => {
 });
 
 describe("normalizeWorkspaceDescriptor", () => {
+  it.each([null, "2026-10-18T22:00:00.000Z"])(
+    "3fdb71dd7bc781c9964de0b6101b4e61@e93b9847d6fd#cli-store preserves explicit superpin %s in a fresh store read",
+    (superpinnedAt) => {
+      initializeTestSession();
+      const payload: WorkspaceDescriptorPayload = {
+        id: "superpin-workspace",
+        projectId: "p1",
+        projectDisplayName: "Project 1",
+        projectRootPath: "/repo",
+        workspaceDirectory: "/repo",
+        projectKind: "git",
+        workspaceKind: "checkout",
+        name: "main",
+        status: "done",
+        statusEnteredAt: null,
+        activityAt: null,
+        archivingAt: null,
+        diffStat: null,
+        scripts: [],
+        pinnedAt: "2026-10-18T21:00:00.000Z",
+        superpinnedAt,
+      };
+      useSessionStore
+        .getState()
+        .setWorkspaces(
+          "test-server",
+          new Map([[payload.id, normalizeWorkspaceDescriptor(payload)]]),
+        );
+      expect(
+        useSessionStore.getState().sessions["test-server"]?.workspaces.get(payload.id)
+          ?.superpinnedAt,
+      ).toBe(superpinnedAt);
+    },
+  );
+
   it("normalizes workspace scripts and invalid activity timestamps", () => {
     const scripts = [
       {

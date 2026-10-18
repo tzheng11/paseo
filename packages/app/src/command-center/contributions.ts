@@ -14,6 +14,7 @@ interface CommandCenterContributionBase {
   rank: number;
   keywords: readonly string[];
   visibility: "always" | "query";
+  disabled?: boolean;
   run(): void | Promise<void>;
 }
 

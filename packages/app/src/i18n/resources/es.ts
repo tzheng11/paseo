@@ -1235,6 +1235,15 @@ export const es: TranslationResources = {
       alphabetical: "A–Z",
       activity: "Última actividad",
     },
+    superpinned: {
+      stateConfirmed: "Estado del espacio de trabajo confirmado.",
+      checkState: "Resultado desconocido. Comprobar estado",
+      title: "Fijados prioritarios",
+      action: "Fijar con prioridad",
+      remove: "Quitar prioridad",
+      outcomeUnknown:
+        "Resultado desconocido. Confirmando el estado del espacio de trabajo antes de otro cambio.",
+    },
     pinned: {
       title: "Anclados",
       sort: {

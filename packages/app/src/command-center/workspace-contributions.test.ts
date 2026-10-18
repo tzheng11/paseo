@@ -73,6 +73,8 @@ function source(gitActions: GitActions): {
         copyBranchName: "Copy branch name",
         pin: "Pin to top",
         unpin: "Unpin",
+        superpin: "Superpin",
+        removeSuperpin: "Remove superpin",
         showSetup: "Show setup",
         labelsGroup: "Labels",
       },
@@ -387,4 +389,36 @@ describe("workspace command center contributions", () => {
       { name: "urgent", assigned: true },
     ]);
   });
+});
+
+it("3fdb71dd-7bc7-816a-bca8-cefc13498226@2467ee223467#command-center offers the confirmed superpin state without a shortcut", () => {
+  const fixture = source({ primary: null, secondary: [], menu: [] });
+  let calls = 0;
+  fixture.value.superpin = {
+    isSuperpinned: false,
+    disabled: false,
+    run: () => {
+      calls++;
+    },
+  };
+  const command = buildWorkspaceCommandCenterContributions(fixture.value).find(
+    (c) => c.id === "workspace:superpin",
+  )!;
+  expect(command.presentation).toMatchObject({ kind: "action", title: "Superpin" });
+  expect(command.presentation).not.toHaveProperty("shortcutKeys");
+  command.run();
+  expect(calls).toBe(1);
+  fixture.value.superpin.isSuperpinned = true;
+  fixture.value.superpin.disabled = true;
+  const updated = buildWorkspaceCommandCenterContributions(fixture.value).find(
+    (c) => c.id === "workspace:superpin",
+  )!;
+  expect(updated.presentation).toMatchObject({ title: "Remove superpin" });
+  expect(updated.disabled).toBe(true);
+  delete fixture.value.superpin;
+  expect(
+    buildWorkspaceCommandCenterContributions(fixture.value).find(
+      (c) => c.id === "workspace:superpin",
+    ),
+  ).toBeUndefined();
 });
