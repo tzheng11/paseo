@@ -194,6 +194,8 @@ function createProviderWithFakeAppServer(
   internals.goalsEnabledPromise = Promise.resolve(false);
   internals.autoReviewEnabledPromise = Promise.resolve(false);
   internals.spawnAppServer = async () => appServer.child;
+  // This fake app-server never launches an installed Codex binary.
+  vi.spyOn(provider, "isAvailable").mockResolvedValue(true);
   return provider;
 }
 

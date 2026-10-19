@@ -465,7 +465,7 @@ test("credential reload routes durable admission without ordinary history refres
     operationId: "intent",
     preserveHistory: true,
   });
-  expect(reloadAgentCredentials).toHaveBeenCalledWith("agent", "intent");
+  expect(reloadAgentCredentials).toHaveBeenCalledWith("agent", "intent", undefined);
   expect(reloadAgentSession).not.toHaveBeenCalled();
   expect(messages).toContainEqual({
     type: "agent.reload_idle.operation.response",

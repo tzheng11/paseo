@@ -246,6 +246,7 @@ function buildAgentManagerSpies() {
     ),
     getTimelineCount: vi.fn((agentId: string) => timelineStore.getCount(agentId)),
     resumeAgentFromPersistence: vi.fn(),
+    invalidateQuotaRecoveryForMessage: vi.fn().mockResolvedValue(undefined),
     hydrateTimelineFromProvider: vi.fn().mockResolvedValue(undefined),
     appendTimelineItem: vi.fn().mockResolvedValue(undefined),
     emitLiveTimelineItem: vi.fn().mockResolvedValue(undefined),
@@ -4009,6 +4010,10 @@ describe("send_agent_prompt MCP tool", () => {
     const response = await tool.handler(parsed.data as Record<string, unknown>);
 
     expect(spies.agentManager.subscribe).toHaveBeenCalledTimes(1);
+    expect(spies.agentManager.invalidateQuotaRecoveryForMessage).toHaveBeenCalledExactlyOnceWith(
+      "child-agent",
+    );
+    expect(spies.agentManager.streamAgent).toHaveBeenCalledTimes(1);
     expect(spies.agentManager.waitForAgentEvent).not.toHaveBeenCalled();
     expect(response.structuredContent.guidance).toBe(
       "You will get notified when the prompted agent finishes, errors, or needs permission. Do not poll for status; continue with other work until the notification arrives.",
@@ -4049,6 +4054,10 @@ describe("send_agent_prompt MCP tool", () => {
     await tool.handler(parsed.data as Record<string, unknown>);
 
     expect(spies.agentManager.subscribe).not.toHaveBeenCalled();
+    expect(spies.agentManager.invalidateQuotaRecoveryForMessage).toHaveBeenCalledExactlyOnceWith(
+      "child-agent",
+    );
+    expect(spies.agentManager.streamAgent).toHaveBeenCalledTimes(1);
     expect(spies.agentManager.waitForAgentEvent).not.toHaveBeenCalled();
   });
 
@@ -4092,6 +4101,10 @@ describe("send_agent_prompt MCP tool", () => {
     });
 
     expect(spies.agentManager.subscribe).not.toHaveBeenCalled();
+    expect(spies.agentManager.invalidateQuotaRecoveryForMessage).toHaveBeenCalledExactlyOnceWith(
+      "child-agent",
+    );
+    expect(spies.agentManager.streamAgent).toHaveBeenCalledTimes(1);
     expect(spies.agentManager.waitForAgentEvent).not.toHaveBeenCalled();
   });
 
