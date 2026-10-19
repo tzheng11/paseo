@@ -168,7 +168,7 @@ export function toAgentPayload(
   return payload;
 }
 
-function buildStoredRuntimeInfo(record: StoredAgentRecord): AgentRuntimeInfo | undefined {
+export function buildStoredRuntimeInfo(record: StoredAgentRecord): AgentRuntimeInfo | undefined {
   if (!record.runtimeInfo) return undefined;
   const ri = record.runtimeInfo;
   const runtimeInfo: AgentRuntimeInfo = {

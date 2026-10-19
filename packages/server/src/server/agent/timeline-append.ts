@@ -10,29 +10,11 @@ export interface AppendTimelineItemIfAgentKnownOptions {
 export async function appendTimelineItemIfAgentKnown(
   options: AppendTimelineItemIfAgentKnownOptions,
 ): Promise<boolean> {
-  try {
-    await options.agentManager.appendTimelineItem(options.agentId, options.item);
-    return true;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (message.includes("Unknown agent")) {
-      return false;
-    }
-    throw error;
-  }
+  return (await options.agentManager.appendTimelineItem(options.agentId, options.item)) !== null;
 }
 
 export async function emitLiveTimelineItemIfAgentKnown(
   options: AppendTimelineItemIfAgentKnownOptions,
 ): Promise<boolean> {
-  try {
-    await options.agentManager.emitLiveTimelineItem(options.agentId, options.item);
-    return true;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (message.includes("Unknown agent")) {
-      return false;
-    }
-    throw error;
-  }
+  return options.agentManager.emitLiveTimelineItem(options.agentId, options.item);
 }

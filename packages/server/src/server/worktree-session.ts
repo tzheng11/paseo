@@ -722,7 +722,12 @@ export async function createPaseoWorktreeWorkflow(
       if (dependencies.startWorkspaceSetup) {
         dependencies.startWorkspaceSetup(workspace.workspaceId, runSetup);
       } else {
-        void runSetup(new AbortController().signal);
+        void runSetup(new AbortController().signal).catch((err) =>
+          dependencies.sessionLogger.warn(
+            { err, workspaceId: workspace.workspaceId },
+            "Workspace setup failed",
+          ),
+        );
       }
     }
   }, 0);
@@ -744,7 +749,9 @@ export async function createPaseoWorktreeWorkflow(
             emitLiveTimelineItem: (item) =>
               setupContinuation.emitLiveTimelineItem({ agentId, item }),
             logger: setupContinuation.logger,
-          });
+          }).catch((err) =>
+            setupContinuation.logger.warn({ err, agentId }, "Agent worktree bootstrap failed"),
+          );
         },
       },
     };

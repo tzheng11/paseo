@@ -142,6 +142,20 @@ describe("runAsyncWorktreeBootstrap", () => {
     }
   });
 
+  it("contains a failure while recording the setup failure", async () => {
+    await expect(
+      runAsyncWorktreeBootstrap({
+        agentId: "removed-target",
+        workspaceId: "removed-workspace",
+        worktree: { branchName: "main", worktreePath: repoDir },
+        terminalManager: null,
+        appendTimelineItem: async () => {
+          throw new Error("timeline store unavailable");
+        },
+      }),
+    ).resolves.toBeUndefined();
+  });
+
   it("truncates each command output to 64kb in the middle", async () => {
     const largeOutputCommand =
       "node -e \"process.stdout.write('prefix-'); process.stdout.write('x'.repeat(70000)); process.stdout.write('-suffix')\"";

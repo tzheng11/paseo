@@ -175,10 +175,15 @@ acknowledges scheduler creation does not prove expiration. Unrecognized schedule
 the runtime. Lifecycle mutations serialize with unloading, and admission is checked again after
 process observation before runtime closure. Sends, timeline reads and attaches resume through
 `ensureAgentLoaded()` using the same provider session and committed Paseo history.
-Runtime setting changes, rewind and timeline producers acquire demand before loading. Metadata,
+Runtime setting changes and rewind acquire demand before loading. Background timeline producers
+write only while the agent is loaded; setup output and plugin writes cannot reopen an unloaded,
+closed, deleted or archived agent. Metadata,
 attention and archive operations classify residency inside the lifecycle lane and update the stored
 identity when the runtime is absent. A workspace archive cannot report success after an agent
 archive fails.
+Stored-state broadcasts are projections of records already committed to storage. Persistence
+listeners skip snapshots without a provider session so those projections cannot erase private
+runtime metadata or credential recovery state.
 
 A provider runtime can still die on its own — crash, OOM kill, host suspend. Work the agent parked
 inside that process dies with it: Claude Code's background Bash shells, `Monitor` watches, and

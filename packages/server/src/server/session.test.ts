@@ -1862,6 +1862,34 @@ function createStoredAgentRecord(
 }
 
 describe("plugin timeline append RPC", () => {
+  test("reports an unavailable target without loading a provider", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const appendTimelineItem = vi.fn().mockResolvedValue(null);
+    const session = createSessionForTest({
+      clientId: "plugin:review",
+      messages,
+      agentManager: { appendTimelineItem },
+    });
+    await session.handleMessage({
+      type: "agent.timeline.append.request",
+      requestId: "gone-target",
+      agentId: "gone-agent",
+      item: { type: "plugin", id: "late", kind: "review", version: 1, data: {} },
+    });
+    expect(messages).toContainEqual({
+      type: "rpc_error",
+      payload: {
+        requestId: "gone-target",
+        requestType: "agent.timeline.append.request",
+        code: "handler_error",
+        error: "Request failed: Agent is not loaded: gone-agent",
+      },
+    });
+    expect(messages.some((message) => message.type === "agent.timeline.append.response")).toBe(
+      false,
+    );
+  });
+
   test("stamps the plugin identity and returns the timeline position", async () => {
     const messages: SessionOutboundMessage[] = [];
     const appendTimelineItem = vi.fn().mockResolvedValue({ seq: 7, epoch: "epoch-1" });

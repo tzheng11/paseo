@@ -4,7 +4,7 @@ import {
   formatSystemNotificationPrompt,
 } from "./agent-messages/index.js";
 import { expect, test, vi } from "vitest";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -33,6 +33,12 @@ import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "./agent-loading.
 import { archiveAgentCommand } from "./lifecycle-command.js";
 import { archiveWorkspaceContents } from "../workspace-archive-service.js";
 import { buildVoiceModeSystemPrompt } from "../voice-config.js";
+import { attachAgentStoragePersistence } from "../persistence-hooks.js";
+import { runAsyncWorktreeBootstrap } from "../worktree-bootstrap.js";
+import {
+  appendTimelineItemIfAgentKnown,
+  emitLiveTimelineItemIfAgentKnown,
+} from "./timeline-append.js";
 import type { AgentOwner } from "./agent-owner.js";
 import type { StoredAgentRecord } from "./agent-storage.js";
 import type {
@@ -13825,24 +13831,152 @@ test("unloaded identity supports metadata, attention, retained history and expli
   }
 });
 
-test("timeline producers resume an unloaded agent before appending new activity", async () => {
-  vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
-  const h = await idleUnloadHarness();
+test("ISS-4420 rereview P1: deleted setup target stops bootstrap without rejection", async () => {
+  const h = await idleUnloadHarness(0);
+  let deleted = false;
   try {
-    await vi.advanceTimersByTimeAsync(180_000);
-    await h.manager.waitForAgentClose(h.agent.id);
-    await h.manager.appendTimelineItem(h.agent.id, {
-      type: "assistant_message",
-      text: "New background update",
-    });
-    expect(h.manager.getTimeline(h.agent.id)).toContainEqual({
-      type: "assistant_message",
-      text: "New background update",
-    });
-    expect(h.resumes[0]?.sessionId).toBe(h.agent.persistence?.sessionId);
+    execFileSync("git", ["init", "-b", "main"], { cwd: h.agent.cwd, stdio: "pipe" });
+    writeFileSync(
+      join(h.agent.cwd, "paseo.json"),
+      JSON.stringify({ worktree: { setup: ["echo setup-progress"] } }),
+    );
+    await expect(
+      runAsyncWorktreeBootstrap({
+        agentId: h.agent.id,
+        workspaceId: "idle-test",
+        worktree: { branchName: "main", worktreePath: h.agent.cwd },
+        terminalManager: null,
+        logger,
+        appendTimelineItem: (item) =>
+          appendTimelineItemIfAgentKnown({ agentManager: h.manager, agentId: h.agent.id, item }),
+        emitLiveTimelineItem: async (item) => {
+          if (!deleted) {
+            deleted = true;
+            await h.manager.closeAgent(h.agent.id);
+            await h.manager.deleteAgentState(h.agent.id);
+            await h.storage.remove(h.agent.id);
+          }
+          return emitLiveTimelineItemIfAgentKnown({
+            agentManager: h.manager,
+            agentId: h.agent.id,
+            item,
+          });
+        },
+      }),
+    ).resolves.toBeUndefined();
+    expect(deleted).toBe(true);
+    expect(await h.storage.get(h.agent.id)).toBeNull();
+    expect(h.manager.getAgent(h.agent.id)).toBeNull();
+    expect(h.sessions).toHaveLength(1);
   } finally {
     await h.close();
-    vi.useRealTimers();
+  }
+});
+
+test.each(["unloaded", "killed", "archived", "deleted"] as const)(
+  "ISS-4420 rereview P2a: background timeline writers never resume %s targets",
+  async (state) => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const h = await idleUnloadHarness();
+    try {
+      if (state === "unloaded") await vi.advanceTimersByTimeAsync(180_000);
+      if (state === "killed") await h.manager.closeAgent(h.agent.id);
+      if (state === "archived") await h.manager.archiveAgent(h.agent.id);
+      if (state === "deleted") await h.storage.remove(h.agent.id);
+      await h.manager.waitForAgentClose(h.agent.id);
+      const before = await h.storage.get(h.agent.id);
+      const resident = h.manager.getAgent(h.agent.id);
+      expect(
+        await appendTimelineItemIfAgentKnown({
+          agentManager: h.manager,
+          agentId: h.agent.id,
+          item: {
+            type: "plugin",
+            id: "late",
+            pluginId: "test",
+            kind: "test",
+            version: 1,
+            data: {},
+          },
+        }),
+      ).toBe(false);
+      expect(
+        await emitLiveTimelineItemIfAgentKnown({
+          agentManager: h.manager,
+          agentId: h.agent.id,
+          item: { type: "assistant_message", text: "Late setup output" },
+        }),
+      ).toBe(false);
+      expect(h.sessions).toHaveLength(1);
+      expect(h.resumes).toEqual([]);
+      expect(h.manager.getAgent(h.agent.id)).toEqual(resident);
+      expect(await h.storage.get(h.agent.id)).toEqual(before);
+    } finally {
+      await h.close();
+      vi.useRealTimers();
+    }
+  },
+);
+
+test("ISS-4420 rereview P2b: persisted-only updates preserve credentials and runtime metadata with production persistence attached", async () => {
+  const h = await idleUnloadHarness(0);
+  let detach = () => {};
+  let unsubscribe = () => {};
+  const notifications: ReturnType<typeof toAgentPayload>[] = [];
+  try {
+    await h.manager.closeAgent(h.agent.id);
+    const stored = (await h.storage.get(h.agent.id))!;
+    const record = {
+      ...stored,
+      lastStatus: "idle" as const,
+      runtimeInfo: {
+        provider: "codex",
+        sessionId: stored.persistence!.sessionId,
+        model: "native-model",
+        thinkingOptionId: "high",
+        modeId: "plan",
+      },
+      credentialGeneration: "generation-new",
+      credentialChangedAt: "2026-10-19T10:00:00.000Z",
+      quotaTurnCheckpoint: {
+        turnId: "quota-turn",
+        sessionId: stored.persistence!.sessionId,
+        failedAt: "2026-10-19T11:00:00.000Z",
+        credentialGeneration: "generation-new",
+        credentialChangedAt: "2026-10-19T10:00:00.000Z",
+      },
+    };
+    await h.storage.upsert(record);
+    detach = attachAgentStoragePersistence(logger, h.manager, h.storage);
+    unsubscribe = h.manager.subscribe(
+      (event) => {
+        if (event.type === "agent_state") notifications.push(toAgentPayload(event.agent));
+      },
+      { replayState: false },
+    );
+    for (const mutate of [
+      () => h.manager.markAgentUnread(h.agent.id),
+      () => h.manager.clearAgentAttention(h.agent.id),
+      () => h.manager.setTitle(h.agent.id, "Stored title"),
+      () => h.manager.setLabels(h.agent.id, { context: "stored" }),
+    ]) {
+      await mutate();
+      await h.manager.flush();
+      await h.storage.flush();
+      expect(await h.storage.get(h.agent.id)).toMatchObject({
+        runtimeInfo: record.runtimeInfo,
+        credentialGeneration: record.credentialGeneration,
+        credentialChangedAt: record.credentialChangedAt,
+        quotaTurnCheckpoint: record.quotaTurnCheckpoint,
+      });
+    }
+    expect(notifications).toHaveLength(4);
+    expect(notifications.every((agent) => agent.runtimeInfo?.model === "native-model")).toBe(true);
+    expect(h.sessions).toHaveLength(1);
+  } finally {
+    unsubscribe();
+    detach();
+    await h.close();
   }
 });
 

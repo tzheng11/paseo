@@ -8136,10 +8136,12 @@ export class Session {
     const pluginId = parsePluginClientId(this.clientId);
     if (!pluginId) throw new Error("Only plugin sessions can append plugin timeline items");
     assertPluginTimelineDataSize(msg.item.data);
-    const { seq, epoch } = await this.agentManager.appendTimelineItem(msg.agentId, {
+    const position = await this.agentManager.appendTimelineItem(msg.agentId, {
       ...msg.item,
       pluginId,
     });
+    if (!position) throw new Error(`Agent is not loaded: ${msg.agentId}`);
+    const { seq, epoch } = position;
     this.emit({
       type: "agent.timeline.append.response",
       payload: { requestId: msg.requestId, seq, epoch },

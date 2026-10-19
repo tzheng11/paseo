@@ -83,7 +83,7 @@ import {
   type ListImportableSessionsOptions,
 } from "./agent-sdk-types.js";
 import { buildArchivedAgentRecord, type ArchivedStoredAgentRecord } from "./agent-archive.js";
-import { toStoredAgentRecord } from "./agent-projections.js";
+import { buildStoredRuntimeInfo, toStoredAgentRecord } from "./agent-projections.js";
 import type { StoredAgentRecord, AgentStorage } from "./agent-storage.js";
 import type { AgentOwner } from "./agent-owner.js";
 import {
@@ -2743,7 +2743,7 @@ export class AgentManager {
         session: null,
         capabilities: STORED_AGENT_CAPABILITIES,
         config: buildStoredAgentConfig(record),
-        runtimeInfo: undefined,
+        runtimeInfo: buildStoredRuntimeInfo(record),
         lifecycle: record.lastStatus === "idle" && !record.archivedAt ? "idle" : "closed",
         createdAt: new Date(record.createdAt),
         updatedAt,
@@ -3319,8 +3319,8 @@ export class AgentManager {
   async appendTimelineItem(
     agentId: string,
     item: AgentTimelineItem,
-  ): Promise<{ seq: number; epoch: string }> {
-    return this.withAgentRuntime(agentId, async (agent) => {
+  ): Promise<{ seq: number; epoch: string } | null> {
+    return this.withResidentTimelineTarget(agentId, async (agent) => {
       item = limitAgentTimelineItemContent(item);
       this.touchUpdatedAt(agent);
       const row = this.recordTimeline(agentId, item);
@@ -3342,14 +3342,30 @@ export class AgentManager {
     });
   }
 
-  async emitLiveTimelineItem(agentId: string, item: AgentTimelineItem): Promise<void> {
-    return this.withAgentRuntime(agentId, async (agent) => {
+  async emitLiveTimelineItem(agentId: string, item: AgentTimelineItem): Promise<boolean> {
+    const emitted = await this.withResidentTimelineTarget(agentId, async (agent) => {
       this.touchUpdatedAt(agent);
       this.dispatchStream(agentId, {
         type: "timeline",
         item,
         provider: agent.provider,
       });
+      return true;
+    });
+    return emitted === true;
+  }
+
+  /** Background producers cannot reopen a runtime or undo user teardown. */
+  private withResidentTimelineTarget<T>(
+    agentId: string,
+    write: (agent: ActiveManagedAgent) => Promise<T>,
+  ): Promise<T | null> {
+    return this.runLifecycleMutation(agentId, async () => {
+      const agent = this.agents.get(agentId);
+      if (!agent) return null;
+      const record = await this.registry?.get(agentId);
+      if (this.registry && (!record || record.archivedAt)) return null;
+      return write(agent);
     });
   }
 
