@@ -53,9 +53,60 @@ Only `completed` confirms registration of the replacement. A missing receipt is 
 `NOT_FOUND`; the exact same UUID may be submitted again because admission deduplicates before
 mutation. A pending receipt left by a daemon restart becomes persisted `unknown` with
 `DAEMON_RESTARTED` and must not be replayed. Unreadable or corrupt storage is an error, never absence.
+A maintenance acknowledgement deadline does not abandon provider cleanup: the daemon retains
+its idle/lifecycle claim, and a late completion updates the same durable receipt. Unresolved
+writer ownership prevents new turns and provider admission for that agent, including after restart.
+Only the admitted maintenance callback carries an opaque writer claim; ordinary queued reload,
+resume and prompt paths cannot borrow it. The claim expires before terminal receipt persistence,
+while the receipt fence remains held until that write finishes.
 Unconfirmed child cleanup is also `unknown`; callers must hold it for inspection. Refusal means
 the runtime was not changed. Do not infer completion from the agent being idle or mint a new UUID
 to bypass an uncertain operation.
+
+### Offline cleanup reconciliation
+
+Legacy cleanup uncertainty has no phase or writer identity. It cannot be reclassified from
+idle, closed, archived, an old error string, or a daemon restart alone. Use the local
+[`agent reload-reconcile-cleanup`](../public-docs/cli.md) command only in a coordinated quiescent
+maintenance window. It holds the normal daemon PID lock, verifies the captured prior worker is
+gone, and rejects remaining attributable or unidentified writers. It never signals a process.
+
+The operator supplies an inspection record binding the unchanged daemon configuration to the
+verified builtin provider launch contract. Version 1 permits builtin-only launches. Version 2
+also permits inspected transparent proxies: each `inspectedWrappers` entry binds `provider`
+(`codex` or `claude`), an absolute whitespace-free regular-file `path`, and its `sha256` to that
+provider's exact single-path command override. Both proxies and detached builtin children must be
+absent; wrapper bytes and configuration are checked again before settlement. Version 1 rejects
+wrapper entries, so older utilities cannot silently ignore a version 2 contract. Symlinks,
+configured interpreter/shell prefixes, renamed binaries and uninspected launches remain unsupported.
+Inspection covers the incident's effective launch paths, not just today's configuration; retain
+uncertainty if those paths cannot be established. Do not change a host's launch configuration to
+make an inspection appear compatible.
+
+Version 3 can retain positively unrelated processes. Its `foreignOwnership` evidence binds the
+original operation, agent and receipt hash to a frozen process forest. The utility re-observes
+kernel PID/UID/birth identities and executable file identities, complete ancestry, and either a
+strictly verified signed app anchor or a launchd/PID-lock/source/config binding to a different
+daemon home. Unreaped zombies use their OS-reported terminal state; they have no executable or
+open files. New descendants, changed identities/ownership, reparented providers, target markers
+and observed access to the protected native session all refuse. The same read-only
+`readInspectedCleanupCensus` predicate is available to maintenance preflight, drain and rollback;
+none of those phases may apply a separate PID/path exclusion list. This macOS observation requires
+system Python 3, libproc, codesign, launchctl and lsof; unavailable/incomplete proof refuses.
+
+This proves retirement of writers attributable to the historical admitted reload, including
+unregistered replacements and older-generation survivors. The captured retiring tree must be
+absent and cannot overlap the foreign forest. Original callbacks cannot remain live. A different
+home or signed app establishes provenance, not native-storage isolation; signature/file identity
+does not certify arbitrary loaded memory. The receipt does not promise global future native-session
+exclusivity. External effect/owner drain and maintenance admission remain separate obligations.
+Do not infer historical ownership from receipt timestamps, archive metadata or a restart alone.
+The command refuses failed, incomplete or ambiguous observations. It compares the original receipt
+bytes before committing and saves sanitized process evidence first. Cleanup settlement writes
+`failed`, `retryable: true`, `RELOAD_CLEANUP_RECONCILED`; it does not claim replacement registration
+or quota continuation. Original operation and credential identities stay intact. Fleet may defer
+that failed attempt and admit a new guarded intent through its normal queue; uncertain continuation,
+startup, registration and restarted-operation receipts remain held.
 
 ### Quota-turn continuation
 

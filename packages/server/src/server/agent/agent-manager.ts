@@ -41,7 +41,11 @@ import type { ToolPolicy } from "@getpaseo/protocol/agent-types";
 import type { ProviderPaseoToolsPolicy } from "@getpaseo/protocol/provider-config";
 import { z } from "zod";
 import type { TerminalManager } from "../../terminal/terminal-manager.js";
-import type { ReloadOperationStore, ReloadOperation } from "./reload-operation-store.js";
+import type {
+  ReloadOperationStore,
+  ReloadOperation,
+  ReloadWriterClaim,
+} from "./reload-operation-store.js";
 
 import {
   getAgentStreamEventTurnId,
@@ -1791,7 +1795,7 @@ export class AgentManager {
     return this.reloadOperations.start(
       agentId,
       operationId,
-      async () => {
+      async (writerClaim) => {
         const record = await this.registry?.get(agentId);
         if (record?.archivedAt) throw new AgentIdleReloadError({ agentId, reason: "unavailable" });
         const checkpoint = this.getAgent(agentId)?.quotaTurnCheckpoint;
@@ -1799,9 +1803,16 @@ export class AgentManager {
         let continuation: ReloadOperation["continuation"];
         await this.reloadIdleAgentSession(agentId, {
           preserveHistory: true,
+          writerClaim,
           afterReload: change
             ? async () => {
-                continuation = await this.continueQuotaTurn(agentId, checkpoint, change, revision);
+                continuation = await this.continueQuotaTurn(
+                  agentId,
+                  checkpoint,
+                  change,
+                  revision,
+                  writerClaim,
+                );
               }
             : undefined,
         });
@@ -1830,6 +1841,9 @@ export class AgentManager {
       if (record?.quotaTurnCheckpoint)
         await this.registry?.upsert({ ...record, quotaTurnCheckpoint: undefined });
     });
+    // A queued user message supersedes quota recovery immediately, but must wait
+    // outside the lifecycle lane for its reload receipt to become authoritative.
+    await this.reloadOperations?.waitForWriterAdmission(agentId);
   }
 
   private readonly quotaContinuationGuards = new Map<string, () => void>();
@@ -1839,6 +1853,7 @@ export class AgentManager {
     checkpoint: QuotaTurnCheckpoint | undefined,
     change: CredentialChange,
     revision: number,
+    writerClaim: ReloadWriterClaim,
   ): Promise<NonNullable<ReloadOperation["continuation"]>> {
     const agent = this.requireSessionAgent(agentId);
     const now = Date.now();
@@ -1925,7 +1940,7 @@ export class AgentManager {
             streamAgent: (id, prompt, options) => {
               validate();
               this.quotaContinuationGuards.set(id, () => validate(true));
-              return this.streamAgentInternal(id, prompt, options);
+              return this.streamAgentInternal(id, prompt, options, writerClaim);
             },
           };
           await startAgentRun(controller, agentId, delivery.prompt, this.logger, {
@@ -1983,7 +1998,11 @@ export class AgentManager {
 
   reloadIdleAgentSession(
     agentId: string,
-    options?: { preserveHistory?: boolean; afterReload?: () => Promise<void> },
+    options?: {
+      preserveHistory?: boolean;
+      afterReload?: () => Promise<void>;
+      writerClaim?: ReloadWriterClaim;
+    },
   ): Promise<ManagedAgent> {
     if (this.idleReloads.has(agentId))
       return Promise.reject(new AgentIdleReloadError({ agentId, reason: "busy" }));
@@ -2020,6 +2039,7 @@ export class AgentManager {
         return this.reloadAgentSessionInternal(agentId, undefined, {
           rehydrateFromDisk: !options?.preserveHistory,
           preserveHistory: options?.preserveHistory,
+          writerClaim: options?.writerClaim,
         })
           .then(async (snapshot) => {
             if (!options?.preserveHistory)
@@ -2055,7 +2075,11 @@ export class AgentManager {
   private async reloadAgentSessionInternal(
     agentId: string,
     overrides?: Partial<AgentSessionConfig>,
-    options: { rehydrateFromDisk?: boolean; preserveHistory?: boolean } = {},
+    options: {
+      rehydrateFromDisk?: boolean;
+      preserveHistory?: boolean;
+      writerClaim?: ReloadWriterClaim;
+    } = {},
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     let existing = this.requireSessionAgent(agentId);
@@ -2089,6 +2113,7 @@ export class AgentManager {
       paseoToolPolicy,
       undefined,
       { reason: "refresh", purpose: "interactive", workspaceId: existing.workspaceId },
+      options.writerClaim,
     );
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
     if (
@@ -2184,6 +2209,20 @@ export class AgentManager {
       this.reloadedSessionCloses.set(session, operation);
       // Keep pending closes across request timeouts; a retry must await the same release.
       void operation.catch(() => this.reloadedSessionCloses.delete(session));
+    }
+    if (maintenance) {
+      // Durable maintenance has no socket deadline. Keep the lifecycle/idle claim
+      // until the actual provider releases its writer, including late success.
+      // The receipt store bounds acknowledgement without abandoning this work.
+      try {
+        await operation;
+      } catch (cause) {
+        throw Object.assign(
+          new Error("Credential reload previous child cleanup could not be confirmed", { cause }),
+          { code: "reload_cleanup_unconfirmed" },
+        );
+      }
+      return;
     }
     const result = await this.waitWithTimeout({
       operation,
@@ -3147,7 +3186,9 @@ export class AgentManager {
     agentId: string,
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
+    writerClaim?: ReloadWriterClaim,
   ): AsyncGenerator<AgentStreamEvent> {
+    this.reloadOperations?.assertWriterAdmissionSync(agentId, writerClaim);
     const existingAgent = this.requireSessionAgent(agentId);
     this.logger.trace(
       {
@@ -6016,7 +6057,10 @@ export class AgentManager {
       purpose: PluginSessionOpenRequest["purpose"];
       workspaceId?: string | null;
     },
+    writerClaim?: ReloadWriterClaim,
   ): Promise<AgentLaunchContext> {
+    if (this.reloadOperations)
+      await this.reloadOperations.assertWriterAdmission(agentId, writerClaim);
     if (this.pluginLifecycle) {
       const request: PluginSessionOpenRequest = {
         agentId,
