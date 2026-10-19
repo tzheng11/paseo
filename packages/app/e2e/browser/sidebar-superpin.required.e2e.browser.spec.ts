@@ -438,19 +438,13 @@ for (const viewport of [
         await assertOldHost(page, seed, info, "old-daemon");
         faults.state.stripCapability = false;
         await faults.disconnect();
-        await expect
-          .poll(async () => {
-            await openRowMenu(page, seed.workspaceId);
-            const count = await page
-              .getByTestId(`sidebar-workspace-menu-superpin-${key(seed.workspaceId)}`)
-              .count();
-            await dismissOverlay(page);
-            return count;
-          })
-          .toBe(1);
+        await expect.poll(() => countRowSuperpin(page, seed.workspaceId)).toBe(1);
         await assertCapableHost(page, seed, info);
         faults.state.stripCapability = true;
         await faults.disconnect();
+        // Last-known support is retained while disconnected. Wait for the new
+        // handshake to remove the action from an actually mounted menu.
+        await expect.poll(() => countRowSuperpin(page, seed.workspaceId)).toBe(0);
         await assertOldHost(page, seed, info, "downgraded-daemon");
         await expect(
           page.getByTestId("app-toast-message").filter({ hasText: "Update the host" }),
@@ -534,6 +528,18 @@ for (const viewport of [
   });
 }
 
+async function countRowSuperpin(page: Page, workspaceId: string) {
+  await openRowMenu(page, workspaceId);
+  await expect(
+    page.getByTestId(`sidebar-workspace-menu-labels-${key(workspaceId)}`),
+  ).toBeInViewport({ ratio: 1 });
+  const count = await page
+    .getByTestId(`sidebar-workspace-menu-superpin-${key(workspaceId)}`)
+    .count();
+  await dismissOverlay(page);
+  return count;
+}
+
 async function assertOldHost(
   page: Page,
   seed: SeededWorkspace,
@@ -541,6 +547,9 @@ async function assertOldHost(
   captureName: string,
 ) {
   await openRowMenu(page, seed.workspaceId);
+  await expect(
+    page.getByTestId(`sidebar-workspace-menu-labels-${key(seed.workspaceId)}`),
+  ).toBeInViewport({ ratio: 1 });
   await expect(
     page.getByTestId(`sidebar-workspace-menu-superpin-${key(seed.workspaceId)}`),
   ).toHaveCount(0);
@@ -557,6 +566,9 @@ async function assertOldHost(
     .getByTestId(`workspace-deck-entry-${key(seed.workspaceId)}`)
     .getByTestId("workspace-header-menu-trigger")
     .click();
+  await expect(page.getByTestId(`workspace-header-labels-${key(seed.workspaceId)}`)).toBeInViewport(
+    { ratio: 1 },
+  );
   await expect(page.getByTestId(`workspace-header-superpin-${key(seed.workspaceId)}`)).toHaveCount(
     0,
   );
@@ -565,7 +577,9 @@ async function assertOldHost(
   });
   await capture(page, info, `${captureName}-header`);
   await dismissOverlay(page);
-  const command = await palette(page, "Superpin");
+  const command = await palette(page, "Rename workspace");
+  await expect(command.action).toBeVisible();
+  await command.input.fill("Superpin");
   await expect(
     command.panel.getByRole("button", { name: /^(Superpin|Remove superpin)$/ }),
   ).toHaveCount(0);
