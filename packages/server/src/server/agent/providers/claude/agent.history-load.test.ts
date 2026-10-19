@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import pino from "pino";
@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { ClaudeAgentClient } from "./agent.js";
 import { claudeProjectDirSync } from "./project-dir.js";
+import type { AgentStreamEvent } from "../../agent-sdk-types.js";
 
 /**
  * A resumed Claude agent whose transcript is missing or unreadable opens with an empty timeline.
@@ -72,6 +73,44 @@ describe("ClaudeAgentSession persisted history load", () => {
         historyPath: transcriptPath(),
       }),
     );
+  });
+
+  test("opening a large transcript yields to daemon callbacks and preserves message order", async () => {
+    const expected = Array.from({ length: 1024 }, (_, index) => `message ${index}`);
+    mkdirSync(path.dirname(transcriptPath()), { recursive: true });
+    writeFileSync(
+      transcriptPath(),
+      expected
+        .map((text, index) =>
+          JSON.stringify({
+            type: "user",
+            uuid: `user-${index}`,
+            message: { role: "user", content: text },
+            metadata: "x".repeat(8192),
+          }),
+        )
+        .join("\r\n"),
+    );
+    const client = new ClaudeAgentClient({
+      logger: pino({ level: "silent" }),
+      queryFactory() {
+        throw new Error("History replay must not start a query");
+      },
+    });
+    const heartbeat = new Promise<"heartbeat">((resolve) => {
+      setImmediate(() => resolve("heartbeat"));
+    });
+    const resumed = client.resumeSession({ provider: "claude", sessionId: SESSION_ID }, { cwd });
+    expect(await Promise.race([heartbeat, resumed.then(() => "history")])).toBe("heartbeat");
+    const session = await resumed;
+    const events: AgentStreamEvent[] = [];
+    for await (const event of session.streamHistory()) events.push(event);
+    expect(
+      events.flatMap((event) =>
+        event.type === "timeline" && event.item.type === "user_message" ? [event.item.text] : [],
+      ),
+    ).toEqual(expected);
+    await session.close();
   });
 
   test("logs a warning with the error when the transcript cannot be read", async () => {
