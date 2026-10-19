@@ -637,7 +637,7 @@ async function assertCapableHost(page: Page, seed: SeededWorkspace, info: TestIn
     .click();
   await expect(
     page.getByTestId(`workspace-header-superpin-${key(seed.workspaceId)}`),
-  ).toBeVisible();
+  ).toBeInViewport({ ratio: 1 });
   await capture(page, info, "capable-header");
   await dismissOverlay(page);
   const command = await palette(page, "Superpin");
