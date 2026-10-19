@@ -91,7 +91,11 @@ async function capture(page: Page, info: TestInfo, name: string) {
 async function openWorkspace(page: Page, seed: SeededWorkspace) {
   await showSidebar(page);
   await row(page, seed.workspaceId).click();
-  await expect(page.getByTestId("workspace-header-title")).toBeVisible();
+  await expect(
+    page
+      .getByTestId(`workspace-deck-entry-${key(seed.workspaceId)}`)
+      .getByTestId("workspace-header-title"),
+  ).toBeVisible();
 }
 async function palette(page: Page, title: string) {
   if (narrow(page)) {
@@ -549,7 +553,10 @@ async function assertOldHost(
   await capture(page, info, `${captureName}-row`);
   await page.getByTestId(`sidebar-workspace-menu-pin-${key(seed.workspaceId)}`).click();
   await openWorkspace(page, seed);
-  await page.getByTestId("workspace-header-menu-trigger").click();
+  await page
+    .getByTestId(`workspace-deck-entry-${key(seed.workspaceId)}`)
+    .getByTestId("workspace-header-menu-trigger")
+    .click();
   await expect(page.getByTestId(`workspace-header-superpin-${key(seed.workspaceId)}`)).toHaveCount(
     0,
   );
@@ -590,7 +597,10 @@ async function assertUnknownHost(page: Page, seed: SeededWorkspace, info: TestIn
   await capture(page, info, `${name}-row`);
   await dismissOverlay(page);
   await openWorkspace(page, seed);
-  await page.getByTestId("workspace-header-menu-trigger").click();
+  await page
+    .getByTestId(`workspace-deck-entry-${key(seed.workspaceId)}`)
+    .getByTestId("workspace-header-menu-trigger")
+    .click();
   await expect(page.getByTestId(`workspace-header-labels-${key(seed.workspaceId)}`)).toBeVisible();
   await expect(page.getByTestId(`workspace-header-superpin-${key(seed.workspaceId)}`)).toHaveCount(
     0,
@@ -615,7 +625,10 @@ async function assertCapableHost(page: Page, seed: SeededWorkspace, info: TestIn
   await capture(page, info, "capable-row");
   await dismissOverlay(page);
   await openWorkspace(page, seed);
-  await page.getByTestId("workspace-header-menu-trigger").click();
+  await page
+    .getByTestId(`workspace-deck-entry-${key(seed.workspaceId)}`)
+    .getByTestId("workspace-header-menu-trigger")
+    .click();
   await expect(
     page.getByTestId(`workspace-header-superpin-${key(seed.workspaceId)}`),
   ).toBeVisible();
