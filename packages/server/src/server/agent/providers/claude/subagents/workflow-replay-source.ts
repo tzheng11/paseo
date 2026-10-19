@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { historyWork } from "../history-records.js";
 
 import type { AgentTimelineItem } from "../../../agent-sdk-types.js";
 import { normalizeProviderReplayTimestamp } from "../../../provider-history-timestamps.js";
@@ -45,48 +46,96 @@ export function parseClaudeWorkflowRun(contents: string): ClaudeWorkflowRun | nu
  * provider runtime was recreated, so replay terminalizes it as failed instead of resurrecting a
  * row that can never receive another update.
  */
-export function observeReplayWorkflows(input: {
+interface ReplayEntryRequest {
+  kind: "read_entry";
+  entry: ClaudeReplayEntry;
+}
+
+type ReplayStep = SubagentObservation | ReplayEntryRequest | null;
+
+interface WorkflowReplayInput {
   workflows: readonly ClaudeWorkflowRun[];
   parentEntries: readonly ClaudeWorkflowParentEntry[];
   entriesByRunId?: ReadonlyMap<string, readonly ClaudeReplayEntry[]>;
   convertEntry?: (entry: ClaudeReplayEntry) => AgentTimelineItem[];
-}): SubagentObservation[] {
-  const toolCallIdByRunId = readWorkflowLinks(input.parentEntries);
+}
+
+export function observeReplayWorkflows(input: WorkflowReplayInput): SubagentObservation[] {
   const observations: SubagentObservation[] = [];
+  for (const observation of replayWorkflows(input)) {
+    if (observation && observation.kind !== "read_entry") observations.push(observation);
+  }
+  return observations;
+}
+
+export async function observeReplayWorkflowsAsync(
+  input: WorkflowReplayInput & {
+    readEntry?: (entry: ClaudeReplayEntry) => Promise<ClaudeReplayEntry>;
+  },
+  signal: AbortSignal,
+): Promise<SubagentObservation[]> {
+  const observations: SubagentObservation[] = [];
+  const replay = replayWorkflows(input);
+  let step = replay.next();
+  try {
+    while (!step.done) {
+      const pause = historyWork.pause();
+      if (pause) await pause;
+      signal.throwIfAborted();
+      const observation = step.value;
+      if (observation?.kind === "read_entry") {
+        const entry = input.readEntry
+          ? await input.readEntry(observation.entry)
+          : observation.entry;
+        step = replay.next(entry);
+      } else {
+        if (observation) observations.push(observation);
+        step = replay.next();
+      }
+    }
+  } finally {
+    replay.return();
+  }
+  return observations;
+}
+
+function* replayWorkflows(
+  input: WorkflowReplayInput,
+): Generator<ReplayStep, void, ClaudeReplayEntry | undefined> {
+  const toolCallIdByRunId = yield* readWorkflowLinks(input.parentEntries);
 
   for (const workflow of input.workflows) {
+    yield null;
     const id = toolCallIdByRunId.get(workflow.runId);
     if (!id) continue;
     const description = readString(workflow.summary) ?? readString(workflow.workflowName);
     const startedAt = normalizeEpochTimestamp(workflow.startTime);
     const finishedAt = normalizeIsoTimestamp(workflow.timestamp);
 
-    observations.push({
+    yield {
       kind: "declared",
       id,
       toolCallId: id,
       title: "Workflow",
       ...(description ? { description } : {}),
       ...(startedAt ? { timestamp: startedAt } : {}),
-    });
+    };
     if (description) {
-      observations.push({
+      yield {
         kind: "timeline",
         id,
         item: { type: "user_message", text: description },
         ...(startedAt ? { timestamp: startedAt } : {}),
-      });
+      };
     }
 
-    observations.push(
-      ...observeWorkflowTimeline({
-        id,
-        result: workflow.result,
-        entries: input.entriesByRunId?.get(workflow.runId) ?? [],
-        convertEntry: input.convertEntry,
-        finishedAt,
-      }),
-    );
+    yield* observeWorkflowTimeline({
+      id,
+      result: workflow.result,
+      entries: input.entriesByRunId?.get(workflow.runId) ?? [],
+      convertEntry: input.convertEntry,
+      finishedAt,
+    });
 
     const subtitle = buildClaudeSubagentSubtitle({
       title: "Workflow",
@@ -96,58 +145,90 @@ export function observeReplayWorkflows(input: {
         : {}),
     });
     if (subtitle) {
-      observations.push({
+      yield {
         kind: "subtitle",
         id,
         subtitle,
         ...(finishedAt ? { timestamp: finishedAt } : {}),
-      });
+      };
     }
-    observations.push({
+    yield {
       kind: "status",
       id,
       status: replayWorkflowStatus(workflow.status),
       ...(finishedAt ? { timestamp: finishedAt } : {}),
-    });
+    };
   }
-
-  return observations;
 }
 
-function observeWorkflowTimeline(input: {
+function* observeWorkflowTimeline(input: {
   id: string;
   result: unknown;
   entries: readonly ClaudeReplayEntry[];
   convertEntry?: (entry: ClaudeReplayEntry) => AgentTimelineItem[];
   finishedAt?: string;
-}): SubagentObservation[] {
-  const observations: SubagentObservation[] = [];
+}): Generator<ReplayStep, void, ClaudeReplayEntry | undefined> {
   const replayedAssistantText = new Set<string>();
-  const entries = [...input.entries].sort(compareReplayTimestamps);
+  const entries = yield* sortReplayEntries(input.entries);
 
   for (const entry of entries) {
-    const timestamp = normalizeProviderReplayTimestamp(entry.timestamp);
-    const items = input.convertEntry?.(entry) ?? [];
+    yield null;
+    const decoded = (yield { kind: "read_entry", entry }) ?? entry;
+    const timestamp = normalizeProviderReplayTimestamp(decoded.timestamp);
+    const items = input.convertEntry?.(decoded) ?? [];
     for (const item of items) {
       if (item.type === "assistant_message") replayedAssistantText.add(item.text.trim());
-      observations.push({
+      yield {
         kind: "timeline",
         id: input.id,
         item,
         ...(timestamp ? { timestamp } : {}),
-      });
+      };
     }
   }
 
   const resultText = formatClaudeWorkflowResult(input.result);
-  if (!resultText || replayedAssistantText.has(resultText.trim())) return observations;
-  observations.push({
+  if (!resultText || replayedAssistantText.has(resultText.trim())) return;
+  yield {
     kind: "timeline",
     id: input.id,
     item: { type: "assistant_message", text: resultText },
     ...(input.finishedAt ? { timestamp: input.finishedAt } : {}),
-  });
-  return observations;
+  };
+  return;
+}
+
+function* sortReplayEntries(
+  entries: readonly ClaudeReplayEntry[],
+): Generator<null, ClaudeReplayEntry[]> {
+  let source = [...entries];
+  for (let width = 1; width < source.length; width *= 2) {
+    const sorted: ClaudeReplayEntry[] = [];
+    for (let start = 0; start < source.length; start += width * 2) {
+      const middle = Math.min(start + width, source.length);
+      const end = Math.min(start + width * 2, source.length);
+      let left = start;
+      let right = middle;
+      while (left < middle || right < end) {
+        yield null;
+        const leftEntry = source[left];
+        const rightEntry = source[right];
+        if (
+          left < middle &&
+          leftEntry &&
+          (right >= end || !rightEntry || compareReplayTimestamps(leftEntry, rightEntry) <= 0)
+        ) {
+          sorted.push(leftEntry);
+          left++;
+        } else if (rightEntry) {
+          sorted.push(rightEntry);
+          right++;
+        }
+      }
+    }
+    source = sorted;
+  }
+  return source;
 }
 
 function compareReplayTimestamps(a: ClaudeReplayEntry, b: ClaudeReplayEntry): number {
@@ -159,11 +240,14 @@ function compareReplayTimestamps(a: ClaudeReplayEntry, b: ClaudeReplayEntry): nu
   return Date.parse(aTimestamp) - Date.parse(bTimestamp);
 }
 
-function readWorkflowLinks(entries: readonly ClaudeWorkflowParentEntry[]): Map<string, string> {
+function* readWorkflowLinks(
+  entries: readonly ClaudeWorkflowParentEntry[],
+): Generator<null, Map<string, string>> {
   const workflowToolCallIds = new Set<string>();
   const toolCallIdByRunId = new Map<string, string>();
 
   for (const entry of entries) {
+    yield null;
     const content = entry.message?.content;
     if (!Array.isArray(content)) continue;
     for (const value of content) {
@@ -175,6 +259,7 @@ function readWorkflowLinks(entries: readonly ClaudeWorkflowParentEntry[]): Map<s
   }
 
   for (const entry of entries) {
+    yield null;
     const content = entry.message?.content;
     if (!Array.isArray(content)) continue;
     for (const value of content) {

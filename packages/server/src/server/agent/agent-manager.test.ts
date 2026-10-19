@@ -5134,7 +5134,75 @@ test("setTitle bumps updatedAt and persists title in the same snapshot write", a
   const live = manager.getAgent(snapshot.id);
   expect(live).not.toBeNull();
   expect(live!.updatedAt.getTime()).toBeGreaterThan(Date.parse(before!.updatedAt));
+
+  // A retry of the previous name received after a real rename is a new change.
+  // Comparing before the prior write settles would drop that later request.
+  await Promise.all([
+    manager.setTitle(snapshot.id, "Intermediate title"),
+    manager.setTitle(snapshot.id, "Generated title"),
+  ]);
+  expect((await storage.get(snapshot.id))?.title).toBe("Generated title");
 });
+
+test.each(["live", "stored"])(
+  "unchanged metadata retries do not write, broadcast, or reorder a %s agent",
+  async (residency) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-manager-idempotent-metadata-"));
+    const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const manager = new AgentManager({
+      clients: { codex: new TestAgentClient() },
+      registry: storage,
+      logger,
+    });
+    const snapshot = await manager.createAgent(
+      { provider: "codex", cwd: workdir, title: "Existing title" },
+      undefined,
+      { workspaceId: undefined },
+    );
+    await manager.setLabels(snapshot.id, { role: "worker", surface: "desktop" });
+    await manager.flush();
+    if (residency === "stored") await manager.closeAgent(snapshot.id);
+    const before = await storage.get(snapshot.id);
+    const snapshotWrites = vi.spyOn(storage, "applySnapshot");
+    const storedWrites = vi.spyOn(storage, "upsert");
+    const events: AgentManagerEvent[] = [];
+    const unsubscribe = manager.subscribe((event) => events.push(event), {
+      agentId: snapshot.id,
+      replayState: false,
+    });
+    try {
+      for (let retry = 0; retry < 32; retry += 1) {
+        await manager.updateAgentMetadata(snapshot.id, {
+          title: "Existing title",
+          labels: { surface: "desktop", role: "worker" },
+        });
+      }
+      expect(snapshotWrites).toHaveBeenCalledTimes(0);
+      expect(storedWrites).toHaveBeenCalledTimes(0);
+      expect(events).toEqual([]);
+      expect(await storage.get(snapshot.id)).toEqual(before);
+
+      await manager.updateAgentMetadata(snapshot.id, {
+        title: "Changed title",
+        labels: { role: "manager" },
+      });
+      const changed = await storage.get(snapshot.id);
+      expect(changed?.title).toBe("Changed title");
+      expect(changed?.labels).toEqual({ role: "manager", surface: "desktop" });
+      expect(Date.parse(changed!.updatedAt)).toBeGreaterThan(Date.parse(before!.updatedAt));
+      expect(snapshotWrites).toHaveBeenCalledTimes(residency === "live" ? 2 : 0);
+      expect(storedWrites).toHaveBeenCalledTimes(residency === "stored" ? 1 : 0);
+      expect(events.filter((event) => event.type === "agent_state")).toHaveLength(
+        residency === "live" ? 2 : 0,
+      );
+    } finally {
+      unsubscribe();
+      await manager.closeAgent(snapshot.id);
+      await manager.flush();
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
 
 test("updateAgentMetadata bumps updatedAt for stored agents", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-stored-metadata-updated-at-"));
@@ -5486,6 +5554,38 @@ test("session config drift events update state through the stream channel", asyn
   expect(persisted?.lastModeId).toBe("build");
   expect(persisted?.config?.modeId).toBe("build");
 });
+
+test.each([false, true])(
+  "setLabels retries persistence after a failed write (missing record: %s)",
+  async (missingRecord) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-manager-label-retry-"));
+    const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const manager = new AgentManager({
+      clients: { codex: new TestAgentClient() },
+      registry: storage,
+      logger,
+    });
+    const snapshot = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    const writes = vi.spyOn(storage, "applySnapshot");
+    const reads = vi.spyOn(storage, "get");
+    if (missingRecord) reads.mockResolvedValueOnce(null);
+    writes.mockRejectedValueOnce(new Error("disk full"));
+    try {
+      await expect(manager.setLabels(snapshot.id, { role: "worker" })).rejects.toThrow("disk full");
+      expect((await storage.get(snapshot.id))?.labels).toEqual({});
+      if (missingRecord) reads.mockResolvedValueOnce(null);
+      await manager.setLabels(snapshot.id, { role: "worker" });
+      expect((await storage.get(snapshot.id))?.labels).toEqual({ role: "worker" });
+      expect(writes).toHaveBeenCalledTimes(2);
+    } finally {
+      await manager.closeAgent(snapshot.id);
+      await manager.flush();
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
 
 test("setLabels merges and persists labels", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-set-labels-"));
