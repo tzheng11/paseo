@@ -1,4 +1,5 @@
 import { expect, test } from "../support/fixtures";
+import { getPanelManifest } from "../../src/panels/panel-manifest";
 import {
   gotoWorkspace,
   pressNewTabShortcut,
@@ -107,17 +108,40 @@ async function expectWorkspaceCloseOnHover(page: Parameters<typeof ensureExplore
 }
 
 async function closeOtherExplorerTabs(page: Parameters<typeof ensureExplorerSidebar>[0]) {
-  const files = explorerSidebar(page).getByRole("button", {
-    name: "Browse workspace files",
-    exact: true,
-  });
+  const explorer = explorerSidebar(page);
+  const main = page.getByTestId("workspace-pane-main");
+  const readTabs = (pane: typeof explorer) =>
+    pane.locator('[data-testid^="workspace-tab-"]').evaluateAll((tabs) =>
+      tabs.map((tab) => ({
+        id: tab.getAttribute("data-testid"),
+        selected: tab.getAttribute("aria-selected"),
+      })),
+    );
+  const before = { explorer: await readTabs(explorer), main: await readTabs(main) };
+  const info = explorer.getByTestId("workspace-tab-info");
+  await info.click({ button: "right", position: { x: 12, y: 13 } });
+  const closeInfo = page.getByRole("menuitem", { name: "Close", exact: true });
+  await expect(closeInfo).toBeDisabled();
+  const infoDirectCloseDisabled = await closeInfo.isDisabled();
+  await page.keyboard.press("Escape");
+  const files = explorer.getByRole("button", { name: "Browse workspace files", exact: true });
   await files.click({ button: "right", position: { x: 12, y: 13 } });
-  const confirmation = page.waitForEvent("dialog").then((dialog) => {
-    expect(dialog.message()).toContain("close 1 tab");
-    return dialog.accept();
+  const confirmation = page.waitForEvent("dialog").then(async (dialog) => {
+    const message = dialog.message();
+    await dialog.accept();
+    return message;
   });
   await page.getByRole("menuitem", { name: "Close other tabs", exact: true }).click();
-  await confirmation;
+  const dialogMessage = await confirmation;
+  await expect(explorer.getByTestId("workspace-tab-changes_tree")).toHaveCount(0);
+  const after = { explorer: await readTabs(explorer), main: await readTabs(main) };
+  return {
+    before,
+    after,
+    dialogMessage,
+    infoDirectCloseDisabled,
+    infoPermanent: getPanelManifest("info").permanent === true,
+  };
 }
 
 test("Explorer keeps Files and Changes close actions in the context menu", async ({
@@ -164,7 +188,16 @@ test("Explorer keeps Files and Changes close actions in the context menu", async
     });
 
     await test.step("standard bulk-close menus affect only Explorer tabs", async () => {
-      await closeOtherExplorerTabs(page);
+      const observation = await closeOtherExplorerTabs(page);
+      await testInfo.attach("bulk-close-observation", {
+        body: JSON.stringify(observation, null, 2),
+        contentType: "application/json",
+      });
+      expect(observation.infoPermanent).toBe(true);
+      expect(observation.infoDirectCloseDisabled).toBe(true);
+      expect(observation.after.main).toEqual(observation.before.main);
+      await expect(explorer.getByTestId("workspace-tab-info")).toBeVisible();
+      expect(observation.dialogMessage).toContain("close 1 tab");
       await expect(explorer.getByTestId("workspace-tab-changes_tree")).toHaveCount(0);
       await expect(explorer.getByTestId("workspace-tab-files")).toBeVisible();
       await expect(main.getByTestId("workspace-tabs-row").getByRole("button")).toHaveCount(
