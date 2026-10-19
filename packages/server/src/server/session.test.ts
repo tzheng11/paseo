@@ -3,11 +3,19 @@ import {
   createTestCreationService,
 } from "./test-utils/session-stubs.js";
 import { execSync } from "child_process";
-import { existsSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "fs";
 import { tmpdir } from "os";
 import { join, resolve as resolvePath } from "path";
 import pino from "pino";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import {
   assertPullRequestAutoMergeDisableReady,
@@ -23,6 +31,7 @@ import {
   type FileTransferFrame,
 } from "@getpaseo/protocol/binary-frames/index";
 import { Session } from "./session.js";
+import { MainHostStore } from "./fleet/main-host-store.js";
 import { OWNER_PERMISSIONS, type DaemonPermission } from "./authorization/index.js";
 import { DownloadTokenStore } from "./file-download/token-store.js";
 import { StructuredAgentFallbackError } from "./agent/agent-response-loop.js";
@@ -38,7 +47,11 @@ import {
 } from "./workspace-registry.js";
 import { deriveProjectKey } from "./project-key.js";
 import type { SessionOptions } from "./session.js";
-import type { SessionInboundMessage, SessionOutboundMessage } from "./messages.js";
+import {
+  SessionInboundMessageSchema,
+  type SessionInboundMessage,
+  type SessionOutboundMessage,
+} from "./messages.js";
 import {
   asSessionInternals as asSessionInternalsHelper,
   asAgentManager,
@@ -294,6 +307,10 @@ vi.mock("./worktree-bootstrap.js", async (importOriginal) => {
 
 interface SessionForTestOptions {
   clientId?: string;
+  clientCapabilities?: SessionOptions["clientCapabilities"];
+  clientType?: SessionOptions["clientType"];
+  principalId?: SessionOptions["principalId"];
+  mainHostStore?: SessionOptions["mainHostStore"];
   permissions?: readonly DaemonPermission[];
   agentManager?: { [K in keyof SessionOptions["agentManager"]]?: unknown };
   agentStorage?: { [K in keyof SessionOptions["agentStorage"]]?: unknown };
@@ -375,6 +392,10 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
     messageReceipts: createMessageReceiptsStub(),
     creationService: createTestCreationService(),
     clientId: options.clientId ?? "test-client",
+    clientCapabilities: options.clientCapabilities,
+    clientType: options.clientType,
+    principalId: options.principalId,
+    mainHostStore: options.mainHostStore,
     onMessage: (message) => messages.push(message),
     ...(options.targetedMessages
       ? {
@@ -926,6 +947,344 @@ describe("session authorization permissions", () => {
         },
       },
     ]);
+  });
+});
+
+describe("Main host session permissions, compatibility and provenance", () => {
+  let paseoHome: string;
+  let store: MainHostStore;
+  const sessions: Session[] = [];
+
+  beforeEach(async () => {
+    paseoHome = mkdtempSync(join(tmpdir(), "paseo-main-session-"));
+    store = new MainHostStore({ paseoHome, serverId: "main-allocator" });
+    await store.initialize();
+  });
+
+  afterEach(async () => {
+    try {
+      const results = await Promise.allSettled(
+        sessions.splice(0).map((session) => session.cleanup()),
+      );
+      expect(results.filter((result) => result.status === "rejected")).toEqual([]);
+    } finally {
+      rmSync(paseoHome, { recursive: true, force: true });
+    }
+  });
+
+  function mainSession(options: SessionForTestOptions = {}): Session {
+    const session = createSessionForTest({
+      paseoHome,
+      serverId: "main-allocator",
+      mainHostStore: store,
+      principalId: "owner",
+      clientType: "browser",
+      clientCapabilities: { [CLIENT_CAPS.mainHost]: true },
+      ...options,
+    });
+    sessions.push(session);
+    return session;
+  }
+
+  async function firstMainChoice() {
+    await mainSession().handleMessage({
+      type: "fleet.main_host.set.request",
+      mainHost: "host-a",
+      expectedGeneration: 0,
+      requestId: "first-main",
+    });
+    const choice = store.snapshot().choice;
+    if (!choice) throw new Error("Expected the owner session to allocate Main");
+    return choice;
+  }
+
+  test("Main daemon.read can read the current setting without changing durable state", async () => {
+    await firstMainChoice();
+    const before = store.snapshot();
+    const bytes = readFileSync(join(paseoHome, "fleet.json"));
+    const messages: SessionOutboundMessage[] = [];
+    const session = mainSession({ permissions: ["daemon.read"], messages });
+
+    await session.handleMessage({ type: "fleet.main_host.get.request", requestId: "read-main" });
+
+    expect(messages).toEqual([
+      {
+        type: "fleet.main_host.get.response",
+        payload: { requestId: "read-main", state: before, allocator: store.allocator() },
+      },
+    ]);
+    expect(store.snapshot()).toEqual(before);
+    expect(readFileSync(join(paseoHome, "fleet.json"))).toEqual(bytes);
+  });
+
+  interface MainDeniedCase {
+    label: string;
+    permissions: readonly DaemonPermission[];
+  }
+  const deniedCases: MainDeniedCase[] = [
+    { label: "daemon.read", permissions: ["daemon.read"] },
+    { label: "hub.execute", permissions: ["hub.execute"] },
+  ];
+
+  test.each(deniedCases)(
+    "Main $label cannot set or apply and keeps the prior durable setting",
+    async ({ permissions }) => {
+      const choice = await firstMainChoice();
+      const before = store.snapshot();
+      const bytes = readFileSync(join(paseoHome, "fleet.json"));
+      const messages: SessionOutboundMessage[] = [];
+      const session = mainSession({ permissions, messages });
+
+      await session.handleMessage({
+        type: "fleet.main_host.set.request",
+        mainHost: "host-b",
+        expectedGeneration: 1,
+        requestId: "denied-set",
+      });
+      await session.handleMessage({
+        type: "fleet.main_host.apply.request",
+        choice,
+        expectedLocalGeneration: 1,
+        confirmation: { allocationId: choice.allocationId },
+        requestId: "denied-apply",
+      });
+
+      expect(messages).toEqual([
+        {
+          type: "rpc_error",
+          payload: {
+            requestId: "denied-set",
+            requestType: "fleet.main_host.set.request",
+            error: "Session is not authorized for fleet.main_host.set.request",
+            code: "access_denied",
+          },
+        },
+        {
+          type: "rpc_error",
+          payload: {
+            requestId: "denied-apply",
+            requestType: "fleet.main_host.apply.request",
+            error: "Session is not authorized for fleet.main_host.apply.request",
+            code: "access_denied",
+          },
+        },
+      ]);
+      expect(store.snapshot()).toEqual(before);
+      expect(readFileSync(join(paseoHome, "fleet.json"))).toEqual(bytes);
+    },
+  );
+
+  test("Main get refuses a session without daemon.read and preserves the prior setting", async () => {
+    await firstMainChoice();
+    const before = store.snapshot();
+    const bytes = readFileSync(join(paseoHome, "fleet.json"));
+    const messages: SessionOutboundMessage[] = [];
+
+    await mainSession({ permissions: [], messages }).handleMessage({
+      type: "fleet.main_host.get.request",
+      requestId: "denied-read",
+    });
+
+    expect(messages).toEqual([
+      {
+        type: "rpc_error",
+        payload: {
+          requestId: "denied-read",
+          requestType: "fleet.main_host.get.request",
+          error: "Session is not authorized for fleet.main_host.get.request",
+          code: "access_denied",
+        },
+      },
+    ]);
+    expect(store.snapshot()).toEqual(before);
+    expect(readFileSync(join(paseoHome, "fleet.json"))).toEqual(bytes);
+  });
+
+  test.each([false, undefined])(
+    "Main omitted or false client capability (%s) refuses with a readable update message",
+    async (capability) => {
+      const choice = await firstMainChoice();
+      const before = store.snapshot();
+      const bytes = readFileSync(join(paseoHome, "fleet.json"));
+      const messages: SessionOutboundMessage[] = [];
+      const clientCapabilities =
+        capability === undefined ? undefined : { [CLIENT_CAPS.mainHost]: capability };
+      const session = mainSession({ messages, clientCapabilities });
+
+      await session.handleMessage({
+        type: "fleet.main_host.set.request",
+        mainHost: "host-b",
+        expectedGeneration: 1,
+        requestId: "old-set",
+      });
+      await session.handleMessage({
+        type: "fleet.main_host.apply.request",
+        choice,
+        expectedLocalGeneration: 1,
+        confirmation: { allocationId: choice.allocationId },
+        requestId: "old-apply",
+      });
+
+      expect(messages).toEqual([
+        {
+          type: "rpc_error",
+          payload: {
+            requestId: "old-set",
+            requestType: "fleet.main_host.set.request",
+            code: "main_host_update_required",
+            error:
+              "Update this client and host to use Main host. The previous setting is unchanged.",
+          },
+        },
+        {
+          type: "rpc_error",
+          payload: {
+            requestId: "old-apply",
+            requestType: "fleet.main_host.apply.request",
+            code: "main_host_update_required",
+            error:
+              "Update this client and host to use Main host. The previous setting is unchanged.",
+          },
+        },
+      ]);
+      expect(store.snapshot()).toEqual(before);
+      expect(readFileSync(join(paseoHome, "fleet.json"))).toEqual(bytes);
+    },
+  );
+
+  const clientTypes: NonNullable<SessionOptions["clientType"]>[] = ["browser", "cli"];
+  test.each(clientTypes)(
+    "Main allocation stamps the admitted %s session identity",
+    async (clientType) => {
+      const messages: SessionOutboundMessage[] = [];
+      const session = mainSession({
+        clientId: "admitted-client",
+        principalId: "admitted-owner",
+        clientType,
+        messages,
+      });
+
+      await session.handleMessage({
+        type: "fleet.main_host.set.request",
+        mainHost: "host-b",
+        expectedGeneration: 0,
+        requestId: "admitted-set",
+      });
+
+      const state = store.snapshot();
+      expect(state).toEqual({
+        held: true,
+        delivery: null,
+        choice: expect.objectContaining({
+          generation: 1,
+          mainHost: "host-b",
+          setBy: {
+            principalId: "admitted-owner",
+            clientId: "admitted-client",
+            clientType,
+            sessionId: session.getSessionId(),
+            serverId: "main-allocator",
+          },
+        }),
+      });
+      expect(messages).toEqual([
+        {
+          type: "fleet.main_host.set.response",
+          payload: { requestId: "admitted-set", state, allocator: store.allocator() },
+        },
+      ]);
+    },
+  );
+
+  test("Main owner browser confirms its allocation and stamps the delivery session", async () => {
+    const choice = await firstMainChoice();
+    const messages: SessionOutboundMessage[] = [];
+    const session = mainSession({ clientId: "owner-browser", messages });
+
+    await session.handleMessage({
+      type: "fleet.main_host.apply.request",
+      choice,
+      expectedLocalGeneration: 1,
+      confirmation: { allocationId: choice.allocationId },
+      requestId: "owner-delivery",
+    });
+
+    const state = store.snapshot();
+    expect(state).toEqual({
+      choice,
+      held: false,
+      delivery: {
+        allocationId: choice.allocationId,
+        confirmedAt: expect.any(String),
+        confirmedBy: {
+          principalId: "owner",
+          clientId: "owner-browser",
+          clientType: "browser",
+          serverId: "main-allocator",
+          sessionId: session.getSessionId(),
+        },
+      },
+    });
+    expect(messages).toEqual([
+      {
+        type: "fleet.main_host.apply.response",
+        payload: { requestId: "owner-delivery", state, allocator: store.allocator() },
+      },
+    ]);
+    const restarted = new MainHostStore({ paseoHome, serverId: "main-allocator" });
+    await restarted.initialize();
+    expect(restarted.snapshot()).toEqual(state);
+  });
+
+  test("Main CLI confirmation refuses and keeps the prior held allocation bytes", async () => {
+    const choice = await firstMainChoice();
+    const before = store.snapshot();
+    const bytes = readFileSync(join(paseoHome, "fleet.json"));
+    const messages: SessionOutboundMessage[] = [];
+
+    await mainSession({ clientType: "cli", messages }).handleMessage({
+      type: "fleet.main_host.apply.request",
+      choice,
+      expectedLocalGeneration: 1,
+      confirmation: { allocationId: choice.allocationId },
+      requestId: "cli-confirmation",
+    });
+
+    expect(messages).toEqual([
+      {
+        type: "rpc_error",
+        payload: {
+          requestId: "cli-confirmation",
+          requestType: "fleet.main_host.apply.request",
+          code: "confirmation_required",
+          error:
+            "Main host change refused: confirmation_required. The previous setting is unchanged.",
+          mainHost: before,
+        },
+      },
+    ]);
+    expect(store.snapshot()).toEqual(before);
+    expect(readFileSync(join(paseoHome, "fleet.json"))).toEqual(bytes);
+  });
+
+  test("Main wire schema refuses caller-supplied generation, timestamp and actor", () => {
+    const callerFields = [
+      { generation: 100 },
+      { setAt: "2026-10-18T00:00:00.000Z" },
+      { setBy: { principalId: "forged-owner" } },
+    ];
+    for (const fields of callerFields) {
+      const parsed = SessionInboundMessageSchema.safeParse({
+        type: "fleet.main_host.set.request",
+        mainHost: "host-a",
+        expectedGeneration: 0,
+        requestId: "forged-fields",
+        ...fields,
+      });
+      expect(parsed.success).toBe(false);
+    }
+    expect(store.snapshot()).toEqual({ choice: null, held: false, delivery: null });
+    expect(existsSync(join(paseoHome, "fleet.json"))).toBe(false);
   });
 });
 
