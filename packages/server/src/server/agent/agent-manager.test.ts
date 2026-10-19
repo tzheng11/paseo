@@ -13697,6 +13697,40 @@ test("unload rechecks eligibility after asynchronous process observation", async
   }
 });
 
+test.each(["metadata", "turn"] as const)(
+  "credential maintenance preserves idle age while %s arrives on the replacement",
+  async (activity) => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const h = await idleUnloadHarness(0);
+    try {
+      await vi.advanceTimersByTimeAsync(180_000);
+      await h.manager.reloadIdleAgentSession(h.agent.id, { preserveHistory: true });
+      const replacement = h.sessions[1]!;
+      replacement.pushEvent(
+        activity === "metadata"
+          ? {
+              type: "model_changed",
+              provider: "codex",
+              runtimeInfo: await replacement.getRuntimeInfo(),
+            }
+          : { type: "turn_completed", provider: "codex" },
+      );
+      await h.manager.flush();
+      h.manager.setIdleUnloadAfterMinutes(2);
+      await h.manager.unloadIdleAgents();
+      expect(replacement.closed).toBe(activity === "metadata" ? 1 : 0);
+      if (activity === "turn") {
+        await vi.advanceTimersByTimeAsync(180_000);
+        await h.manager.waitForAgentClose(h.agent.id);
+        expect(replacement.closed).toBe(1);
+      }
+    } finally {
+      await h.close();
+      vi.useRealTimers();
+    }
+  },
+);
+
 test("credential reload acknowledges an unloaded idle session without spawning and preserves receipts", async () => {
   vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
   const h = await idleUnloadHarness();
@@ -13798,6 +13832,23 @@ test("idle unload retains a runtime fenced by an uncertain reload receipt", asyn
     await h.manager.waitForAgentClose(h.agent.id);
     expect(h.session.closed).toBe(0);
   } finally {
+    await h.close();
+    vi.useRealTimers();
+  }
+});
+
+test("idle unload retains the runtime when its idle snapshot cannot persist", async () => {
+  vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+  const h = await idleUnloadHarness();
+  await h.manager.flush();
+  const persist = vi.spyOn(h.storage, "applySnapshot").mockRejectedValue(new Error("disk full"));
+  try {
+    await vi.advanceTimersByTimeAsync(180_000);
+    await h.manager.waitForAgentClose(h.agent.id);
+    expect(h.session.closed).toBe(0);
+    expect(h.manager.getAgent(h.agent.id)?.lifecycle).toBe("idle");
+  } finally {
+    persist.mockRestore();
     await h.close();
     vi.useRealTimers();
   }

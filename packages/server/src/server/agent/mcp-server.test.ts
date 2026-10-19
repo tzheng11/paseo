@@ -6981,8 +6981,9 @@ it("reports an unloaded idle agent through MCP status and listings without loadi
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(new Date("2026-04-11T00:00:00.000Z"));
   try {
+    const logger = createTestLogger();
     const { agentManager, agentStorage, spies } = createTestDeps();
-    const record = createStoredRecord({ lastStatus: "idle" });
+    const record = createStoredRecord({ lastStatus: "idle", archivedAt: null });
     spies.agentManager.getAgent.mockReturnValue(null);
     spies.agentStorage.get.mockResolvedValue(record);
     spies.agentStorage.list.mockResolvedValue([record]);

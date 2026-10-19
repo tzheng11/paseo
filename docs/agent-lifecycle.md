@@ -10,7 +10,7 @@ initializing → idle → running → idle (or error → closed)
                  └────────┘  (agent completes a turn, awaits next prompt)
 ```
 
-Each live agent in `AgentManager` carries a `lastStatus` of `initializing`, `idle`, `running`, or `error`. `closed` is the persisted, resumable state for an agent record that has no live provider runtime. State transitions persist to disk and stream to subscribed clients via WebSocket.
+Each live agent in `AgentManager` carries a `lastStatus` of `initializing`, `idle`, `running`, or `error`. Explicit closure persists the resumable `closed` state. Automatic idle unloading releases the provider runtime while keeping `idle`. State transitions persist to disk and stream to subscribed clients via WebSocket.
 
 ## Idle-only reload
 
@@ -141,8 +141,9 @@ replacement. Once closure succeeds, a failed resume leaves the durable agent clo
 The daemon also unloads long-idle runtimes while preserving the user-visible `idle` status.
 Configure the [idle unload period](../public-docs/configuration.md#idle-agent-runtimes) in
 `config.json`; changes apply through daemon config reload. The sweep runs
-once a minute and measures inactivity from the latest agent event or runtime demand, including
-send preparation and timeline access. Unloading does not mark the chat read or change its
+once a minute and measures inactivity from the latest work event or runtime demand, including
+send preparation and timeline access. Credential maintenance and provider configuration metadata
+do not renew that clock. Unloading does not mark the chat read or change its
 last-activity timestamp. `paseo inspect --json` exposes `RuntimeLoaded`; the snapshot field is
 `runtimeLoaded`.
 

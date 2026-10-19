@@ -18,7 +18,20 @@ export async function hasRuntimeShellChild(pid: number): Promise<boolean> {
       return { pid: Number(match[1]), parent: Number(match[2]), command: path.basename(match[3]!) };
     });
   if (!rows.some((row) => row.pid === pid)) return true;
-  const shells = new Set(["sh", "bash", "zsh", "dash", "fish", "ksh", "csh", "tcsh", "nu", "pwsh"]);
+  const shells = new Set([
+    "sh",
+    "ash",
+    "bash",
+    "zsh",
+    "dash",
+    "fish",
+    "ksh",
+    "mksh",
+    "csh",
+    "tcsh",
+    "nu",
+    "pwsh",
+  ]);
   return rows.some((row) => row.parent === pid && shells.has(row.command.replace(/^-/, "")));
 }
 

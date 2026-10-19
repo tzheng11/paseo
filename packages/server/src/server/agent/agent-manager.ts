@@ -1000,7 +1000,7 @@ export class AgentManager {
       agent.session.hasActiveBackgroundTasks?.() === false &&
       !this.sessionSchedulers.get(agent.id)?.active &&
       !this.providerSubagents.list(agent.id).some((child) => child.status === "running") &&
-      Date.now() - Math.max(agent.updatedAt.getTime(), this.lastRuntimeDemand.get(agent.id) ?? 0) >=
+      Date.now() - (this.lastRuntimeDemand.get(agent.id) ?? agent.updatedAt.getTime()) >=
         this.idleUnloadAfterMinutes * 60_000
     );
   }
@@ -1021,22 +1021,20 @@ export class AgentManager {
           if (pid === undefined || (pid !== null && (await this.hasRuntimeShellChild(pid)))) return;
           await this.drainSessionEvents(agentId);
           if (!this.canUnloadIdleAgent(agent)) return;
+          // Commit the resumable idle identity before releasing provider ownership.
+          await this.persistSnapshot(agent);
+          if (!this.canUnloadIdleAgent(agent)) return;
           const idleMinutes =
-            (Date.now() -
-              Math.max(agent.updatedAt.getTime(), this.lastRuntimeDemand.get(agentId) ?? 0)) /
+            (Date.now() - (this.lastRuntimeDemand.get(agentId) ?? agent.updatedAt.getTime())) /
             60_000;
           await agent.session.close();
           const closed = this.prepareAgentForClosure(agent, "idle runtime unloaded");
           const unloaded: ManagedAgentUnloaded = { ...closed, lifecycle: "idle" };
-          try {
-            await this.persistSnapshot(unloaded);
-          } finally {
-            this.emitState(unloaded, { persist: false });
-            this.logger.info(
-              { agentId, provider: agent.provider, idleMinutes },
-              "Unloaded idle agent runtime",
-            );
-          }
+          this.emitState(unloaded, { persist: false });
+          this.logger.info(
+            { agentId, provider: agent.provider, idleMinutes },
+            "Unloaded idle agent runtime",
+          );
         } catch (err) {
           this.logger.warn(
             { err, agentId, provider: agent.provider },
@@ -1186,8 +1184,9 @@ export class AgentManager {
     };
   }
 
-  private touchUpdatedAt(agent: ManagedAgent): Date {
+  private touchUpdatedAt(agent: ManagedAgent, runtimeActivity = true): Date {
     const nowMs = Date.now();
+    if (runtimeActivity) this.lastRuntimeDemand.set(agent.id, nowMs);
     const previousMs = agent.updatedAt.getTime();
     const nextMs = nowMs > previousMs ? nowMs : previousMs + 1;
     const next = new Date(nextMs);
@@ -2264,7 +2263,11 @@ export class AgentManager {
       await this.closeReloadedSession(existing.session, agentId, options.preserveHistory);
       await this.drainSessionEvents(agentId);
       this.cancelRunningProviderSubagents(agentId);
-      closedExisting = this.prepareAgentForClosure(existing, "agent reloaded");
+      closedExisting = this.prepareAgentForClosure(
+        existing,
+        "agent reloaded",
+        options.preserveHistory,
+      );
       await this.persistSnapshot(closedExisting);
       this.assertAcceptingAgentRegistrations();
 
@@ -4270,6 +4273,14 @@ export class AgentManager {
     });
   }
 
+  private initializeRuntimeDemand(agentId: string, maintenanceReload = false): void {
+    // Credential maintenance replaces ownership without renewing idle activity.
+    // Retain any demand that arrived while the old runtime was closing, too.
+    if (!maintenanceReload || !this.lastRuntimeDemand.has(agentId)) {
+      this.lastRuntimeDemand.set(agentId, Date.now());
+    }
+  }
+
   private async registerSession(
     session: AgentSession,
     config: AgentSessionConfig,
@@ -4343,7 +4354,7 @@ export class AgentManager {
 
       this.assertAcceptingAgentRegistrations();
       this.agents.set(resolvedAgentId, managed);
-      this.lastRuntimeDemand.set(resolvedAgentId, Date.now());
+      this.initializeRuntimeDemand(resolvedAgentId, options?.maintenanceReload);
       this.sessionSchedulers.set(resolvedAgentId, new ClaudeSessionSchedulers());
       registered = true;
       // Initialize previousStatus to track transitions
@@ -4569,11 +4580,12 @@ export class AgentManager {
   private prepareAgentForClosure(
     agent: LiveManagedAgent,
     cancelReason: string,
+    preserveRuntimeDemand = false,
   ): ManagedAgentClosed {
     this.agentStreamCoalescer.flushAndDiscard(agent.id);
     this.agents.delete(agent.id);
     this.sessionSchedulers.delete(agent.id);
-    this.lastRuntimeDemand.delete(agent.id);
+    if (!preserveRuntimeDemand) this.lastRuntimeDemand.delete(agent.id);
     this.previousStatuses.delete(agent.id);
     if (agent.unsubscribeSession) {
       agent.unsubscribeSession();
@@ -4630,8 +4642,15 @@ export class AgentManager {
     agent.unsubscribeSession = unsubscribe;
   }
 
+  private isRuntimeActivity(event: AgentStreamEvent): boolean {
+    // Providers report startup/configuration metadata again on credential reload.
+    return !["thread_started", "model_changed", "mode_changed", "thinking_option_changed"].includes(
+      event.type,
+    );
+  }
+
   private enqueueSessionEvent(agentId: string, event: AgentStreamEvent): void {
-    this.lastRuntimeDemand.set(agentId, Date.now());
+    if (this.isRuntimeActivity(event)) this.lastRuntimeDemand.set(agentId, Date.now());
     this.logger.trace(
       {
         agentId,
@@ -5072,7 +5091,7 @@ export class AgentManager {
 
     // Only update timestamp for live events, not history replay
     if (!options?.fromHistory) {
-      this.touchUpdatedAt(agent);
+      this.touchUpdatedAt(agent, this.isRuntimeActivity(event));
       if (this.agentStreamCoalescer.handle(agent.id, event)) {
         this.traceCoalescerBuffered(agent, event, eventTurnId);
         return false;
