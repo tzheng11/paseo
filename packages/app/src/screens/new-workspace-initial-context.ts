@@ -7,6 +7,7 @@ import {
 import type { HostRuntimeConnectionStatus } from "@/runtime/host-runtime";
 
 export interface NewWorkspaceInitialServerInput {
+  mainHostServerId?: string | null;
   allServerIds: readonly string[];
   routeServerId: string | null | undefined;
   lastActiveProject: HostProjectListItem | null;
@@ -153,8 +154,12 @@ export function resolveNewWorkspaceInitialServerId(input: NewWorkspaceInitialSer
   }
 
   if (onlineServerIdsWithProjects.length > 0) {
+    const mainHost = knownServerId(serverIds, input.mainHostServerId);
+    if (mainHost && isOnline(input.hostConnectionStatusByServerId, mainHost)) return mainHost;
     return onlineServerIdsWithProjects[0] ?? "";
   }
+  const mainHost = knownServerId(serverIds, input.mainHostServerId);
+  if (mainHost && isOnline(input.hostConnectionStatusByServerId, mainHost)) return mainHost;
   if (onlineServerIds.length === 1) {
     return onlineServerIds[0] ?? "";
   }
@@ -205,6 +210,7 @@ export function resolveNewWorkspaceAutomaticServerId(
   if (routeServerId === nextServerId) {
     return nextServerId;
   }
+  if (!routeServerId && nextServerId === input.mainHostServerId) return nextServerId;
 
   const lastActiveProjectServerId = findLastActiveProjectServerId({
     serverIds,

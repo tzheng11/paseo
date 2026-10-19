@@ -5,6 +5,7 @@ import type {
 import type { AgentSnapshotPayload, CreationSnapshot } from "@getpaseo/protocol/messages";
 import { encodeImages } from "@/utils/encode-images";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
+import { useMainHost } from "@/hosts/use-main-host";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import type { ReactElement, ReactNode, RefObject } from "react";
 import { useTranslation } from "react-i18next";
@@ -1178,9 +1179,11 @@ function useNewWorkspaceHostSelector(input: {
   workspaceMultiplicityByServerId: ReadonlyMap<string, boolean>;
 }) {
   const routeServerId = input.initialServerId.trim();
+  const { resolution: main } = useMainHost();
   const defaultServerId = useMemo(
     () =>
       resolveNewWorkspaceInitialServerId({
+        mainHostServerId: main.mainHost,
         allServerIds: input.allServerIds,
         routeServerId: input.initialServerId,
         lastActiveProject: input.lastActiveProject,
@@ -1190,6 +1193,7 @@ function useNewWorkspaceHostSelector(input: {
       }),
     [
       input.allServerIds,
+      main.mainHost,
       input.hostConnectionStatusByServerId,
       input.initialServerId,
       input.lastActiveProject,
@@ -1212,6 +1216,7 @@ function useNewWorkspaceHostSelector(input: {
       const nextServerId =
         current.routeServerId === routeServerId
           ? resolveNewWorkspaceAutomaticServerId({
+              mainHostServerId: main.mainHost,
               allServerIds: input.allServerIds,
               routeServerId: input.initialServerId,
               lastActiveProject: input.lastActiveProject,
@@ -1231,6 +1236,7 @@ function useNewWorkspaceHostSelector(input: {
     });
   }, [
     defaultServerId,
+    main.mainHost,
     input.allServerIds,
     input.hostConnectionStatusByServerId,
     input.initialServerId,
@@ -1925,10 +1931,19 @@ export function NewWorkspaceScreen({
       // multiplicity is off, any project when it's on); don't re-gate here on
       // canCreateWorktree or non-git projects become unselectable.
       selectProjectOption(id);
+      // A project choice also chooses its host. Later default hydration or Main
+      // updates must not replace this in-progress form's explicit target.
+      handleSelectHost(selectedServerId);
       setProjectPickerOpen(false);
       clearPickerSelectionForTargetChange(selectedProjectOptionId, id);
     },
-    [clearPickerSelectionForTargetChange, selectProjectOption, selectedProjectOptionId],
+    [
+      clearPickerSelectionForTargetChange,
+      handleSelectHost,
+      selectProjectOption,
+      selectedProjectOptionId,
+      selectedServerId,
+    ],
   );
 
   const handleSelectWorkspaceHost = useCallback(

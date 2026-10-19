@@ -21,6 +21,15 @@ export { TerminalProfileSchema, type TerminalProfile } from "./terminal-profile.
 import { z } from "zod";
 import { TerminalActivitySchema } from "./terminal-activity.js";
 import { CLIENT_CAPS } from "./client-capabilities.js";
+import {
+  MainHostGetRequestSchema,
+  MainHostSetRequestSchema,
+  MainHostApplyRequestSchema,
+  MainHostGetResponseSchema,
+  MainHostSetResponseSchema,
+  MainHostApplyResponseSchema,
+  MainHostStateSchema,
+} from "./fleet/main-host.js";
 import { AGENT_LIFECYCLE_STATUSES } from "./agent-lifecycle.js";
 import { MAX_EXPLICIT_AGENT_TITLE_CHARS } from "./agent-title-limits.js";
 import { AgentProviderSchema } from "./provider-manifest.js";
@@ -3295,6 +3304,9 @@ export const SubscriptionReleaseResponseSchema = z.object({
 });
 
 export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
+  MainHostGetRequestSchema,
+  MainHostSetRequestSchema,
+  MainHostApplyRequestSchema,
   BrowserHostRegisterRequestSchema,
   SubscriptionReleaseRequestSchema,
   SessionEventsSetSubscriptionRequestSchema,
@@ -3665,6 +3677,8 @@ const ServerCapabilitiesFromUnknownSchema = z
 export const ServerInfoStatusPayloadSchema = z
   .object({
     status: z.literal("server_info"),
+    // COMPAT(mainHost): added in v0.11.3; remove optional after 2027-04-18.
+    mainHost: MainHostStateSchema.optional(),
     protocolVersion: z.number().int().optional(),
     // COMPAT(workspaceFields): added in v0.11.3; remove optional after 2027-04-14.
     workspaceFieldCatalogVersion: z.number().int().positive().optional(),
@@ -3679,6 +3693,8 @@ export const ServerInfoStatusPayloadSchema = z
     // COMPAT(providersSnapshot): added in v0.1.48, remove gating when all clients use snapshot
     features: z
       .object({
+        // COMPAT(mainHost): added in v0.11.3; remove gate after 2027-04-18.
+        mainHost: z.boolean().optional(),
         // COMPAT(agentRequestReceipts): added in v0.8.0; remove gate after 2027-03-05.
         agentRequestReceipts: z.boolean().optional(),
         // COMPAT(workspaceRequestReceipts): added in v0.8.0; remove gate after 2027-03-07.
@@ -3900,6 +3916,7 @@ export const RpcErrorMessageSchema = z.object({
     requestType: z.string().optional(),
     error: z.string(),
     code: z.string().optional(),
+    mainHost: MainHostStateSchema.optional(),
   }),
 });
 
@@ -7076,6 +7093,9 @@ export const AgentSkillsImportLegacySelectionResponseSchema = z.object({
 });
 
 export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
+  MainHostGetResponseSchema,
+  MainHostSetResponseSchema,
+  MainHostApplyResponseSchema,
   BrowserHostRegisterResponseSchema,
   SubscriptionReleaseResponseSchema,
   SessionEventsSetSubscriptionResponseSchema,

@@ -1,4 +1,5 @@
 import { MessageReceipts } from "./message-receipts/index.js";
+import { MainHostStore } from "./fleet/main-host-store.js";
 import type { PluginRegistries } from "@getpaseo/protocol/plugin-registry";
 import { describeHookWorkspace } from "./plugins/lifecycle/index.js";
 import express from "express";
@@ -637,6 +638,17 @@ export async function createPaseoDaemon(
   });
 
   const serverId = getOrCreateServerId(config.paseoHome, { logger });
+  let mainHostStore: MainHostStore | undefined;
+  try {
+    const store = new MainHostStore({ paseoHome: config.paseoHome, serverId });
+    await store.initialize();
+    mainHostStore = store;
+  } catch (error) {
+    logger.error(
+      { err: error },
+      "Main host initialization failed; Main is disabled for this daemon run. Restore fleet.json and fleet-allocator-key.pem from the same backup, then restart to retry. Other daemon services remain available.",
+    );
+  }
   const daemonKeyPair = await loadOrCreateDaemonKeyPair(config.paseoHome, logger);
   const managedProcesses = createBootstrapManagedProcessRegistry(config, logger);
   // Reconcile the helper-process ledger in the background so it never blocks the
@@ -1701,6 +1713,7 @@ export async function createPaseoDaemon(
               mcpBaseUrl,
               {
                 getAllowedOrigins: () => allowedOrigins,
+                mainHostStore,
                 getHostnames: () => configuredHostnames,
                 daemonStatusRpc: dependencies.serverFeatureOverrides?.daemonStatusRpc,
                 relayConfig: dependencies.serverFeatureOverrides?.relayConfig,

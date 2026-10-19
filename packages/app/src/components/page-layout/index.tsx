@@ -12,6 +12,7 @@ interface PageLayoutProps {
   onBack?: () => void;
   testID?: string;
   titleTestID?: string;
+  fullWidth?: boolean;
   /** Controls for the whole page: right of the title on desktop, in the back header on compact. */
   actions?: ReactNode;
   children: ReactNode;
@@ -27,12 +28,17 @@ export function PageLayout({
   onBack,
   testID,
   titleTestID,
+  fullWidth = false,
   actions,
   children,
 }: PageLayoutProps) {
   const isCompact = useIsCompactFormFactor();
   const insets = useSafeAreaInsets();
   const scrollContentStyle = useMemo(() => ({ paddingBottom: insets.bottom }), [insets.bottom]);
+  const contentStyle = useMemo(
+    () => [styles.content, fullWidth ? styles.fullWidth : null],
+    [fullWidth],
+  );
   const showTitle = !isCompact && title !== undefined;
 
   return (
@@ -43,7 +49,7 @@ export function PageLayout({
         <MenuHeader borderless />
       )}
       <ScrollView style={styles.scroll} contentContainerStyle={scrollContentStyle} testID={testID}>
-        <View style={styles.content}>
+        <View style={contentStyle}>
           {showTitle ? (
             <View style={styles.titleRow} testID={titleTestID}>
               <Text style={styles.title} testID="page-title">
@@ -73,6 +79,9 @@ const styles = StyleSheet.create((theme) => ({
     width: "100%",
     maxWidth: 720,
     alignSelf: "center",
+  },
+  fullWidth: {
+    maxWidth: "100%",
   },
   titleRow: {
     flexDirection: "row",

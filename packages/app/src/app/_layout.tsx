@@ -1,4 +1,5 @@
 import "@/styles/unistyles";
+import { MainHostProvider } from "@/hosts/use-main-host";
 import { BottomSheetModalProvider } from "@gorhom/bottom-sheet";
 import { PortalProvider } from "@gorhom/portal";
 import { LucideProvider } from "lucide-react-native";
@@ -949,6 +950,16 @@ function RuntimeProviders({ children }: { children: ReactNode }) {
 // auth, settings, ...) must wrap PortalProvider, not be wrapped by it.
 // BottomSheetModalProvider is the exception: Gorhom modals consume portal
 // context and need one shared provider for sibling sheets to stack.
+function PortalProviders({ children }: { children: ReactNode }) {
+  return (
+    <MainHostProvider>
+      <PortalProvider>
+        <BottomSheetModalProvider>{children}</BottomSheetModalProvider>
+      </PortalProvider>
+    </MainHostProvider>
+  );
+}
+
 function RootProviders({ children }: { children: ReactNode }) {
   return (
     <KeyboardActionDispatcherProvider>
@@ -956,9 +967,7 @@ function RootProviders({ children }: { children: ReactNode }) {
         <KeyboardProvider>
           <KeyboardShiftProvider>
             <ToastProvider>
-              <PortalProvider>
-                <BottomSheetModalProvider>{children}</BottomSheetModalProvider>
-              </PortalProvider>
+              <PortalProviders>{children}</PortalProviders>
             </ToastProvider>
           </KeyboardShiftProvider>
         </KeyboardProvider>

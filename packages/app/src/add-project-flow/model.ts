@@ -56,6 +56,7 @@ export interface AddProjectFlowState {
 }
 
 export interface OpenAddProjectFlowInput {
+  mainHostId?: string | null;
   hosts: AddProjectHost[];
   preferredHostId?: string;
 }
@@ -75,7 +76,8 @@ export function openAddProjectFlow(input: OpenAddProjectFlowInput): AddProjectFl
     ? input.hosts.find((host) => host.serverId === input.preferredHostId)
     : null;
   const onlyHost = input.hosts.length === 1 ? input.hosts[0] : null;
-  const initialHost = preferredHost ?? onlyHost;
+  const mainHost = input.hosts.find((host) => host.serverId === input.mainHostId);
+  const initialHost = preferredHost ?? mainHost ?? onlyHost;
 
   return {
     hosts: input.hosts,
@@ -89,6 +91,7 @@ export function applyAvailableAddProjectHosts(
   state: AddProjectFlowState,
   hosts: AddProjectHost[],
   preferredHostId?: string,
+  mainHostId?: string | null,
 ): AddProjectFlowState {
   const current = currentAddProjectPage(state);
   if (state.pages.length !== 1 || current.kind !== "host") {
@@ -98,7 +101,8 @@ export function applyAvailableAddProjectHosts(
     ? hosts.find((host) => host.serverId === preferredHostId)
     : null;
   const onlyHost = hosts.length === 1 ? hosts[0] : null;
-  const initialHost = preferredHost ?? onlyHost;
+  const mainHost = hosts.find((host) => host.serverId === mainHostId);
+  const initialHost = preferredHost ?? mainHost ?? onlyHost;
   return {
     ...state,
     hosts,

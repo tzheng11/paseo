@@ -14,6 +14,7 @@ import {
 import type { TFunction } from "i18next";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useLocalSearchParams } from "expo-router";
 import { Alert, Pressable, Text, View } from "react-native";
 import { StyleSheet, useUnistyles, withUnistyles } from "react-native-unistyles";
 import type { TerminalProfile } from "@getpaseo/protocol/messages";
@@ -52,6 +53,7 @@ import {
 import { ProvidersSection } from "@/screens/settings/providers-section";
 import { HostUsageSection } from "@/usage";
 import { HostAppearanceSection } from "@/screens/settings/host-appearance-section";
+import { MainHostConfirmation, MainHostSection } from "@/screens/settings/main-host-section";
 import { SettingsSection } from "@/components/settings/headings/settings-section";
 import { useSessionStore } from "@/stores/session-store";
 import { settingsStyles } from "@/styles/settings";
@@ -363,10 +365,13 @@ export function HostSettingsPage({
 }) {
   const host = useHostProfile(serverId);
   const isLocalDaemon = useIsLocalDaemon(serverId);
+  const params = useLocalSearchParams<{ mainHost?: string }>();
 
   if (!host) {
     return <HostNotFound />;
   }
+
+  if (params.mainHost === "confirm") return <MainHostConfirmation serverId={serverId} />;
 
   return (
     <View>
@@ -374,6 +379,7 @@ export function HostSettingsPage({
       <HostConnectionError serverId={serverId} />
 
       <HostAppearanceSection host={host} />
+      <MainHostSection serverId={serverId} />
 
       {isLocalDaemon ? <LocalDaemonSection /> : null}
 

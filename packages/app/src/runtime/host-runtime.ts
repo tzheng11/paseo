@@ -542,7 +542,7 @@ function createDefaultDeps(): HostRuntimeControllerDeps {
       const base = {
         suppressSendErrors: true,
         clientId,
-        clientType: "mobile",
+        clientType: isWeb ? "browser" : "mobile",
         appVersion: resolveAppVersion() ?? undefined,
         runtimeGeneration,
         capabilities: appCapabilities,

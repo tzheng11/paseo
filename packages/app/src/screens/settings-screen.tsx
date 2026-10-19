@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useMainHost } from "@/hosts/use-main-host";
+import { MainHostBadge } from "@/screens/settings/main-host-section";
 import type { ComponentType, ReactNode } from "react";
 import {
   Alert,
@@ -8,7 +10,7 @@ import {
   View,
   type PressableStateCallbackType,
 } from "react-native";
-import { useRouter } from "expo-router";
+import { useLocalSearchParams, useRouter } from "expo-router";
 import { useFocusEffect } from "@react-navigation/native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { StyleSheet, useUnistyles } from "react-native-unistyles";
@@ -575,6 +577,7 @@ function HostVersionRow({
         <Text style={settingsStyles.rowTitle} numberOfLines={1}>
           {host.label}
         </Text>
+        <MainHostBadge serverId={host.serverId} />
         {isMismatch ? (
           <Text style={settingsStyles.rowHint}>{t("settings.about.versionDiffers")}</Text>
         ) : null}
@@ -1080,6 +1083,7 @@ export interface SettingsScreenProps {
 
 export default function SettingsScreen({ view, openAddHostIntent = null }: SettingsScreenProps) {
   const router = useRouter();
+  const { mainHost: mainHostIntent } = useLocalSearchParams<{ mainHost?: string }>();
   const { t } = useTranslation();
   const voiceAudioEngine = useVoiceAudioEngineOptional();
   const { settings, isLoading: settingsLoading, updateSettings } = useAppSettings();
@@ -1097,6 +1101,7 @@ export default function SettingsScreen({ view, openAddHostIntent = null }: Setti
   const insets = useSafeAreaInsets();
   const insetBottomStyle = useMemo(() => ({ paddingBottom: insets.bottom }), [insets.bottom]);
   const hosts = useHosts();
+  const { resolution: main } = useMainHost();
   const localServerId = useLocalDaemonServerId();
   const sortedHosts = useSortedHosts(hosts, localServerId);
   const lastWorkspaceSelection = useLastWorkspaceSelection();
@@ -1121,12 +1126,13 @@ export default function SettingsScreen({ view, openAddHostIntent = null }: Setti
     if (view.kind === "host" || view.kind === "project" || view.kind === "plugin")
       return view.serverId;
     return resolveActiveHostServerId({
+      mainHostServerId: main.mainHost,
       selectedServerId: selectedSettingsHostServerId,
       localServerId,
       hosts,
       orderedHosts: sortedHosts,
     });
-  }, [view, selectedSettingsHostServerId, localServerId, hosts, sortedHosts]);
+  }, [view, selectedSettingsHostServerId, localServerId, hosts, sortedHosts, main.mainHost]);
 
   const handleLanguageChange = useCallback(
     (language: AppLanguage) => {
@@ -1305,7 +1311,10 @@ export default function SettingsScreen({ view, openAddHostIntent = null }: Setti
   }, []);
 
   const installedPlugins = useInstalledPlugins();
+  const isMainHostConfirmation =
+    view.kind === "host" && view.section === "host" && mainHostIntent === "confirm";
   const detailTitle = ((): string | undefined => {
+    if (isMainHostConfirmation) return undefined;
     if (view.kind === "plugin") {
       const screen = installedPlugins
         .find((plugin) => plugin.serverId === view.serverId && plugin.id === view.pluginId)
@@ -1452,7 +1461,11 @@ export default function SettingsScreen({ view, openAddHostIntent = null }: Setti
   if (isCompactLayout) {
     return (
       <View style={styles.container}>
-        <PageLayout title={detailTitle} onBack={handleBackFromDetail}>
+        <PageLayout
+          title={detailTitle}
+          onBack={handleBackFromDetail}
+          fullWidth={isMainHostConfirmation}
+        >
           {content}
         </PageLayout>
         {addHostModals}
@@ -1480,7 +1493,11 @@ export default function SettingsScreen({ view, openAddHostIntent = null }: Setti
         </WindowChromeRegion>
         <WindowChromeRegion corners="top-right">
           <View style={desktopStyles.contentPane} testID="settings-detail-pane">
-            <PageLayout title={detailTitle} titleTestID="settings-detail-header-title">
+            <PageLayout
+              title={detailTitle}
+              titleTestID="settings-detail-header-title"
+              fullWidth={isMainHostConfirmation}
+            >
               {content}
             </PageLayout>
           </View>

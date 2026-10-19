@@ -1,4 +1,5 @@
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
+import { useMainHost } from "@/hosts/use-main-host";
 import { router } from "expo-router";
 import type { WorkspaceProjectDescriptorPayload } from "@getpaseo/protocol/messages";
 import {
@@ -316,6 +317,7 @@ function setPageStatus(
 // The product flow is intentionally one cohesive page-stack state machine.
 // eslint-disable-next-line complexity
 export function AddProjectFlow({ request, onClose }: AddProjectFlowProps) {
+  const { resolution: main } = useMainHost();
   const hosts = useHosts();
   const hostIds = useMemo(() => hosts.map((host) => host.serverId), [hosts]);
   const connectionStatuses = useHostRuntimeConnectionStatuses(hostIds);
@@ -361,6 +363,7 @@ export function AddProjectFlow({ request, onClose }: AddProjectFlowProps) {
   );
   const [state, setState] = useState(() =>
     openAddProjectFlow({
+      mainHostId: main.mainHost,
       hosts: availableHosts,
       ...(request.preferredHostId ? { preferredHostId: request.preferredHostId } : {}),
     }),
@@ -393,9 +396,14 @@ export function AddProjectFlow({ request, onClose }: AddProjectFlowProps) {
 
   useEffect(() => {
     setState((current) =>
-      applyAvailableAddProjectHosts(current, availableHosts, request.preferredHostId),
+      applyAvailableAddProjectHosts(
+        current,
+        availableHosts,
+        request.preferredHostId,
+        main.mainHost,
+      ),
     );
-  }, [availableHosts, request.preferredHostId]);
+  }, [availableHosts, request.preferredHostId, main.mainHost]);
 
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedQuery(query), 250);

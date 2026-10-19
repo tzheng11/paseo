@@ -1,4 +1,5 @@
 import { pairCommand } from "./commands/daemon/pair.js";
+import { createFleetCommand } from "./commands/fleet/index.js";
 import { Command, Option } from "commander";
 import { createAgentCommand } from "./commands/agent/index.js";
 import { createDaemonCommand } from "./commands/daemon/index.js";
@@ -130,6 +131,7 @@ export function createCli(): Command {
 
   // Daemon commands
   program.addCommand(createDaemonCommand());
+  program.addCommand(createFleetCommand());
   program.addCommand(createHubCommand());
 
   // Chat commands
