@@ -223,6 +223,8 @@ function buildAgentManagerSpies() {
   const timelineStore = new InMemoryAgentTimelineStore();
   return {
     timelineStore,
+    beginAgentActivity: vi.fn(() => () => {}),
+    invalidateQuotaRecoveryForMessage: vi.fn().mockResolvedValue(undefined),
     createAgent: vi.fn(),
     waitForAgentEvent: vi.fn().mockResolvedValue({
       status: "idle",
@@ -6973,4 +6975,32 @@ describe("workspace field MCP tools", () => {
       await server.close();
     }
   });
+});
+
+it("reports an unloaded idle agent through MCP status and listings without loading it", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date("2026-04-11T00:00:00.000Z"));
+  try {
+    const { agentManager, agentStorage, spies } = createTestDeps();
+    const record = createStoredRecord({ lastStatus: "idle" });
+    spies.agentManager.getAgent.mockReturnValue(null);
+    spies.agentStorage.get.mockResolvedValue(record);
+    spies.agentStorage.list.mockResolvedValue([record]);
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      providerSnapshotManager: createClaudeOnlyManager(),
+      logger,
+    });
+    const status = await registeredTool(server, "get_agent_status").handler({ agentId: record.id });
+    expect(status.structuredContent).toMatchObject({
+      status: "idle",
+      snapshot: { runtimeLoaded: false, status: "idle" },
+    });
+    const listing = await invokeToolWithParsedInput(registeredTool(server, "list_agents"), {});
+    expect(agentsOf(listing)).toEqual([expect.objectContaining({ id: record.id, status: "idle" })]);
+    expect(spies.agentManager.resumeAgentFromPersistence).not.toHaveBeenCalled();
+  } finally {
+    vi.useRealTimers();
+  }
 });

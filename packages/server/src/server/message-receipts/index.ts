@@ -20,10 +20,14 @@ interface SendMessageInput {
 /** Owns message delivery receipts; creation is owned by CreationService. */
 export class MessageReceipts {
   private readonly pending = new Map<string, Promise<void>>();
-  constructor(private readonly directory: string) {}
+  constructor(
+    private readonly directory: string,
+    private readonly beginActivity?: (agentId: string) => () => void,
+  ) {}
 
   send(input: SendMessageInput): Promise<void> {
     // Preserve the existing on-disk identity and shape across daemon upgrades.
+    const finishActivity = this.beginActivity?.(input.agentId);
     const key = digest(["send", input.agentId, input.messageId]);
     const previous = this.pending.get(key);
     const result = (previous ? previous.catch(() => undefined) : Promise.resolve()).then(() =>
@@ -33,6 +37,7 @@ export class MessageReceipts {
     void result
       .finally(() => {
         if (this.pending.get(key) === result) this.pending.delete(key);
+        finishActivity?.();
       })
       .catch(() => undefined);
     return result;

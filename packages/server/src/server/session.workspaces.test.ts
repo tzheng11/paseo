@@ -124,6 +124,7 @@ interface SessionTestAccess {
   agentManager: {
     listAgents(): unknown[];
     getAgent(agentId: string): unknown;
+    acknowledgeUnloadedAgentReload(agentId: string): Promise<StoredAgentRecord | null>;
     reloadAgentSession(agentId: string, overrides?: unknown, options?: unknown): Promise<unknown>;
     listImportableSessions(options?: unknown): Promise<{
       sessions: unknown[];
@@ -9842,3 +9843,32 @@ test("workspace.create.request reports an archived explicit project", async () =
     errorCode: "archived_project",
   });
 });
+
+test.each(["refresh_agent_request", "agent.reload_idle.request"] as const)(
+  "%s acknowledges an unloaded idle agent without loading its provider",
+  async (type) => {
+    const emitted: SessionOutboundMessage[] = [];
+    const record = makeStoredAgent({
+      id: "unloaded-idle",
+      cwd: REPO_CWD,
+      updatedAt: "2026-10-19T12:00:00.000Z",
+    });
+    record.lastStatus = "idle";
+    const resume = vi.fn();
+    const session = createSessionForWorkspaceTests({
+      onMessage: (message) => emitted.push(message),
+      agentManager: {
+        acknowledgeUnloadedAgentReload: async () => record,
+        resumeAgentFromPersistence: resume,
+      },
+    });
+    session.agentUpdates.emitStoredRecord = vi.fn();
+    await session.handleMessage({ type, agentId: record.id, requestId: "unloaded-reload" });
+    expect(resume).not.toHaveBeenCalled();
+    expect(session.agentUpdates.emitStoredRecord).toHaveBeenCalledWith(record);
+    expect(emitted).toContainEqual({
+      type: type === "refresh_agent_request" ? "status" : "agent.reload_idle.response",
+      payload: { status: "agent_refreshed", agentId: record.id, requestId: "unloaded-reload" },
+    });
+  },
+);

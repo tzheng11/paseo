@@ -18,6 +18,7 @@ interface AgentInspect {
   Model: string;
   Thinking: string;
   Status: string;
+  RuntimeLoaded: boolean | null;
   Archived: boolean;
   ArchivedAt: string | null;
   Mode: string;
@@ -134,6 +135,7 @@ function toInspectData(snapshot: AgentSnapshotPayload): AgentInspect {
     Model: resolveModel(snapshot) ?? "-",
     Thinking: snapshot.effectiveThinkingOptionId ?? "auto",
     Status: snapshot.status,
+    RuntimeLoaded: snapshot.runtimeLoaded ?? null,
     Archived: snapshot.archivedAt != null,
     ArchivedAt: snapshot.archivedAt ?? null,
     Mode: snapshot.currentModeId ?? "default",

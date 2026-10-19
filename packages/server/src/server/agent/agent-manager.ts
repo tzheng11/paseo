@@ -1,3 +1,4 @@
+import { ClaudeSessionSchedulers, hasRuntimeShellChild } from "./idle-agent-unload.js";
 import type { MessageReceipts } from "../message-receipts/index.js";
 import { startAgentRun, type AgentRunController } from "./agent-prompt.js";
 import { prepareAgentMessage } from "./agent-messages/index.js";
@@ -396,6 +397,8 @@ export interface AgentManagerOptions {
   appendSystemPrompt?: string;
   agentStreamCoalesceWindowMs?: number;
   rescueTimeouts?: AgentManagerRescueTimeouts;
+  idleUnloadAfterMinutes?: number;
+  hasRuntimeShellChild?: (pid: number) => Promise<boolean>;
   beforeSteerUnavailableFallback?: (input: {
     agentId: string;
     expectedTurnId: string;
@@ -540,12 +543,19 @@ type ManagedAgentClosed = ManagedAgentBase & {
   activeForegroundTurnId: null;
 };
 
+type ManagedAgentUnloaded = ManagedAgentBase & {
+  lifecycle: "idle";
+  session: null;
+  activeForegroundTurnId: null;
+};
+
 export type ManagedAgent =
   | ManagedAgentInitializing
   | ManagedAgentIdle
   | ManagedAgentRunning
   | ManagedAgentError
-  | ManagedAgentClosed;
+  | ManagedAgentClosed
+  | ManagedAgentUnloaded;
 
 export interface AgentMetricsSnapshot {
   total: number;
@@ -885,6 +895,12 @@ export class AgentManager {
   private readonly rescueTimeouts: Required<AgentManagerRescueTimeouts>;
   private readonly beforeSteerUnavailableFallback?: AgentManagerOptions["beforeSteerUnavailableFallback"];
   private acceptingAgentRegistrations = true;
+  private idleUnloadAfterMinutes = 0;
+  private idleUnloadTimer?: NodeJS.Timeout;
+  private hasRuntimeShellChild = hasRuntimeShellChild;
+  private readonly agentActivity = new Map<string, number>();
+  private readonly lastRuntimeDemand = new Map<string, number>();
+  private readonly sessionSchedulers = new Map<string, ClaudeSessionSchedulers>();
 
   constructor(options: AgentManagerOptions) {
     this.reloadOperations = options.reloadOperations;
@@ -920,6 +936,127 @@ export class AgentManager {
     this.updateProviderRegistry({
       providerDefinitions: options.providerDefinitions ?? {},
       clients: options.clients ?? {},
+    });
+    this.configureIdleUnloading(options);
+  }
+
+  private configureIdleUnloading(options: AgentManagerOptions): void {
+    this.hasRuntimeShellChild = options.hasRuntimeShellChild ?? hasRuntimeShellChild;
+    // Bootstrap supplies the daemon default; standalone managers own no maintenance timer.
+    this.setIdleUnloadAfterMinutes(options.idleUnloadAfterMinutes ?? 0);
+  }
+
+  setIdleUnloadAfterMinutes(minutes: number): void {
+    if (!Number.isSafeInteger(minutes) || minutes < 0)
+      throw new Error("Invalid idle unload period");
+    this.idleUnloadAfterMinutes = minutes;
+    clearTimeout(this.idleUnloadTimer);
+    this.idleUnloadTimer = undefined;
+    if (!minutes || !this.acceptingAgentRegistrations) return;
+    this.idleUnloadTimer = setTimeout(() => {
+      void this.unloadIdleAgents()
+        .catch((err) => {
+          this.logger.warn({ err }, "Idle agent unload sweep failed");
+        })
+        .finally(() => this.setIdleUnloadAfterMinutes(this.idleUnloadAfterMinutes));
+    }, 60_000);
+    this.idleUnloadTimer.unref();
+  }
+
+  /** Includes prompt preparation and the receipt write after provider admission. */
+  beginAgentActivity(agentId: string): () => void {
+    this.agentActivity.set(agentId, (this.agentActivity.get(agentId) ?? 0) + 1);
+    this.lastRuntimeDemand.set(agentId, Date.now());
+    return () => {
+      const remaining = (this.agentActivity.get(agentId) ?? 1) - 1;
+      if (remaining) this.agentActivity.set(agentId, remaining);
+      else this.agentActivity.delete(agentId);
+      this.lastRuntimeDemand.set(agentId, Date.now());
+    };
+  }
+
+  private hasUnloadPermissionsClear(agent: LiveManagedAgent): boolean {
+    return (
+      !agent.pendingPermissions.size &&
+      !agent.inFlightPermissionResponses.size &&
+      !agent.session.getPendingPermissions().length
+    );
+  }
+
+  private canUnloadIdleAgent(agent: LiveManagedAgent): boolean {
+    if (!this.acceptingAgentRegistrations || !this.idleUnloadAfterMinutes || !this.registry)
+      return false;
+    return (
+      !agent.internal &&
+      !!agent.persistence &&
+      agent.historyPrimed &&
+      agent.lifecycle === "idle" &&
+      !agent.activeTurnId &&
+      !agent.pendingReplacement &&
+      !this.hasInFlightRun(agent.id) &&
+      !this.agentActivity.has(agent.id) &&
+      this.hasUnloadPermissionsClear(agent) &&
+      !this.sessionEventTails.has(agent.id) &&
+      agent.session.hasActiveBackgroundTasks?.() === false &&
+      !this.sessionSchedulers.get(agent.id)?.active &&
+      !this.providerSubagents.list(agent.id).some((child) => child.status === "running") &&
+      Date.now() - Math.max(agent.updatedAt.getTime(), this.lastRuntimeDemand.get(agent.id) ?? 0) >=
+        this.idleUnloadAfterMinutes * 60_000
+    );
+  }
+
+  async unloadIdleAgents(): Promise<void> {
+    for (const agentId of this.agents.keys()) {
+      if (this.idleReloads.has(agentId) || this.lifecycleMutationTails.has(agentId)) continue;
+      await this.runLifecycleMutation(agentId, async () => {
+        const agent = this.agents.get(agentId);
+        if (!agent || !this.canUnloadIdleAgent(agent)) return;
+        // Share maintenance admission with direct stream callers. Normal sends
+        // hold activity before waiting for this lifecycle lane.
+        this.idleReloads.add(agentId);
+        try {
+          await this.reloadOperations?.assertWriterAdmission(agentId);
+          if ((await agent.session.hasPersistedSession?.()) !== true) return;
+          const pid = agent.session.getRuntimeProcessId?.();
+          if (pid === undefined || (pid !== null && (await this.hasRuntimeShellChild(pid)))) return;
+          await this.drainSessionEvents(agentId);
+          if (!this.canUnloadIdleAgent(agent)) return;
+          const idleMinutes =
+            (Date.now() -
+              Math.max(agent.updatedAt.getTime(), this.lastRuntimeDemand.get(agentId) ?? 0)) /
+            60_000;
+          await agent.session.close();
+          const closed = this.prepareAgentForClosure(agent, "idle runtime unloaded");
+          const unloaded: ManagedAgentUnloaded = { ...closed, lifecycle: "idle" };
+          try {
+            await this.persistSnapshot(unloaded);
+          } finally {
+            this.emitState(unloaded, { persist: false });
+            this.logger.info(
+              { agentId, provider: agent.provider, idleMinutes },
+              "Unloaded idle agent runtime",
+            );
+          }
+        } catch (err) {
+          this.logger.warn(
+            { err, agentId, provider: agent.provider },
+            "Idle agent unload deferred",
+          );
+        } finally {
+          this.idleReloads.delete(agentId);
+        }
+      });
+    }
+  }
+
+  /** Idle records without a runtime need no credential refresh; next load resolves launch config. */
+  acknowledgeUnloadedAgentReload(agentId: string): Promise<StoredAgentRecord | null> {
+    return this.runLifecycleMutation(agentId, async () => {
+      if (this.agents.has(agentId)) return null;
+      const record = await this.registry?.get(agentId);
+      return record && !record.archivedAt && record.lastStatus === "idle" && record.persistence
+        ? record
+        : null;
     });
   }
 
@@ -984,6 +1121,7 @@ export class AgentManager {
 
   prepareForShutdown(): void {
     this.acceptingAgentRegistrations = false;
+    clearTimeout(this.idleUnloadTimer);
   }
 
   setPaseoToolsEnabled(enabled: boolean): void {
@@ -1323,6 +1461,7 @@ export class AgentManager {
     // Loading during reload must wait for the replacement, not resume another writer.
     await this.lifecycleMutationTails.get(agentId);
     await this.inFlightAgentCloses?.get(agentId)?.catch(() => undefined);
+    this.lastRuntimeDemand.set(agentId, Date.now());
   }
 
   getTimeline(id: string): AgentTimelineItem[] {
@@ -1789,6 +1928,9 @@ export class AgentManager {
       async (writerClaim) => {
         const record = await this.registry?.get(agentId);
         if (record?.archivedAt) throw new AgentIdleReloadError({ agentId, reason: "unavailable" });
+        if (await this.acknowledgeUnloadedAgentReload(agentId)) {
+          return change ? { status: "not_needed", reasonCode: "RUNTIME_UNLOADED" } : undefined;
+        }
         const checkpoint = this.getAgent(agentId)?.quotaTurnCheckpoint;
         const revision = this.quotaActivityRevisions.get(agentId) ?? 0;
         let continuation: ReloadOperation["continuation"];
@@ -4201,6 +4343,8 @@ export class AgentManager {
 
       this.assertAcceptingAgentRegistrations();
       this.agents.set(resolvedAgentId, managed);
+      this.lastRuntimeDemand.set(resolvedAgentId, Date.now());
+      this.sessionSchedulers.set(resolvedAgentId, new ClaudeSessionSchedulers());
       registered = true;
       // Initialize previousStatus to track transitions
       this.previousStatuses.set(resolvedAgentId, managed.lifecycle);
@@ -4428,6 +4572,8 @@ export class AgentManager {
   ): ManagedAgentClosed {
     this.agentStreamCoalescer.flushAndDiscard(agent.id);
     this.agents.delete(agent.id);
+    this.sessionSchedulers.delete(agent.id);
+    this.lastRuntimeDemand.delete(agent.id);
     this.previousStatuses.delete(agent.id);
     if (agent.unsubscribeSession) {
       agent.unsubscribeSession();
@@ -4485,6 +4631,7 @@ export class AgentManager {
   }
 
   private enqueueSessionEvent(agentId: string, event: AgentStreamEvent): void {
+    this.lastRuntimeDemand.set(agentId, Date.now());
     this.logger.trace(
       {
         agentId,
@@ -5580,6 +5727,7 @@ export class AgentManager {
     },
   ): AgentTimelineRow {
     item = limitAgentTimelineItemContent(item);
+    this.sessionSchedulers.get(agentId)?.observe(item);
     const row = this.timelineStore.append(agentId, item, options);
     this.enqueueDurableTimelineAppend(agentId, row);
     return row;

@@ -206,6 +206,7 @@ export const MutableDaemonConfigSchema = z
       .optional(),
     app: z.object({ baseUrl: z.string() }).optional(),
     catalogRefreshTimeoutMs: z.number().int().positive().optional(),
+    idleUnloadAfterMinutes: z.number().int().nonnegative().optional(),
     browserTools: MutableBrowserToolsConfigSchema.default({ enabled: false }),
     providers: z.record(z.string(), MutableDaemonProviderConfigSchema).default({}),
     metadataGeneration: MutableMetadataGenerationConfigSchema.default({ providers: [] }),
@@ -229,6 +230,7 @@ export const MutableDaemonConfigPatchSchema = z
       .record(z.string(), MutableDaemonProviderConfigSchema.partial().passthrough())
       .optional(),
     removeProviders: z.array(z.string().min(1)).optional(),
+    idleUnloadAfterMinutes: z.number().int().nonnegative().optional(),
     metadataGeneration: MutableMetadataGenerationConfigSchema.partial().optional(),
     autoArchiveAfterMerge: z.boolean().optional(),
     enableTerminalAgentHooks: z.boolean().optional(),
@@ -832,6 +834,7 @@ export const AgentSnapshotPayloadSchema = z.object({
   updatedAt: z.string(),
   lastUserMessageAt: z.string().nullable(),
   status: AgentStatusSchema,
+  runtimeLoaded: z.boolean().optional(),
   activeTurn: AgentActiveTurnPayloadSchema.nullable().optional(),
   capabilities: AgentCapabilityFlagsSchema,
   currentModeId: z.string().nullable(),

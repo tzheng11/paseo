@@ -70,7 +70,7 @@ The daemon validates the complete file before applying anything. It applies runt
 paseo daemon restart
 ```
 
-Runtime-safe settings include relay enablement, MCP settings, browser tools, hostnames, CORS origins, trusted proxies, Git process limits, agent and terminal profiles, provider definitions, metadata generation, the app base URL, provider catalog timeout, and the global plugin switch. Removing one of these settings applies its omitted-field behavior; removing a provider removes it from future launches.
+Runtime-safe settings include relay enablement, MCP settings, browser tools, hostnames, CORS origins, trusted proxies, Git process limits, agent and terminal profiles, provider definitions, metadata generation, the app base URL, provider catalog timeout, the idle unload period, and the global plugin switch. Removing one of these settings applies its omitted-field behavior; removing a provider removes it from future launches.
 
 New homes keep relay disabled when you remove `daemon.relay.enabled`. A daemon whose config already omitted this field when it started keeps the legacy relay-enabled behavior for compatibility. Set `daemon.relay.enabled` explicitly when editing an older config.
 
@@ -83,6 +83,14 @@ Deployment environment variables and legacy supervisor flags remain authoritativ
 Agent providers, both the first-class ones Paseo ships with and custom entries you add under `agents.providers`, are documented on their own page.
 
 See [Providers](/docs/providers) for the mental model and [Supported providers](/docs/supported-providers) for the full list of agents Paseo can launch. For pointing Claude at Anthropic-compatible endpoints (Z.AI, Alibaba/Qwen), multiple profiles, custom binaries, ACP agents, and the `additionalModels` merge behavior, see [Custom providers](/docs/custom-providers). The full field reference lives on GitHub at [docs/custom-providers.md](https://github.com/getpaseo/paseo/blob/main/docs/custom-providers.md).
+
+## Idle agent runtimes
+
+Set `agents.idleUnloadAfterMinutes` to the number of idle minutes before the daemon releases
+an agent's provider process. The default is 120; 0 disables it. This setting applies through
+`paseo reload` without a restart. Agents stay listed as idle and resume their session on the
+next send, timeline read or attach. See [runtime residency](https://github.com/getpaseo/paseo/blob/main/docs/agent-lifecycle.md#runtime-residency)
+for the guards that retain agents with background work or uncertain activity.
 
 ## Worktrees
 

@@ -13445,3 +13445,360 @@ test("quota recovery also preserves Codex context and submits one deterministic 
     await f.cleanup();
   }
 });
+
+class IdleUnloadSession extends TestAgentSession {
+  closed = 0;
+  background = false;
+  persisted = true;
+  async hasPersistedSession(): Promise<boolean> {
+    return this.persisted;
+  }
+  pid: number | null | undefined = 4420;
+  override async close(): Promise<void> {
+    this.closed++;
+  }
+  hasActiveBackgroundTasks(): boolean {
+    return this.background;
+  }
+  getRuntimeProcessId(): number | null | undefined {
+    return this.pid;
+  }
+}
+
+async function idleUnloadHarness(minutes = 2) {
+  const workdir = mkdtempSync(join(tmpdir(), "idle-unload-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const sessions: IdleUnloadSession[] = [];
+  const resumes: AgentPersistenceHandle[] = [];
+  const shellChild = vi.fn(async (_pid: number) => false);
+  class Client extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      const session = new IdleUnloadSession(config);
+      sessions.push(session);
+      return session;
+    }
+    override async resumeSession(
+      handle: AgentPersistenceHandle,
+      config?: Partial<AgentSessionConfig>,
+    ): Promise<AgentSession> {
+      resumes.push(handle);
+      const session = new IdleUnloadSession({ provider: "codex", cwd: config?.cwd ?? workdir });
+      Object.defineProperty(session, "id", { value: handle.sessionId });
+      sessions.push(session);
+      return session;
+    }
+  }
+  const reloadOperations = new ReloadOperationStore(join(workdir, "reload-operations"), logger);
+  const manager = new AgentManager({
+    clients: { codex: new Client() },
+    registry: storage,
+    logger,
+    idleUnloadAfterMinutes: minutes,
+    hasRuntimeShellChild: shellChild,
+    reloadOperations,
+  });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: "idle-test",
+  });
+  return {
+    manager,
+    reloadOperations,
+    storage,
+    agent,
+    session: sessions[0]!,
+    sessions,
+    resumes,
+    shellChild,
+    async close() {
+      manager.prepareForShutdown();
+      await manager.closeAgent(agent.id);
+      await manager.flush();
+      await storage.flush();
+      rmSync(workdir, { recursive: true, force: true });
+    },
+  };
+}
+
+test("idle runtime unload timer keeps status idle, metadata and canonical history", async () => {
+  vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+  const h = await idleUnloadHarness();
+  try {
+    await h.manager.appendTimelineItem(h.agent.id, {
+      type: "assistant_message",
+      text: "Preserved history",
+    });
+    await h.manager.flush();
+    const before = await h.storage.get(h.agent.id);
+    const events: AgentManagerEvent[] = [];
+    h.manager.subscribe((event) => events.push(event), { replayState: false });
+    await vi.advanceTimersByTimeAsync(119_999);
+    expect(h.session.closed).toBe(0);
+    await vi.advanceTimersByTimeAsync(60_001);
+    await h.manager.waitForAgentClose(h.agent.id);
+    expect(h.session.closed).toBe(1);
+    expect(h.manager.getAgent(h.agent.id)).toBeNull();
+    expect(await h.storage.get(h.agent.id)).toEqual(before);
+    expect(
+      events
+        .filter((event) => event.type === "agent_state")
+        .map((event) => (event.type === "agent_state" ? toAgentPayload(event.agent) : null)),
+    ).toEqual([expect.objectContaining({ id: h.agent.id, status: "idle", runtimeLoaded: false })]);
+    await ensureAgentLoaded(h.agent.id, {
+      agentManager: h.manager,
+      agentStorage: h.storage,
+      logger,
+    });
+    expect(h.resumes.map((handle) => handle.sessionId)).toEqual([h.agent.persistence?.sessionId]);
+    expect(h.manager.getTimeline(h.agent.id)).toEqual([
+      { type: "assistant_message", text: "Preserved history" },
+    ]);
+    expect(toAgentPayload(h.manager.getAgent(h.agent.id)!)).toMatchObject({
+      status: "idle",
+      runtimeLoaded: true,
+    });
+  } finally {
+    await h.close();
+    vi.useRealTimers();
+  }
+});
+
+test("idle unload disabled with zero minutes", async () => {
+  vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+  const h = await idleUnloadHarness(0);
+  try {
+    await vi.advanceTimersByTimeAsync(24 * 60 * 60_000);
+    await h.manager.unloadIdleAgents();
+    expect(h.session.closed).toBe(0);
+    expect(h.shellChild).not.toHaveBeenCalled();
+  } finally {
+    await h.close();
+    vi.useRealTimers();
+  }
+});
+
+test.each([
+  "unpersisted",
+  "unknown-persistence",
+  "background",
+  "unknown-background",
+  "unknown-process",
+  "shell",
+  "census-error",
+  "permission",
+  "permission-response",
+  "running",
+  "subagent",
+  "send",
+  "receipt",
+] as const)("idle unload retains agent with %s guard", async (guard) => {
+  vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+  const h = await idleUnloadHarness();
+  let finishActivity: (() => void) | undefined;
+  let finishReceipt: (() => void) | undefined;
+  let receipt: Promise<void> | undefined;
+  try {
+    switch (guard) {
+      case "unpersisted":
+        h.session.persisted = false;
+        break;
+      case "unknown-persistence":
+        Object.defineProperty(h.session, "hasPersistedSession", { value: undefined });
+        break;
+      case "background":
+        h.session.background = true;
+        break;
+      case "unknown-background":
+        Object.defineProperty(h.session, "hasActiveBackgroundTasks", { value: undefined });
+        break;
+      case "unknown-process":
+        h.session.pid = undefined;
+        break;
+      case "shell":
+        h.shellChild.mockResolvedValue(true);
+        break;
+      case "census-error":
+        h.shellChild.mockRejectedValue(new Error("ps unavailable"));
+        break;
+      case "permission":
+        h.manager.getAgent(h.agent.id)!.pendingPermissions.set("pending", {
+          id: "pending",
+          provider: "codex",
+          name: "shell",
+          kind: "tool",
+        });
+        break;
+      case "permission-response":
+        h.manager.getAgent(h.agent.id)!.inFlightPermissionResponses.add("pending");
+        break;
+      case "running":
+        h.session.pushEvent({ type: "turn_started", provider: "codex", turnId: "active" });
+        break;
+      case "subagent":
+        h.session.pushEvent({
+          type: "provider_subagent",
+          provider: "codex",
+          event: {
+            type: "upsert",
+            id: "background-workflow",
+            title: "Workflow",
+            status: "running",
+          },
+        });
+        break;
+      case "send":
+        finishActivity = h.manager.beginAgentActivity(h.agent.id);
+        break;
+      case "receipt": {
+        const held = deferred<void>();
+        finishReceipt = () => held.resolve();
+        receipt = new MessageReceipts(join(h.agent.cwd, "receipts"), (id) =>
+          h.manager.beginAgentActivity(id),
+        ).send({
+          agentId: h.agent.id,
+          messageId: "held",
+          request: {},
+          send: () => held.promise,
+        });
+        break;
+      }
+    }
+    await h.manager.flush();
+    await vi.advanceTimersByTimeAsync(180_000);
+    await h.manager.waitForAgentClose(h.agent.id);
+    expect(h.session.closed).toBe(0);
+    expect(h.manager.getAgent(h.agent.id)?.lifecycle).toBe(
+      guard === "running" ? "running" : "idle",
+    );
+  } finally {
+    finishActivity?.();
+    finishReceipt?.();
+    await receipt;
+    await h.close();
+    vi.useRealTimers();
+  }
+});
+
+test("unload rechecks eligibility after asynchronous process observation", async () => {
+  vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+  const h = await idleUnloadHarness();
+  const census = deferred<boolean>();
+  h.shellChild.mockImplementation(() => census.promise);
+  try {
+    await vi.advanceTimersByTimeAsync(180_000);
+    const finish = h.manager.beginAgentActivity(h.agent.id);
+    census.resolve(false);
+    await h.manager.waitForAgentClose(h.agent.id);
+    expect(h.session.closed).toBe(0);
+    finish();
+  } finally {
+    census.resolve(false);
+    await h.close();
+    vi.useRealTimers();
+  }
+});
+
+test("credential reload acknowledges an unloaded idle session without spawning and preserves receipts", async () => {
+  vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+  const h = await idleUnloadHarness();
+  try {
+    await vi.advanceTimersByTimeAsync(180_000);
+    await h.manager.waitForAgentClose(h.agent.id);
+    const operationId = randomUUID();
+    const operation = await h.manager.reloadAgentCredentials(h.agent.id, operationId);
+    expect(operation.status).toBe("pending");
+    await vi.waitFor(async () =>
+      expect((await h.manager.getReloadOperation(operationId))?.status).toBe("completed"),
+    );
+    expect(await h.manager.acknowledgeUnloadedAgentReload(h.agent.id)).toMatchObject({
+      lastStatus: "idle",
+    });
+    expect(h.sessions).toHaveLength(1);
+    const sending = sendPromptToAgent({
+      agentId: h.agent.id,
+      prompt: "Continue",
+      agentManager: h.manager,
+      agentStorage: h.storage,
+      logger,
+    });
+    await vi.waitFor(() => expect(h.sessions).toHaveLength(2));
+    await vi.advanceTimersByTimeAsync(0);
+    await sending;
+    expect(h.resumes.map((handle) => handle.sessionId)).toEqual([h.agent.persistence?.sessionId]);
+  } finally {
+    await h.close();
+    vi.useRealTimers();
+  }
+});
+
+test.each(["CronCreate", "ScheduleWakeup", "Monitor"])(
+  "idle unload retains an agent with a live %s",
+  async (name) => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const h = await idleUnloadHarness();
+    try {
+      await h.manager.appendTimelineItem(h.agent.id, {
+        type: "tool_call",
+        callId: "scheduler",
+        name,
+        status: "completed",
+        error: null,
+        detail: { type: "unknown", input: {}, output: { id: "timer" } },
+      });
+      await h.manager.flush();
+      await vi.advanceTimersByTimeAsync(180_000);
+      await h.manager.waitForAgentClose(h.agent.id);
+      expect(h.session.closed).toBe(0);
+    } finally {
+      await h.close();
+      vi.useRealTimers();
+    }
+  },
+);
+
+test("idle unload retains a queued turn before provider acknowledgement", async () => {
+  vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+  const h = await idleUnloadHarness();
+  const started = deferred<void>();
+  const proceed = deferred<void>();
+  vi.spyOn(h.session, "startTurn").mockImplementation(async () => {
+    started.resolve();
+    await proceed.promise;
+    return { turnId: "queued-turn" };
+  });
+  const running = h.manager.runAgent(h.agent.id, "Queued prompt");
+  try {
+    await started.promise;
+    expect(h.manager.hasInFlightRun(h.agent.id)).toBe(true);
+    await vi.advanceTimersByTimeAsync(180_000);
+    await h.manager.waitForAgentClose(h.agent.id);
+    expect(h.session.closed).toBe(0);
+    proceed.resolve();
+    h.session.pushEvent({ type: "turn_started", provider: "codex", turnId: "queued-turn" });
+    h.session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "queued-turn" });
+    await running;
+  } finally {
+    proceed.resolve();
+    await h.close();
+    vi.useRealTimers();
+  }
+});
+
+test("idle unload retains a runtime fenced by an uncertain reload receipt", async () => {
+  vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+  const h = await idleUnloadHarness();
+  try {
+    const operationId = randomUUID();
+    await h.reloadOperations.start(h.agent.id, operationId, async () => {
+      throw Object.assign(new Error("Cleanup unknown"), { code: "reload_cleanup_unconfirmed" });
+    });
+    await vi.waitFor(async () =>
+      expect((await h.reloadOperations.get(operationId))?.status).toBe("unknown"),
+    );
+    await vi.advanceTimersByTimeAsync(180_000);
+    await h.manager.waitForAgentClose(h.agent.id);
+    expect(h.session.closed).toBe(0);
+  } finally {
+    await h.close();
+    vi.useRealTimers();
+  }
+});

@@ -4854,6 +4854,22 @@ export class CodexAppServerAgentSession implements AgentSession {
     };
   }
 
+  async hasPersistedSession(): Promise<boolean> {
+    if (!this.client || !this.currentThreadId) return false;
+    const metadata = await readCodexThreadHistoryMetadata(this.client, this.currentThreadId);
+    if (!metadata.path || !path.isAbsolute(metadata.path)) return false;
+    try {
+      const stat = await fs.stat(metadata.path);
+      return stat.isFile() && stat.size > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  getRuntimeProcessId(): number | null | undefined {
+    return this.client ? this.client.processId : null;
+  }
+
   hasActiveBackgroundTasks(): boolean {
     return this.backgroundTasks.active;
   }

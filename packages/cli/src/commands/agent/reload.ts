@@ -28,7 +28,7 @@ export const reloadSchema: OutputSchema<AgentReloadResult> = {
 
 export function addReloadOptions(cmd: Command): Command {
   return cmd
-    .description("Reload an agent (restarts the underlying process)")
+    .description("Reload an agent runtime; unloaded idle agents stay unloaded")
     .argument("<id>", "Agent ID, prefix, or name")
     .option("--only-if-idle", "Refuse to reload an active agent; never interrupt a turn")
     .option("--preserve-history", "Reload credentials without replaying provider history")

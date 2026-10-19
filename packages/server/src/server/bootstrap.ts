@@ -424,6 +424,7 @@ export interface PaseoDaemonConfig {
   mcpDebug: boolean;
   isDev?: boolean;
   agentClients: Partial<Record<AgentProvider, AgentClient>>;
+  idleUnloadAfterMinutes?: number;
   agentStoragePath: string;
   relayEnabled?: boolean;
   relayEnabledMutable?: boolean;
@@ -542,6 +543,10 @@ function resolveExpressTrustProxySetting(config: PaseoDaemonConfig): true | stri
   return config.trustedProxies ?? ["loopback"];
 }
 
+function resolveIdleUnloadAfterMinutes(value: number | undefined): number {
+  return value ?? 120;
+}
+
 function createInitialMutableDaemonConfig(config: PaseoDaemonConfig): MutableDaemonConfig {
   const providers = config.providerOverrides ?? {};
 
@@ -559,6 +564,7 @@ function createInitialMutableDaemonConfig(config: PaseoDaemonConfig): MutableDae
     ...(config.providerCatalogRefreshTimeoutMs !== undefined
       ? { catalogRefreshTimeoutMs: config.providerCatalogRefreshTimeoutMs }
       : {}),
+    idleUnloadAfterMinutes: resolveIdleUnloadAfterMinutes(config.idleUnloadAfterMinutes),
     browserTools: { enabled: config.browserToolsEnabled ?? false },
     providers,
     metadataGeneration: {
@@ -968,6 +974,7 @@ export async function createPaseoDaemon(
       logger,
     ),
     timelineStore,
+    idleUnloadAfterMinutes: daemonConfigStore.get().idleUnloadAfterMinutes,
     pluginLifecycle: pluginRuntime,
     clients: initialAgentManagerState.clients,
     providerDefinitions: initialAgentManagerState.providerDefinitions,
@@ -980,6 +987,9 @@ export async function createPaseoDaemon(
     resolvePaseoToolPolicy: (provider) =>
       resolvePaseoToolPolicy(provider, daemonConfigStore.get().providers),
     logger,
+  });
+  daemonConfigStore.onFieldChange("idleUnloadAfterMinutes", (value) => {
+    agentManager.setIdleUnloadAfterMinutes(typeof value === "number" ? value : 120);
   });
   const syncPluginProviders = () => {
     agentManager.updateProviderRegistry(

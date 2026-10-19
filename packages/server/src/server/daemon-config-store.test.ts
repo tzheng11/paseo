@@ -1193,3 +1193,29 @@ describe("DaemonConfigStore reload", () => {
     });
   });
 });
+
+test("idle unload period patches persist under agents and notify the runtime", () => {
+  const paseoHome = mkdtempSync(path.join(tmpdir(), "paseo-idle-config-"));
+  try {
+    const store = new DaemonConfigStore(paseoHome, {
+      mcp: { injectIntoAgents: false },
+      browserTools: { enabled: false },
+      providers: {},
+      metadataGeneration: { providers: [] },
+      autoArchiveAfterMerge: false,
+      enableTerminalAgentHooks: false,
+      appendSystemPrompt: "",
+      idleUnloadAfterMinutes: 120,
+    });
+    const observed: unknown[] = [];
+    store.onFieldChange("idleUnloadAfterMinutes", (minutes) => {
+      observed.push(minutes);
+    });
+    store.patch({ idleUnloadAfterMinutes: 0 });
+    expect(loadPersistedConfig(paseoHome).agents?.idleUnloadAfterMinutes).toBe(0);
+    expect(observed).toEqual([0]);
+    expect(() => store.patch({ idleUnloadAfterMinutes: -1 })).toThrow();
+  } finally {
+    rmSync(paseoHome, { recursive: true, force: true });
+  }
+});

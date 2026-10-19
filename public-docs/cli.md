@@ -122,7 +122,7 @@ selected separately with `workspace create --background`; this release does not 
 
 ## Reloading agents
 
-Restart an agent's provider process with `paseo agent reload <id-or-name>`. Add
+Use `paseo agent reload <id-or-name>` for [runtime reload](../docs/agent-lifecycle.md#idle-only-reload). Add
 `--only-if-idle` to refuse the reload if the agent has active work. This requires a
 host that supports atomic idle-only reloads.
 

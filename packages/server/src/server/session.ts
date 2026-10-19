@@ -4749,6 +4749,16 @@ export class Session {
 
     try {
       const onlyIfIdle = msg.type === "agent.reload_idle.request";
+      const unloaded = await this.agentManager.acknowledgeUnloadedAgentReload(agentId);
+      if (unloaded) {
+        await this.agentUpdates.emitStoredRecord(unloaded);
+        if (requestId)
+          this.emit({
+            type: onlyIfIdle ? "agent.reload_idle.response" : "status",
+            payload: { status: "agent_refreshed", agentId, requestId },
+          });
+        return;
+      }
       if (onlyIfIdle) {
         const record = await this.agentStorage.get(agentId);
         if (!record || record.archivedAt || !this.agentManager.getAgent(agentId)) {
