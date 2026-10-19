@@ -248,7 +248,7 @@ function WorkspaceSuperpinMenuItem({
         superpinnedAt: fields.superpinnedAt,
       });
   }, [fields, serverId, workspaceKey, toggle]);
-  if (canSuperpin === false || !fields) return null;
+  if (canSuperpin !== true || !fields) return null;
   return (
     <WorkspaceMenuItem
       surface={surface}

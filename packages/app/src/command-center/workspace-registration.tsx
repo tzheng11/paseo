@@ -356,7 +356,7 @@ interface WorkspacePinCommandFields {
   pinnedAt: string | null;
   superpinnedAt: string | null;
 }
-function useWorkspaceSuperpinCommand(
+export function useWorkspaceSuperpinCommand(
   serverId: string | null,
   workspaceKey: string | null,
   fields: WorkspacePinCommandFields | null,
@@ -379,7 +379,7 @@ function useWorkspaceSuperpinCommand(
     () => ({
       pinDisabled: !connected || pending,
       superpin:
-        capable !== false
+        capable === true
           ? {
               isSuperpinned: fields?.superpinnedAt != null,
               disabled: !connected || capable !== true || pending,
