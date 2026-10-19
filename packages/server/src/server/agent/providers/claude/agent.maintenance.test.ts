@@ -8,6 +8,9 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { createTestLogger } from "../../../../test-utils/test-logger.js";
 import type { TreeKillTarget, TerminateWithTreeKillResult } from "../../../../utils/tree-kill.js";
 import type { AgentStreamEvent } from "../../agent-sdk-types.js";
+import { AgentManager } from "../../agent-manager.js";
+import { AgentStorage } from "../../agent-storage.js";
+import { ReloadOperationStore } from "../../reload-operation-store.js";
 import { ClaudeAgentClient } from "./agent.js";
 import type { ClaudeQuery, ClaudeQueryInput } from "./query.js";
 import { claudeProjectDirSync } from "./project-dir.js";
@@ -324,6 +327,104 @@ describe("Claude credential maintenance", () => {
     expect(await first).toEqual({ done: true, value: undefined });
     expect(h.spawnCalls).toBe(1);
     expect(h.prompts).toEqual([]);
+  });
+
+  test("guarded reload owns streamed-history cancellation and late cleanup before queued metadata", async () => {
+    const directory = claudeProjectDirSync(cwd, { configDir });
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(
+      path.join(directory, `${sessionId}.jsonl`),
+      Array.from({ length: 1024 }, (_, index) =>
+        JSON.stringify({
+          type: "user",
+          uuid: `user-${index}`,
+          message: { role: "user", content: `message ${index}` },
+          metadata: "x".repeat(8192),
+        }),
+      ).join("\n"),
+    );
+    const cleanupStarted = deferred<void>();
+    const cleanup = deferred<TerminateWithTreeKillResult>();
+    const h = harness({ onTerminate: () => cleanupStarted.resolve() });
+    h.cleanupPromise = cleanup.promise;
+    const session = await h.resume();
+    // Only the SDK/process boundary is substituted. History, manager lifecycle,
+    // metadata and durable reload receipts use the real combined implementation.
+    vi.spyOn(h.client, "isAvailable").mockResolvedValue(true);
+    vi.spyOn(h.client, "createSession").mockResolvedValueOnce(session);
+    const logger = createTestLogger();
+    const storage = new AgentStorage(path.join(root, "agents"), logger);
+    const manager = new AgentManager({
+      clients: { claude: h.client },
+      logger,
+      registry: storage,
+      reloadOperations: new ReloadOperationStore(path.join(root, "operations"), logger, {
+        completionTimeoutMs: 10,
+      }),
+    });
+    const agent = await manager.createAgent(
+      { provider: "claude", cwd, model: "claude-sonnet-4-5" },
+      undefined,
+      { workspaceId: undefined },
+    );
+    const change = {
+      credentialGeneration: "original-fixture-generation",
+      credentialChangedAt: "2026-10-17T12:00:00.000Z",
+    };
+    try {
+      const first = session.streamHistory().next();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(
+        await manager.reloadAgentCredentials(agent.id, "streamed-close", change),
+      ).toMatchObject({
+        status: "pending",
+        ...change,
+      });
+      await cleanupStarted.promise;
+      expect(await first).toEqual({ done: true, value: undefined });
+      const title = manager.setTitle(agent.id, "Retained after cleanup");
+      await vi.waitFor(async () =>
+        expect(await manager.getReloadOperation("streamed-close")).toMatchObject({
+          status: "unknown",
+          reasonCode: "RELOAD_COMPLETION_UNCONFIRMED",
+          retryable: false,
+          ...change,
+        }),
+      );
+      // Keep the real provider close unresolved beyond the old production 3s
+      // deadline; only the receipt acknowledgement may time out here.
+      await new Promise<void>((resolve) => setTimeout(resolve, 3_100));
+      expect(
+        await manager.reloadAgentCredentials(agent.id, "streamed-close", change),
+      ).toMatchObject({
+        status: "unknown",
+      });
+      await expect(manager.runAgent(agent.id, "must stay fenced")).rejects.toMatchObject({
+        code: "agent_reload_in_progress",
+      });
+      expect(h.spawnCalls).toBe(1);
+      expect(h.terminations).toHaveLength(1);
+      expect(h.prompts).toEqual([]);
+
+      cleanup.resolve("terminated");
+      await title;
+      await vi.waitFor(async () =>
+        expect(await manager.getReloadOperation("streamed-close")).toMatchObject({
+          status: "completed",
+          agentId: agent.id,
+          ...change,
+        }),
+      );
+      expect(h.spawnCalls).toBe(2);
+      expect((await storage.get(agent.id))?.title).toBe("Retained after cleanup");
+      const writes = vi.spyOn(storage, "applySnapshot");
+      await manager.setTitle(agent.id, "Retained after cleanup");
+      expect(writes).not.toHaveBeenCalled();
+      expect(h.prompts).toEqual([]);
+    } finally {
+      cleanup.resolve("terminated");
+      await manager.closeAgent(agent.id);
+    }
   });
 
   test("a missing resumed conversation cancels in-progress history before the next turn", async () => {

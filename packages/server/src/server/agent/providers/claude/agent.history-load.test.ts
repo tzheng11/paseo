@@ -125,9 +125,22 @@ describe("ClaudeAgentSession persisted history load", () => {
         msg: "Failed to load Claude history from transcript",
         sessionId: SESSION_ID,
         historyPath: transcriptPath(),
-        err: expect.objectContaining({ message: expect.stringContaining("EISDIR") }),
+        err: expect.objectContaining({
+          code: "EISDIR",
+          path: transcriptPath(),
+          message: expect.stringContaining("EISDIR"),
+        }),
       }),
     );
+  });
+
+  test("an empty regular transcript does not log an unreadable-history warning", async () => {
+    mkdirSync(path.dirname(transcriptPath()), { recursive: true });
+    writeFileSync(transcriptPath(), "");
+
+    await resume();
+
+    expect(records.filter((record) => record.level >= pino.levels.values.warn)).toEqual([]);
   });
 
   // chmod does not remove read access on Windows, or for root.

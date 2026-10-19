@@ -34,7 +34,15 @@ export async function* readClaudeHistoryRecords(
 ): AsyncGenerator<Record<string, unknown>> {
   const file = await open(filePath, "r");
   try {
-    const { size } = await file.stat();
+    const stats = await file.stat();
+    if (!stats.isFile()) {
+      const code = stats.isDirectory() ? "EISDIR" : "EINVAL";
+      throw Object.assign(new Error(`${code}: history transcript is not a regular file`), {
+        code,
+        path: filePath,
+      });
+    }
+    const { size } = stats;
     if (size === 0) return;
     // Freeze the read boundary so a provider appending during replay cannot extend it indefinitely.
     const input = file.createReadStream({

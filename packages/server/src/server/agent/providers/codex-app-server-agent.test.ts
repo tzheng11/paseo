@@ -194,6 +194,8 @@ function createProviderWithFakeAppServer(
   internals.goalsEnabledPromise = Promise.resolve(false);
   internals.autoReviewEnabledPromise = Promise.resolve(false);
   internals.spawnAppServer = async () => appServer.child;
+  // This fake app-server never launches an installed Codex binary.
+  vi.spyOn(provider, "isAvailable").mockResolvedValue(true);
   return provider;
 }
 
@@ -1287,6 +1289,31 @@ describe("Codex app-server provider", () => {
     const startCall = requests.find((req) => req.method === "thread/start");
     expect(startCall).toBeDefined();
     expect((startCall!.params as Record<string, unknown>).ephemeral).toBeUndefined();
+  });
+
+  test("session close retries cleanup after an uncertain kill later reports exit", async () => {
+    const appServer = createFakeCodexAppServer();
+    const session = new CodexAppServerAgentSession(
+      createConfig(),
+      null,
+      createTestLogger(),
+      async () => appServer.child,
+    );
+    await session.connect();
+    appServer.child.kill = vi.fn(() => true);
+    vi.useFakeTimers();
+    try {
+      const firstClose = expect(session.close()).rejects.toThrow("did not report exit");
+      await vi.advanceTimersByTimeAsync(3_000);
+      await firstClose;
+      appServer.child.exitCode = 0;
+      appServer.child.emit("exit", 0, null);
+      await expect(session.close()).resolves.toBeUndefined();
+    } finally {
+      appServer.child.exitCode = 0;
+      appServer.child.emit("exit", 0, null);
+      vi.useRealTimers();
+    }
   });
 
   test("disposes an unresponsive app-server child with SIGKILL", async () => {

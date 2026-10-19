@@ -54,6 +54,51 @@ describe("workspace bulk close helpers", () => {
     });
   });
 
+  it("excludes permanent panels from counts and cleanup while retaining hidden-close panels", async () => {
+    const info: WorkspaceTabDescriptor = {
+      key: "retained-panel",
+      tabId: "retained-panel",
+      kind: "info",
+      target: { kind: "info" },
+    };
+    const files: WorkspaceTabDescriptor = {
+      key: "browse",
+      tabId: "browse",
+      kind: "files",
+      target: { kind: "files" },
+    };
+    const changes: WorkspaceTabDescriptor = {
+      key: "review",
+      tabId: "review",
+      kind: "changes_tree",
+      target: { kind: "changes_tree" },
+    };
+    const groups = classifyBulkClosableTabs([info, files, changes, makeFileTab("/repo/README.md")]);
+    expect(groups.otherTabs.map((tab) => tab.tabId)).toEqual([
+      "browse",
+      "review",
+      "file_/repo/README.md",
+    ]);
+    expect(buildBulkCloseConfirmationMessage(groups)).toBe("This will close 3 tab(s).");
+    const closed: string[] = [];
+    const cleanup = vi.fn();
+    const closeItems = vi.fn();
+    await closeBulkWorkspaceTabs({
+      groups,
+      client: { closeItems },
+      closeTab: async (tabId, action) => {
+        closed.push(tabId);
+        await action();
+      },
+      closeWorkspaceTabWithCleanup: cleanup,
+      closeLayoutOnlyAgent: vi.fn(),
+      logLabel: "eligibility regression",
+    });
+    expect(closed).toEqual(["browse", "review", "file_/repo/README.md"]);
+    expect(cleanup.mock.calls.map(([input]) => input.tabId)).toEqual(closed);
+    expect(closeItems).not.toHaveBeenCalled();
+  });
+
   it("separates subagent tabs from agents that archive on close", () => {
     const groups = classifyBulkClosableTabs(
       [makeAgentTab("root"), makeAgentTab("child")],

@@ -180,6 +180,7 @@ import {
   buildBulkCloseConfirmationMessage,
   type BulkCloseConfirmationLabels,
   classifyBulkClosableTabs,
+  filterBulkClosableTabs,
   closeBulkWorkspaceTabs,
 } from "@/screens/workspace/workspace-bulk-close";
 import { resolveCloseAgentTabPolicy } from "@/subagents";
@@ -2834,7 +2835,8 @@ function WorkspaceScreenContent({
       title: string;
       logLabel: string;
     }): Promise<boolean> => {
-      const { tabsToClose, title, logLabel } = input;
+      const { tabsToClose: requestedTabsToClose, title, logLabel } = input;
+      const tabsToClose = filterBulkClosableTabs(requestedTabsToClose);
       if (tabsToClose.length === 0) {
         return true;
       }
