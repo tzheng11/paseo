@@ -57,12 +57,26 @@ async function rowAction(page: Page, id: string, action: "superpin" | "pin") {
 }
 async function dismissOverlay(page: Page) {
   const backdrop = page.getByRole("button", { name: "Bottom sheet backdrop", exact: true });
-  if (narrow(page) && (await backdrop.count()) > 0) {
-    await backdrop.click({ position: { x: 8, y: 8 } });
-    await expect(backdrop).toHaveCount(0);
-  } else {
-    await page.keyboard.press("Escape");
-  }
+  // A workspace moving sections can close its sheet between observation and click.
+  // Retry that whole operation, bounded, and require the dismissal postcondition.
+  await expect(async () => {
+    if (narrow(page) && (await backdrop.count()) > 0)
+      await backdrop.click({ position: { x: 8, y: 8 }, timeout: 500 });
+    else await page.keyboard.press("Escape");
+    await expect(backdrop).toHaveCount(0, { timeout: 500 });
+  }).toPass({ timeout: 5_000, intervals: [100, 250, 500] });
+}
+async function waitForPinSettled(page: Page, seed: SeededWorkspace, isPinned: boolean) {
+  await openWorkspace(page, seed);
+  await page
+    .getByTestId(`workspace-deck-entry-${key(seed.workspaceId)}`)
+    .getByTestId("workspace-header-menu-trigger")
+    .click();
+  const pin = page.getByTestId(`workspace-header-pin-${key(seed.workspaceId)}`);
+  await expect(pin).toHaveText(isPinned ? "Unpin" : "Pin to top");
+  // Pin and Superpin share pending state, cleared only after the app settles its RPC.
+  await expect(pin).toBeEnabled();
+  await dismissOverlay(page);
 }
 async function readState(seed: SeededWorkspace) {
   const workspace = (await seed.client.fetchWorkspaces()).entries.find(
@@ -207,6 +221,7 @@ for (const viewport of [
           (await pinned(page).boundingBox())!.y,
         );
         await capture(page, info, "superpinned-project");
+        await waitForPinSettled(page, seed, true);
         await page.reload();
         await showSidebar(page);
         await expect(top(page).getByTestId(rowID(seed.workspaceId))).toBeVisible();
@@ -314,6 +329,8 @@ for (const viewport of [
         await expect
           .poll(() => cachedSuperpin(page, second.workspaceId))
           .toBe(before.superpinnedAt);
+        await waitForPinSettled(page, first, true);
+        await waitForPinSettled(page, second, true);
         gate.setServerMessageSuppressed("fetch_workspaces_response", true);
         gate.setServerMessageSuppressed("workspace_update", true);
         await page.reload();
@@ -594,6 +611,7 @@ async function assertOldHost(
     .poll(async () => Boolean((await readState(seed)).pinnedAt))
     .toBe(before.pinnedAt == null);
   expect((await readState(seed)).superpinnedAt).toBeNull();
+  await waitForPinSettled(page, seed, before.pinnedAt == null);
 }
 
 async function cachedSuperpin(page: Page, workspaceId: string) {
