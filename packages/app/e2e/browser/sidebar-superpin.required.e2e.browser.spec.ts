@@ -569,6 +569,8 @@ async function assertOldHost(
   await expect(
     command.panel.getByRole("button", { name: /^(Superpin|Remove superpin)$/ }),
   ).toHaveCount(0);
+  await expect(command.panel.getByTestId("command-center-file-search-loading")).toHaveCount(0);
+  if (narrow(page)) await expect(page.getByTestId("sidebar-sessions")).not.toBeInViewport();
   await capture(page, info, `${captureName}-command-center`);
   await dismissOverlay(page);
   const before = await readState(seed);
@@ -590,7 +592,7 @@ async function assertUnknownHost(page: Page, seed: SeededWorkspace, info: TestIn
   await openRowMenu(page, seed.workspaceId);
   await expect(
     page.getByTestId(`sidebar-workspace-menu-labels-${key(seed.workspaceId)}`),
-  ).toBeVisible();
+  ).toBeInViewport({ ratio: 1 });
   await expect(
     page.getByTestId(`sidebar-workspace-menu-superpin-${key(seed.workspaceId)}`),
   ).toHaveCount(0);
@@ -601,7 +603,9 @@ async function assertUnknownHost(page: Page, seed: SeededWorkspace, info: TestIn
     .getByTestId(`workspace-deck-entry-${key(seed.workspaceId)}`)
     .getByTestId("workspace-header-menu-trigger")
     .click();
-  await expect(page.getByTestId(`workspace-header-labels-${key(seed.workspaceId)}`)).toBeVisible();
+  await expect(page.getByTestId(`workspace-header-labels-${key(seed.workspaceId)}`)).toBeInViewport(
+    { ratio: 1 },
+  );
   await expect(page.getByTestId(`workspace-header-superpin-${key(seed.workspaceId)}`)).toHaveCount(
     0,
   );
@@ -613,6 +617,8 @@ async function assertUnknownHost(page: Page, seed: SeededWorkspace, info: TestIn
   await expect(
     command.panel.getByRole("button", { name: /^(Superpin|Remove superpin)$/ }),
   ).toHaveCount(0);
+  await expect(command.panel.getByTestId("command-center-file-search-loading")).toHaveCount(0);
+  if (narrow(page)) await expect(page.getByTestId("sidebar-sessions")).not.toBeInViewport();
   await capture(page, info, `${name}-command-center`);
   await dismissOverlay(page);
 }
@@ -621,7 +627,7 @@ async function assertCapableHost(page: Page, seed: SeededWorkspace, info: TestIn
   await openRowMenu(page, seed.workspaceId);
   await expect(
     page.getByTestId(`sidebar-workspace-menu-superpin-${key(seed.workspaceId)}`),
-  ).toBeVisible();
+  ).toBeInViewport({ ratio: 1 });
   await capture(page, info, "capable-row");
   await dismissOverlay(page);
   await openWorkspace(page, seed);
