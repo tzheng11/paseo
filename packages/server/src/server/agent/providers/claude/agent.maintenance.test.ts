@@ -30,6 +30,7 @@ class InMemoryClaudeQuery implements ClaudeQuery {
   commandRequests = 0;
   closeCalls = 0;
   interrupts = 0;
+  onDelivered: (() => void) | null = null;
   private readonly messages: QueuedSdkMessage[] = [];
   private wake: (() => void) | null = null;
   private processed: (() => void) | null = null;
@@ -46,6 +47,7 @@ class InMemoryClaudeQuery implements ClaudeQuery {
     const queued = this.messages.shift();
     if (!queued) throw new Error("Expected queued SDK message");
     this.processed = queued.processed;
+    this.onDelivered?.();
     return { done: false, value: queued.message };
   }
   emit(message: SDKMessage): Promise<void> {
@@ -103,6 +105,7 @@ const sessionId = "80c16252-cab4-4e1d-872a-a2c27fc34817";
 interface HarnessOptions {
   resolveBinary?: () => Promise<string>;
   spawnChild?: boolean;
+  onTerminate?: () => void;
 }
 
 describe("Claude credential maintenance", () => {
@@ -167,6 +170,7 @@ describe("Claude credential maintenance", () => {
       },
       async terminateProcess(target) {
         terminations.push(target);
+        options.onTerminate?.();
         if (cleanupPromise) return cleanupPromise;
         if (cleanupResult !== "kill-timeout") {
           child.exitCode = 0;
@@ -292,6 +296,200 @@ describe("Claude credential maintenance", () => {
     });
     expect(JSON.stringify(events)).not.toContain("BEFORE MAINTENANCE");
     await session.close();
+  });
+
+  test("closing during deferred large-history replay cancels it without blocking callbacks", async () => {
+    const directory = claudeProjectDirSync(cwd, { configDir });
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(
+      path.join(directory, `${sessionId}.jsonl`),
+      Array.from({ length: 1024 }, (_, index) =>
+        JSON.stringify({
+          type: "user",
+          uuid: `user-${index}`,
+          message: { role: "user", content: `message ${index}` },
+          metadata: "x".repeat(8192),
+        }),
+      ).join("\n"),
+    );
+    const h = harness();
+    const session = await h.resume();
+    const history = session.streamHistory();
+    const heartbeat = new Promise<"heartbeat">((resolve) =>
+      setImmediate(() => resolve("heartbeat")),
+    );
+    const first = history.next();
+    expect(await Promise.race([heartbeat, first.then(() => "history")])).toBe("heartbeat");
+    await session.close();
+    expect(await first).toEqual({ done: true, value: undefined });
+    expect(h.spawnCalls).toBe(1);
+    expect(h.prompts).toEqual([]);
+  });
+
+  test("a missing resumed conversation cancels in-progress history before the next turn", async () => {
+    const directory = claudeProjectDirSync(cwd, { configDir });
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(
+      path.join(directory, `${sessionId}.jsonl`),
+      Array.from({ length: 1024 }, (_, index) =>
+        JSON.stringify({
+          type: "user",
+          uuid: `stale-${index}`,
+          message: { role: "user", content: "STALE HISTORY" },
+          metadata: "x".repeat(8192),
+        }),
+      ).join("\n"),
+    );
+    const retiring = deferred<void>();
+    const retired = deferred<TerminateWithTreeKillResult>();
+    const h = harness({ onTerminate: () => retiring.resolve() });
+    const session = await h.resume();
+    h.cleanupPromise = retired.promise;
+    const history = session.streamHistory();
+    const first = history.next();
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      void h.query.emit({
+        type: "result",
+        subtype: "error_during_execution",
+        uuid: "missing-resume",
+        session_id: sessionId,
+        errors: [`No conversation found with session ID: ${sessionId}`],
+      });
+      await retiring.promise;
+      expect(await first).toEqual({ done: true, value: undefined });
+      const starting = session.startTurn("new turn");
+      const heartbeat = new Promise<"heartbeat">((resolve) =>
+        setImmediate(() => resolve("heartbeat")),
+      );
+      expect(await Promise.race([heartbeat, starting.then(() => "started")])).toBe("heartbeat");
+      expect(h.prompts).toEqual([]);
+      retired.resolve("terminated");
+      await starting;
+      expect(await session.streamHistory().next()).toEqual({ done: true, value: undefined });
+      expect(h.launches).toHaveLength(2);
+    } finally {
+      retired.resolve("terminated");
+      await session.close();
+    }
+  });
+
+  test("interrupt during deferred history cannot dispatch the waiting model prompt", async () => {
+    const directory = claudeProjectDirSync(cwd, { configDir });
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(
+      path.join(directory, `${sessionId}.jsonl`),
+      Array.from({ length: 1024 }, () =>
+        JSON.stringify({ type: "progress", metadata: "x".repeat(8192) }),
+      ).join("\n"),
+    );
+    const h = harness();
+    const session = await h.resume();
+    try {
+      const starting = session.startTurn("must not dispatch");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await session.interrupt();
+      await expect(starting).rejects.toThrow("interrupted");
+      expect(h.prompts).toEqual([]);
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("live tool results wait for deferred history to rebuild the owning tool call", async () => {
+    const directory = claudeProjectDirSync(cwd, { configDir });
+    mkdirSync(directory, { recursive: true });
+    const lines = Array.from({ length: 1024 }, () =>
+      JSON.stringify({ type: "progress", metadata: "x".repeat(8192) }),
+    );
+    lines.push(
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_history",
+              name: "Bash",
+              input: { command: "echo historical" },
+            },
+          ],
+        },
+      }),
+    );
+    writeFileSync(path.join(directory, `${sessionId}.jsonl`), lines.join("\n"));
+    const h = harness();
+    const session = await h.resume();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    try {
+      const history = session.streamHistory();
+      const first = history.next();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const processed = h.query.emit({
+        type: "user",
+        uuid: "live-result",
+        session_id: sessionId,
+        parent_tool_use_id: null,
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "toolu_history", content: "LIVE OUTPUT" }],
+        },
+      });
+      await first;
+      await processed;
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "timeline",
+          item: expect.objectContaining({
+            type: "tool_call",
+            callId: "toolu_history",
+            name: "Bash",
+            status: "completed",
+            detail: expect.objectContaining({
+              type: "shell",
+              command: "echo historical",
+              output: "LIVE OUTPUT",
+            }),
+          }),
+        }),
+      );
+      await history.return();
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("closing suppresses SDK frames queued behind deferred history replay", async () => {
+    const directory = claudeProjectDirSync(cwd, { configDir });
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(
+      path.join(directory, `${sessionId}.jsonl`),
+      Array.from({ length: 1024 }, () =>
+        JSON.stringify({ type: "progress", metadata: "x".repeat(8192) }),
+      ).join("\n"),
+    );
+    const h = harness();
+    const session = await h.resume();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const first = session.streamHistory().next();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const delivered = deferred<void>();
+    h.query.onDelivered = () => delivered.resolve();
+    void h.query.emit({
+      type: "user",
+      uuid: "late-user",
+      session_id: sessionId,
+      parent_tool_use_id: null,
+      message: { role: "user", content: "must not arrive after close" },
+    });
+    await delivered.promise;
+    await session.close();
+    expect(await first).toEqual({ done: true, value: undefined });
+    expect(session.hasActiveBackgroundTasks?.()).toBe(false);
+    expect(events).toEqual([]);
   });
 
   test("explicit rewind loads deferred real anchors before choosing its fork", async () => {
