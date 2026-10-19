@@ -3,9 +3,10 @@ import { stat } from "node:fs/promises";
 import { z } from "zod";
 import { ensureValidJson } from "../../json-utils.js";
 import type { Logger } from "pino";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 import type { AgentMode, AgentProvider, AgentSessionConfig } from "../agent-sdk-types.js";
-import type { AgentManager } from "../agent-manager.js";
+import type { AgentManager, ManagedAgent } from "../agent-manager.js";
 import { AgentProfileSchema } from "@getpaseo/protocol/messages";
 import {
   WORKSPACE_FIELDS,
@@ -31,7 +32,7 @@ import {
 import { curateAgentActivity } from "../activity-curator.js";
 import type { AgentStorage } from "../agent-storage.js";
 import { ensureAgentLoaded } from "../agent-loading.js";
-import { isStoredAgentProviderAvailable } from "../../persistence-hooks.js";
+import { buildConfigOverrides, isStoredAgentProviderAvailable } from "../../persistence-hooks.js";
 import {
   archiveByScope,
   killTerminalsForWorkspace,
@@ -105,6 +106,12 @@ import type {
 } from "./types.js";
 import type { ProviderPaseoToolsPolicy } from "@getpaseo/protocol/provider-config";
 import { isPaseoToolEnabled } from "../paseo-tool-policy.js";
+
+type CallerSnapshot = Pick<
+  ManagedAgent,
+  "id" | "provider" | "cwd" | "workspaceId" | "config" | "currentModeId"
+>;
+const callerSnapshots = new AsyncLocalStorage<CallerSnapshot | null>();
 
 export interface PaseoToolHostDependencies {
   agentManager: AgentManager;
@@ -605,6 +612,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   };
 
   const tools = new Map<string, PaseoToolDefinition>();
+
   const registerTool = (
     name: string,
     config: PaseoToolConfig,
@@ -637,7 +645,33 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       if (!tool) {
         throw new Error(`Paseo tool not found: ${name}`);
       }
-      return tool.handler(await parseToolInput(tool, input), context);
+      const parsed = await parseToolInput(tool, input);
+      const finish = callerAgentId ? agentManager.beginAgentActivity(callerAgentId) : undefined;
+      try {
+        // Caller inheritance needs identity/configuration, not a provider. Scope
+        // the snapshot to this request so concurrent calls cannot share stale data.
+        const caller = callerAgentId ? agentManager.getAgent(callerAgentId) : null;
+        let snapshot: CallerSnapshot | null = caller;
+        if (callerAgentId && !caller) {
+          const record = await agentStorage.get(callerAgentId);
+          if (record && !record.archivedAt)
+            snapshot = {
+              id: record.id,
+              cwd: record.cwd,
+              workspaceId: record.workspaceId,
+              provider: record.provider,
+              config: {
+                ...buildConfigOverrides(record),
+                provider: record.provider,
+                cwd: record.cwd,
+              },
+              currentModeId: record.lastModeId ?? null,
+            };
+        }
+        return await callerSnapshots.run(snapshot, () => tool.handler(parsed, context));
+      } finally {
+        finish?.();
+      }
     },
   });
 
@@ -667,7 +701,9 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
     if (!callerAgentId) {
       return null;
     }
-    const parentAgent = agentManager.getAgent(callerAgentId);
+    const stored = callerSnapshots.getStore();
+    const parentAgent =
+      agentManager.getAgent(callerAgentId) ?? (stored?.id === callerAgentId ? stored : null);
     if (!parentAgent) {
       throw new Error(`Parent agent ${callerAgentId} not found`);
     }
@@ -709,7 +745,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   async function resolveTerminalWorkspaceId(resolvedCwd: string): Promise<string> {
     // An agent-spawned terminal belongs to the caller agent's workspace. Only if
     // the caller has no workspace do we mint one for the cwd.
-    const callerAgent = callerAgentId ? agentManager.getAgent(callerAgentId) : null;
+    const callerAgent = resolveCallerAgent();
     if (callerAgent?.workspaceId) {
       return callerAgent.workspaceId;
     }

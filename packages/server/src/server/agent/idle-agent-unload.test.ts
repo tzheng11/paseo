@@ -36,19 +36,21 @@ test.each(["CronCreate", "ScheduleWakeup", "Monitor"])(
 
 test("only confirmed matching deletion retires a scheduler", () => {
   const schedulers = new ClaudeSessionSchedulers();
-  schedulers.observe(call("CronCreate", "completed", "a", {}, JSON.stringify({ id: "job-a" })));
   schedulers.observe(
-    call("CronDelete", "completed", "delete-b", { id: "job-b" }, { deleted: true }),
+    call(
+      "CronCreate",
+      "completed",
+      "a",
+      {},
+      { output: { id: "job-a", humanSchedule: "every 5 minutes", recurring: true } },
+    ),
   );
+  schedulers.observe(call("CronDelete", "completed", "delete-b", { id: "job-b" }, { id: "job-b" }));
   expect(schedulers.active).toBe(true);
-  schedulers.observe(
-    call("CronDelete", "completed", "delete-a", { id: "job-a" }, { deleted: true }),
-  );
+  schedulers.observe(call("CronDelete", "completed", "delete-a", { id: "job-a" }, { id: "job-a" }));
   expect(schedulers.active).toBe(false);
   schedulers.observe(call("CronCreate", "completed", "unknown", {}, "Unrecognized output"));
-  schedulers.observe(
-    call("CronDelete", "completed", "delete-a", { id: "job-a" }, { deleted: true }),
-  );
+  schedulers.observe(call("CronDelete", "completed", "delete-a", { id: "job-a" }, { id: "job-a" }));
   expect(schedulers.active).toBe(true);
 });
 
@@ -65,11 +67,45 @@ test.skipIf(process.platform === "win32")("observes a real direct shell child", 
 
 test("interrupted scheduler creation retains its runtime until confirmed deletion", () => {
   const schedulers = new ClaudeSessionSchedulers();
-  schedulers.observe(call("CronCreate", "completed", "a", {}, { id: "job-a" }));
+  schedulers.observe(
+    call(
+      "CronCreate",
+      "completed",
+      "a",
+      {},
+      { output: { id: "job-a", humanSchedule: "every 5 minutes", recurring: true } },
+    ),
+  );
   schedulers.observe({ ...call("CronCreate", "running", "a"), status: "canceled" });
   expect(schedulers.active).toBe(true);
-  schedulers.observe(
-    call("CronDelete", "completed", "delete-a", { id: "job-a" }, { deleted: true }),
-  );
+  schedulers.observe(call("CronDelete", "completed", "delete-a", { id: "job-a" }, { id: "job-a" }));
   expect(schedulers.active).toBe(false);
 });
+
+test.each(["text", "sdk"])(
+  "ISS-4420 review 4: wrapped Claude CronCreate/CronDelete %s results retire the matching scheduler",
+  (shape) => {
+    const schedulers = new ClaudeSessionSchedulers();
+    // Claude's mapToolResultToToolResultBlockParam renders these messages; the
+    // provider's generic result projection wraps them in { output: content }.
+    const creation =
+      "Scheduled recurring job a1b2c3d4 (every 5 minutes). Session-only (not written to disk, dies when Claude exits). Auto-expires after 3 days. Use CronDelete to cancel sooner.";
+    schedulers.observe(call("CronCreate", "completed", "a", {}, { output: creation }));
+    schedulers.observe(
+      call("CronDelete", "completed", "wrong", { id: "other" }, { output: "Cancelled job other." }),
+    );
+    expect(schedulers.active).toBe(true);
+    schedulers.observe(
+      call(
+        "CronDelete",
+        "completed",
+        "delete-a",
+        { id: "a1b2c3d4" },
+        {
+          output: shape === "text" ? "Cancelled job a1b2c3d4." : { id: "a1b2c3d4" },
+        },
+      ),
+    );
+    expect(schedulers.active).toBe(false);
+  },
+);

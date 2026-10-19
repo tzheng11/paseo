@@ -518,6 +518,13 @@ export async function archiveWorkspaceContents(
     }
   }
 
+  // A failed agent archive must not authorize archiving its workspace or
+  // deleting the backing directory. Terminal cleanup remains best-effort.
+  const failedArchive = archiveResults
+    .slice(0, agentIdsToArchive.size)
+    .find((result) => result.status === "rejected");
+  if (failedArchive?.status === "rejected") throw failedArchive.reason;
+
   return archivedAgents;
 }
 

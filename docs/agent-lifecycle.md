@@ -156,12 +156,21 @@ process prevents unloading. Failed process observation, unknown provider ownersh
 background-work signals keep the runtime resident. Claude and Codex expose these signals;
 providers without them and Windows hosts retain their runtimes until observation is supported.
 
+Pending quota checkpoints remain resident so a later confirmed credential switch can continue the
+failed turn. Hub-owned executions also remain resident: reconnect replay currently reads the live
+execution map. Voice mode keeps its runtime until its owner restores the system prompt, including
+socket cleanup; listening without speech still needs that cleanup path.
+
 A Claude `CronCreate`, `ScheduleWakeup` or `Monitor` call also prevents unloading until its
 rejected creation or a matching confirmed deletion proves it ended. Interrupted creation stays held. A tool result that
 acknowledges scheduler creation does not prove expiration. Unrecognized scheduler results retain
 the runtime. Lifecycle mutations serialize with unloading, and admission is checked again after
 process observation before runtime closure. Sends, timeline reads and attaches resume through
 `ensureAgentLoaded()` using the same provider session and committed Paseo history.
+Runtime setting changes, rewind and timeline producers acquire demand before loading. Metadata,
+attention and archive operations classify residency inside the lifecycle lane and update the stored
+identity when the runtime is absent. A workspace archive cannot report success after an agent
+archive fails.
 
 A provider runtime can still die on its own — crash, OOM kill, host suspend. Work the agent parked
 inside that process dies with it: Claude Code's background Bash shells, `Monitor` watches, and

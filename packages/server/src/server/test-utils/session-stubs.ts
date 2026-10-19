@@ -36,6 +36,7 @@ export function asAgentManager(stub: {
   return createStub<SessionOptions["agentManager"]>({
     listProviderSubagentActivity: () => [],
     beginAgentActivity: () => () => {},
+    waitForAgentClose: async () => {},
     acknowledgeUnloadedAgentReload: async () => null,
     getRetiredInternalAgent: () => null,
     ...stub,

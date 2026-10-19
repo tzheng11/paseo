@@ -30,6 +30,10 @@ import { getOpenAgentTabLabel, PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/
 import { startAgentRun, sendPromptToAgent } from "./agent-prompt.js";
 import { StaleProviderSessionError } from "./stale-provider-session-error.js";
 import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "./agent-loading.js";
+import { archiveAgentCommand } from "./lifecycle-command.js";
+import { archiveWorkspaceContents } from "../workspace-archive-service.js";
+import { buildVoiceModeSystemPrompt } from "../voice-config.js";
+import type { AgentOwner } from "./agent-owner.js";
 import type { StoredAgentRecord } from "./agent-storage.js";
 import type {
   AgentTimelineFetchOptions,
@@ -12944,6 +12948,12 @@ async function quotaRecoveryFixture(provider: "claude" | "codex" = "claude") {
     hasActiveBackgroundTasks() {
       return background;
     }
+    async hasPersistedSession() {
+      return true;
+    }
+    getRuntimeProcessId() {
+      return null;
+    }
   }
   class QuotaClient extends TestAgentClient {
     override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
@@ -13066,6 +13076,31 @@ test("quota recovery preserves checkpoint through ordinary maintenance then cont
     expect(f.prompts).toHaveLength(2);
     expect((await f.storage.get(f.agent.id))?.quotaTurnCheckpoint).toBeUndefined();
   } finally {
+    await f.cleanup();
+  }
+});
+
+test("ISS-4420 review 1: idle maintenance cannot unload a pending quota continuation", async () => {
+  const f = await quotaRecoveryFixture();
+  try {
+    await f.fail();
+    await f.reload("ordinary-maintenance");
+    const checkpoint = f.manager.getAgent(f.agent.id)!.quotaTurnCheckpoint;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 3 * 60 * 60_000);
+    f.manager.setIdleUnloadAfterMinutes(120);
+    await f.manager.unloadIdleAgents();
+    expect(f.manager.getAgent(f.agent.id)?.quotaTurnCheckpoint).toEqual(checkpoint);
+    const change = await f.change();
+    expect(await f.reload("confirmed-switch", change)).toMatchObject({
+      status: "completed",
+      continuation: { status: "submitted", failedTurnId: checkpoint?.turnId },
+    });
+    expect(f.prompts).toHaveLength(2);
+    expect(f.manager.getAgent(f.agent.id)?.credentialGeneration).toBe(change.credentialGeneration);
+  } finally {
+    f.manager.setIdleUnloadAfterMinutes(0);
+    vi.useRealTimers();
     await f.cleanup();
   }
 });
@@ -13463,9 +13498,13 @@ class IdleUnloadSession extends TestAgentSession {
   getRuntimeProcessId(): number | null | undefined {
     return this.pid;
   }
+  async setFeature(): Promise<void> {}
 }
 
-async function idleUnloadHarness(minutes = 2) {
+async function idleUnloadHarness(
+  minutes = 2,
+  options?: { owner?: AgentOwner; systemPrompt?: string },
+) {
   const workdir = mkdtempSync(join(tmpdir(), "idle-unload-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
   const sessions: IdleUnloadSession[] = [];
@@ -13497,9 +13536,14 @@ async function idleUnloadHarness(minutes = 2) {
     hasRuntimeShellChild: shellChild,
     reloadOperations,
   });
-  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
-    workspaceId: "idle-test",
-  });
+  const agent = await manager.createAgent(
+    { provider: "codex", cwd: workdir, systemPrompt: options?.systemPrompt },
+    undefined,
+    {
+      workspaceId: "idle-test",
+      owner: options?.owner,
+    },
+  );
   return {
     manager,
     reloadOperations,
@@ -13518,6 +13562,189 @@ async function idleUnloadHarness(minutes = 2) {
     },
   };
 }
+
+test.each(["mode", "model", "thinking", "feature"] as const)(
+  "ISS-4420 review 2: %s settings load an unloaded agent on the same session",
+  async (setting) => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const h = await idleUnloadHarness();
+    try {
+      await vi.advanceTimersByTimeAsync(180_000);
+      await h.manager.waitForAgentClose(h.agent.id);
+      expect(h.manager.getAgent(h.agent.id)).toBeNull();
+      switch (setting) {
+        case "mode":
+          await h.manager.setAgentMode(h.agent.id, "plan");
+          break;
+        case "model":
+          await h.manager.setAgentModel(h.agent.id, "new-model");
+          break;
+        case "thinking":
+          await h.manager.setAgentThinkingOption(h.agent.id, "high");
+          break;
+        case "feature":
+          await h.manager.setAgentFeature(h.agent.id, "test", true);
+          break;
+      }
+      await h.manager.flush();
+      expect(h.manager.getAgent(h.agent.id)?.persistence?.sessionId).toBe(
+        h.agent.persistence?.sessionId,
+      );
+      expect(h.resumes).toHaveLength(1);
+    } finally {
+      await h.close();
+      vi.useRealTimers();
+    }
+  },
+);
+
+test.each(["agent", "workspace"] as const)(
+  "ISS-4420 review 3: %s archive queued during unload archives the durable agent",
+  async (target) => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const h = await idleUnloadHarness();
+    const census = deferred<boolean>();
+    h.shellChild.mockImplementation(() => census.promise);
+    try {
+      await vi.advanceTimersByTimeAsync(180_000);
+      const archive = vi.spyOn(
+        h.manager,
+        target === "agent" ? "clearAgentAttention" : "archiveAgent",
+      );
+      const archiving =
+        target === "agent"
+          ? archiveAgentCommand(
+              { agentManager: h.manager, agentStorage: h.storage, logger },
+              h.agent.id,
+            )
+          : archiveWorkspaceContents(
+              {
+                agentManager: h.manager,
+                agentStorage: h.storage,
+                killTerminalsForWorkspace: async () => undefined,
+                sessionLogger: logger,
+              },
+              "idle-test",
+            );
+      await vi.waitFor(() => expect(archive).toHaveBeenCalled());
+      census.resolve(false);
+      await archiving;
+      expect((await h.storage.get(h.agent.id))?.archivedAt).toEqual(expect.any(String));
+      expect(h.sessions).toHaveLength(1);
+    } finally {
+      census.resolve(false);
+      await h.close();
+      vi.useRealTimers();
+    }
+  },
+);
+
+test("ISS-4420 review 5: Hub-owned idle executions remain resident for reconnect replay", async () => {
+  vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+  const h = await idleUnloadHarness(2, {
+    owner: { kind: "daemon", daemonId: "hub", executionId: "execution" },
+  });
+  try {
+    await vi.advanceTimersByTimeAsync(180_000);
+    await h.manager.waitForAgentClose(h.agent.id);
+    expect(h.session.closed).toBe(0);
+    const replay: AgentManagerEvent[] = [];
+    const unsubscribe = h.manager.subscribe((event) => replay.push(event), { replayState: true });
+    unsubscribe();
+    expect(replay).toContainEqual(
+      expect.objectContaining({
+        type: "agent_state",
+        agent: expect.objectContaining({ id: h.agent.id, lifecycle: "idle", owner: h.agent.owner }),
+      }),
+    );
+  } finally {
+    await h.close();
+    vi.useRealTimers();
+  }
+});
+
+test("ISS-4420 review 6: listening voice mode retains runtime until its prompt is restored", async () => {
+  vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+  const h = await idleUnloadHarness(2, {
+    systemPrompt: buildVoiceModeSystemPrompt("Base instructions", true),
+  });
+  try {
+    await vi.advanceTimersByTimeAsync(180_000);
+    await h.manager.waitForAgentClose(h.agent.id);
+    expect(h.session.closed).toBe(0);
+    await h.manager.reloadAgentSession(h.agent.id, {
+      systemPrompt: buildVoiceModeSystemPrompt("Base instructions", false),
+    });
+    expect((await h.storage.get(h.agent.id))?.config?.systemPrompt).not.toContain(
+      "Always use the speak tool",
+    );
+    await vi.advanceTimersByTimeAsync(180_000);
+    await h.manager.waitForAgentClose(h.agent.id);
+    expect(h.sessions[1]?.closed).toBe(1);
+  } finally {
+    await h.close();
+    vi.useRealTimers();
+  }
+});
+
+test("unloaded identity supports metadata, attention, retained history and explicit close", async () => {
+  vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+  const h = await idleUnloadHarness();
+  try {
+    await h.manager.appendTimelineItem(h.agent.id, {
+      type: "assistant_message",
+      text: "Retained answer",
+    });
+    await vi.advanceTimersByTimeAsync(180_000);
+    await h.manager.waitForAgentClose(h.agent.id);
+    expect(await h.manager.getLastAssistantMessage(h.agent.id)).toBe("Retained answer");
+    const states: AgentManagerEvent[] = [];
+    const unsubscribe = h.manager.subscribe((event) => states.push(event), { replayState: false });
+    await h.manager.markAgentUnread(h.agent.id);
+    await h.manager.setTitle(h.agent.id, "Updated while unloaded");
+    await h.manager.setLabels(h.agent.id, { purpose: "test" });
+    await h.manager.clearAgentAttention(h.agent.id);
+    expect(await h.storage.get(h.agent.id)).toMatchObject({
+      title: "Updated while unloaded",
+      labels: { purpose: "test" },
+      requiresAttention: false,
+      lastStatus: "idle",
+    });
+    expect(
+      states
+        .filter((event) => event.type === "agent_state")
+        .every((event) => event.type === "agent_state" && event.agent.lifecycle === "idle"),
+    ).toBe(true);
+    expect(h.sessions).toHaveLength(1);
+    await h.manager.closeAgent(h.agent.id);
+    expect((await h.storage.get(h.agent.id))?.lastStatus).toBe("closed");
+    unsubscribe();
+  } finally {
+    await h.close();
+    vi.useRealTimers();
+  }
+});
+
+test("timeline producers resume an unloaded agent before appending new activity", async () => {
+  vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+  const h = await idleUnloadHarness();
+  try {
+    await vi.advanceTimersByTimeAsync(180_000);
+    await h.manager.waitForAgentClose(h.agent.id);
+    await h.manager.appendTimelineItem(h.agent.id, {
+      type: "assistant_message",
+      text: "New background update",
+    });
+    expect(h.manager.getTimeline(h.agent.id)).toContainEqual({
+      type: "assistant_message",
+      text: "New background update",
+    });
+    expect(h.resumes[0]?.sessionId).toBe(h.agent.persistence?.sessionId);
+  } finally {
+    await h.close();
+    vi.useRealTimers();
+  }
+});
 
 test("idle runtime unload timer keeps status idle, metadata and canonical history", async () => {
   vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });

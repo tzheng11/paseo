@@ -1539,28 +1539,30 @@ export class Session {
     return source ? (this.clientSources.get(source)?.activity ?? null) : null;
   }
 
-  private getFocusedAgentSelectionForCwd(cwd: string):
+  private async getFocusedAgentSelectionForCwd(cwd: string): Promise<
     | {
         provider?: string | null;
         model?: string | null;
         thinkingOptionId?: string | null;
       }
-    | undefined {
+    | undefined
+  > {
     const focusedAgentId = this.getClientActivity()?.focusedAgentId;
     if (!focusedAgentId) {
       return undefined;
     }
 
-    const agent = this.agentManager.getAgent(focusedAgentId);
-    if (!agent || agent.cwd !== cwd) {
+    const live = this.agentManager.getAgent(focusedAgentId);
+    const agent = live ?? (await this.agentStorage.get(focusedAgentId));
+    if (!agent || ("archivedAt" in agent && agent.archivedAt) || agent.cwd !== cwd) {
       return undefined;
     }
 
     return {
       provider: agent.provider,
-      model: agent.runtimeInfo?.model ?? agent.config.model ?? null,
+      model: agent.runtimeInfo?.model ?? agent.config?.model ?? null,
       thinkingOptionId:
-        agent.runtimeInfo?.thinkingOptionId ?? agent.config.thinkingOptionId ?? null,
+        agent.runtimeInfo?.thinkingOptionId ?? agent.config?.thinkingOptionId ?? null,
     };
   }
 
@@ -4443,7 +4445,7 @@ export class Session {
         firstAgentContext,
         setupContinuation: worktree ? undefined : this.agentWorktreeSetupContinuation(),
         background: msg.background,
-        callerWorkspaceId: this.getCallerWorkspaceId(msg.callerAgentId),
+        callerWorkspaceId: await this.getCallerWorkspaceId(msg.callerAgentId),
       });
       createdWorktreeForCleanup = createdWorktree;
       const resolvedIntent = await this.resolveSessionCreateAgentIntent({
@@ -4507,7 +4509,9 @@ export class Session {
             cwd: resolvedIntent.config.cwd,
             firstAgentContext,
           },
-          { currentSelection: this.getFocusedAgentSelectionForCwd(resolvedIntent.config.cwd) },
+          {
+            currentSelection: await this.getFocusedAgentSelectionForCwd(resolvedIntent.config.cwd),
+          },
         );
       }
       this.createAgentLifecycleDispatch.registerAutoArchiveIfRequested({
@@ -4536,9 +4540,13 @@ export class Session {
   }): Promise<ResolvedSessionCreateAgentIntent> {
     const { request, createdWorktree } = input;
     const callerAgent = request.callerAgentId
-      ? this.agentManager.getAgent(request.callerAgentId)
+      ? (this.agentManager.getAgent(request.callerAgentId) ??
+        (await this.agentStorage.get(request.callerAgentId)))
       : null;
-    if (request.callerAgentId && !callerAgent) {
+    if (
+      request.callerAgentId &&
+      (!callerAgent || ("archivedAt" in callerAgent && callerAgent.archivedAt))
+    ) {
       throw new Error(`Caller agent ${request.callerAgentId} not found`);
     }
 
@@ -4883,6 +4891,11 @@ export class Session {
     this.sessionLogger.info({ agentId }, `Cancel request received for agent ${agentId}`);
 
     try {
+      await ensureAgentLoaded(agentId, {
+        agentManager: this.agentManager,
+        agentStorage: this.agentStorage,
+        logger: this.sessionLogger,
+      });
       await cancelAgentRunCommand(
         { agentManager: this.agentManager, logger: this.sessionLogger },
         agentId,
@@ -6911,10 +6924,12 @@ export class Session {
     }
   }
 
-  private getCallerWorkspaceId(callerAgentId?: string): string | undefined {
+  private async getCallerWorkspaceId(callerAgentId?: string): Promise<string | undefined> {
     if (!callerAgentId) return undefined;
-    const caller = this.agentManager.getAgent(callerAgentId);
-    if (!caller) throw new Error(`Caller agent ${callerAgentId} not found`);
+    const caller =
+      this.agentManager.getAgent(callerAgentId) ?? (await this.agentStorage.get(callerAgentId));
+    if (!caller || ("archivedAt" in caller && caller.archivedAt))
+      throw new Error(`Caller agent ${callerAgentId} not found`);
     return caller.workspaceId;
   }
 
@@ -6965,7 +6980,7 @@ export class Session {
         expectsInitialAgent: Boolean(request.firstAgentContext),
         workspaceId,
         background: request.background,
-        callerWorkspaceId: this.getCallerWorkspaceId(request.callerAgentId),
+        callerWorkspaceId: await this.getCallerWorkspaceId(request.callerAgentId),
       },
     );
     await this.syncWorkspaceGitObserverForWorkspace(workspace);
@@ -6990,7 +7005,7 @@ export class Session {
           cwd: workspace.cwd,
           firstAgentContext,
         },
-        { currentSelection: this.getFocusedAgentSelectionForCwd(workspace.cwd) },
+        { currentSelection: await this.getFocusedAgentSelectionForCwd(workspace.cwd) },
       );
     }
     return descriptor;
@@ -7029,7 +7044,7 @@ export class Session {
         firstAgentContext: request.firstAgentContext,
         title: request.title,
         background: request.background,
-        callerWorkspaceId: this.getCallerWorkspaceId(request.callerAgentId),
+        callerWorkspaceId: await this.getCallerWorkspaceId(request.callerAgentId),
       },
       source.baseBranch
         ? { resolveDefaultBranch: async () => source.baseBranch as string }
@@ -7554,10 +7569,18 @@ export class Session {
         createPaseoWorktree: (workflowInput, serviceOptions) =>
           this.createPaseoWorktree(workflowInput, serviceOptions),
         warmWorkspaceGitData: (workspace) => this.warmWorkspaceGitDataForWorkspace(workspace),
-        autoNameWorkspaceBranchForFirstAgent: (autoNameInput) =>
-          this.workspaceAutoName.scheduleForWorktree(autoNameInput, {
-            currentSelection: this.getFocusedAgentSelectionForCwd(autoNameInput.workspace.cwd),
-          }),
+        autoNameWorkspaceBranchForFirstAgent: (autoNameInput) => {
+          void this.getFocusedAgentSelectionForCwd(autoNameInput.workspace.cwd)
+            .then((currentSelection) =>
+              this.workspaceAutoName.scheduleForWorktree(autoNameInput, { currentSelection }),
+            )
+            .catch((err) =>
+              this.sessionLogger.warn(
+                { err, workspaceId: autoNameInput.workspace.workspaceId },
+                "Failed to resolve focused selection for worktree naming",
+              ),
+            );
+        },
         startWorkspaceSetup: (workspaceId, operation) =>
           this.workspaceSetupRuntime.start(workspaceId, operation),
         assertWorkspaceAutomationAllowed: (workspaceId) =>

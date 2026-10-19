@@ -179,7 +179,9 @@ export function createAgentStructuredTextGeneration(deps: {
   readDaemonConfig: () => StructuredGenerationDaemonConfig;
   getFocusedSelection: (
     cwd: string,
-  ) => ResolveStructuredGenerationProvidersOptions["currentSelection"];
+  ) =>
+    | ResolveStructuredGenerationProvidersOptions["currentSelection"]
+    | Promise<ResolveStructuredGenerationProvidersOptions["currentSelection"]>;
 }): StructuredTextGeneration {
   return {
     async generate({ cwd, prompt, schema, schemaName, agentTitle }) {
@@ -187,7 +189,7 @@ export function createAgentStructuredTextGeneration(deps: {
         cwd,
         providerSnapshotManager: deps.providerSnapshotManager,
         daemonConfig: deps.readDaemonConfig(),
-        currentSelection: deps.getFocusedSelection(cwd),
+        currentSelection: await deps.getFocusedSelection(cwd),
       });
       return generateStructuredAgentResponseWithFallback({
         manager: deps.agentManager,

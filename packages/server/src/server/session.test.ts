@@ -143,16 +143,19 @@ test("interruptAgentIfRunning rejects when graceful cancellation is refused", as
 test("cancel_agent_request reports refusal only through its response", async () => {
   const agentId = "11111111-1111-4111-8111-111111111111";
   const messages: SessionOutboundMessage[] = [];
-  const getAgent = vi
-    .fn()
-    .mockReturnValueOnce({ id: agentId, provider: "codex", lifecycle: "running" })
-    .mockReturnValue(null);
+  let agentAvailable = true;
+  const getAgent = vi.fn(() =>
+    agentAvailable ? { id: agentId, provider: "codex", lifecycle: "running" } : null,
+  );
   const session = createSessionForTest({
     messages,
     agentManager: {
       getAgent,
       hasInFlightRun: vi.fn(() => true),
-      cancelAgentRun: vi.fn(async () => ({ status: "refused" as const })),
+      cancelAgentRun: vi.fn(async () => {
+        agentAvailable = false;
+        return { status: "refused" as const };
+      }),
     },
   });
 
