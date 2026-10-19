@@ -26,8 +26,20 @@ const pinned = (page: Page) => page.getByTestId("sidebar-pinned-section");
 const narrow = (page: Page) => (page.viewportSize()?.width ?? 1440) < 600;
 async function showSidebar(page: Page) {
   if (narrow(page)) {
-    const box = await page.getByTestId("sidebar-close").boundingBox();
-    if (!box || box.x < 0) await openMobileAgentSidebar(page);
+    // A closing drawer can still contain a visible close button. Wait for the whole
+    // panel to settle before deciding whether it needs opening again.
+    let settled = "moving";
+    await expect
+      .poll(async () => {
+        const box = await page.getByTestId("sidebar-sessions").boundingBox();
+        const width = page.viewportSize()!.width;
+        if (!box || box.x + box.width <= 0 || box.x >= width) settled = "closed";
+        else if (box.x >= 0 && box.x + box.width <= width) settled = "open";
+        else settled = "moving";
+        return settled;
+      })
+      .not.toBe("moving");
+    if (settled === "closed") await openMobileAgentSidebar(page);
     await expectMobileAgentSidebarVisible(page);
   }
 }
@@ -79,7 +91,11 @@ async function capture(page: Page, info: TestInfo, name: string) {
 async function openWorkspace(page: Page, seed: SeededWorkspace) {
   await showSidebar(page);
   await row(page, seed.workspaceId).click();
-  await expect(page.getByTestId("workspace-header-title")).toBeVisible();
+  await expect(
+    page
+      .getByTestId(`workspace-deck-entry-${key(seed.workspaceId)}`)
+      .getByTestId("workspace-header-title"),
+  ).toBeVisible();
 }
 async function palette(page: Page, title: string) {
   if (narrow(page)) {
@@ -96,7 +112,7 @@ async function palette(page: Page, title: string) {
   return { panel, input, action: panel.getByRole("button", { name: title, exact: true }) };
 }
 async function installFaults(page: Page) {
-  const state = { stripCapability: false, denyNext: false, requests: 0 };
+  const state = { stripCapability: false, dropServerInfo: false, denyNext: false, requests: 0 };
   const sockets = new Set<WebSocketRoute>();
   await page.routeWebSocket(daemonWsRoutePattern(), (browser) => {
     sockets.add(browser);
@@ -130,6 +146,12 @@ async function installFaults(page: Page) {
     server.onMessage((frame) => {
       const envelope = JSON.parse(typeof frame === "string" ? frame : frame.toString("utf8"));
       const message = envelope.message ?? envelope;
+      if (
+        state.dropServerInfo &&
+        message.type === "status" &&
+        message.payload?.status === "server_info"
+      )
+        return;
       if (
         state.stripCapability &&
         message.type === "status" &&
@@ -362,6 +384,49 @@ for (const viewport of [
       }
     });
 
+    test("3fdb71dd-7bc7-81fe-9280-c37f47c8e4b9@c0b2fb81314b#old-daemon hides all entry points while server info is unknown", async ({
+      page,
+    }, info) => {
+      test.setTimeout(150_000);
+      const plain = await seedWorkspace({
+        repoPrefix: "superpin-unknown-plain-",
+        title: "Unknown host ordinary workspace",
+      });
+      const priority = await seedWorkspace({
+        repoPrefix: "superpin-unknown-priority-",
+        title: "Unknown host priority workspace",
+      });
+      try {
+        const faults = await installFaults(page);
+        await priority.client.setWorkspaceSuperpinned(priority.workspaceId, true);
+        const before = [await readState(plain), await readState(priority)];
+        await gotoAppShell(page);
+        await openWorkspace(page, plain);
+        for (const seed of [plain, priority])
+          await waitForWorkspaceInReplicaCache(page, seed.workspaceId);
+        await expect
+          .poll(() => cachedSuperpin(page, priority.workspaceId))
+          .toBe(before[1].superpinnedAt);
+        faults.state.dropServerInfo = true;
+        await page.reload();
+        for (const seed of [plain, priority]) {
+          await assertUnknownHost(
+            page,
+            seed,
+            info,
+            `unknown-${seed === plain ? "ordinary" : "priority"}`,
+          );
+          await showSidebar(page);
+          await expect(row(page, seed.workspaceId)).toHaveCount(1);
+        }
+        expect([await readState(plain), await readState(priority)]).toEqual(before);
+        expect(faults.state.requests).toBe(0);
+      } finally {
+        await plain.cleanup();
+        await priority.cleanup();
+      }
+    });
+
     test("3fdb71dd-7bc7-81fe-9280-c37f47c8e4b9@c0b2fb81314b#old-daemon hides all entry points initially and after reconnect downgrade", async ({
       page,
     }, info) => {
@@ -383,6 +448,7 @@ for (const viewport of [
             return count;
           })
           .toBe(1);
+        await assertCapableHost(page, seed, info);
         faults.state.stripCapability = true;
         await faults.disconnect();
         await assertOldHost(page, seed, info, "downgraded-daemon");
@@ -487,7 +553,10 @@ async function assertOldHost(
   await capture(page, info, `${captureName}-row`);
   await page.getByTestId(`sidebar-workspace-menu-pin-${key(seed.workspaceId)}`).click();
   await openWorkspace(page, seed);
-  await page.getByTestId("workspace-header-menu-trigger").click();
+  await page
+    .getByTestId(`workspace-deck-entry-${key(seed.workspaceId)}`)
+    .getByTestId("workspace-header-menu-trigger")
+    .click();
   await expect(page.getByTestId(`workspace-header-superpin-${key(seed.workspaceId)}`)).toHaveCount(
     0,
   );
@@ -500,6 +569,8 @@ async function assertOldHost(
   await expect(
     command.panel.getByRole("button", { name: /^(Superpin|Remove superpin)$/ }),
   ).toHaveCount(0);
+  await expect(command.panel.getByTestId("command-center-file-search-loading")).toHaveCount(0);
+  if (narrow(page)) await expect(page.getByTestId("sidebar-sessions")).not.toBeInViewport();
   await capture(page, info, `${captureName}-command-center`);
   await dismissOverlay(page);
   const before = await readState(seed);
@@ -515,4 +586,62 @@ async function cachedSuperpin(page: Page, workspaceId: string) {
   const cache = await readReplicaCache(page);
   const workspaces = cache?.hosts?.flatMap((host) => host.workspaces);
   return workspaces?.find((workspace) => workspace.id === workspaceId)?.superpinnedAt;
+}
+
+async function assertUnknownHost(page: Page, seed: SeededWorkspace, info: TestInfo, name: string) {
+  await openRowMenu(page, seed.workspaceId);
+  await expect(
+    page.getByTestId(`sidebar-workspace-menu-labels-${key(seed.workspaceId)}`),
+  ).toBeInViewport({ ratio: 1 });
+  await expect(
+    page.getByTestId(`sidebar-workspace-menu-superpin-${key(seed.workspaceId)}`),
+  ).toHaveCount(0);
+  await capture(page, info, `${name}-row`);
+  await dismissOverlay(page);
+  await openWorkspace(page, seed);
+  await page
+    .getByTestId(`workspace-deck-entry-${key(seed.workspaceId)}`)
+    .getByTestId("workspace-header-menu-trigger")
+    .click();
+  await expect(page.getByTestId(`workspace-header-labels-${key(seed.workspaceId)}`)).toBeInViewport(
+    { ratio: 1 },
+  );
+  await expect(page.getByTestId(`workspace-header-superpin-${key(seed.workspaceId)}`)).toHaveCount(
+    0,
+  );
+  await capture(page, info, `${name}-header`);
+  await dismissOverlay(page);
+  const command = await palette(page, "Rename workspace");
+  await expect(command.action).toBeVisible();
+  await command.input.fill("Superpin");
+  await expect(
+    command.panel.getByRole("button", { name: /^(Superpin|Remove superpin)$/ }),
+  ).toHaveCount(0);
+  await expect(command.panel.getByTestId("command-center-file-search-loading")).toHaveCount(0);
+  if (narrow(page)) await expect(page.getByTestId("sidebar-sessions")).not.toBeInViewport();
+  await capture(page, info, `${name}-command-center`);
+  await dismissOverlay(page);
+}
+
+async function assertCapableHost(page: Page, seed: SeededWorkspace, info: TestInfo) {
+  await openRowMenu(page, seed.workspaceId);
+  await expect(
+    page.getByTestId(`sidebar-workspace-menu-superpin-${key(seed.workspaceId)}`),
+  ).toBeInViewport({ ratio: 1 });
+  await capture(page, info, "capable-row");
+  await dismissOverlay(page);
+  await openWorkspace(page, seed);
+  await page
+    .getByTestId(`workspace-deck-entry-${key(seed.workspaceId)}`)
+    .getByTestId("workspace-header-menu-trigger")
+    .click();
+  await expect(
+    page.getByTestId(`workspace-header-superpin-${key(seed.workspaceId)}`),
+  ).toBeInViewport({ ratio: 1 });
+  await capture(page, info, "capable-header");
+  await dismissOverlay(page);
+  const command = await palette(page, "Superpin");
+  await expect(command.action).toBeVisible();
+  await capture(page, info, "capable-command-center");
+  await dismissOverlay(page);
 }
