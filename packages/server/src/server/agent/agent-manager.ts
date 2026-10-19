@@ -731,8 +731,10 @@ function applyLabelPatch(
   labels: Record<string, string>,
   patch: AgentLabelPatch,
 ): Record<string, string> {
-  const nextLabels = { ...labels };
+  let nextLabels = labels;
   for (const [key, value] of Object.entries(patch)) {
+    if (value === null ? !Object.hasOwn(nextLabels, key) : nextLabels[key] === value) continue;
+    if (nextLabels === labels) nextLabels = { ...labels };
     if (value === null) {
       delete nextLabels[key];
     } else {
@@ -740,6 +742,13 @@ function applyLabelPatch(
     }
   }
   return nextLabels;
+}
+
+function sameLabels(left: Record<string, string>, right: Record<string, string>): boolean {
+  return (
+    Object.keys(left).length === Object.keys(right).length &&
+    Object.entries(left).every(([key, value]) => right[key] === value)
+  );
 }
 
 function buildExplicitTimelineSeedForRegister(
@@ -2885,13 +2894,15 @@ export class AgentManager {
       await this.writeStoredMetadata(agentId, { title: normalizedTitle });
       return;
     }
+    const stored = this.registry ? await this.registry.get(agent.id) : null;
     if (
       this.agentsAwaitingInitialSnapshotPersist.has(agent.id) &&
       this.registry &&
-      (await this.registry.get(agent.id)) === null
+      stored === null
     ) {
       return;
     }
+    if (stored?.title === normalizedTitle) return;
     this.touchUpdatedAt(agent);
     await this.persistSnapshot(agent, { title: normalizedTitle });
     this.emitState(agent, { persist: false });
@@ -2906,10 +2917,17 @@ export class AgentManager {
   private async writeLabels(agentId: string, patch: AgentLabelPatch): Promise<WriteLabelsResult> {
     const liveAgent = this.agents.get(agentId);
     if (liveAgent) {
-      liveAgent.labels = applyLabelPatch(liveAgent.labels, patch);
-      this.touchUpdatedAt(liveAgent);
-      await this.persistSnapshot(liveAgent);
-      this.emitState(liveAgent, { persist: false });
+      const labels = applyLabelPatch(liveAgent.labels, patch);
+      const stored = this.registry ? await this.registry.get(agentId) : null;
+      if (
+        labels !== liveAgent.labels ||
+        (this.registry && (!stored || !sameLabels(stored.labels, labels)))
+      ) {
+        liveAgent.labels = labels;
+        this.touchUpdatedAt(liveAgent);
+        await this.persistSnapshot(liveAgent);
+        this.emitState(liveAgent, { persist: false });
+      }
       const record = this.registry ? await this.registry.get(agentId) : null;
       return { record, live: true };
     }
@@ -2928,10 +2946,13 @@ export class AgentManager {
       throw new Error(`Agent not found: ${agentId}`);
     }
 
+    const title = patch.title || record.title;
+    const labels = patch.labels ? applyLabelPatch(record.labels, patch.labels) : record.labels;
+    if (title === record.title && labels === record.labels) return record;
     const nextRecord = {
       ...record,
-      ...(patch.title ? { title: patch.title } : {}),
-      ...(patch.labels ? { labels: applyLabelPatch(record.labels, patch.labels) } : {}),
+      title,
+      labels,
       updatedAt: this.nextStoredUpdatedAt(record),
     };
     await registry.upsert(nextRecord);

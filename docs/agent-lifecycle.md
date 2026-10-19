@@ -32,6 +32,14 @@ requiring its paginated-history protocol (0.159.2 or newer). Claude starts a fre
 for control readiness without sending a prompt; daemon-side transcript hydration waits for an
 explicit history or rewind request, or the next user turn. Other providers fail closed.
 
+Claude transcript hydration streams parent and child JSONL files into a temporary replay spool,
+retaining compact ownership and runtime facts instead of complete decoded transcripts. Reading,
+relationship reconstruction, and replay share a cooperative work budget. Normal resume awaits the
+ready snapshot; maintenance remains deferred. Closing a session or invalidating a missing native
+conversation cancels hydration before discarding its state. The extra disk I/O reduces peak memory
+and lets other daemon work run during large history loads. Parsing one individual JSONL record
+still runs synchronously, so the work budget does not bound the cost of an unusually large record.
+
 Idle-only reload also checks provider-owned background work. Claude's background shells do not
 appear in the subagent catalogue, so their process-level activity signal participates in admission.
 Codex tool completion can leave a native PTY running. Live command and terminal notifications
