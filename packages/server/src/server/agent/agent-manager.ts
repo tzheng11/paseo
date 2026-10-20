@@ -618,6 +618,10 @@ function limitAgentStreamEventContent(event: AgentStreamEvent): AgentStreamEvent
 }
 
 type HistoryReplayEvent = Extract<AgentStreamEvent, { type: "timeline" | "provider_subagent" }>;
+type TimelineHistorySource =
+  | AsyncIterable<AgentStreamEvent>
+  | Iterable<AgentStreamEvent>
+  | AgentHistoryReplay<HistoryReplayEvent>;
 async function* projectHistoryReplay(
   history: AsyncIterable<AgentStreamEvent> | Iterable<AgentStreamEvent>,
 ): AsyncGenerator<HistoryReplayEvent> {
@@ -912,6 +916,8 @@ export class AgentManager {
   private readonly agentActivity = new Map<string, number>();
   private readonly lastRuntimeDemand = new Map<string, number>();
   private readonly sessionSchedulers = new Map<string, ClaudeSessionSchedulers>();
+  // A cold stored identity can receive Paseo rows before its native history is read.
+  private readonly timelinesAwaitingProviderHistory = new Set<string>();
 
   constructor(options: AgentManagerOptions) {
     this.reloadOperations = options.reloadOperations;
@@ -3320,9 +3326,9 @@ export class AgentManager {
     agentId: string,
     item: AgentTimelineItem,
   ): Promise<{ seq: number; epoch: string } | null> {
-    return this.withResidentTimelineTarget(agentId, async (agent) => {
+    return this.withTimelineWriteTarget(agentId, async (agent) => {
       item = limitAgentTimelineItemContent(item);
-      this.touchUpdatedAt(agent);
+      if ("session" in agent) this.touchUpdatedAt(agent);
       const row = this.recordTimeline(agentId, item);
       this.dispatchStream(
         agentId,
@@ -3337,14 +3343,14 @@ export class AgentManager {
           timestamp: row.timestamp,
         },
       );
-      await this.persistSnapshot(agent);
+      if ("session" in agent) await this.persistSnapshot(agent);
       return { seq: row.seq, epoch: this.timelineStore.getEpoch(agentId) };
     });
   }
 
   async emitLiveTimelineItem(agentId: string, item: AgentTimelineItem): Promise<boolean> {
-    const emitted = await this.withResidentTimelineTarget(agentId, async (agent) => {
-      this.touchUpdatedAt(agent);
+    const emitted = await this.withTimelineWriteTarget(agentId, async (agent) => {
+      if ("session" in agent) this.touchUpdatedAt(agent);
       this.dispatchStream(agentId, {
         type: "timeline",
         item,
@@ -3355,17 +3361,40 @@ export class AgentManager {
     return emitted === true;
   }
 
-  /** Background producers cannot reopen a runtime or undo user teardown. */
-  private withResidentTimelineTarget<T>(
+  /** Background writes use idle stored identities without reopening a provider. */
+  private withTimelineWriteTarget<T>(
     agentId: string,
-    write: (agent: ActiveManagedAgent) => Promise<T>,
+    write: (agent: ActiveManagedAgent | StoredAgentRecord) => Promise<T>,
   ): Promise<T | null> {
     return this.runLifecycleMutation(agentId, async () => {
       const agent = this.agents.get(agentId);
-      if (!agent) return null;
       const record = await this.registry?.get(agentId);
       if (this.registry && (!record || record.archivedAt)) return null;
-      return write(agent);
+      const target = agent ?? record;
+      if (!target) return null;
+      if (!agent && (!record || record.lastStatus !== "idle")) return null;
+      const commit = async () => {
+        if (!this.timelineStore.has(agentId)) {
+          const { durableTimelineHasRows } = await this.initializeAgentTimelineForRegister({
+            agentId,
+            now: new Date(),
+            options: undefined,
+          });
+          if (!durableTimelineHasRows) this.timelinesAwaitingProviderHistory.add(agentId);
+        }
+        const result = await write(target);
+        if (!agent && record) {
+          const nextRecord = { ...record, updatedAt: this.nextStoredUpdatedAt(record) };
+          await this.requireRegistry().upsert(nextRecord);
+          this.dispatchStoredAgentState(nextRecord);
+        }
+        return result;
+      };
+      // A cold seed can be merging with the first native replay. Loaded producers
+      // keep their existing path, including writes from provider permission hooks.
+      return !agent || this.timelinesAwaitingProviderHistory.has(agentId)
+        ? this.runSessionOperation(agentId, commit)
+        : commit();
     });
   }
 
@@ -4609,8 +4638,9 @@ export class AgentManager {
       ? await this.loadCommittedTimelineSeed(agentId, now)
       : null;
     const durableTimelineHasRows =
-      timelineAlreadyPrimed ||
-      (durableTimelineSeed != null && (durableTimelineSeed.nextSeq ?? 1) > 1);
+      !this.timelinesAwaitingProviderHistory.has(agentId) &&
+      (timelineAlreadyPrimed ||
+        (durableTimelineSeed != null && (durableTimelineSeed.nextSeq ?? 1) > 1));
     const timelineSeed = explicitTimelineSeed ?? durableTimelineSeed;
     if (timelineSeed || !this.timelineStore.has(agentId)) {
       this.timelineStore.initialize(agentId, timelineSeed ?? { timestamp: now.toISOString() });
@@ -4743,6 +4773,7 @@ export class AgentManager {
 
   private discardRetainedAgentState(agentId: string): void {
     this.timelineStore.delete(agentId);
+    this.timelinesAwaitingProviderHistory.delete(agentId);
     this.paseoToolPolicies.delete(agentId);
     for (const event of this.providerSubagents.deleteParent(agentId)) {
       this.dispatch({ type: "provider_subagent", event });
@@ -5109,25 +5140,28 @@ export class AgentManager {
   private async primeTimelineFromLegacyProviderHistory(
     agent: ActiveManagedAgent,
     broadcast: boolean | (() => boolean),
-    source:
-      | AsyncIterable<AgentStreamEvent>
-      | Iterable<AgentStreamEvent>
-      | AgentHistoryReplay<HistoryReplayEvent> = agent.session.streamHistory(),
+    source: TimelineHistorySource = agent.session.streamHistory(),
   ): Promise<void> {
     return this.runSessionOperation(agent.id, async () => {
       if (agent.historyPrimed) return;
       agent.historyPrimed = false;
       let history: AgentHistoryReplay<HistoryReplayEvent>;
+      let providerTimelineCount: number | undefined;
       try {
-        history =
-          source instanceof AgentHistoryReplay
-            ? source
-            : await AgentHistoryReplay.create(projectHistoryReplay(source));
+        ({ history, providerTimelineCount } = await this.stageInitialTimelineHistory(
+          agent,
+          source,
+        ));
       } catch (error) {
         this.logger.warn({ err: error, agentId: agent.id }, "Failed to hydrate provider history");
         throw error;
       }
+      const hasBackgroundSeed = providerTimelineCount !== undefined;
       try {
+        if (hasBackgroundSeed) {
+          // Stage both sources before replacing the cache; failed reads retain the seed.
+          this.timelineStore.initialize(agent.id);
+        }
         await this.deleteCommittedTimeline(agent.id);
         const deferredBroadcast = typeof broadcast === "function";
         // These descriptors are also retained by ProviderSubagentStore. Timeline
@@ -5153,8 +5187,21 @@ export class AgentManager {
               });
             }
         }
-        this.historySourceBoundarySeq.set(agent.id, this.timelineStore.getNextSeq(agent.id) - 1);
+        this.historySourceBoundarySeq.set(
+          agent.id,
+          providerTimelineCount !== undefined
+            ? startSeq + providerTimelineCount - 1
+            : this.timelineStore.getNextSeq(agent.id) - 1,
+        );
         agent.historyPrimed = true;
+        if (hasBackgroundSeed) {
+          this.timelinesAwaitingProviderHistory.delete(agent.id);
+          this.dispatch({
+            type: "timeline_replacement",
+            agentId: agent.id,
+            epoch: this.timelineStore.getEpoch(agent.id),
+          });
+        }
         if (typeof broadcast !== "function" || !broadcast()) return;
         for (const event of providerSubagentEvents) this.dispatch(event);
         let seq = startSeq;
@@ -5167,9 +5214,44 @@ export class AgentManager {
           });
         }
       } finally {
-        if (!(source instanceof AgentHistoryReplay)) await history.close();
+        if (history !== source) await history.close();
       }
     });
+  }
+
+  private async stageInitialTimelineHistory(
+    agent: ActiveManagedAgent,
+    source: TimelineHistorySource,
+  ): Promise<{ history: AgentHistoryReplay<HistoryReplayEvent>; providerTimelineCount?: number }> {
+    const providerHistory =
+      source instanceof AgentHistoryReplay ? source.events() : projectHistoryReplay(source);
+    if (!this.timelinesAwaitingProviderHistory.has(agent.id)) {
+      return {
+        history:
+          source instanceof AgentHistoryReplay
+            ? source
+            : await AgentHistoryReplay.create(providerHistory),
+      };
+    }
+    let providerTimelineCount = 0;
+    const timelineStore = this.timelineStore;
+    const history = await AgentHistoryReplay.create(
+      (async function* (): AsyncGenerator<HistoryReplayEvent> {
+        for await (const event of providerHistory) {
+          if (event.type === "timeline") providerTimelineCount++;
+          yield event;
+        }
+        for await (const row of timelineStore.streamRows(agent.id)) {
+          yield {
+            type: "timeline",
+            provider: agent.provider,
+            item: row.item,
+            timestamp: row.timestamp,
+          };
+        }
+      })(),
+    );
+    return { history, providerTimelineCount };
   }
 
   private notifyForegroundTurnWaiters(agentId: string, event: AgentStreamEvent): void {

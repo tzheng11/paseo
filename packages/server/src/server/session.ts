@@ -8140,7 +8140,7 @@ export class Session {
       ...msg.item,
       pluginId,
     });
-    if (!position) throw new Error(`Agent is not loaded: ${msg.agentId}`);
+    if (!position) throw new Error(`Agent cannot accept timeline writes: ${msg.agentId}`);
     const { seq, epoch } = position;
     this.emit({
       type: "agent.timeline.append.response",

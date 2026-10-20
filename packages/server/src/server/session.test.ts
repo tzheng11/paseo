@@ -36,6 +36,11 @@ import { OWNER_PERMISSIONS, type DaemonPermission } from "./authorization/index.
 import { DownloadTokenStore } from "./file-download/token-store.js";
 import { StructuredAgentFallbackError } from "./agent/agent-response-loop.js";
 import type { StoredAgentRecord } from "./agent/agent-storage.js";
+import { AgentStorage } from "./agent/agent-storage.js";
+import { AgentManager } from "./agent/agent-manager.js";
+import { DiskAgentTimelineStore } from "./agent/disk-agent-timeline-store.js";
+import { ensureAgentLoaded } from "./agent/agent-loading.js";
+import { createTestAgentClient } from "./test-utils/fake-agent-client.js";
 import type { AgentManagerEvent } from "./agent/agent-manager.js";
 import type { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import { WorkspaceLabelError, type WorkspaceLabelService } from "./workspace-labels/index.js";
@@ -1862,6 +1867,134 @@ function createStoredAgentRecord(
 }
 
 describe("plugin timeline append RPC", () => {
+  test.each(["retained", "cold"] as const)(
+    "ISS-4420 idle writer: plugin append survives %s projection, load and timeline refetch without spawning on append",
+    async (projection) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const directory = mkdtempSync(join(tmpdir(), "plugin-idle-timeline-"));
+      const logger = pino({ level: "silent" });
+      const storage = new AgentStorage(join(directory, "agents"), logger);
+      const timelineStore = new DiskAgentTimelineStore({ directory: join(directory, "timeline") });
+      const client = createTestAgentClient("codex");
+      const create = client.createSession.bind(client);
+      const creates = vi.spyOn(client, "createSession").mockImplementation(async (...args) =>
+        Object.assign(await create(...args), {
+          hasPersistedSession: async () => true,
+          hasActiveBackgroundTasks: () => false,
+          getRuntimeProcessId: () => null,
+        }),
+      );
+      const resume = client.resumeSession.bind(client);
+      const history = vi.fn(async function* () {
+        yield {
+          type: "timeline" as const,
+          provider: "codex",
+          item: { type: "assistant_message" as const, text: "Earlier history" },
+        };
+      });
+      const resumes = vi.spyOn(client, "resumeSession").mockImplementation(async (...args) =>
+        Object.assign(await resume(...args), {
+          streamHistory: history,
+          readHistoryWindows: async () => ({
+            head: [],
+            tail: [],
+            totalEvents: 1,
+            totalBytes: 0,
+            gap: null,
+          }),
+        }),
+      );
+      const manager = new AgentManager({
+        clients: { codex: client },
+        registry: storage,
+        timelineStore,
+        logger,
+        idleUnloadAfterMinutes: 2,
+      });
+      let agentId: string | undefined;
+      try {
+        const agent = await manager.createAgent({ provider: "codex", cwd: directory }, undefined, {
+          workspaceId: undefined,
+        });
+        agentId = agent.id;
+        await manager.appendTimelineItem(agent.id, {
+          type: "assistant_message",
+          text: "Earlier history",
+        });
+        vi.setSystemTime(Date.now() + 180_000);
+        await manager.unloadIdleAgents();
+        expect(manager.getAgent(agent.id)).toBeNull();
+        if (projection === "cold") timelineStore.delete(agent.id);
+        const before = await storage.get(agent.id);
+        const messages: SessionOutboundMessage[] = [];
+        const session = createSessionForTest({
+          clientId: "plugin:review",
+          messages,
+          agentManager: { appendTimelineItem: manager.appendTimelineItem.bind(manager) },
+        });
+        await session.handleMessage({
+          type: "agent.timeline.append.request",
+          requestId: "idle-result",
+          agentId: agent.id,
+          item: {
+            type: "plugin",
+            id: "review-result",
+            kind: "review",
+            version: 1,
+            data: { status: "completed" },
+          },
+        });
+        expect(messages).toContainEqual({
+          type: "agent.timeline.append.response",
+          payload: {
+            requestId: "idle-result",
+            seq: expect.any(Number),
+            epoch: expect.any(String),
+          },
+        });
+        expect(manager.getAgent(agent.id)).toBeNull();
+        expect(creates).toHaveBeenCalledTimes(1);
+        expect(resumes).not.toHaveBeenCalled();
+        expect(await storage.get(agent.id)).toMatchObject({
+          lastStatus: "idle",
+          persistence: before!.persistence,
+          config: before!.config,
+          runtimeInfo: before!.runtimeInfo,
+        });
+        await ensureAgentLoaded(agent.id, { agentManager: manager, agentStorage: storage, logger });
+        expect(manager.getAgent(agent.id)?.persistence?.sessionId).toBe(
+          agent.persistence?.sessionId,
+        );
+        const refetch = await manager.fetchTimelineAsync(agent.id, { limit: 0 });
+        expect(refetch.rows.map((row) => row.item)).toContainEqual({
+          type: "plugin",
+          id: "review-result",
+          pluginId: "review",
+          kind: "review",
+          version: 1,
+          data: { status: "completed" },
+        });
+        expect(refetch.rows.map((row) => row.item)).toContainEqual({
+          type: "assistant_message",
+          text: "Earlier history",
+        });
+        expect(resumes).toHaveBeenCalledTimes(1);
+        expect(history).toHaveBeenCalledTimes(projection === "cold" ? 1 : 0);
+        expect(
+          (await manager.readTimelineHistory(agent.id, { operation: "windows" })).liveAfterSeq,
+        ).toBe(projection === "cold" ? 1 : undefined);
+      } finally {
+        manager.prepareForShutdown();
+        if (agentId) await manager.closeAgent(agentId);
+        await manager.flush();
+        await storage.flush();
+        timelineStore.close();
+        rmSync(directory, { recursive: true, force: true });
+        vi.useRealTimers();
+      }
+    },
+  );
+
   test("reports an unavailable target without loading a provider", async () => {
     const messages: SessionOutboundMessage[] = [];
     const appendTimelineItem = vi.fn().mockResolvedValue(null);
@@ -1882,7 +2015,7 @@ describe("plugin timeline append RPC", () => {
         requestId: "gone-target",
         requestType: "agent.timeline.append.request",
         code: "handler_error",
-        error: "Request failed: Agent is not loaded: gone-agent",
+        error: "Request failed: Agent cannot accept timeline writes: gone-agent",
       },
     });
     expect(messages.some((message) => message.type === "agent.timeline.append.response")).toBe(

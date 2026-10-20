@@ -176,8 +176,9 @@ the runtime. Lifecycle mutations serialize with unloading, and admission is chec
 process observation before runtime closure. Sends, timeline reads and attaches resume through
 `ensureAgentLoaded()` using the same provider session and committed Paseo history.
 Runtime setting changes and rewind acquire demand before loading. Background timeline producers
-write only while the agent is loaded; setup output and plugin writes cannot reopen an unloaded,
-closed, deleted or archived agent. Metadata,
+write to the retained timeline of an idle-unloaded agent without starting a provider. Setup output
+and plugin writes still refuse closed, deleted and archived agents. A later load retains those rows;
+a cold projection stages them after native history when that history is first read. Metadata,
 attention and archive operations classify residency inside the lifecycle lane and update the stored
 identity when the runtime is absent. A workspace archive cannot report success after an agent
 archive fails.

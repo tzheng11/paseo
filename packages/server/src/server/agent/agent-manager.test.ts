@@ -35,6 +35,8 @@ import { archiveWorkspaceContents } from "../workspace-archive-service.js";
 import { buildVoiceModeSystemPrompt } from "../voice-config.js";
 import { attachAgentStoragePersistence } from "../persistence-hooks.js";
 import { runAsyncWorktreeBootstrap } from "../worktree-bootstrap.js";
+import { createStub } from "../test-utils/class-mocks.js";
+import type { TerminalManager } from "../../terminal/terminal-manager.js";
 import {
   appendTimelineItemIfAgentKnown,
   emitLiveTimelineItemIfAgentKnown,
@@ -13873,13 +13875,12 @@ test("ISS-4420 rereview P1: deleted setup target stops bootstrap without rejecti
   }
 });
 
-test.each(["unloaded", "killed", "archived", "deleted"] as const)(
+test.each(["killed", "archived", "deleted"] as const)(
   "ISS-4420 rereview P2a: background timeline writers never resume %s targets",
   async (state) => {
     vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
     const h = await idleUnloadHarness();
     try {
-      if (state === "unloaded") await vi.advanceTimersByTimeAsync(180_000);
       if (state === "killed") await h.manager.closeAgent(h.agent.id);
       if (state === "archived") await h.manager.archiveAgent(h.agent.id);
       if (state === "deleted") await h.storage.remove(h.agent.id);
@@ -13911,6 +13912,99 @@ test.each(["unloaded", "killed", "archived", "deleted"] as const)(
       expect(h.resumes).toEqual([]);
       expect(h.manager.getAgent(h.agent.id)).toEqual(resident);
       expect(await h.storage.get(h.agent.id)).toEqual(before);
+    } finally {
+      await h.close();
+      vi.useRealTimers();
+    }
+  },
+);
+
+test.each([
+  {
+    status: "completed",
+    command: "echo setup-progress",
+    terminalStatuses: ["completed"],
+    terminalInputs: [[{ type: "input", data: "echo terminal-ready\r" }]],
+  },
+  { status: "failed", command: "exit 1", terminalStatuses: [], terminalInputs: [] },
+])(
+  "ISS-4420 idle writer: setup $status after unload retains its row and expected terminal startup",
+  async ({ status, command, terminalStatuses, terminalInputs }) => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const h = await idleUnloadHarness();
+    const input = vi.fn();
+    const terminal = {
+      id: "setup-terminal",
+      name: "Setup terminal",
+      send: input,
+      getState: () => ({ scrollback: [], grid: [[{ char: "$" }]] }),
+    };
+    const createTerminal = vi.fn(async () => terminal);
+    const liveWrites: boolean[] = [];
+    let unloaded = false;
+    try {
+      execFileSync("git", ["init", "-b", "main"], { cwd: h.agent.cwd, stdio: "pipe" });
+      writeFileSync(
+        join(h.agent.cwd, "paseo.json"),
+        JSON.stringify({
+          worktree: {
+            setup: [command],
+            terminals: [{ name: "Setup terminal", command: "echo terminal-ready" }],
+          },
+        }),
+      );
+      await runAsyncWorktreeBootstrap({
+        agentId: h.agent.id,
+        workspaceId: "idle-test",
+        worktree: { branchName: "main", worktreePath: h.agent.cwd },
+        terminalManager: createStub<TerminalManager>({ registerCwdEnv: () => {}, createTerminal }),
+        logger,
+        appendTimelineItem: (item) =>
+          appendTimelineItemIfAgentKnown({ agentManager: h.manager, agentId: h.agent.id, item }),
+        emitLiveTimelineItem: async (item) => {
+          if (!unloaded) {
+            vi.setSystemTime(Date.now() + 180_000);
+            await h.manager.unloadIdleAgents();
+            expect(h.manager.getAgent(h.agent.id)).toBeNull();
+            unloaded = true;
+          }
+          const written = await emitLiveTimelineItemIfAgentKnown({
+            agentManager: h.manager,
+            agentId: h.agent.id,
+            item,
+          });
+          liveWrites.push(written);
+          return written;
+        },
+      });
+      expect(unloaded).toBe(true);
+      expect(liveWrites.length).toBeGreaterThan(0);
+      expect(liveWrites.every(Boolean)).toBe(true);
+      expect(h.manager.getAgent(h.agent.id)).toBeNull();
+      expect(h.sessions).toHaveLength(1);
+      expect(createTerminal).toHaveBeenCalledTimes(terminalInputs.length);
+      expect(input.mock.calls).toEqual(terminalInputs);
+      await ensureAgentLoaded(h.agent.id, {
+        agentManager: h.manager,
+        agentStorage: h.storage,
+        logger,
+      });
+      expect(h.resumes[0]?.sessionId).toBe(h.agent.persistence?.sessionId);
+      const refetch = await h.manager.fetchTimelineAsync(h.agent.id, { limit: 0 });
+      expect(refetch.rows.map((row) => row.item)).toContainEqual(
+        expect.objectContaining({
+          type: "tool_call",
+          name: "paseo_worktree_setup",
+          status,
+        }),
+      );
+      expect(
+        refetch.rows.flatMap((row) =>
+          row.item.type === "tool_call" && row.item.name === "paseo_worktree_terminals"
+            ? [row.item.status]
+            : [],
+        ),
+      ).toEqual(terminalStatuses);
     } finally {
       await h.close();
       vi.useRealTimers();
