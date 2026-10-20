@@ -22,6 +22,7 @@ interface SupportedMutableConfigPatch {
   browserTools?: { enabled?: boolean };
   providers?: MutableDaemonConfig["providers"];
   removeProviders?: string[];
+  idleUnloadAfterMinutes?: number;
   metadataGeneration?: MutableDaemonConfig["metadataGeneration"];
   autoArchiveAfterMerge?: boolean;
   enableTerminalAgentHooks?: boolean;
@@ -186,6 +187,7 @@ const RELOADABLE_PATHS = [
   "app.baseUrl",
   "agents.providers",
   "agents.catalogRefreshTimeoutMs",
+  "agents.idleUnloadAfterMinutes",
   "agents.metadataGeneration",
   "agents.skills.selection",
   "pluginsEnabled",
@@ -209,6 +211,7 @@ const PERSISTED_TO_MUTABLE_PATH = new Map<string, string>([
   ["app.baseUrl", "app.baseUrl"],
   ["agents.providers", "providers"],
   ["agents.catalogRefreshTimeoutMs", "catalogRefreshTimeoutMs"],
+  ["agents.idleUnloadAfterMinutes", "idleUnloadAfterMinutes"],
   ["agents.metadataGeneration", "metadataGeneration"],
   ["agents.skills.selection", "skills.selection"],
   ["pluginsEnabled", "pluginsEnabled"],
@@ -259,6 +262,9 @@ function pickSupportedPatchFields(patch: MutableDaemonConfigPatch): SupportedMut
       ? { browserTools: { enabled: patch.browserTools.enabled } }
       : {}),
     ...(patch.providers !== undefined ? { providers: patch.providers } : {}),
+    ...(patch.idleUnloadAfterMinutes !== undefined
+      ? { idleUnloadAfterMinutes: patch.idleUnloadAfterMinutes }
+      : {}),
     ...(patch.removeProviders !== undefined ? { removeProviders: patch.removeProviders } : {}),
     ...(patch.metadataGeneration?.providers !== undefined
       ? { metadataGeneration: { providers: patch.metadataGeneration.providers } }
@@ -599,6 +605,7 @@ function mergeMutableAgentPatch(
   removeProviders: readonly string[],
 ): PersistedConfig["agents"] {
   if (
+    patch.idleUnloadAfterMinutes === undefined &&
     patch.providers === undefined &&
     patch.metadataGeneration === undefined &&
     patch.skills === undefined &&
@@ -608,6 +615,9 @@ function mergeMutableAgentPatch(
   }
 
   const next = { ...persistedAgents } as Record<string, unknown>;
+  if (patch.idleUnloadAfterMinutes !== undefined) {
+    next["idleUnloadAfterMinutes"] = patch.idleUnloadAfterMinutes;
+  }
   const persistedProviderOverrides = omitProvidersFromOverrides(
     persistedAgents?.providers as Record<string, ProviderOverride> | undefined,
     removeProviders,

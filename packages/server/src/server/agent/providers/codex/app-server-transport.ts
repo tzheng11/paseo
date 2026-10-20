@@ -177,6 +177,10 @@ export class CodexAppServerClient {
   private disposed = false;
   private stderrBuffer = "";
 
+  get processId(): number | undefined {
+    return this.child.pid;
+  }
+
   constructor(
     private readonly child: ChildProcessWithoutNullStreams,
     private readonly logger: Logger,

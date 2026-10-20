@@ -708,6 +708,10 @@ export interface AgentSession {
   getPendingPermissions(): AgentPermissionRequest[];
   /** Provider-owned background work that closing this runtime would terminate. */
   hasActiveBackgroundTasks?(): boolean;
+  /** undefined means process ownership cannot be confirmed; null means no process exists. */
+  getRuntimeProcessId?(): number | null | undefined;
+  /** A session id alone may precede durable provider history (for example a new Codex thread). */
+  hasPersistedSession?(): Promise<boolean>;
   respondToPermission(
     requestId: string,
     response: AgentPermissionResponse,

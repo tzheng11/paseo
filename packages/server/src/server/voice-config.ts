@@ -39,6 +39,18 @@ export function stripVoiceModeSystemPrompt(existing?: string): string | undefine
   return stripped.length > 0 ? stripped : undefined;
 }
 
+/** Retain the runtime until the voice owner restores its agent configuration. */
+export function hasActiveVoiceModeSystemPrompt(existing?: string): boolean {
+  if (!existing) return false;
+  // Unknown or incomplete voice blocks stay resident until cleanup confirms off.
+  return (
+    existing.replace(makeVoicePromptBlockRegex(), "").includes(VOICE_PROMPT_BLOCK_START) ||
+    (existing.match(makeVoicePromptBlockRegex()) ?? []).some(
+      (block) => !block.includes(VOICE_AGENT_DISABLED_INSTRUCTION),
+    )
+  );
+}
+
 export function buildVoiceModeSystemPrompt(existing: string | undefined, enabled: boolean): string {
   const basePrompt = stripVoiceModeSystemPrompt(existing);
   const voiceInstruction = enabled

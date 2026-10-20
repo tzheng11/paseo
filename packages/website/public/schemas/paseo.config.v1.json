@@ -351,6 +351,11 @@
                 "additionalProperties": false
               }
             },
+            "idleUnloadAfterMinutes": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
             "catalogRefreshTimeoutMs": {
               "type": "integer",
               "exclusiveMinimum": 0,

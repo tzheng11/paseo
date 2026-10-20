@@ -192,6 +192,30 @@ function assertArchiveResult(
 }
 
 describe("archiveByScope", () => {
+  test("failed agent teardown cannot report its workspace archived", async () => {
+    const { tempDir, repoDir } = createGitRepo();
+    const deps = createArchiveDeps({
+      paseoHome: tempDir,
+      activeWorkspaces: [{ workspaceId: "failure", cwd: repoDir, kind: "local_checkout" }],
+    });
+    deps.agentStorage.listByWorkspace = async () => [
+      { id: "unloaded", workspaceId: "failure", archivedAt: null } as StoredAgentRecord,
+    ];
+    deps.agentManager.archiveSnapshot = async () => {
+      throw new Error("agent archive failed");
+    };
+    const result = await archiveByScope(deps, {
+      scope: { kind: "workspace", workspaceId: "failure" },
+      requestId: "failure",
+    });
+    expect(result.archivedWorkspaceIds).toEqual([]);
+    expect(result.archivedAgentIds).toEqual([]);
+    expect(result.removedDirectory).toBe(false);
+    expect((await deps.listActiveWorkspaces()).map((workspace) => workspace.workspaceId)).toEqual([
+      "failure",
+    ]);
+  });
+
   test("archives through a 120-second native unwatch hang and restarts the bounded child", async () => {
     const { tempDir, repoDir } = createGitRepo();
     const paseoHome = path.join(tempDir, "paseo-home");

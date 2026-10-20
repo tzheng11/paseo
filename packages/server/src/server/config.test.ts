@@ -215,3 +215,22 @@ test("loads private plugin registry settings through the configuration boundary"
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test("idle unload defaults to two hours and accepts zero to disable", async () => {
+  const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-idle-unload-"));
+  try {
+    expect(loadConfig(paseoHome, { env: {} }).idleUnloadAfterMinutes).toBe(120);
+    await writeFile(
+      path.join(paseoHome, "config.json"),
+      JSON.stringify({ agents: { idleUnloadAfterMinutes: 0 } }),
+    );
+    expect(loadConfig(paseoHome, { env: {} }).idleUnloadAfterMinutes).toBe(0);
+    await writeFile(
+      path.join(paseoHome, "config.json"),
+      JSON.stringify({ agents: { idleUnloadAfterMinutes: -1 } }),
+    );
+    expect(() => loadConfig(paseoHome, { env: {} })).toThrow();
+  } finally {
+    await rm(paseoHome, { recursive: true, force: true });
+  }
+});

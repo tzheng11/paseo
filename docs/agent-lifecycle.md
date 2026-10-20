@@ -10,13 +10,16 @@ initializing → idle → running → idle (or error → closed)
                  └────────┘  (agent completes a turn, awaits next prompt)
 ```
 
-Each live agent in `AgentManager` carries a `lastStatus` of `initializing`, `idle`, `running`, or `error`. `closed` is the persisted, resumable state for an agent record that has no live provider runtime. State transitions persist to disk and stream to subscribed clients via WebSocket.
+Each live agent in `AgentManager` carries a `lastStatus` of `initializing`, `idle`, `running`, or `error`. Explicit closure persists the resumable `closed` state. Automatic idle unloading releases the provider runtime while keeping `idle`. State transitions persist to disk and stream to subscribed clients via WebSocket.
 
 ## Idle-only reload
 
-`paseo agent reload UUID --only-if-idle` refuses a busy or unloaded agent instead
-of interrupting it. The host serializes lifecycle mutations and holds an idle
-claim until replacement registration and history replay finish; incoming turns must retry while
+`paseo agent reload UUID --only-if-idle` refuses a busy agent instead
+of interrupting it. An idle agent whose runtime is unloaded acknowledges the reload without
+starting a provider. Credential reload receipts use the same rule; `completed` also covers
+this no-runtime acknowledgement. The next load resolves the current provider launch configuration.
+
+The host serializes lifecycle mutations and holds an idle claim until replacement registration and history replay finish; incoming turns must retry while
 the claim is held. Active permission requests and native subagents also prevent
 the reload. The client checks the host capability before sending the namespaced
 request; older hosts receive no reload request and require an update.
@@ -49,7 +52,8 @@ History and rewind still read real provider records when requested.
 An RPC timeout is not evidence that a reload failed. Callers persist an operation UUID before
 dispatch and reconcile it through `agent reload-status UUID`. Receipts under
 `PASEO_HOME/reload-operations` commit before any session closure and survive socket loss.
-Only `completed` confirms registration of the replacement. A missing receipt is `unknown` with
+Only `completed` confirms registration of the replacement or acknowledgement that an idle
+runtime was already unloaded. A missing receipt is `unknown` with
 `NOT_FOUND`; the exact same UUID may be submitted again because admission deduplicates before
 mutation. A pending receipt left by a daemon restart becomes persisted `unknown` with
 `DAEMON_RESTARTED` and must not be replayed. Unreadable or corrupt storage is an error, never absence.
@@ -142,8 +146,45 @@ Reload releases the old runtime before resuming its durable session: an idle pro
 still own an exclusive writer. A close failure retains that runtime for cleanup and blocks the
 replacement. Once closure succeeds, a failed resume leaves the durable agent closed and retryable.
 
-Idle agents remain resident indefinitely. Runtime closure happens only through an explicit lifecycle
-action such as archive, replacement, reload, workspace teardown, or daemon shutdown.
+The daemon also unloads long-idle runtimes while preserving the user-visible `idle` status.
+Configure the [idle unload period](../public-docs/configuration.md#idle-agent-runtimes) in
+`config.json`; changes apply through daemon config reload. The sweep runs
+once a minute and measures inactivity from the latest work event or runtime demand, including
+send preparation and timeline access. Credential maintenance and provider configuration metadata
+do not renew that clock. Unloading does not mark the chat read or change its
+last-activity timestamp. `paseo inspect --json` exposes `RuntimeLoaded`; the snapshot field is
+`runtimeLoaded`.
+
+Unloading requires an idle persistent public agent, no active or queued turn, no replacement,
+no send or message receipt in flight, no permission or permission response pending, and no
+running provider subagent, Workflow or background Agent. The provider must confirm that no
+background work is active, identify its runtime process and confirm durable native history.
+A newly allocated Codex thread id has no resumable rollout until its history is persisted. A shell directly parented by that
+process prevents unloading. Failed process observation, unknown provider ownership or missing
+background-work signals keep the runtime resident. Claude and Codex expose these signals;
+providers without them and Windows hosts retain their runtimes until observation is supported.
+
+Pending quota checkpoints remain resident so a later confirmed credential switch can continue the
+failed turn. Hub-owned executions also remain resident: reconnect replay currently reads the live
+execution map. Voice mode keeps its runtime until its owner restores the system prompt, including
+socket cleanup; listening without speech still needs that cleanup path.
+
+A Claude `CronCreate`, `ScheduleWakeup` or `Monitor` call also prevents unloading until its
+rejected creation or a matching confirmed deletion proves it ended. Interrupted creation stays held. A tool result that
+acknowledges scheduler creation does not prove expiration. Unrecognized scheduler results retain
+the runtime. Lifecycle mutations serialize with unloading, and admission is checked again after
+process observation before runtime closure. Sends, timeline reads and attaches resume through
+`ensureAgentLoaded()` using the same provider session and committed Paseo history.
+Runtime setting changes and rewind acquire demand before loading. Background timeline producers
+write to the retained timeline of an idle-unloaded agent without starting a provider. Setup output
+and plugin writes still refuse closed, deleted and archived agents. A later load retains those rows;
+a cold projection stages them after native history when that history is first read. Metadata,
+attention and archive operations classify residency inside the lifecycle lane and update the stored
+identity when the runtime is absent. A workspace archive cannot report success after an agent
+archive fails.
+Stored-state broadcasts are projections of records already committed to storage. Persistence
+listeners skip snapshots without a provider session so those projections cannot erase private
+runtime metadata or credential recovery state.
 
 A provider runtime can still die on its own — crash, OOM kill, host suspend. Work the agent parked
 inside that process dies with it: Claude Code's background Bash shells, `Monitor` watches, and

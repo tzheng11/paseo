@@ -697,16 +697,23 @@ export async function runAsyncWorktreeBootstrap(
     }
     await liveEmitQueue;
     const message = error instanceof Error ? error.message : String(error);
-    await options.appendTimelineItem(
-      buildSetupTimelineItem({
-        callId: setupCallId,
-        status: "failed",
-        worktree: options.worktree,
-        results: setupResults,
-        outputAccumulatorsByIndex: progressAccumulator.outputAccumulatorsByIndex,
-        errorMessage: message,
-      }),
-    );
+    try {
+      await options.appendTimelineItem(
+        buildSetupTimelineItem({
+          callId: setupCallId,
+          status: "failed",
+          worktree: options.worktree,
+          results: setupResults,
+          outputAccumulatorsByIndex: progressAccumulator.outputAccumulatorsByIndex,
+          errorMessage: message,
+        }),
+      );
+    } catch (err) {
+      options.logger?.warn(
+        { err, agentId: options.agentId },
+        "Failed to record worktree setup failure",
+      );
+    }
     return;
   }
 

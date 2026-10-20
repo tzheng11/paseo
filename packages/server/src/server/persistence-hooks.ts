@@ -39,8 +39,8 @@ function isProviderRegistered(
 }
 
 /**
- * Attach AgentStorage persistence to an AgentManager instance so every
- * agent_state snapshot is flushed to disk.
+ * Flush runtime snapshots to disk. Stored-state broadcasts already describe a
+ * committed record and must not be persisted again.
  */
 export function attachAgentStoragePersistence(
   logger: LoggerLike,
@@ -52,7 +52,9 @@ export function attachAgentStoragePersistence(
     if (event.type !== "agent_state") {
       return;
     }
-    if (event.agent.lifecycle === "closed") {
+    // Stored-state notifications are projections of an already committed record.
+    // They omit runtime/private fields and must never be projected back to disk.
+    if (event.agent.session === null) {
       return;
     }
     void storage.applySnapshot(event.agent).catch((error) => {

@@ -223,6 +223,8 @@ function buildAgentManagerSpies() {
   const timelineStore = new InMemoryAgentTimelineStore();
   return {
     timelineStore,
+    beginAgentActivity: vi.fn(() => () => {}),
+    invalidateQuotaRecoveryForMessage: vi.fn().mockResolvedValue(undefined),
     createAgent: vi.fn(),
     waitForAgentEvent: vi.fn().mockResolvedValue({
       status: "idle",
@@ -595,6 +597,10 @@ class FakeBrowserToolsBroker {
 }
 
 class BoundaryAgentManagerFake {
+  public resident = true;
+  public beginAgentActivity(): () => void {
+    return () => {};
+  }
   private readonly agent = createManagedAgent({
     id: "agent-1",
     cwd: REPO_CWD,
@@ -602,7 +608,7 @@ class BoundaryAgentManagerFake {
   });
 
   public getAgent(agentId: string): ManagedAgent | null {
-    return agentId === this.agent.id ? this.agent : null;
+    return this.resident && agentId === this.agent.id ? this.agent : null;
   }
 
   public listAgents(): ManagedAgent[] {
@@ -611,6 +617,10 @@ class BoundaryAgentManagerFake {
 }
 
 class BoundaryAgentStorageFake {
+  constructor(private readonly record: StoredAgentRecord | null = null) {}
+  public async get(): Promise<StoredAgentRecord | null> {
+    return this.record;
+  }
   public async list(): Promise<StoredAgentRecord[]> {
     return [];
   }
@@ -853,6 +863,50 @@ function createAgentMcpServer(options: Parameters<typeof createAgentMcpServerWit
 
 describe("browser MCP tools", () => {
   const logger = createTestLogger();
+
+  it("scoped metadata tools use an unloaded caller without starting its provider", async () => {
+    const agentManager = new BoundaryAgentManagerFake();
+    agentManager.resident = false;
+    const record = createStoredRecord({
+      id: "agent-1",
+      cwd: REPO_CWD,
+      workspaceId: BROWSER_WORKSPACE_ID,
+      lastStatus: "idle",
+      archivedAt: null,
+    });
+    const broker = new FakeBrowserToolsBroker({
+      requestId: "unloaded-tabs",
+      ok: true,
+      result: { command: "list_tabs", tabs: [] },
+    });
+    const server = await createAgentMcpServer({
+      agentManager: agentManager as AgentManager,
+      agentStorage: new BoundaryAgentStorageFake(record) as AgentStorage,
+      providerSnapshotManager:
+        new BoundaryProviderSnapshotManagerFake() as unknown as ProviderSnapshotManager,
+      browserToolsEnabled: true,
+      browserToolsBroker: broker as BrowserToolsBroker,
+      callerAgentId: record.id,
+      logger,
+    });
+    const client = await connectInMemoryMcpClient(server);
+    try {
+      const result = await client.callTool({ name: "browser_list_tabs", arguments: {} });
+      expect(result.isError).not.toBe(true);
+      expect(broker.calls).toEqual([
+        {
+          agentId: record.id,
+          cwd: REPO_CWD,
+          workspaceId: BROWSER_WORKSPACE_ID,
+          command: { command: "list_tabs", args: {} },
+        },
+      ]);
+      expect(agentManager.getAgent(record.id)).toBeNull();
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
 
   it("omits output schemas from tools/list and keeps tool call content model-visible", async () => {
     const agentManager = new BoundaryAgentManagerFake();
@@ -6973,4 +7027,33 @@ describe("workspace field MCP tools", () => {
       await server.close();
     }
   });
+});
+
+it("reports an unloaded idle agent through MCP status and listings without loading it", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date("2026-04-11T00:00:00.000Z"));
+  try {
+    const logger = createTestLogger();
+    const { agentManager, agentStorage, spies } = createTestDeps();
+    const record = createStoredRecord({ lastStatus: "idle", archivedAt: null });
+    spies.agentManager.getAgent.mockReturnValue(null);
+    spies.agentStorage.get.mockResolvedValue(record);
+    spies.agentStorage.list.mockResolvedValue([record]);
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      providerSnapshotManager: createClaudeOnlyManager(),
+      logger,
+    });
+    const status = await registeredTool(server, "get_agent_status").handler({ agentId: record.id });
+    expect(status.structuredContent).toMatchObject({
+      status: "idle",
+      snapshot: { runtimeLoaded: false, status: "idle" },
+    });
+    const listing = await invokeToolWithParsedInput(registeredTool(server, "list_agents"), {});
+    expect(agentsOf(listing)).toEqual([expect.objectContaining({ id: record.id, status: "idle" })]);
+    expect(spies.agentManager.resumeAgentFromPersistence).not.toHaveBeenCalled();
+  } finally {
+    vi.useRealTimers();
+  }
 });

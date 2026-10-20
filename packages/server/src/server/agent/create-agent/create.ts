@@ -27,6 +27,7 @@ import {
   emitLiveTimelineItemIfAgentKnown,
 } from "../timeline-append.js";
 import { resolveCreateAgentIntent } from "./intent.js";
+import { ensureAgentLoaded } from "../agent-loading.js";
 
 export interface CreateAgentSessionWorktreeResult {
   sessionConfig: AgentSessionConfig;
@@ -320,7 +321,7 @@ async function resolveMcpCreateAgent(
   const resolvedProviderModel = resolveProviderModel(input.provider);
   const provider = resolvedProviderModel.provider;
   const parentAgent = input.callerAgentId
-    ? requireParentAgent(dependencies.agentManager, input.callerAgentId)
+    ? await requireParentAgent(dependencies, input.callerAgentId)
     : null;
   const cwd = resolveMcpInitialCwd(input, parentAgent);
   const { resolvedCwd, setupContinuation, createdWorkspaceId, createdWorktree } =
@@ -508,12 +509,17 @@ async function sendInitialPrompt(
   }
 }
 
-function requireParentAgent(agentManager: AgentManager, parentAgentId: string): ManagedAgent {
-  const parentAgent = agentManager.getAgent(parentAgentId);
-  if (!parentAgent) {
+async function requireParentAgent(
+  dependencies: CreateAgentCommandDependencies,
+  parentAgentId: string,
+): Promise<ManagedAgent> {
+  const parentAgent = dependencies.agentManager.getAgent(parentAgentId);
+  if (parentAgent) return parentAgent;
+  const record = await dependencies.agentStorage.get(parentAgentId);
+  if (!record || record.archivedAt) {
     throw new Error(`Parent agent ${parentAgentId} not found`);
   }
-  return parentAgent;
+  return ensureAgentLoaded(parentAgentId, dependencies);
 }
 
 function resolveChildAgentCwd(params: {

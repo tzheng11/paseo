@@ -313,6 +313,17 @@ async function resolvePromptSource(
 export async function sendPromptToAgent(
   params: SendPromptToAgentParams,
 ): Promise<{ disposition: PromptDispatchDisposition }> {
+  const finishActivity = params.agentManager.beginAgentActivity(params.agentId);
+  try {
+    return await sendPromptWithActivity(params);
+  } finally {
+    finishActivity();
+  }
+}
+
+async function sendPromptWithActivity(
+  params: SendPromptToAgentParams,
+): Promise<{ disposition: PromptDispatchDisposition }> {
   const unarchive = params.unarchive ?? true;
   await params.agentManager.invalidateQuotaRecoveryForMessage(params.agentId);
 

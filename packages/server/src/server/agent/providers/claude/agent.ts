@@ -2299,6 +2299,22 @@ class ClaudeAgentSession implements AgentSession {
     }
   }
 
+  async hasPersistedSession(): Promise<boolean> {
+    if (!this.claudeSessionId || this.persistSession === false) return false;
+    const historyPath = this.resolveHistoryPath(this.claudeSessionId);
+    if (!historyPath) return false;
+    try {
+      const stat = await promises.stat(historyPath);
+      return stat.isFile() && stat.size > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  getRuntimeProcessId(): number | null | undefined {
+    return this.childProcess ? this.childProcess.pid : null;
+  }
+
   hasActiveBackgroundTasks(): boolean {
     return this.backgroundTasks.hasActive;
   }

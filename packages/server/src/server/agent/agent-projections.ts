@@ -128,6 +128,7 @@ export function toAgentPayload(
     updatedAt: agent.updatedAt.toISOString(),
     lastUserMessageAt: agent.lastUserMessageAt ? agent.lastUserMessageAt.toISOString() : null,
     status: agent.lifecycle,
+    runtimeLoaded: agent.session !== null,
     activeTurn: agent.activeTurnId
       ? {
           turnId: agent.activeTurnId,
@@ -167,7 +168,7 @@ export function toAgentPayload(
   return payload;
 }
 
-function buildStoredRuntimeInfo(record: StoredAgentRecord): AgentRuntimeInfo | undefined {
+export function buildStoredRuntimeInfo(record: StoredAgentRecord): AgentRuntimeInfo | undefined {
   if (!record.runtimeInfo) return undefined;
   const ri = record.runtimeInfo;
   const runtimeInfo: AgentRuntimeInfo = {
@@ -241,6 +242,7 @@ export function buildStoredAgentPayload(
     updatedAt: updatedAt.toISOString(),
     lastUserMessageAt: lastUserMessageAt ? lastUserMessageAt.toISOString() : null,
     status: record.lastStatus,
+    runtimeLoaded: false,
     capabilities: defaultCapabilities,
     currentModeId: record.lastModeId ?? null,
     availableModes: [],
