@@ -2785,6 +2785,17 @@ export class AgentManager {
   ): Promise<T> {
     const finish = this.beginAgentActivity(agentId);
     try {
+      // Rewind must claim its run before a following prompt can enter. Keep the
+      // loaded path synchronous unless teardown already owns the lifecycle lane.
+      const loaded = this.agents.get(agentId);
+      if (
+        loaded &&
+        !this.lifecycleMutationTails.has(agentId) &&
+        !this.inFlightAgentCloses?.has(agentId) &&
+        !this.idleReloads.has(agentId)
+      ) {
+        return await operation(loaded);
+      }
       await this.waitForAgentClose(agentId);
       if (!this.agents.has(agentId)) {
         if (!this.registry) this.requireSessionAgent(agentId);
