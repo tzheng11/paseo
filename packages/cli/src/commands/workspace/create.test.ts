@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildWorkspaceSource } from "./create.js";
+import { buildWorkspaceSource, resolveWorkspaceHierarchy } from "./create.js";
 
 describe("workspace create source", () => {
   it("maps local isolation to a directory workspace", () => {
@@ -121,5 +121,29 @@ describe("workspace create source", () => {
     expect(() => buildWorkspaceSource({ isolation: "container" })).toThrow(
       "Unsupported workspace isolation",
     );
+  });
+});
+
+describe("workspace create hierarchy", () => {
+  it("accepts a parent and fractional sibling order", () => {
+    expect(resolveWorkspaceHierarchy({ parent: " ws-parent ", siblingOrder: "1.5" })).toEqual({
+      parentWorkspaceId: "ws-parent",
+      siblingOrder: 1.5,
+    });
+  });
+
+  it("leaves hierarchy allocation to the daemon when omitted", () => {
+    expect(resolveWorkspaceHierarchy({})).toEqual({});
+  });
+
+  it.each(["", " ", "Infinity", "NaN", "1x"])(
+    "rejects invalid sibling order %j",
+    (siblingOrder) => {
+      expect(() => resolveWorkspaceHierarchy({ siblingOrder })).toThrow();
+    },
+  );
+
+  it("rejects an empty parent", () => {
+    expect(() => resolveWorkspaceHierarchy({ parent: " " })).toThrow();
   });
 });

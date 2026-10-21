@@ -4,6 +4,8 @@ import {
   mergePersistedCollapsedProjects,
   serializeCollapsedProjects,
   setProjectCollapsed,
+  setWorkspaceCollapsed,
+  toggleWorkspaceCollapsed,
   togglePinnedCollapsed,
   toggleProjectCollapsed,
   toggleWorkspaceGroupCollapsed,
@@ -13,11 +15,25 @@ function emptyState(): CollapsedProjectsState {
   return {
     collapsedProjectKeys: new Set(),
     collapsedWorkspaceGroupKeys: new Set(),
+    collapsedWorkspaceKeys: new Set(),
     collapsedPinned: false,
   };
 }
 
 describe("sidebar collapsed projects transitions", () => {
+  it("persists workspace collapse independently of section collapse", () => {
+    const state = setWorkspaceCollapsed(emptyState(), "srv:parent", true);
+    const restored = mergePersistedCollapsedProjects(
+      serializeCollapsedProjects(state),
+      emptyState(),
+    );
+    expect(restored.collapsedWorkspaceKeys).toEqual(new Set(["srv:parent"]));
+    expect(restored.collapsedProjectKeys).toEqual(new Set());
+    expect(toggleWorkspaceCollapsed(restored, "srv:parent").collapsedWorkspaceKeys).toEqual(
+      new Set(),
+    );
+  });
+
   it("tracks collapsed project keys as a Set", () => {
     let state = emptyState();
 
@@ -34,12 +50,14 @@ describe("sidebar collapsed projects transitions", () => {
     const state: CollapsedProjectsState = {
       collapsedProjectKeys: new Set(["project-a", "project-b"]),
       collapsedWorkspaceGroupKeys: new Set(["running"]),
+      collapsedWorkspaceKeys: new Set(["srv:parent"]),
       collapsedPinned: true,
     };
 
     expect(serializeCollapsedProjects(state)).toEqual({
       collapsedProjectKeys: ["project-a", "project-b"],
       collapsedWorkspaceGroupKeys: ["running"],
+      collapsedWorkspaceKeys: ["srv:parent"],
       collapsedPinned: true,
     });
   });

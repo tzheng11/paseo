@@ -1001,6 +1001,14 @@ export const WorkspaceFieldValueSetRequestSchema = z.object({
   requestId: z.string(),
 });
 
+export const WorkspaceMoveRequestSchema = z.object({
+  type: z.literal("workspace.move.request"),
+  workspaceId: z.string(),
+  parentWorkspaceId: z.string().nullable(),
+  beforeWorkspaceId: z.string().nullable().optional(),
+  requestId: z.string(),
+});
+
 export const WorkspacePinSetRequestSchema = z.object({
   type: z.literal("workspace.pin.set.request"),
   workspaceId: z.string(),
@@ -2196,6 +2204,18 @@ export const WorkspaceFieldValueSetResponseSchema = z.object({
   }),
 });
 
+export const WorkspaceMoveResponseSchema = z.object({
+  type: z.literal("workspace.move.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    accepted: z.boolean(),
+    parentWorkspaceId: z.string().nullable(),
+    siblingOrder: z.number().finite().nullable(),
+    error: z.string().nullable(),
+  }),
+});
+
 export const WorkspacePinSetResponsePayloadSchema = z.object({
   requestId: z.string(),
   workspaceId: z.string(),
@@ -2759,6 +2779,8 @@ export const WorkspaceCreateRequestSchema = z.object({
   idempotencyKey: z.string().min(1).max(512).optional(),
   // Optional user-set title applied to the created workspace.
   title: z.string().optional(),
+  parentWorkspaceId: z.string().nullable().optional(),
+  siblingOrder: z.number().finite().optional(),
   // Optional prompt context for workspace-level name/branch generation.
   firstAgentContext: FirstAgentContextSchema.optional(),
   // Retained for wire parsing; public internal creation is no longer supported.
@@ -3335,6 +3357,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   ProjectRemoveRequestSchema,
   WorkspaceTitleSetRequestSchema,
   WorkspaceFieldValueSetRequestSchema,
+  WorkspaceMoveRequestSchema,
   WorkspacePinSetRequestSchema,
   WorkspaceSuperpinSetRequestSchema,
   WorkspaceLabelListRequestSchema,
@@ -3715,6 +3738,7 @@ export const ServerInfoStatusPayloadSchema = z
         backgroundWorkspaces: z.boolean().optional(),
         // COMPAT(workspaceFields): added in v0.11.3; remove gate after 2027-04-14.
         workspaceFields: z.boolean().optional(),
+        workspaceHierarchy: z.boolean().optional(),
         providersSnapshot: z.boolean().optional(),
         usageSources: z.boolean().optional(),
         // COMPAT(providersSnapshotCwd): added in v0.3.2, remove gate after 2027-02-10.
@@ -4203,6 +4227,8 @@ export const WorkspaceGitHubRuntimePayloadSchema = z
 export const WorkspaceDescriptorPayloadSchema = z
   .object({
     id: z.string(),
+    parentWorkspaceId: z.string().nullable().optional(),
+    siblingOrder: z.number().finite().optional(),
     projectId: z.string(),
     projectDisplayName: z.string(),
     // COMPAT(projectCustomName): added in v0.1.76, drop the optional gate when floor >= v0.1.76.
@@ -7236,6 +7262,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   ProjectRemoveResponseSchema,
   WorkspaceTitleSetResponseSchema,
   WorkspaceFieldValueSetResponseSchema,
+  WorkspaceMoveResponseSchema,
   WorkspacePinSetResponseSchema,
   WorkspaceSuperpinSetResponseSchema,
   WorkspaceRecoveryInspectResponseSchema,
@@ -7919,3 +7946,5 @@ export type WorkspaceSuperpinSetResponse = z.infer<typeof WorkspaceSuperpinSetRe
 export type WorkspaceSuperpinSetResponsePayload = z.infer<
   typeof WorkspaceSuperpinSetResponsePayloadSchema
 >;
+export type WorkspaceMoveRequest = z.infer<typeof WorkspaceMoveRequestSchema>;
+export type WorkspaceMoveResponse = z.infer<typeof WorkspaceMoveResponseSchema>;

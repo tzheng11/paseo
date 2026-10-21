@@ -264,7 +264,7 @@ export function composeWorkspaceStructure(input: {
         ...project,
         workspaceKeys: applyStoredOrdering({
           items: project.workspaceKeys,
-          storedOrder: workspaceOrder,
+          storedOrder: project.workspaceHierarchy ? EMPTY_WORKSPACE_KEYS : workspaceOrder,
           getKey: (workspaceKey) => workspaceKey,
         }),
       };

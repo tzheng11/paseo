@@ -104,6 +104,8 @@ export interface Agent {
 
 export interface WorkspaceDescriptor {
   id: string;
+  parentWorkspaceId?: string | null;
+  siblingOrder?: number;
   projectId: string;
   projectDisplayName: string;
   projectCustomName?: string | null;
@@ -141,6 +143,9 @@ export function normalizeWorkspaceDescriptor(
       : null;
   return {
     id: normalizeWorkspaceOpaqueId(payload.id) ?? payload.id,
+    // COMPAT(workspaceHierarchy): added in v0.11.2, remove after 2027-04-21 once daemon floor supports hierarchy.
+    parentWorkspaceId: payload.parentWorkspaceId ?? null,
+    siblingOrder: payload.siblingOrder,
     projectId: payload.projectId,
     projectDisplayName: payload.projectDisplayName,
     projectCustomName: payload.projectCustomName ?? null,

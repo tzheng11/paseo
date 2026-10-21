@@ -10,6 +10,8 @@ export interface WorkspaceRow {
   background: boolean;
   pinnedAt?: string | null;
   superpinnedAt?: string | null;
+  parentWorkspaceId: string | null;
+  siblingOrder: number;
 }
 
 export const workspaceSchema: OutputSchema<WorkspaceRow> = {
@@ -42,5 +44,8 @@ export function toWorkspaceRow(workspace: WorkspaceDescriptorPayload): Workspace
     background: workspace.background === true,
     pinnedAt: workspace.pinnedAt,
     superpinnedAt: workspace.superpinnedAt,
+    // COMPAT(workspaceHierarchy): added in v0.11.2, remove after 2027-04-21 once daemon floor >= v0.11.2.
+    parentWorkspaceId: workspace.parentWorkspaceId ?? null,
+    siblingOrder: workspace.siblingOrder ?? 0,
   };
 }

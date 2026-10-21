@@ -496,6 +496,73 @@ describe("ReplicaCache", () => {
     expect(reopened.checkpoint).toEqual(baseline.checkpoint);
   });
 
+  it("preserves workspace parents and fractional sibling ranks after flushing and reopening", async () => {
+    const storage = new MemoryStorage();
+    const writer = createCache(storage);
+    const baseline = directory({ workspaces: { generation: "hierarchy", afterSeq: 23 } });
+    baseline.workspaces.set(
+      "workspace-1",
+      normalizeWorkspaceDescriptor({
+        ...workspacePayload(),
+        parentWorkspaceId: "parent-workspace",
+        siblingOrder: 0.125,
+      }),
+    );
+    writer.replaceDirectoryBaseline(SERVER_ID, baseline);
+    await writer.flush();
+
+    const reader = createCache(storage);
+    expect((await reader.readDirectory(SERVER_ID)).workspaces.get("workspace-1")).toMatchObject({
+      parentWorkspaceId: "parent-workspace",
+      siblingOrder: 0.125,
+    });
+    expect((await reader.readWorkspace(SERVER_ID, "workspace-1"))?.workspace).toMatchObject({
+      parentWorkspaceId: "parent-workspace",
+      siblingOrder: 0.125,
+    });
+    expect((await reader.readDirectory(SERVER_ID)).checkpoint).toEqual(baseline.checkpoint);
+  });
+
+  it("revalidates pre-hierarchy checkpoints while retaining older workspace rows and timelines", async () => {
+    const storage = new MemoryStorage();
+    const writer = createCache(storage);
+    const baseline = directory({ workspaces: { generation: "old", afterSeq: 23 } });
+    writer.replaceDirectoryBaseline(SERVER_ID, baseline);
+    writer.commitTimeline(SERVER_ID, "agent-1", timeline());
+    await writer.flush();
+    const row = storage.rows.get(`${SERVER_ID}:workspace:workspace-1`);
+    if (!row) throw new Error("Missing workspace fixture");
+    const payload = JSON.parse(row.payload) as Record<string, unknown>;
+    delete payload.parentWorkspaceId;
+    delete payload.siblingOrder;
+    await storage.apply({
+      deletes: [],
+      upserts: [
+        { ...row, payload: JSON.stringify(payload) },
+        {
+          serverId: SERVER_ID,
+          kind: "checkpoint",
+          id: "singleton",
+          payload: JSON.stringify({ version: 1, cursors: baseline.checkpoint }),
+        },
+      ],
+    });
+
+    const reader = createCache(storage);
+    const restored = await reader.readDirectory(SERVER_ID);
+    expect(restored.checkpoint).toBeUndefined();
+    expect(restored.workspaces.get("workspace-1")?.name).toBe("main");
+    expect([...restored.agents.keys()]).toEqual([...baseline.agents.keys()]);
+    expect([...restored.projects.keys()]).toEqual([...baseline.projects.keys()]);
+    expect(await reader.readTimeline(SERVER_ID, "agent-1")).toEqual(timeline());
+    expect(await storage.read(SERVER_ID, ["checkpoint"])).toEqual([]);
+    reader.replaceDirectoryBaseline(SERVER_ID, baseline);
+    await reader.flush();
+    expect((await createCache(storage).readDirectory(SERVER_ID)).checkpoint).toEqual(
+      baseline.checkpoint,
+    );
+  });
+
   it("does nothing until an owner explicitly commits data", async () => {
     const storage = new MemoryStorage();
     const cache = createCache(storage);

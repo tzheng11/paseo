@@ -12,11 +12,9 @@ import {
   View,
   Text,
   Pressable,
-  ScrollView,
   type GestureResponderEvent,
   type PressableStateCallbackType,
 } from "react-native";
-import { NestableScrollContainer } from "react-native-draggable-flatlist";
 import type { GestureType } from "react-native-gesture-handler";
 import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store";
 import { useActiveWorkspaceSelection } from "@/stores/navigation-active-workspace-store";
@@ -68,6 +66,7 @@ import {
   useSidebarWorkspaceTrailing,
   type SidebarWorkspaceTrailing,
 } from "@/components/sidebar/workspace-trailing";
+import { useSidebarOrderStore } from "@/stores/sidebar-order-store";
 import { useSidebarCollapsedSectionsStore } from "@/stores/sidebar-collapsed-sections-store";
 import {
   SidebarWorkspaceContextMenu,
@@ -77,8 +76,10 @@ import { PinnedSectionHeader } from "@/components/sidebar/pinned-section-header"
 import { SidebarGroupToggleRow } from "@/components/sidebar/sidebar-group-toggle-row";
 import { useLimitedSidebarGroup } from "@/components/sidebar/use-limited-sidebar-group";
 import type { ToggleSidebarWorkspacePin } from "@/hooks/use-sidebar-workspace-pin";
-import { DraggableList, type DraggableRenderItemInfo } from "@/components/draggable-list";
+import { type DraggableRenderItemInfo } from "@/components/draggable-list";
 import type { DraggableListDragHandleProps } from "@/components/draggable-list.types";
+import { SidebarWorkspaceTreeList } from "./workspace-tree/list";
+import { WorkspaceTreeScrollView } from "./workspace-tree";
 import { useLongPressDragInteraction } from "@/components/sidebar/use-long-press-drag-interaction";
 
 // Themed icon wrappers
@@ -107,10 +108,6 @@ const ThemedCircleCheck = withUnistyles(CircleCheck);
 const ThemedCircleDot = withUnistyles(CircleDot);
 const ThemedCircleX = withUnistyles(CircleX);
 const EMPTY_SHORTCUT_INDEX = new Map<string, number>();
-
-function statusWorkspaceKeyExtractor(workspace: SidebarWorkspaceEntry): string {
-  return workspace.workspaceKey;
-}
 
 interface StatusWorkspaceListProps {
   groups: SidebarWorkspaceGroup[];
@@ -142,11 +139,11 @@ export function SidebarStatusWorkspaceList({
   hostBadgeByServerId,
   supportsPinningByServerId,
   onToggleWorkspacePin,
-  onPinnedWorkspaceReorder,
+  onPinnedWorkspaceReorder: _onPinnedWorkspaceReorder,
   listHeaderComponent,
   sidebarFilterEmpty = false,
-  parentGestureRef,
-  dragGestureHostActive,
+  parentGestureRef: _parentGestureRef,
+  dragGestureHostActive: _dragGestureHostActive,
 }: StatusWorkspaceListProps) {
   const { t } = useTranslation();
   const superpinnedCollapsed = useSidebarCollapsedSectionsStore((state) =>
@@ -162,16 +159,13 @@ export function SidebarStatusWorkspaceList({
   const collapsedWorkspaceGroupKeys = useSidebarCollapsedSectionsStore(
     (state) => state.collapsedWorkspaceGroupKeys,
   );
+  const sortPinnedSiblings = useSidebarOrderStore(
+    (state) => state.pinnedWorkspaceSortMode === "manual",
+  );
   const pinnedCollapsed = useSidebarCollapsedSectionsStore((state) => state.collapsedPinned);
   const togglePinnedCollapsed = useSidebarCollapsedSectionsStore(
     (state) => state.togglePinnedCollapsed,
   );
-  const {
-    visibleItems: visiblePinnedWorkspaces,
-    expanded: pinnedWorkspacesExpanded,
-    canToggle: canTogglePinnedWorkspaces,
-    toggleExpanded: togglePinnedWorkspacesExpanded,
-  } = useLimitedSidebarGroup(pinnedWorkspaces);
 
   const statusShortcutIndex = showShortcutBadges
     ? shortcutIndexByWorkspaceKey
@@ -223,13 +217,11 @@ export function SidebarStatusWorkspaceList({
             onToggle={toggleSuperpinnedCollapsed}
           />
           {superpinnedCollapsed ? null : (
-            <View testID="sidebar-superpinned-list">
-              {superpinnedWorkspaces.map((item, index) => (
-                <View key={item.workspaceKey}>
-                  {renderPinnedWorkspace({ item, index, isActive: false })}
-                </View>
-              ))}
-            </View>
+            <SidebarWorkspaceTreeList
+              testID="sidebar-superpinned-list"
+              data={superpinnedWorkspaces}
+              renderItem={renderPinnedWorkspace}
+            />
           )}
         </View>
       ) : null}
@@ -237,27 +229,12 @@ export function SidebarStatusWorkspaceList({
         <View style={styles.pinnedSection} testID="sidebar-pinned-section">
           <PinnedSectionHeader collapsed={pinnedCollapsed} onToggle={togglePinnedCollapsed} />
           {pinnedCollapsed ? null : (
-            <>
-              <DraggableList
-                testID="sidebar-pinned-list"
-                data={visiblePinnedWorkspaces}
-                keyExtractor={statusWorkspaceKeyExtractor}
-                renderItem={renderPinnedWorkspace}
-                onDragEnd={onPinnedWorkspaceReorder}
-                scrollEnabled={false}
-                useDragHandle
-                nestable={platformIsNative}
-                simultaneousGestureRef={parentGestureRef}
-                gestureHostPresented={dragGestureHostActive}
-              />
-              {canTogglePinnedWorkspaces ? (
-                <SidebarGroupToggleRow
-                  expanded={pinnedWorkspacesExpanded}
-                  onPress={togglePinnedWorkspacesExpanded}
-                  testID="sidebar-pinned-show-more"
-                />
-              ) : null}
-            </>
+            <SidebarWorkspaceTreeList
+              testID="sidebar-pinned-list"
+              data={pinnedWorkspaces}
+              sortSiblings={sortPinnedSiblings}
+              renderItem={renderPinnedWorkspace}
+            />
           )}
         </View>
       ) : null}
@@ -282,25 +259,14 @@ export function SidebarStatusWorkspaceList({
 
   return (
     <View style={styles.container}>
-      {platformIsNative ? (
-        <NestableScrollContainer
-          style={styles.list}
-          contentContainerStyle={styles.listContent}
-          showsVerticalScrollIndicator={false}
-          testID="sidebar-status-list-scroll"
-        >
-          {content}
-        </NestableScrollContainer>
-      ) : (
-        <ScrollView
-          style={styles.list}
-          contentContainerStyle={styles.listContent}
-          showsVerticalScrollIndicator={false}
-          testID="sidebar-status-list-scroll"
-        >
-          {content}
-        </ScrollView>
-      )}
+      <WorkspaceTreeScrollView
+        style={styles.list}
+        contentContainerStyle={styles.listContent}
+        showsVerticalScrollIndicator={false}
+        testID="sidebar-status-list-scroll"
+      >
+        {content}
+      </WorkspaceTreeScrollView>
     </View>
   );
 }

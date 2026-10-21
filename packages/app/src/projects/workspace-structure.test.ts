@@ -38,6 +38,33 @@ function workspace(id: string, projectId: string, root: string): WorkspaceDescri
 }
 
 describe("buildWorkspaceStructureProjects", () => {
+  test("carries persisted parenting and sibling order into the structural sidebar model", () => {
+    const first = {
+      ...workspace("first", "prj_a", "/repo"),
+      parentWorkspaceId: null,
+      siblingOrder: 20,
+    };
+    const second = {
+      ...workspace("second", "prj_a", "/repo"),
+      parentWorkspaceId: "first",
+      siblingOrder: 10,
+    };
+    const result = buildWorkspaceStructureProjects({
+      sessions: [
+        {
+          serverId: "host-a",
+          projects: [project({ id: "prj_a", key: null, root: "/repo" })],
+          workspaces: [first, second],
+        },
+      ],
+    });
+    expect(result[0]?.workspaceKeys).toEqual(["host-a:second", "host-a:first"]);
+    expect(result[0]?.workspaceHierarchy).toEqual({
+      "host-a:first": { parentWorkspaceId: null, siblingOrder: 20 },
+      "host-a:second": { parentWorkspaceId: "first", siblingOrder: 10 },
+    });
+  });
+
   test("groups the same project key across hosts and keeps host-local ids", () => {
     const key = "remote:github.com/acme/app";
     const result = buildWorkspaceStructureProjects({

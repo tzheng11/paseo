@@ -10,6 +10,8 @@ export type PinnedWorkspaceSortMode = SidebarWorkspaceSortMode;
 interface SidebarOrderStoreState {
   projectOrder: string[];
   pinnedWorkspaceOrder: string[];
+  superpinnedWorkspaceOrder: string[];
+  setSuperpinnedWorkspaceOrder: (keys: string[]) => void;
   pinnedWorkspaceSortMode: PinnedWorkspaceSortMode;
   setPinnedWorkspaceSortMode: (mode: PinnedWorkspaceSortMode) => void;
   workspaceOrderByProject: Record<string, string[]>;
@@ -26,6 +28,7 @@ interface SidebarOrderStoreState {
 interface SidebarOrderPersistedState {
   projectOrder?: string[];
   pinnedWorkspaceOrder?: string[];
+  superpinnedWorkspaceOrder?: string[];
   pinnedWorkspaceSortMode?: PinnedWorkspaceSortMode;
   workspaceOrderByProject?: Record<string, string[]>;
   workspaceSortModeByProject?: Record<string, SidebarWorkspaceSortMode>;
@@ -38,6 +41,7 @@ const StringArrayRecordSchema = z.record(z.string(), z.array(z.string()));
 const SidebarOrderPersistedStateSchema = z.strictObject({
   projectOrder: z.array(z.string()).optional(),
   pinnedWorkspaceOrder: z.array(z.string()).optional(),
+  superpinnedWorkspaceOrder: z.array(z.string()).optional(),
   pinnedWorkspaceSortMode: WorkspaceSortModeSchema.optional(),
   workspaceSortModeByProject: z.record(z.string(), WorkspaceSortModeSchema).optional(),
   workspaceOrderByProject: StringArrayRecordSchema.optional(),
@@ -121,6 +125,7 @@ function normalizeLegacyWorkspaceKey(serverId: string, rawWorkspaceKey: string):
 export function migrateSidebarOrderState(persistedState: unknown): {
   projectOrder: string[];
   pinnedWorkspaceOrder: string[];
+  superpinnedWorkspaceOrder: string[];
   pinnedWorkspaceSortMode: PinnedWorkspaceSortMode;
   workspaceOrderByProject: Record<string, string[]>;
   workspaceSortModeByProject: Record<string, SidebarWorkspaceSortMode>;
@@ -130,6 +135,7 @@ export function migrateSidebarOrderState(persistedState: unknown): {
     return {
       projectOrder: [],
       pinnedWorkspaceOrder: [],
+      superpinnedWorkspaceOrder: [],
       pinnedWorkspaceSortMode: "manual",
       workspaceOrderByProject: {},
       workspaceSortModeByProject: {},
@@ -166,6 +172,7 @@ export function migrateSidebarOrderState(persistedState: unknown): {
   return {
     projectOrder,
     pinnedWorkspaceOrder: normalizeKeys(state.pinnedWorkspaceOrder ?? []),
+    superpinnedWorkspaceOrder: normalizeKeys(state.superpinnedWorkspaceOrder ?? []),
     pinnedWorkspaceSortMode: state.pinnedWorkspaceSortMode ?? "manual",
     workspaceOrderByProject,
     workspaceSortModeByProject: state.workspaceSortModeByProject ?? {},
@@ -177,6 +184,8 @@ export const useSidebarOrderStore = create<SidebarOrderStoreState>()(
     (set, get) => ({
       projectOrder: [],
       pinnedWorkspaceOrder: [],
+      superpinnedWorkspaceOrder: [],
+      setSuperpinnedWorkspaceOrder: (keys) => set({ superpinnedWorkspaceOrder: dedupeKeys(keys) }),
       pinnedWorkspaceSortMode: "manual",
       setPinnedWorkspaceSortMode: (mode) => set({ pinnedWorkspaceSortMode: mode }),
       workspaceOrderByProject: {},
@@ -218,6 +227,7 @@ export const useSidebarOrderStore = create<SidebarOrderStoreState>()(
       partialize: (state) => ({
         projectOrder: state.projectOrder,
         pinnedWorkspaceOrder: state.pinnedWorkspaceOrder,
+        superpinnedWorkspaceOrder: state.superpinnedWorkspaceOrder,
         pinnedWorkspaceSortMode: state.pinnedWorkspaceSortMode,
         workspaceOrderByProject: state.workspaceOrderByProject,
         workspaceSortModeByProject: state.workspaceSortModeByProject,

@@ -21,7 +21,9 @@ Inside each project are workspaces. For example:
 ```
 my-app
 ├── main
-├── fix-login-flow
+├── authentication
+│   ├── fix-login-flow
+│   └── review-permissions
 └── redesign-settings
 ```
 
@@ -29,15 +31,29 @@ Each workspace is a separate place to work. You can keep one for your main check
 
 Use the [CLI project commands](/docs/cli#projects) to register, list, rename, or delete projects.
 
+Drag a workspace onto the middle of another workspace to nest it. Drop near the top or bottom
+edge to place it before or after that workspace. Dragging a parent carries its children with it.
+On a phone or tablet, hold the grip beside a workspace, then drag. The arrow beside a parent
+expands or collapses its children.
+
+Workspaces can be nested within one project on one host. Each workspace keeps its own working
+directory, sessions, and isolation. Hierarchy and sibling order are saved by the daemon and shared
+between clients; expanded and collapsed branches are saved on each client. Archiving a parent
+keeps its children active and makes them visible at the top level.
+
 ## Pinned workspaces
 
-Pin a workspace to keep it in the Pinned section above the project list. The menu beside Pinned
+Pin a workspace to keep it and its children in the Pinned section above the project list. A child
+already included under a pinned ancestor appears once. The menu beside Pinned
 chooses **Manual** or **A–Z**. A–Z follows the displayed workspace title (or branch name when that
 display option is selected), ignores case, and puts numbered names such as Task 2 before Task 10.
 Renaming a workspace updates its position.
 
+A–Z orders pinned roots; children keep their sibling order. Status grouping remains a flat activity list.
+
 The choice is saved on this client. Switching back to Manual restores your saved drag order.
 Dragging a pinned workspace selects Manual and saves the new order.
+Dragging between Pinned and the project list pins or unpins the workspace to follow the destination.
 
 ## Workspaces contain sessions
 

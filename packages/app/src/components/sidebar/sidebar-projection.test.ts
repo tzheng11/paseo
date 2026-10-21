@@ -119,6 +119,35 @@ function twoProjectInput(groupMode: "project" | "status") {
 
 describe("buildSidebarProjection", () => {
   for (const groupMode of ["project", "status"] as const) {
+    it(`keeps collapsed pinned children out of ${groupMode} keyboard shortcuts`, () => {
+      const parent = makeWorkspace("parent");
+      const child = makeWorkspace("child");
+      child.placement.parentWorkspaceId = "parent";
+      child.entry.parentWorkspaceId = "parent";
+      const projection = buildSidebarProjection({
+        ...projectionInput({ groupMode }),
+        projects: [makeProject([parent.placement, child.placement])],
+        pinnedKeys: {
+          pinnedWorkspaceKeys: [parent.placement.workspaceKey],
+          superpinnedAtByKey: {},
+          pinnedAtByKey: {},
+        },
+        workspaceEntriesByKey: new Map(
+          [parent.entry, child.entry].map((entry) => [entry.workspaceKey, entry]),
+        ),
+        collapsedWorkspaceKeys: new Set([parent.placement.workspaceKey]),
+      });
+      expect(projection.pinnedGroups.pinnedChats.map((workspace) => workspace.workspaceId)).toEqual(
+        ["parent", "child"],
+      );
+      expect(projection.shortcutModel.shortcutTargets).toEqual([
+        { serverId: "srv", workspaceId: "parent" },
+      ]);
+      expect(projection.workspaceGroups).toEqual([]);
+    });
+  }
+
+  for (const groupMode of ["project", "status"] as const) {
     it(`sorts pinned display names naturally and keeps ${groupMode} shortcuts in the same order`, () => {
       const workspaces = [makeWorkspace("z"), makeWorkspace("a10"), makeWorkspace("a2")];
       workspaces[0]!.entry.name = "Zeta";

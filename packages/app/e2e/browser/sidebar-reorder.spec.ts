@@ -1,4 +1,5 @@
 import type { Locator, Page } from "@playwright/test";
+import { z } from "zod";
 import { expect, test } from "../support/fixtures";
 import { daemonWsRoutePattern } from "../support/helpers/daemon-port";
 import { gotoAppShell } from "../support/helpers/app";
@@ -6,6 +7,7 @@ import { projectEquivalenceViewKey } from "../support/helpers/project-view-key";
 import { getServerId } from "../support/helpers/server-id";
 import { seedWorkspace } from "../support/helpers/seed-client";
 import { waitForSidebarHydration } from "../support/helpers/workspace-ui";
+import { getE2EDaemonPort } from "../support/helpers/daemon-port";
 
 async function rowTestIds(rows: Locator) {
   return rows.evaluateAll((elements) =>
@@ -45,13 +47,11 @@ async function quickDragFirstRowAfterSecond(
 
   const page = rows.page();
   const source = { x: sourceBox.x + sourceBox.width / 2, y: sourceBox.y + sourceBox.height / 2 };
-  const target = { x: targetBox.x + targetBox.width / 2, y: targetBox.y + targetBox.height / 2 };
+  const target = { x: targetBox.x + targetBox.width / 2, y: targetBox.y + targetBox.height * 0.9 };
 
   await page.mouse.move(source.x, source.y);
-  const trailingScrim = rows.nth(0).getByTestId("sidebar-workspace-trailing-scrim");
   await pressRow(rows);
   await page.mouse.move(source.x, source.y + 7);
-  await expect(trailingScrim).toHaveCount(0);
   await page.mouse.move(target.x, target.y, { steps: 4 });
   await page.mouse.up();
 
@@ -107,6 +107,273 @@ test("projects, workspaces, and pinned chats reorder with an immediate mouse dra
   } finally {
     await firstProject.cleanup();
     await secondProject.cleanup();
+  }
+});
+
+async function dragWorkspace(
+  page: Page,
+  sourceId: string,
+  targetId: string,
+  position: "before" | "inside" | "after",
+) {
+  const source = page
+    .getByTestId(`workspace-tree-drag-${getServerId()}:${sourceId}`)
+    .filter({ visible: true })
+    .first();
+  const target = page
+    .getByTestId(`workspace-tree-node-${getServerId()}:${targetId}`)
+    .filter({ visible: true })
+    .first();
+  await source.scrollIntoViewIfNeeded();
+  const from = await visibleBoundingBox(source);
+  const to = await visibleBoundingBox(target);
+  const fraction = { before: 0.1, inside: 0.5, after: 0.9 }[position];
+  await page.mouse.move(from.x + from.width / 2, from.y + from.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(from.x + from.width / 2 + 8, from.y + from.height / 2, { steps: 2 });
+  await page.mouse.move(to.x + to.width / 2, to.y + to.height * fraction, { steps: 8 });
+  await expect(page.getByTestId(`workspace-tree-drop-${position}`)).toBeVisible();
+  await page.mouse.up();
+}
+
+test("dragging nests and orders siblings, moves whole subtrees, and survives reload", async ({
+  page,
+}, testInfo) => {
+  test.setTimeout(150_000);
+  const seeded = await seedWorkspace({ repoPrefix: "workspace-tree-", title: "Parent" });
+  async function create(title: string, parentWorkspaceId: string | null = null) {
+    const response = await seeded.client.createWorkspace({
+      source: { kind: "directory", path: seeded.repoPath, projectId: seeded.projectId },
+      title,
+      parentWorkspaceId,
+    });
+    if (!response.workspace) throw new Error(response.error ?? "Workspace creation failed");
+    return response.workspace.id;
+  }
+  async function hierarchy(id: string) {
+    const snapshot = await seeded.client.fetchWorkspaces({
+      filter: { projectId: seeded.projectId },
+    });
+    const workspace = snapshot.entries.find((entry) => entry.id === id);
+    if (!workspace) throw new Error("Workspace missing from directory");
+    return { parentWorkspaceId: workspace.parentWorkspaceId, siblingOrder: workspace.siblingOrder };
+  }
+  try {
+    const first = await create("First child", seeded.workspaceId);
+    const last = await create("Last child");
+    const between = await create("Between children");
+    await page.setViewportSize({ width: 1440, height: 1100 });
+    await gotoAppShell(page);
+    await waitForSidebarHydration(page);
+    await dragWorkspace(page, last, seeded.workspaceId, "inside");
+    await expect
+      .poll(async () => (await hierarchy(last)).parentWorkspaceId)
+      .toBe(seeded.workspaceId);
+    const firstRank = (await hierarchy(first)).siblingOrder!;
+    const lastRank = (await hierarchy(last)).siblingOrder!;
+    await dragWorkspace(page, between, last, "before");
+    await expect
+      .poll(() => hierarchy(between))
+      .toEqual({ parentWorkspaceId: seeded.workspaceId, siblingOrder: (firstRank + lastRank) / 2 });
+    const grandchild = await create("Grandchild", last);
+    await dragWorkspace(page, last, between, "inside");
+    await expect.poll(async () => (await hierarchy(last)).parentWorkspaceId).toBe(between);
+    expect((await hierarchy(grandchild)).parentWorkspaceId).toBe(last);
+    await dragWorkspace(page, last, seeded.workspaceId, "before");
+    await expect.poll(async () => (await hierarchy(last)).parentWorkspaceId).toBe(null);
+    await seeded.client.setWorkspacePinned(last, true);
+    await seeded.client.setWorkspacePinned(seeded.workspaceId, true);
+    const pinned = page.getByTestId("sidebar-pinned-section").filter({ visible: true }).first();
+    await expect(
+      pinned.getByTestId(`workspace-tree-node-${getServerId()}:${grandchild}`),
+    ).toBeVisible();
+    await expect(
+      page
+        .getByTestId(`workspace-tree-node-${getServerId()}:${grandchild}`)
+        .filter({ visible: true }),
+    ).toHaveCount(1);
+    await page
+      .getByTestId(`workspace-tree-toggle-${getServerId()}:${last}`)
+      .filter({ visible: true })
+      .click();
+    await expect(
+      page
+        .getByTestId(`workspace-tree-node-${getServerId()}:${grandchild}`)
+        .filter({ visible: true }),
+    ).toHaveCount(0);
+    await page.reload();
+    await expect(
+      page.getByTestId(`workspace-tree-toggle-${getServerId()}:${last}`).filter({ visible: true }),
+    ).toBeVisible();
+    await expect(
+      page
+        .getByTestId(`workspace-tree-node-${getServerId()}:${grandchild}`)
+        .filter({ visible: true }),
+    ).toHaveCount(0);
+    await page
+      .getByTestId(`workspace-tree-toggle-${getServerId()}:${last}`)
+      .filter({ visible: true })
+      .click();
+    await expect(
+      pinned.getByTestId(`workspace-tree-node-${getServerId()}:${grandchild}`),
+    ).toBeVisible();
+    expect((await hierarchy(grandchild)).parentWorkspaceId).toBe(last);
+    await page.mouse.move(1000, 900);
+    await page.screenshot({
+      path: testInfo.outputPath("workspace-hierarchy.png"),
+      animations: "disabled",
+    });
+    const arriving = await create("Move between sections");
+    const unpinnedParent = await create("Unpinned parent");
+    await dragWorkspace(page, arriving, last, "before");
+    await expect(
+      pinned.getByTestId(`workspace-tree-node-${getServerId()}:${arriving}`),
+    ).toBeVisible();
+    await dragWorkspace(page, arriving, unpinnedParent, "before");
+    await expect(
+      pinned.getByTestId(`workspace-tree-node-${getServerId()}:${arriving}`),
+    ).toHaveCount(0);
+    await expect(
+      page
+        .getByTestId(`workspace-tree-node-${getServerId()}:${arriving}`)
+        .filter({ visible: true }),
+    ).toBeVisible();
+    await dragWorkspace(page, last, unpinnedParent, "inside");
+    await expect.poll(async () => (await hierarchy(last)).parentWorkspaceId).toBe(unpinnedParent);
+    await expect(pinned.getByTestId(`workspace-tree-node-${getServerId()}:${last}`)).toHaveCount(0);
+    await expect(
+      page
+        .getByTestId(`workspace-tree-node-${getServerId()}:${grandchild}`)
+        .filter({ visible: true }),
+    ).toBeVisible();
+  } finally {
+    await seeded.cleanup();
+  }
+});
+
+test("a rejected drag stays visible and can be retried against the real daemon", async ({
+  page,
+}) => {
+  test.setTimeout(120_000);
+  const seeded = await seedWorkspace({ repoPrefix: "workspace-tree-retry-", title: "Parent" });
+  try {
+    const response = await seeded.client.createWorkspace({
+      source: { kind: "directory", path: seeded.repoPath, projectId: seeded.projectId },
+      title: "Move me",
+    });
+    if (!response.workspace) throw new Error(response.error ?? "Workspace creation failed");
+    const movingId = response.workspace.id;
+    let rejectNextMove = true;
+    const moveMessage = z
+      .object({
+        type: z.literal("session"),
+        message: z
+          .object({
+            type: z.literal("workspace.move.request"),
+            workspaceId: z.string(),
+            parentWorkspaceId: z.string().nullable(),
+          })
+          .passthrough(),
+      })
+      .passthrough();
+    await page.routeWebSocket(new RegExp(`:${getE2EDaemonPort()}(?:/|$)`), (socket) => {
+      const server = socket.connectToServer();
+      socket.onMessage((message) => {
+        const parsed = moveMessage.safeParse(JSON.parse(message.toString()));
+        if (parsed.success && rejectNextMove) {
+          rejectNextMove = false;
+          // Exercise the real daemon's cycle refusal, then retry the original intent.
+          server.send(
+            JSON.stringify({
+              ...parsed.data,
+              message: {
+                ...parsed.data.message,
+                parentWorkspaceId: parsed.data.message.workspaceId,
+              },
+            }),
+          );
+        } else server.send(message);
+      });
+      server.onMessage((message) => socket.send(message));
+    });
+    await gotoAppShell(page);
+    await waitForSidebarHydration(page);
+    await dragWorkspace(page, movingId, seeded.workspaceId, "inside");
+    const error = page.getByTestId("workspace-tree-move-error").filter({ visible: true });
+    await expect(error).toBeVisible();
+    await expect(error).toContainText("A workspace cannot be its own ancestor");
+    await error.getByRole("button", { name: "Retry", exact: true }).click();
+    await expect(error).toHaveCount(0);
+    await expect
+      .poll(async () => {
+        const snapshot = await seeded.client.fetchWorkspaces({
+          filter: { projectId: seeded.projectId },
+        });
+        return snapshot.entries.find((entry) => entry.id === movingId)?.parentWorkspaceId;
+      })
+      .toBe(seeded.workspaceId);
+  } finally {
+    await seeded.cleanup();
+  }
+});
+
+test("a workspace can be dragged through a scrolling sidebar into a parent", async ({ page }) => {
+  test.setTimeout(120_000);
+  const seeded = await seedWorkspace({
+    repoPrefix: "workspace-tree-scroll-",
+    title: "Parent at top",
+  });
+  try {
+    let movingId = "";
+    for (let index = 0; index < 30; index += 1) {
+      const created = await seeded.client.createWorkspace({
+        source: { kind: "directory", path: seeded.repoPath, projectId: seeded.projectId },
+        title: `Workspace ${index}`,
+      });
+      if (!created.workspace) throw new Error(created.error ?? "Workspace creation failed");
+      movingId = created.workspace.id;
+    }
+    await page.setViewportSize({ width: 1200, height: 720 });
+    await gotoAppShell(page);
+    await waitForSidebarHydration(page);
+    const source = page
+      .getByTestId(`workspace-tree-drag-${getServerId()}:${movingId}`)
+      .filter({ visible: true })
+      .first();
+    const target = page
+      .getByTestId(`workspace-tree-node-${getServerId()}:${seeded.workspaceId}`)
+      .filter({ visible: true })
+      .first();
+    const scroll = page
+      .getByTestId("sidebar-project-workspace-list-scroll")
+      .filter({ visible: true })
+      .first();
+    await source.scrollIntoViewIfNeeded();
+    const from = await visibleBoundingBox(source);
+    const viewport = await visibleBoundingBox(scroll);
+    await page.mouse.move(from.x + from.width / 2, from.y + from.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(from.x + from.width / 2 + 8, from.y + from.height / 2, { steps: 2 });
+    await page.mouse.move(viewport.x + viewport.width / 2, viewport.y + 12, { steps: 12 });
+    await expect(target).toBeInViewport({ timeout: 20_000 });
+    const destination = await visibleBoundingBox(target);
+    await page.mouse.move(
+      destination.x + destination.width / 2,
+      destination.y + destination.height / 2,
+      { steps: 4 },
+    );
+    await expect(page.getByTestId("workspace-tree-drop-inside")).toBeVisible();
+    await page.mouse.up();
+    await expect
+      .poll(async () => {
+        const snapshot = await seeded.client.fetchWorkspaces({
+          filter: { projectId: seeded.projectId },
+        });
+        return snapshot.entries.find((entry) => entry.id === movingId)?.parentWorkspaceId;
+      })
+      .toBe(seeded.workspaceId);
+  } finally {
+    await seeded.cleanup();
   }
 });
 

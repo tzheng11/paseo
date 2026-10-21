@@ -4,6 +4,7 @@ import { addJsonAndDaemonHostOptions } from "../../utils/command-options.js";
 import { runArchiveCommand } from "./archive.js";
 import { runCreateCommand } from "./create.js";
 import { runLsCommand } from "./ls.js";
+import { runMoveCommand } from "./move.js";
 import { runRenameCommand } from "./rename.js";
 import { runSetupCommand } from "./setup.js";
 
@@ -25,6 +26,8 @@ export function createWorkspaceCommand(): Command {
       .option("--path <path>", "Local directory or source checkout (default: current)")
       .option("--project <id>", "Existing project id")
       .option("--title <title>", "Workspace title")
+      .option("--parent <id>", "Parent workspace id")
+      .option("--sibling-order <number>", "Workspace order among siblings")
       .option(
         "--mode <mode>",
         "Worktree mode: branch-off, checkout-branch, or checkout-pr (default: branch-off)",
@@ -57,6 +60,17 @@ export function createWorkspaceCommand(): Command {
       // the first word of an unquoted multi-word title and silently drop the rest.
       .allowExcessArguments(false),
   ).action(withOutput(runRenameCommand));
+
+  addJsonAndDaemonHostOptions(
+    workspace
+      .command("move")
+      .description("Move a workspace under a parent or to the project root")
+      .argument("<workspace-id>", "Workspace id")
+      .option("--parent <id>", "Destination parent workspace id")
+      .option("--root", "Move to the project root")
+      .option("--before <id>", "Place before a workspace in the destination")
+      .allowExcessArguments(false),
+  ).action(withOutput(runMoveCommand));
 
   addJsonAndDaemonHostOptions(
     workspace
