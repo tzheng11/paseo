@@ -45,7 +45,8 @@ Archiving a parent keeps its children active and moves them up one level.
 
 ## Pinned workspaces
 
-Pin a workspace to keep it in the Pinned section above the project list. The menu beside Pinned
+Pin a workspace to keep a shortcut in the Pinned section above the project list. Its place in the
+project hierarchy stays the same. The menu beside Pinned
 chooses **Manual** or **A–Z**. A–Z follows the displayed workspace title (or branch name when that
 display option is selected), ignores case, and puts numbered names such as Task 2 before Task 10.
 Renaming a workspace updates its position.
