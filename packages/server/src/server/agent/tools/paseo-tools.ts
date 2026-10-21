@@ -138,7 +138,7 @@ export interface PaseoToolHostDependencies {
   listActiveWorkspaces?: ArchiveDependencies["listActiveWorkspaces"];
   archiveWorkspaceRecord?: ArchiveDependencies["archiveWorkspaceRecord"];
   emitWorkspaceUpdatesForWorkspaceIds?: ArchiveDependencies["emitWorkspaceUpdatesForWorkspaceIds"];
-  workspaceRegistry?: Pick<WorkspaceRegistry, "get" | "list" | "upsert">;
+  workspaceRegistry?: Pick<WorkspaceRegistry, "get" | "list" | "upsert" | "move">;
   setWorkspaceFieldValue?: (
     input: Parameters<typeof setWorkspaceFieldValueTransaction>[1],
   ) => Promise<string>;
@@ -147,7 +147,11 @@ export interface PaseoToolHostDependencies {
     cwd: string,
     title?: string | null,
     projectId?: string,
-    context?: { background?: boolean; callerWorkspaceId?: string },
+    context?: {
+      background?: boolean;
+      callerWorkspaceId?: string;
+      parentWorkspaceId?: string | null;
+    },
   ) => Promise<PersistedWorkspaceRecord>;
   workspaceScripts?: Pick<WorkspaceScriptsService, "list" | "launch" | "stop">;
   markWorkspaceArchiving?: ArchiveDependencies["markWorkspaceArchiving"];
@@ -210,6 +214,8 @@ interface ProviderSummary {
 
 const WorkspaceAutomationSummarySchema = z.object({
   workspaceId: z.string(),
+  parentWorkspaceId: z.string().nullable().optional(),
+  siblingOrder: z.number().optional(),
   projectId: z.string(),
   cwd: z.string(),
   isolation: z.enum(["local", "worktree"]),
@@ -221,6 +227,8 @@ const WorkspaceAutomationSummarySchema = z.object({
 function toWorkspaceAutomationSummary(workspace: PersistedWorkspaceRecord) {
   return {
     workspaceId: workspace.workspaceId,
+    parentWorkspaceId: workspace.parentWorkspaceId ?? null,
+    siblingOrder: workspace.siblingOrder,
     projectId: workspace.projectId,
     cwd: workspace.cwd,
     isolation: workspace.kind === "worktree" ? ("worktree" as const) : ("local" as const),
@@ -1378,6 +1386,13 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
             "Local directory or source checkout. Defaults to your current workspace. Local isolation adopts an existing directory and never creates one.",
           ),
         projectId: z.string().optional().describe("Existing project id to own the workspace."),
+        parentWorkspaceId: z
+          .string()
+          .nullable()
+          .optional()
+          .describe(
+            "Parent workspace on this host in the same project; null creates a root workspace.",
+          ),
         title: z.string().trim().min(1).optional(),
         background: z
           .boolean()
@@ -1422,6 +1437,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       isolation,
       path,
       projectId,
+      parentWorkspaceId,
       title,
       background,
       mode,
@@ -1432,6 +1448,14 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       prNumber,
       forge,
     }) => {
+      if (parentWorkspaceId) {
+        const parent = await options.workspaceRegistry?.get(parentWorkspaceId);
+        if (!parent || parent.archivedAt)
+          throw new PaseoToolInputError("Active parent workspace not found on this host");
+        if (projectId && parent.projectId !== projectId)
+          throw new PaseoToolInputError("Parent workspace must belong to the same project");
+        projectId = parent.projectId;
+      }
       let workspace: PersistedWorkspaceRecord;
       if (isolation === "local") {
         const cwd = resolveScopedCwd(path, { required: true });
@@ -1455,6 +1479,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         }
         workspace = await options.createDirectoryWorkspace(cwd, title, projectId, {
           background,
+          parentWorkspaceId,
           callerWorkspaceId: resolveCallerAgent()?.workspaceId,
         });
       } else {
@@ -1488,6 +1513,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
             ...worktreeTarget,
             ...(title ? { title } : {}),
             background,
+            parentWorkspaceId,
             callerWorkspaceId: resolveCallerAgent()?.workspaceId,
           },
         );
@@ -1500,6 +1526,34 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       return {
         content: [],
         structuredContent: ensureValidJson(toWorkspaceAutomationSummary(workspace)),
+      };
+    },
+  );
+
+  registerTool(
+    "move_workspace",
+    {
+      title: "Move workspace",
+      description:
+        "Move an active workspace under a parent and before a sibling. Omit beforeWorkspaceId to append. Sessions, directories, and descendants remain attached.",
+      inputSchema: {
+        workspaceId: z.string(),
+        parentWorkspaceId: z.string().nullable(),
+        beforeWorkspaceId: z.string().nullable().optional(),
+      },
+      outputSchema: { workspaces: z.array(WorkspaceAutomationSummarySchema) },
+    },
+    async (input) => {
+      if (!options.workspaceRegistry?.move) throw new Error("Workspace hierarchy is unavailable");
+      const workspaces = await options.workspaceRegistry.move(input);
+      await options.emitWorkspaceUpdatesForWorkspaceIds?.(
+        workspaces.map((workspace) => workspace.workspaceId),
+      );
+      return {
+        content: [],
+        structuredContent: ensureValidJson({
+          workspaces: workspaces.map(toWorkspaceAutomationSummary),
+        }),
       };
     },
   );

@@ -2992,6 +2992,8 @@ export class Session {
         return this.handleProjectRemoveRequest(msg);
       case "workspace.field.value.set.request":
         return this.handleWorkspaceFieldValueSetRequest(msg);
+      case "workspace.move.request":
+        return this.handleWorkspaceMoveRequest(msg);
       case "workspace.title.set.request":
         return this.handleWorkspaceTitleSetRequest(msg.workspaceId, msg.title, msg.requestId);
       case "workspace.superpin.set.request":
@@ -3793,6 +3795,44 @@ export class Session {
           value: "",
           error: error instanceof Error ? error.message : "Unable to save workspace field.",
           errorCode: error instanceof WorkspaceFieldError ? error.code : null,
+        },
+      });
+    }
+  }
+
+  private async handleWorkspaceMoveRequest(
+    request: Extract<SessionInboundMessage, { type: "workspace.move.request" }>,
+  ): Promise<void> {
+    try {
+      if (!this.workspaceRegistry.move) throw new Error("Workspace hierarchy is unavailable");
+      const changed = await this.workspaceRegistry.move(request);
+      const descriptors = await this.buildWorkspaceDescriptorMap({
+        includeGitData: false,
+        workspaceIds: changed.map((workspace) => workspace.workspaceId),
+      });
+      const workspaces = [...descriptors.values()];
+      this.emit({
+        type: "workspace.move.response",
+        payload: {
+          requestId: request.requestId,
+          workspaceId: request.workspaceId,
+          accepted: true,
+          workspaces,
+          error: null,
+        },
+      });
+      await this.emitWorkspaceUpdatesForWorkspaceIds(
+        changed.map((workspace) => workspace.workspaceId),
+      );
+    } catch (error) {
+      this.emit({
+        type: "workspace.move.response",
+        payload: {
+          requestId: request.requestId,
+          workspaceId: request.workspaceId,
+          accepted: false,
+          workspaces: [],
+          error: getErrorMessageOr(error, "Unable to move workspace"),
         },
       });
     }
@@ -5805,6 +5845,8 @@ export class Session {
     return {
       id: workspace.workspaceId,
       projectId: workspace.projectId,
+      parentWorkspaceId: workspace.parentWorkspaceId,
+      siblingOrder: workspace.siblingOrder,
       projectDisplayName: resolvedProjectRecord
         ? resolveProjectDisplayName(resolvedProjectRecord)
         : workspace.projectId,
@@ -5897,6 +5939,8 @@ export class Session {
     return {
       id: result.workspace.workspaceId,
       projectId: result.workspace.projectId,
+      parentWorkspaceId: result.workspace.parentWorkspaceId ?? null,
+      siblingOrder: result.workspace.siblingOrder,
       projectDisplayName: projectRecord
         ? resolveProjectDisplayName(projectRecord)
         : result.workspace.projectId,
@@ -6951,6 +6995,17 @@ export class Session {
       const transformed = await this.pluginRuntime.before("workspace.create", input);
       creationRequest = { ...transformed, type, requestId };
     }
+    if (creationRequest.parentWorkspaceId) {
+      const parent = await this.workspaceRegistry.get(creationRequest.parentWorkspaceId);
+      if (!parent || parent.archivedAt)
+        throw new Error("Active parent workspace not found on this host");
+      if (creationRequest.source.projectId && creationRequest.source.projectId !== parent.projectId)
+        throw new Error("Parent workspace must belong to the same project");
+      creationRequest = {
+        ...creationRequest,
+        source: { ...creationRequest.source, projectId: parent.projectId },
+      };
+    }
     return creationRequest.source.kind === "directory"
       ? this.handleWorkspaceCreateLocal(creationRequest, workspaceId)
       : this.handleWorkspaceCreateWorktree(creationRequest, workspaceId);
@@ -6980,6 +7035,7 @@ export class Session {
         expectsInitialAgent: Boolean(request.firstAgentContext),
         workspaceId,
         background: request.background,
+        parentWorkspaceId: request.parentWorkspaceId,
         callerWorkspaceId: await this.getCallerWorkspaceId(request.callerAgentId),
       },
     );
@@ -7044,6 +7100,7 @@ export class Session {
         firstAgentContext: request.firstAgentContext,
         title: request.title,
         background: request.background,
+        parentWorkspaceId: request.parentWorkspaceId,
         callerWorkspaceId: await this.getCallerWorkspaceId(request.callerAgentId),
       },
       source.baseBranch

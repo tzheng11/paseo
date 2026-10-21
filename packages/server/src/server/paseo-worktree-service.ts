@@ -35,6 +35,7 @@ export interface CreatePaseoWorktreeInput extends CreateWorktreeCoreInput {
   title?: string;
   background?: boolean;
   callerWorkspaceId?: string;
+  parentWorkspaceId?: string | null;
 }
 
 export interface CreatePaseoWorktreeResult {
@@ -104,6 +105,7 @@ async function createPaseoWorktreeWithPriority(
       title: input.title?.trim() || resolveFirstAgentPromptTitle(input.firstAgentContext),
       expectsInitialAgent: Boolean(input.firstAgentContext),
       background: input.background,
+      parentWorkspaceId: input.parentWorkspaceId,
       callerWorkspaceId: input.callerWorkspaceId,
       ...(createdWorktree.intent.kind === "checkout-change-request" &&
       createdWorktree.intent.headRepository

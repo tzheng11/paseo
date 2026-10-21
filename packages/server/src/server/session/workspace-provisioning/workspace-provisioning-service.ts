@@ -28,6 +28,7 @@ export interface ResolveOrCreateWorkspaceIdInput {
   initialTitle: string | null;
   background?: boolean;
   callerWorkspaceId?: string;
+  parentWorkspaceId?: string | null;
 }
 
 export interface ImportWorkspaceInput {
@@ -54,6 +55,7 @@ export interface CreateWorktreeWorkspaceInput {
   untrustedSource?: UntrustedWorkspaceSource;
   background?: boolean;
   callerWorkspaceId?: string;
+  parentWorkspaceId?: string | null;
 }
 
 export interface WorkspaceProvisioningService {
@@ -72,6 +74,7 @@ export interface WorkspaceProvisioningService {
       workspaceId?: string;
       background?: boolean;
       callerWorkspaceId?: string;
+      parentWorkspaceId?: string | null;
     },
   ): Promise<PersistedWorkspaceRecord>;
   createWorkspaceForWorktree(
@@ -227,6 +230,7 @@ export function createWorkspaceProvisioningService(deps: {
   async function resolveBackground(input?: {
     background?: boolean;
     callerWorkspaceId?: string;
+    parentWorkspaceId?: string | null;
   }): Promise<boolean> {
     if (input?.background !== undefined) return input.background;
     if (!input?.callerWorkspaceId) return false;
@@ -244,6 +248,7 @@ export function createWorkspaceProvisioningService(deps: {
       workspaceId?: string;
       background?: boolean;
       callerWorkspaceId?: string;
+      parentWorkspaceId?: string | null;
     },
   ): Promise<PersistedWorkspaceRecord> {
     const normalizedCwd = resolve(cwd);
@@ -261,12 +266,14 @@ export function createWorkspaceProvisioningService(deps: {
       createdAt: timestamp,
       updatedAt: timestamp,
       background: await resolveBackground(context),
+      parentWorkspaceId: context?.parentWorkspaceId,
     });
     await workspaceRegistry.upsert(workspace, {
       expectsInitialAgent: context?.expectsInitialAgent,
     });
-    emitWorkspaceCreated(workspace);
-    return workspace;
+    const persisted = (await workspaceRegistry.get(workspace.workspaceId)) ?? workspace;
+    emitWorkspaceCreated(persisted);
+    return persisted;
   }
 
   async function createWorkspaceForWorktree(
@@ -298,12 +305,14 @@ export function createWorkspaceProvisioningService(deps: {
       updatedAt: timestamp,
       ...(input.untrustedSource ? { untrustedSource: input.untrustedSource } : {}),
       background: await resolveBackground(input),
+      parentWorkspaceId: input.parentWorkspaceId,
     });
     await workspaceRegistry.upsert(workspace, {
       expectsInitialAgent: input.expectsInitialAgent,
     });
-    emitWorkspaceCreated(workspace);
-    return workspace;
+    const persisted = (await workspaceRegistry.get(workspace.workspaceId)) ?? workspace;
+    emitWorkspaceCreated(persisted);
+    return persisted;
   }
 
   function emitWorkspaceCreated(workspace: PersistedWorkspaceRecord): void {

@@ -1001,6 +1001,15 @@ export const WorkspaceFieldValueSetRequestSchema = z.object({
   requestId: z.string(),
 });
 
+export const WorkspaceMoveRequestSchema = z.object({
+  type: z.literal("workspace.move.request"),
+  requestId: z.string(),
+  workspaceId: z.string(),
+  parentWorkspaceId: z.string().nullable(),
+  // Missing or null appends to the destination's children.
+  beforeWorkspaceId: z.string().nullable().optional(),
+});
+
 export const WorkspacePinSetRequestSchema = z.object({
   type: z.literal("workspace.pin.set.request"),
   workspaceId: z.string(),
@@ -2757,6 +2766,7 @@ export const WorkspaceCreateRequestSchema = z.object({
   subscribe: z.boolean().optional(),
   requestId: z.string(),
   idempotencyKey: z.string().min(1).max(512).optional(),
+  parentWorkspaceId: z.string().nullable().optional(),
   // Optional user-set title applied to the created workspace.
   title: z.string().optional(),
   // Optional prompt context for workspace-level name/branch generation.
@@ -3337,6 +3347,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceFieldValueSetRequestSchema,
   WorkspacePinSetRequestSchema,
   WorkspaceSuperpinSetRequestSchema,
+  WorkspaceMoveRequestSchema,
   WorkspaceLabelListRequestSchema,
   WorkspaceLabelAssignmentSetRequestSchema,
   WorkspaceLabelUpdateRequestSchema,
@@ -3713,6 +3724,7 @@ export const ServerInfoStatusPayloadSchema = z
         // COMPAT(internalWorkspaces): added in v0.9.0; remove gate after 2027-03-17.
         internalWorkspaces: z.boolean().optional(),
         backgroundWorkspaces: z.boolean().optional(),
+        workspaceHierarchy: z.boolean().optional(),
         // COMPAT(workspaceFields): added in v0.11.3; remove gate after 2027-04-14.
         workspaceFields: z.boolean().optional(),
         providersSnapshot: z.boolean().optional(),
@@ -4204,6 +4216,8 @@ export const WorkspaceDescriptorPayloadSchema = z
   .object({
     id: z.string(),
     projectId: z.string(),
+    parentWorkspaceId: z.string().nullable().optional(),
+    siblingOrder: z.number().finite().optional(),
     projectDisplayName: z.string(),
     // COMPAT(projectCustomName): added in v0.1.76, drop the optional gate when floor >= v0.1.76.
     // When the user has renamed a project, projectDisplayName carries the resolved
@@ -4276,6 +4290,19 @@ export const WorkspaceDescriptorPayloadSchema = z
     ...workspace,
     workspaceDirectory: workspace.workspaceDirectory ?? workspace.projectRootPath,
   }));
+
+export const WorkspaceMoveResponsePayloadSchema = z.object({
+  requestId: z.string(),
+  workspaceId: z.string(),
+  accepted: z.boolean(),
+  workspaces: z.array(WorkspaceDescriptorPayloadSchema),
+  error: z.string().nullable(),
+});
+
+export const WorkspaceMoveResponseSchema = z.object({
+  type: z.literal("workspace.move.response"),
+  payload: WorkspaceMoveResponsePayloadSchema,
+});
 
 export const AgentUpdateMessageSchema = z.object({
   type: z.literal("agent_update"),
@@ -7238,6 +7265,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceFieldValueSetResponseSchema,
   WorkspacePinSetResponseSchema,
   WorkspaceSuperpinSetResponseSchema,
+  WorkspaceMoveResponseSchema,
   WorkspaceRecoveryInspectResponseSchema,
   WorkspaceRecoveryRestoreResponseSchema,
   WaitForFinishResponseMessageSchema,
@@ -7919,3 +7947,7 @@ export type WorkspaceSuperpinSetResponse = z.infer<typeof WorkspaceSuperpinSetRe
 export type WorkspaceSuperpinSetResponsePayload = z.infer<
   typeof WorkspaceSuperpinSetResponsePayloadSchema
 >;
+
+export type WorkspaceMoveRequest = z.infer<typeof WorkspaceMoveRequestSchema>;
+export type WorkspaceMoveResponse = z.infer<typeof WorkspaceMoveResponseSchema>;
+export type WorkspaceMoveResponsePayload = z.infer<typeof WorkspaceMoveResponsePayloadSchema>;

@@ -9,6 +9,14 @@ import {
   workspaceFieldValuesByteLength,
 } from "@getpaseo/protocol/workspace-fields";
 
+import {
+  appendWorkspaceToHierarchy,
+  moveWorkspaceInHierarchy,
+  promoteWorkspaceChildren,
+  normalizeLegacyWorkspaceHierarchy,
+  type WorkspaceMoveInput,
+} from "./workspace-hierarchy.js";
+
 import { writeJsonFileAtomic } from "./atomic-file.js";
 import { areEquivalentPaths } from "../utils/path.js";
 import {
@@ -58,6 +66,8 @@ const PersistedWorkspaceRecordSchema = z
   .object({
     workspaceId: z.string(),
     projectId: z.string(),
+    parentWorkspaceId: z.string().nullable().optional(),
+    siblingOrder: z.number().finite().optional(),
     cwd: z.string(),
     kind: z.enum(["local_checkout", "worktree", "directory"]),
     displayName: z.string(),
@@ -180,6 +190,7 @@ export interface ProjectRegistry {
 }
 
 export interface WorkspaceRegistry {
+  move?(input: WorkspaceMoveInput): Promise<PersistedWorkspaceRecord[]>;
   initialize(): Promise<void>;
   existsOnDisk(): Promise<boolean>;
   list(): Promise<PersistedWorkspaceRecord[]>;
@@ -330,8 +341,11 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
         this.logger.error({ err: error, filePath: this.filePath }, "Failed to load registry file");
       }
     }
+    this.normalizeLoadedRecords(this.cache);
     this.loaded = true;
   }
+
+  protected normalizeLoadedRecords(_records: Map<string, TRecord>): void {}
 
   protected async mutateMany(
     updater: (records: ReadonlyMap<string, TRecord>) => readonly TRecord[],
@@ -584,14 +598,57 @@ export class FileBackedWorkspaceRegistry
     record: PersistedWorkspaceRecord,
     context?: WorkspaceMutationContext,
   ): Promise<void> {
-    const workspace = PersistedWorkspaceRecordSchema.parse(record);
-    await super.upsert(workspace);
+    let rebalanced: PersistedWorkspaceRecord[] = [];
+    const workspace = await this.mutateCache((records) => {
+      const existing = records.get(record.workspaceId);
+      // Placement refreshes must preserve concurrent hierarchy edits.
+      const next = existing
+        ? {
+            ...record,
+            parentWorkspaceId: existing.parentWorkspaceId ?? null,
+            siblingOrder: existing.siblingOrder,
+          }
+        : (() => {
+            const appended = appendWorkspaceToHierarchy(records, record);
+            rebalanced = appended.filter((entry) => entry.workspaceId !== record.workspaceId);
+            for (const entry of rebalanced) records.set(entry.workspaceId, entry);
+            return appended.find((entry) => entry.workspaceId === record.workspaceId)!;
+          })();
+      const parsed = PersistedWorkspaceRecordSchema.parse(next);
+      records.set(parsed.workspaceId, parsed);
+      return parsed;
+    });
     await this.notifyMutation({
       kind: "upsert",
       workspaceId: workspace.workspaceId,
       workspace,
       ...(context?.expectsInitialAgent ? { expectsInitialAgent: true } : {}),
     });
+    await this.publishHierarchyUpdates(rebalanced);
+  }
+
+  protected override normalizeLoadedRecords(records: Map<string, PersistedWorkspaceRecord>): void {
+    normalizeLegacyWorkspaceHierarchy(records);
+  }
+
+  async move(input: WorkspaceMoveInput): Promise<PersistedWorkspaceRecord[]> {
+    const changed = await this.mutateMany((records) => moveWorkspaceInHierarchy(records, input));
+    await this.publishHierarchyUpdates(changed);
+    return changed;
+  }
+
+  private async publishHierarchyUpdates(
+    workspaces: readonly PersistedWorkspaceRecord[],
+  ): Promise<void> {
+    await Promise.all(
+      workspaces.map((workspace) =>
+        this.notifyMutation({
+          kind: "upsert",
+          workspaceId: workspace.workspaceId,
+          workspace,
+        }),
+      ),
+    );
   }
 
   override async archive(
@@ -599,22 +656,42 @@ export class FileBackedWorkspaceRegistry
     archivedAt: string,
     context?: WorkspaceArchiveContext,
   ): Promise<void> {
-    const workspace = await super.update(workspaceId, (existing) => ({
-      ...existing,
-      updatedAt: archivedAt,
-      archivedAt,
-      ...(context?.autoArchivedChangeRequestUrl
-        ? { autoArchivedChangeRequestUrl: context.autoArchivedChangeRequestUrl }
-        : {}),
-    }));
+    let workspace: PersistedWorkspaceRecord | null = null;
+    const promoted = await this.mutateCache((records) => {
+      const existing = records.get(workspaceId);
+      if (!existing) return [];
+      workspace = PersistedWorkspaceRecordSchema.parse({
+        ...existing,
+        updatedAt: archivedAt,
+        archivedAt,
+        ...(context?.autoArchivedChangeRequestUrl
+          ? { autoArchivedChangeRequestUrl: context.autoArchivedChangeRequestUrl }
+          : {}),
+      });
+      const children = promoteWorkspaceChildren(records, existing, archivedAt);
+      records.set(workspaceId, workspace);
+      for (const child of children) records.set(child.workspaceId, child);
+      return children;
+    });
     if (!workspace) return;
     await this.notifyMutation({ kind: "archive", workspaceId, workspace });
+    await this.publishHierarchyUpdates(promoted);
   }
 
   override async remove(workspaceId: string): Promise<void> {
-    const workspace = await this.removeIfPresent(workspaceId);
-    if (!workspace) return;
+    let removed = false;
+    const promoted = await this.mutateCache((records) => {
+      const existing = records.get(workspaceId);
+      if (!existing) return [];
+      const children = promoteWorkspaceChildren(records, existing, new Date().toISOString());
+      records.delete(workspaceId);
+      for (const child of children) records.set(child.workspaceId, child);
+      removed = true;
+      return children;
+    });
+    if (!removed) return;
     await this.notifyMutation({ kind: "remove", workspaceId, workspace: null });
+    await this.publishHierarchyUpdates(promoted);
   }
 
   async commitWorkspaceLabelMutation<TResult>(input: {
@@ -699,6 +776,8 @@ export function resolveProjectDisplayName(record: PersistedProjectRecord): strin
 export function createPersistedWorkspaceRecord(input: {
   workspaceId: string;
   projectId: string;
+  parentWorkspaceId?: string | null;
+  siblingOrder?: number;
   cwd: string;
   kind: PersistedWorkspaceKind;
   displayName: string;
