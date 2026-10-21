@@ -166,6 +166,8 @@ export function buildAgentLsFetchOptions(
   return fetchOptions;
 }
 
+type AgentLsClient = Pick<Awaited<ReturnType<typeof connectToDaemon>>, "fetchAgents" | "close">;
+
 /**
  * Agent ls command semantics:
  * - `paseo agent ls`    → active non-archived agents
@@ -177,7 +179,16 @@ export async function runLsCommand(
   options: AgentLsOptions,
   _command: Command,
 ): Promise<AgentLsResult> {
-  const client = await connectToDaemon({ target: options.daemonTarget });
+  return listAgents(options);
+}
+
+export async function listAgents(
+  options: AgentLsOptions,
+  connect: (
+    options: Parameters<typeof connectToDaemon>[0],
+  ) => Promise<AgentLsClient> = connectToDaemon,
+): Promise<AgentLsResult> {
+  const client = await connect({ target: options.daemonTarget });
 
   try {
     const normalizedThinkingOptionId = options.thinking?.trim();

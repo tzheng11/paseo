@@ -7,6 +7,7 @@ interface FetchProjectedTimelineItemsInput {
   client: DaemonClient;
   agentId: string;
   timeoutMs?: number;
+  sinceTimestampMs?: number;
 }
 
 export async function fetchProjectedTimelineItems(
@@ -18,7 +19,12 @@ export async function fetchProjectedTimelineItems(
     projection: "projected",
     timeout: input.timeoutMs,
   });
-  const items = timeline.entries.map((entry) => entry.item);
+  const sinceTimestampMs = input.sinceTimestampMs;
+  const entries =
+    sinceTimestampMs === undefined
+      ? timeline.entries
+      : timeline.entries.filter((entry) => Date.parse(entry.timestamp) >= sinceTimestampMs);
+  const items = entries.map((entry) => entry.item);
   const gap = timeline.historyWindow?.gap;
   if (gap)
     items.unshift({
