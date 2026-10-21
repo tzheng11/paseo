@@ -5,7 +5,7 @@ import { toWorkspaceRow, workspaceSchema, workspaceWithBackgroundSchema } from "
 
 describe("workspace inventory output", () => {
   it.each([workspaceSchema, workspaceWithBackgroundSchema])(
-    "preserves pinned, unpinned and unavailable metadata in structured output",
+    "preserves pin metadata and hierarchy in structured output",
     (schema) => {
       const base = {
         projectDisplayName: "Project",
@@ -14,7 +14,13 @@ describe("workspace inventory output", () => {
         workspaceDirectory: "/tmp/project",
       };
       const descriptors = [
-        { ...base, id: "pinned", pinnedAt: "2026-10-16T20:00:00.000Z" },
+        {
+          ...base,
+          id: "pinned",
+          pinnedAt: "2026-10-16T20:00:00.000Z",
+          parentWorkspaceId: "parent",
+          siblingOrder: 12.5,
+        },
         { ...base, id: "unpinned", pinnedAt: null, background: true },
         { ...base, id: "older-host" },
       ] as WorkspaceDescriptorPayload[];
@@ -29,6 +35,8 @@ describe("workspace inventory output", () => {
           cwd: "/tmp/project",
           background: false,
           pinnedAt: "2026-10-16T20:00:00.000Z",
+          parentWorkspaceId: "parent",
+          siblingOrder: 12.5,
         },
         {
           workspaceId: "unpinned",
@@ -38,6 +46,8 @@ describe("workspace inventory output", () => {
           cwd: "/tmp/project",
           background: true,
           pinnedAt: null,
+          parentWorkspaceId: null,
+          siblingOrder: 0,
         },
         {
           workspaceId: "older-host",
@@ -46,6 +56,8 @@ describe("workspace inventory output", () => {
           isolation: "local",
           cwd: "/tmp/project",
           background: false,
+          parentWorkspaceId: null,
+          siblingOrder: 0,
         },
       ]);
       expect(render(result, { quiet: true })).toBe("pinned\nunpinned\nolder-host");
