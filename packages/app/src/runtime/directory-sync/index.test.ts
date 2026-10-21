@@ -31,6 +31,7 @@ import { subscriptionFixture } from "../subscription-fixture";
 type WorkspaceFetchResult = Awaited<ReturnType<DaemonClient["fetchWorkspaces"]>>;
 type ProjectListResult = Awaited<ReturnType<DaemonClient["listProjects"]>>;
 type AgentFetchResult = Awaited<ReturnType<DaemonClient["fetchAgents"]>>;
+type WorkspaceScriptsResult = Awaited<ReturnType<DaemonClient["listWorkspaceScripts"]>>;
 
 class FakeDirectoryClient {
   supportsBackgroundWorkspaces(): boolean {
@@ -184,6 +185,14 @@ class FakeDirectoryClient {
       labels: [{ name: "Urgent", color: "red" }],
       sync: { mode: "snapshot", removals: [], generation: "generation-1", headSeq: 0 },
     };
+  }
+
+  listWorkspaceScriptsCalls = 0;
+  workspaceScripts: WorkspaceScriptsResult["scripts"] = [];
+
+  async listWorkspaceScripts(workspaceId: string): Promise<WorkspaceScriptsResult> {
+    this.listWorkspaceScriptsCalls += 1;
+    return { requestId: "scripts", workspaceId, scripts: this.workspaceScripts, error: null };
   }
 
   getLastServerInfoMessage() {
@@ -366,7 +375,7 @@ describe("DirectorySync session readiness", () => {
     await expect(directory.refreshDemand()).rejects.toThrow("Project list timed out");
 
     expect(client.listProjectsCalls).toBe(1);
-    expect(client.fetchWorkspacesCalls).toBe(0);
+    expect(client.fetchWorkspacesCalls).toBe(1);
     expect(store.getSession(serverId)?.hasHydratedWorkspaces).toBe(false);
     expect(scheduler.delays).toEqual([1_000]);
 
@@ -374,7 +383,7 @@ describe("DirectorySync session readiness", () => {
     await directory.refreshDemand();
 
     expect(client.listProjectsCalls).toBe(2);
-    expect(client.fetchWorkspacesCalls).toBe(1);
+    expect(client.fetchWorkspacesCalls).toBe(2);
     expect(store.getSession(serverId)?.hasHydratedWorkspaces).toBe(true);
     expect([...(store.getSession(serverId)?.workspaces.keys() ?? [])]).toEqual(["recovered-chat"]);
     expect(scheduler.delays).toEqual([]);
@@ -434,6 +443,38 @@ describe("DirectorySync session readiness", () => {
     scheduler.runNext();
     await directory.refreshDemand();
     expect(client.fetchAgentsCalls).toBe(2);
+    expect(client.listProjectsCalls).toBe(2);
+    expect(scheduler.delays).toEqual([]);
+    directory.dispose();
+  });
+
+  it("waits for an in-flight workspace baseline before retrying a failed project baseline", async () => {
+    const serverId = "directory-retry-workspace-no-overlap";
+    const scheduler = new FakeDirectoryScheduler();
+    const { client, directory } = createDirectory(serverId, { scheduler });
+    initializeDirectorySession(serverId, client);
+    const completeWorkspaces = client.holdWorkspaceFetch();
+    client.projectFailures.push(new Error("Project list timed out"));
+    directory.setDemand({}, true);
+    const refresh = directory.refreshDemand();
+    const rejected = expect(refresh).rejects.toThrow("Project list timed out");
+    await expect.poll(() => client.fetchWorkspacesCalls).toBe(1);
+
+    expect(scheduler.delays).toEqual([]);
+    expect(directory.refreshDemand()).toBe(refresh);
+    expect(client.listProjectsCalls).toBe(1);
+    completeWorkspaces({
+      requestId: "workspaces",
+      entries: [],
+      emptyProjects: [],
+      pageInfo: { hasMore: false, nextCursor: null, prevCursor: null },
+    });
+    await rejected;
+    expect(scheduler.delays).toEqual([1_000]);
+
+    scheduler.runNext();
+    await directory.refreshDemand();
+    expect(client.fetchWorkspacesCalls).toBe(2);
     expect(client.listProjectsCalls).toBe(2);
     expect(scheduler.delays).toEqual([]);
     directory.dispose();
@@ -748,6 +789,52 @@ describe("DirectorySync session readiness", () => {
           mutation.id === workspace.id,
       );
     expect(persisted?.value.scripts[0]?.lifecycle).toBe("running");
+    directory.dispose();
+  });
+
+  it("keeps a workspace's script status live without demanding the directory", async () => {
+    const serverId = "script-status-demand";
+    const { client, directory } = createDirectory(serverId);
+    useSessionStore.getState().initializeSession(serverId, client as unknown as DaemonClient, 1);
+    const workspace = normalizeWorkspaceDescriptor({
+      ...createWorkspaceEntry("workspace-1"),
+      scripts: [],
+    });
+    directory.acceptWorkspaces([workspace]);
+    const script = {
+      scriptName: "worker",
+      type: "script" as const,
+      hostname: "worker.paseo.localhost",
+      port: null,
+      proxyUrl: null,
+      lifecycle: "running" as const,
+      health: null,
+      exitCode: null,
+      terminalId: "terminal-1",
+    };
+    const lifecycle = () =>
+      useSessionStore.getState().sessions[serverId]?.workspaces.get(workspace.id)?.scripts[0]
+        ?.lifecycle;
+    client.workspaceScripts = [script];
+    const source = {};
+
+    directory.setScriptStatusDemand(source, workspace.id);
+
+    await expect.poll(lifecycle).toBe("running");
+    client.emit({
+      type: "script_status_update",
+      payload: { workspaceId: workspace.id, scripts: [{ ...script, lifecycle: "stopped" }] },
+    });
+    expect(lifecycle()).toBe("stopped");
+    expect(client.fetchAgentsCalls).toBe(0);
+    expect(client.fetchWorkspacesCalls).toBe(0);
+
+    directory.setScriptStatusDemand(source, null);
+    client.emit({
+      type: "script_status_update",
+      payload: { workspaceId: workspace.id, scripts: [script] },
+    });
+    expect(lifecycle()).toBe("stopped");
     directory.dispose();
   });
 
@@ -1420,6 +1507,60 @@ describe("DirectorySync session readiness", () => {
     expect(writtenProjectIds).not.toContain("untouched-project");
     directory.dispose();
   });
+
+  it.each(["projects", "workspaces"] as const)(
+    "requests projects and workspaces together and commits once when %s responds first",
+    async (firstResponse) => {
+      const serverId = `parallel-directory-${firstResponse}`;
+      const { client, directory } = createDirectory(serverId);
+      const store = useSessionStore.getState();
+      store.initializeSession(serverId, client as unknown as DaemonClient, 1);
+      store.updateSessionServerInfo(serverId, {
+        serverId,
+        hostname: null,
+        version: "test",
+        features: { workspaceMultiplicity: true, projectList: true },
+      });
+      const releaseProjects = client.holdProjectFetch();
+      const releaseWorkspaces = client.holdWorkspaceFetch();
+      const project = {
+        projectId: "parallel-project",
+        projectDisplayName: "Project baseline",
+        projectRootPath: "/repo/parallel",
+        projectKind: "git" as const,
+      };
+      const projects: ProjectListResult = { requestId: "projects", projects: [project] };
+      const workspaces: WorkspaceFetchResult = {
+        requestId: "workspaces",
+        entries: [createWorkspaceEntry("parallel-workspace")],
+        emptyProjects: [{ ...project, projectDisplayName: "Newer workspace overlay" }],
+        pageInfo: { hasMore: false, nextCursor: null, prevCursor: null },
+      };
+      const refresh = directory.refreshWorkspaces();
+      try {
+        await expect.poll(() => client.listProjectsCalls).toBe(1);
+        await expect.poll(() => client.fetchWorkspacesCalls).toBe(1);
+        if (firstResponse === "projects") releaseProjects(projects);
+        else releaseWorkspaces(workspaces);
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        expect(useSessionStore.getState().sessions[serverId].workspaces.size).toBe(0);
+        expect(useSessionStore.getState().sessions[serverId].projects.size).toBe(0);
+        releaseProjects(projects);
+        releaseWorkspaces(workspaces);
+        await refresh;
+        const session = useSessionStore.getState().sessions[serverId];
+        expect(session.workspaces.has("parallel-workspace")).toBe(true);
+        expect(session.projects.get(project.projectId)?.projectDisplayName).toBe(
+          "Newer workspace overlay",
+        );
+      } finally {
+        releaseProjects(projects);
+        releaseWorkspaces(workspaces);
+        await refresh;
+        directory.dispose();
+      }
+    },
+  );
 
   it("keeps the accepted baseline when an old connection finishes its workspace request", async () => {
     const serverId = "superseded-workspace-baseline";

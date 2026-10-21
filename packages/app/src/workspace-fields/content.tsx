@@ -1,6 +1,7 @@
 import { useCallback } from "react";
 import { type WorkspaceFieldsModel, type FieldsSnapshot } from "./model";
-import { Pressable, ScrollView, Text, View } from "react-native";
+import { ScrollView, Text, View, type PressableStateCallbackType } from "react-native";
+import { PressHighlight } from "@/components/ui/press-highlight";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import type { Theme } from "@/styles/theme";
@@ -64,17 +65,18 @@ function WorkspaceFieldRow({
   if (editor?.conflict) error = t("panels.info.conflict");
   return (
     <View>
-      <Pressable
+      <PressHighlight
         accessibilityRole="button"
         accessibilityLabel={field.label}
         disabled={state.availability !== "ready" || state.editor !== null}
         onPress={edit}
-        style={styles.row}
+        style={fieldRowStyle}
+        highlightStyle={styles.highlightedRow}
         testID={`workspace-info-field-${field.key}`}
       >
         <Text style={styles.label}>{field.label}</Text>
         <WorkspaceFieldValue fieldKey={field.key} state={state} />
-      </Pressable>
+      </PressHighlight>
       {editor ? (
         <View style={styles.editor}>
           <FormTextInput
@@ -144,6 +146,9 @@ function WorkspaceFieldValue({ fieldKey, state }: { fieldKey: string; state: Fie
     </Text>
   );
 }
+function fieldRowStyle({ hovered, pressed }: PressableStateCallbackType & { hovered?: boolean }) {
+  return [styles.row, (hovered || pressed) && styles.highlightedRow];
+}
 const styles = StyleSheet.create((theme) => ({
   container: { flex: 1, minWidth: 0 },
   content: { paddingVertical: theme.spacing[4] },
@@ -166,6 +171,7 @@ const styles = StyleSheet.create((theme) => ({
     paddingHorizontal: theme.spacing[4],
     paddingVertical: theme.spacing[3],
   },
+  highlightedRow: { backgroundColor: theme.colors.interactionHighlight },
   label: {
     width: 144,
     flexShrink: 0,

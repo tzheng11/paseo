@@ -54,6 +54,35 @@ describe("workspace bulk close helpers", () => {
     });
   });
 
+  it("excludes permanent panels from confirmation counts and close operations", async () => {
+    const groups = classifyBulkClosableTabs([
+      { key: "info", tabId: "info", kind: "info", target: { kind: "info" } },
+      {
+        key: "changes_tree",
+        tabId: "changes_tree",
+        kind: "changes_tree",
+        target: { kind: "changes_tree" },
+      },
+    ]);
+    expect(groups).toEqual({
+      archiveAgentTabs: [],
+      layoutOnlyAgentTabs: [],
+      terminalTabs: [],
+      otherTabs: [{ tabId: "changes_tree", target: { kind: "changes_tree" } }],
+    });
+    expect(buildBulkCloseConfirmationMessage(groups)).toBe("This will close 1 tab(s).");
+    const closed: string[] = [];
+    await closeBulkWorkspaceTabs({
+      groups,
+      client: null,
+      closeTab: async (_tabId, action) => action(),
+      closeWorkspaceTabWithCleanup: ({ tabId }) => closed.push(tabId),
+      closeLayoutOnlyAgent: async () => {},
+      logLabel: "other Explorer tabs",
+    });
+    expect(closed).toEqual(["changes_tree"]);
+  });
+
   it("separates subagent tabs from agents that archive on close", () => {
     const groups = classifyBulkClosableTabs(
       [makeAgentTab("root"), makeAgentTab("child")],

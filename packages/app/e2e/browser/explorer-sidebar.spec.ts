@@ -167,6 +167,7 @@ test("Explorer keeps Files and Changes close actions in the context menu", async
       await closeOtherExplorerTabs(page);
       await expect(explorer.getByTestId("workspace-tab-changes_tree")).toHaveCount(0);
       await expect(explorer.getByTestId("workspace-tab-files")).toBeVisible();
+      await expect(explorer.getByTestId("workspace-tab-info")).toBeVisible();
       await expect(main.getByTestId("workspace-tabs-row").getByRole("button")).toHaveCount(
         mainTabsBefore,
       );

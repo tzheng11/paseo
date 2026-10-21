@@ -167,11 +167,19 @@ test.describe("Workspace header action parity", () => {
       await expect(row).toBeVisible({ timeout: 30_000 });
       await row.click();
       await page.setViewportSize({ width: 390, height: 844 });
+      await page.getByRole("button", { name: /Switch tabs/ }).click();
+      const newAgent = page.getByTestId("workspace-tab-switcher-new-agent");
+      await expect(newAgent).toBeVisible();
+      await expect(page.getByTestId("workspace-tab-switcher-new-terminal")).toBeVisible();
+      await newAgent.click();
+      await expect(
+        page.getByRole("textbox", { name: "Message agent..." }).filter({ visible: true }),
+      ).toHaveCount(1);
+      await expect(page.getByRole("button", { name: "Bottom sheet backdrop" })).toHaveCount(0);
       await openHeaderMenu(page);
       await expect(
         page.getByRole("button", { name: "Bottom sheet backdrop" }).first(),
       ).toBeVisible();
-      await expect(page.getByTestId("workspace-header-new-agent")).toBeVisible();
       for (const action of ["rename", "pin", "labels", "archive"])
         await expect(headerAction(page, workspace.workspaceId, action)).toBeVisible();
       await headerAction(page, workspace.workspaceId, "labels").click();

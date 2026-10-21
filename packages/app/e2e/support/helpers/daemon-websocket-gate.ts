@@ -307,7 +307,7 @@ export async function installDaemonWebSocketGate(page: Page) {
   const heldTimelineResponses: Array<() => void> = [];
   const heldTimelineResponseWaiters = new Set<() => void>();
   let heldClientRequestType: string | null = null;
-  let heldClientRequest: { server: WebSocketRoute; message: string | Buffer } | null = null;
+  const heldClientRequests: Array<{ server: WebSocketRoute; message: string | Buffer }> = [];
   let resolveHeldClientRequest: (() => void) | null = null;
   const pendingServerMessageHolds = new Map<string, PendingServerMessageHold>();
   const heldServerMessages: HeldServerMessage[] = [];
@@ -478,7 +478,9 @@ export async function installDaemonWebSocketGate(page: Page) {
         clientRequests.set(request.type, requests);
       }
       if (request?.type === heldClientRequestType) {
-        heldClientRequest = { server, message };
+        // Reconnect bootstrap and explicit read-back can request the same directory
+        // concurrently. Preserve both requests until the test releases the gate.
+        heldClientRequests.push({ server, message });
         resolveHeldClientRequest?.();
         resolveHeldClientRequest = null;
         return;
@@ -629,21 +631,25 @@ export async function installDaemonWebSocketGate(page: Page) {
       reconnectWithFreshClient = true;
       acceptingConnections = true;
     },
+    // Hold a batch of this request type until release; another call discards that batch.
     holdNextClientRequest(type: string): void {
       heldClientRequestType = type;
-      heldClientRequest = null;
+      heldClientRequests.length = 0;
     },
     waitForHeldClientRequest(): Promise<void> {
-      if (heldClientRequest) return Promise.resolve();
+      if (heldClientRequests.length > 0) return Promise.resolve();
       return new Promise<void>((resolve) => {
         resolveHeldClientRequest = resolve;
       });
     },
+    getHeldClientRequests(): ReadonlyArray<ClientRequest | null> {
+      return heldClientRequests.map(({ message }) => readClientRequest(message));
+    },
     releaseHeldClientRequest(): void {
-      if (!heldClientRequest) throw new Error("No held client request to release");
-      heldClientRequest.server.send(heldClientRequest.message);
-      heldClientRequest = null;
+      if (heldClientRequests.length === 0) throw new Error("No held client request to release");
+      const requests = heldClientRequests.splice(0);
       heldClientRequestType = null;
+      for (const { server, message } of requests) server.send(message);
     },
     holdNextServerMessage(type: string): void {
       pendingServerMessageHolds.set(serverMessageKey(type), {

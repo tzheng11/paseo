@@ -18,11 +18,12 @@ import {
   HEADER_INNER_HEIGHT_MOBILE,
   HEADER_TOP_PADDING_MOBILE,
 } from "@/constants/layout";
-import { TitlebarDragRegion } from "@/components/desktop/titlebar-drag-region";
 import { useLocalDaemonServerId } from "@/hooks/use-is-local-daemon";
 import { PairDeviceModal } from "@/desktop/components/pair-device-modal";
 import { buildSettingsHostSectionRoute } from "@/utils/host-routes";
 import { HostsOverview } from "@/hosts-overview/hosts-overview";
+
+const WINDOW_CONTENT_DATASET = { "window-content": "" };
 
 export function OpenProjectScreen() {
   const { t } = useTranslation();
@@ -62,9 +63,13 @@ export function OpenProjectScreen() {
   return (
     <View style={styles.container}>
       <MenuHeader borderless />
-      <ScrollView style={styles.scroll} contentContainerStyle={styles.scrollContent}>
+      <ScrollView
+        testID="open-project-scroll"
+        style={styles.scroll}
+        contentContainerStyle={styles.scrollContent}
+        dataSet={WINDOW_CONTENT_DATASET}
+      >
         <View style={styles.content}>
-          <TitlebarDragRegion />
           <View style={styles.logo}>
             <PaseoLogo size={52} />
           </View>
@@ -190,6 +195,7 @@ const styles = StyleSheet.create((theme) => ({
   content: {
     position: "relative",
     flexGrow: 1,
+    flexShrink: 0,
     justifyContent: { xs: "flex-start", md: "center" },
     alignItems: "center",
     gap: 0,
@@ -247,6 +253,7 @@ const styles = StyleSheet.create((theme) => ({
   },
   communityRow: {
     // Balances the header above, so the content stays optically centered.
+    flexShrink: 0,
     paddingBottom: {
       xs: HEADER_INNER_HEIGHT_MOBILE + HEADER_TOP_PADDING_MOBILE + theme.spacing[2],
       md: HEADER_INNER_HEIGHT + theme.spacing[2],

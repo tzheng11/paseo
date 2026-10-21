@@ -1,5 +1,5 @@
 import { createHook } from "node:async_hooks";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import {
   mkdtempSync,
   mkdirSync,
@@ -9,6 +9,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -1066,6 +1067,16 @@ describe("relative typed-entry configuration", () => {
   });
 });
 
+interface SearchProcessExit {
+  code: number | null;
+  signal: string | null;
+}
+
+interface SearchProcess {
+  child: ChildProcess;
+  exited: Promise<SearchProcessExit>;
+}
+
 // Reading a tree is cheap; re-deriving each entry's path state is not. A scan that asks whether
 // every ancestor of every entry is inside the root, or is Git-ignored, costs multiples of the
 // read and is what made large home directories exceed the client request timeout.
@@ -1073,8 +1084,13 @@ describe("home-tree scan cost", () => {
   const DEPTH = 8;
   const CHAINS = 40;
   let scanRoot: string;
+  let searchProcess: SearchProcess | null = null;
+  let fixtureSetup: Promise<void> | null = null;
+  let stopFixtureSetup = false;
 
   beforeEach(() => {
+    fixtureSetup = null;
+    stopFixtureSetup = false;
     scanRoot = realpathSync.native(mkdtempSync(path.join(tmpdir(), "directory-scan-cost-")));
     for (let chain = 0; chain < CHAINS; chain += 1) {
       const segments: string[] = [];
@@ -1083,8 +1099,20 @@ describe("home-tree scan cost", () => {
     }
   });
 
-  afterEach(() => {
-    rmSync(scanRoot, { recursive: true, force: true });
+  afterEach(async () => {
+    stopFixtureSetup = true;
+    try {
+      // A test timeout must not let pending fixture writes race directory removal.
+      await fixtureSetup?.catch(() => undefined);
+      if (searchProcess) {
+        searchProcess.child.kill();
+        await searchProcess.exited;
+      }
+    } finally {
+      fixtureSetup = null;
+      searchProcess = null;
+      rmSync(scanRoot, { recursive: true, force: true });
+    }
   });
 
   // Nothing matches, so the scan walks the whole tree instead of stopping at a confident result.
@@ -1101,6 +1129,104 @@ describe("home-tree scan cost", () => {
     await run();
     return stopPathContainmentMetrics();
   }
+
+  async function createBroadTree(root: string): Promise<void> {
+    await mkdir(root);
+    let parents = [root];
+    for (const level of ["branch", "group", "leaf"]) {
+      const children: string[] = [];
+      for (const parent of parents) {
+        for (let child = 0; child < 30; child += 1) {
+          children.push(path.join(parent, `${level}-${child}`));
+        }
+      }
+      const workers = Array.from({ length: 4 }, async (_, worker) => {
+        for (let index = worker; index < children.length; index += 4) {
+          if (stopFixtureSetup) return;
+          await mkdir(children[index]);
+        }
+      });
+      // Settle every worker even when one fails, so teardown can safely remove the tree.
+      const settled = await Promise.allSettled(workers);
+      const failed = settled.find((result) => result.status === "rejected");
+      if (failed?.status === "rejected") throw failed.reason;
+      if (stopFixtureSetup) throw new Error("Broad-tree fixture setup cancelled during teardown");
+      parents = children;
+    }
+  }
+
+  // Keep the full 30³-leaf tree: eager traversal retains its unvisited siblings across
+  // all 14 searches. Bounded async setup avoids serial Windows metadata overhead and
+  // blocking Vitest's clock; the child's heap and 20 s search deadline stay unchanged.
+  it("finishes overlapping broad-tree searches within a bounded heap", async () => {
+    const broadRoot = path.join(scanRoot, "broad");
+    const fixtureStartedAt = performance.now();
+    fixtureSetup = createBroadTree(broadRoot);
+    await fixtureSetup;
+    const fixtureMs = performance.now() - fixtureStartedAt;
+    console.info("directory-search-heap-fixture-ready", { fixtureMs });
+    // A smaller real tree and explicit heap budget keep the million-directory repro cheap in CI.
+    const moduleUrl = new URL("./directory-suggestions.ts", import.meta.url).href;
+    const source = `
+      const { searchDirectoryEntries } = await import(${JSON.stringify(moduleUrl)});
+      const results = await Promise.all(Array.from({ length: 14 }, (_, index) =>
+        searchDirectoryEntries({
+          root: ${JSON.stringify(broadRoot)},
+          query: "z".repeat(index + 1),
+          pathFormat: "absolute",
+          includeFiles: false,
+          includeDirectories: true,
+          pathQueryPolicy: "rooted",
+          rootAliases: ["~"],
+          blankQueryBehavior: "none",
+          confidentResultScanThreshold: 5000,
+          maxEntriesScanned: 2000,
+          limit: 30,
+        })
+      ));
+      process.stdout.write(JSON.stringify(results));
+    `;
+    const searchStartedAt = performance.now();
+    const child = spawn(
+      process.execPath,
+      [
+        "--max-old-space-size=128",
+        "--conditions=source",
+        "--import",
+        "tsx",
+        "--input-type=module",
+        "--eval",
+        source,
+      ],
+      { stdio: ["ignore", "pipe", "pipe"], timeout: 20_000 },
+    );
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    const exited = new Promise<SearchProcessExit>((resolve, reject) => {
+      child.on("error", reject);
+      child.on("close", (code, signal) => resolve({ code, signal }));
+    });
+    searchProcess = { child, exited };
+    const exit = await exited;
+    console.info("directory-search-heap-proof", {
+      fixtureMs,
+      searchMs: performance.now() - searchStartedAt,
+    });
+    expect({ ...exit, outOfMemory: stderr.includes("heap out of memory") }).toEqual({
+      code: 0,
+      signal: null,
+      outOfMemory: false,
+    });
+    expect(JSON.parse(stdout)).toEqual(Array.from({ length: 14 }, () => []));
+  }, 120_000);
 
   it("derives no containment for a tree that cannot leave the root", async () => {
     const checks = await countContainmentChecks(scanWholeTree);

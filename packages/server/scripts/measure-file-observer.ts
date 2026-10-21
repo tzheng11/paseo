@@ -199,8 +199,8 @@ async function measure(run: number): Promise<Measurement> {
         root,
         (nextError, events) => {
           error ??= nextError;
-          delivered.push(...events);
           for (const event of events) {
+            delivered.push(event);
             if (!firstObservedAt.has(event.path))
               firstObservedAt.set(event.path, performance.now());
           }
@@ -210,15 +210,28 @@ async function measure(run: number): Promise<Measurement> {
     ),
   );
   const setupMs = performance.now() - setupStarted;
-  await new Promise((resolve) => setTimeout(resolve, 25));
-  const startupEvents = delivered.length;
-  const kernelWatchCount = await readKernelWatchCount();
-
   let peakPendingClassificationCount = 0;
   let lateIgnoredTrackedFileCount: number | null = null;
   let samplePending: ReturnType<typeof setInterval> | undefined;
 
   try {
+    // Startup inventory is delivered in bounded batches across event-loop turns.
+    // Drain it before counting startup events or measuring the first edit.
+    const initialSettled = await waitFor(() => {
+      const diagnostics = observer.getDiagnostics();
+      return (
+        diagnostics.pendingEventCount === 0 &&
+        diagnostics.pendingReconciliationWorkCount === 0 &&
+        diagnostics.reconciliationInFlightCount === 0
+      );
+    }, 120_000);
+    if (!initialSettled) {
+      throw new Error("Timed out waiting for initial observer inventory to settle");
+    }
+    if (error) throw error;
+    const startupEvents = delivered.length;
+    const kernelWatchCount = await readKernelWatchCount();
+
     samplePending = setInterval(() => {
       peakPendingClassificationCount = Math.max(
         peakPendingClassificationCount,
@@ -456,7 +469,7 @@ async function measureDirectoryChurn(run: number): Promise<Measurement> {
     const setupStarted = performance.now();
     subscription = await observer.subscribe(root, (nextError, events) => {
       error ??= nextError;
-      delivered.push(...events);
+      for (const event of events) delivered.push(event);
     });
     const setupMs = performance.now() - setupStarted;
 

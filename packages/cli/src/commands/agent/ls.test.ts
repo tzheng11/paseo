@@ -2,7 +2,7 @@ import { Command } from "commander";
 import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render } from "../../output/index.js";
-import { buildAgentLsFetchOptions, runLsCommand, type AgentLsOptions } from "./ls.js";
+import { buildAgentLsFetchOptions, runLsCommand, listAgents, type AgentLsOptions } from "./ls.js";
 
 const { fetchAgents, close } = vi.hoisted(() => ({
   fetchAgents: vi.fn(),
@@ -228,5 +228,70 @@ describe("runLsCommand pagination", () => {
     });
     expect(fetchAgents).toHaveBeenCalledTimes(3);
     expect(close).toHaveBeenCalledTimes(1);
+  });
+});
+
+const daemonTarget = { kind: "endpoint" as const, host: "example.test:12345" };
+
+function createPagingClient() {
+  const daemonAgents: AgentSnapshotPayload[] = [3, 2, 1].map((n) => ({
+    id: `${n}${n}${n}${n}${n}${n}${n}${n}-0000-4000-8000-000000000000`,
+    provider: "codex",
+    title: `agent ${n}`,
+    status: "closed",
+    archivedAt: null,
+    cwd: "/tmp/project",
+    createdAt: `2026-10-0${n}T00:00:00.000Z`,
+    updatedAt: `2026-10-0${n}T00:00:00.000Z`,
+    labels: {},
+    model: null,
+    lastUserMessageAt: null,
+    currentModeId: null,
+    availableModes: [],
+    pendingPermissions: [],
+    persistence: null,
+    capabilities: {
+      supportsStreaming: true,
+      supportsSessionPersistence: true,
+      supportsDynamicModes: false,
+      supportsMcpServers: true,
+      supportsReasoningStream: true,
+      supportsToolInvocations: true,
+    },
+  }));
+
+  // The fake daemon pages two agents at a time, newest first by the requested key
+  // (updated_at by default), and agent 1 is updated right after the first page is served.
+  const fetchPage = async (options?: { sort?: { key: string }[]; page?: { cursor?: string } }) => {
+    const key: "createdAt" | "updatedAt" =
+      options?.sort?.[0]?.key === "created_at" ? "createdAt" : "updatedAt";
+    const cursor = options?.page?.cursor;
+    const ordered = daemonAgents
+      .filter((agent) => cursor === undefined || agent[key] < cursor)
+      .sort((left, right) => right[key].localeCompare(left[key]));
+    const agentsPage = ordered.slice(0, 2);
+    const hasMore = ordered.length > 2;
+    if (cursor === undefined) {
+      daemonAgents[2]!.updatedAt = "2026-10-09T00:00:00.000Z";
+    }
+    return {
+      entries: agentsPage.map((agent) => ({ agent })),
+      pageInfo: {
+        hasMore,
+        nextCursor: hasMore ? agentsPage[agentsPage.length - 1]![key] : null,
+        prevCursor: null,
+      },
+    };
+  };
+  return { fetchAgents: fetchPage, close: async () => {} };
+}
+
+describe("runLsCommand", () => {
+  it("lists agents on every page, including one updated during the listing", async () => {
+    const result = await listAgents({ daemonTarget, all: true, global: true }, async () =>
+      createPagingClient(),
+    );
+
+    expect(result.data.map((item) => item.name)).toEqual(["agent 3", "agent 2", "agent 1"]);
   });
 });

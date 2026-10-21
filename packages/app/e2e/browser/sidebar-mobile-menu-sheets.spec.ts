@@ -15,11 +15,30 @@ async function closeMenuSheet(page: Page): Promise<void> {
 
 test("project and workspace kebabs open action sheets on compact layouts", async ({ page }) => {
   const seeded = await seedWorkspace({ repoPrefix: "sidebar-mobile-menu-sheet-" });
+  let secondProject: Awaited<ReturnType<typeof seedWorkspace>> | null = null;
 
   try {
+    // Project filtering appears only with multiple projects. Establish that menu
+    // shape explicitly rather than depending on earlier specs' daemon inventory.
+    secondProject = await seedWorkspace({ repoPrefix: "sidebar-mobile-menu-second-project-" });
     await gotoAppShell(page);
     await page.getByRole("button", { name: "Open menu", exact: true }).click();
     await waitForSidebarHydration(page);
+    for (const project of [seeded, secondProject]) {
+      await expect(
+        page.getByTestId(`sidebar-project-row-${projectEquivalenceViewKey(project.projectKey)}`),
+      ).toBeVisible();
+    }
+
+    await page.getByTestId("sidebar-display-preferences-menu").click();
+    await expect(page.getByRole("menuitem")).toHaveText([
+      /^Grouping/,
+      /^Title/,
+      "Show",
+      "Project",
+      "Show background",
+    ]);
+    await closeMenuSheet(page);
 
     await page
       .getByTestId(`sidebar-project-kebab-${projectEquivalenceViewKey(seeded.projectKey)}`)
@@ -44,6 +63,7 @@ test("project and workspace kebabs open action sheets on compact layouts", async
     });
     await expect(page.getByText("Workspace actions", { exact: true })).toBeVisible();
   } finally {
+    await secondProject?.cleanup();
     await seeded.cleanup();
   }
 });
