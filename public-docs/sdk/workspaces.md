@@ -69,6 +69,23 @@ as workspace creation intent, never as an agent property.
 Creation and inclusive discovery require `features.backgroundWorkspaces`; the client rejects an
 unsupported host with an update-host message.
 
+## Nest and order workspaces
+
+Pass `parentWorkspaceId` to `create()` to append a workspace under an active workspace in the same project and daemon. Move an existing workspace with:
+
+```ts
+await client.workspaces.move(childId, {
+  parentWorkspaceId: parentId,
+  beforeWorkspaceId: nextSiblingId,
+});
+
+await workspace.move({ parentWorkspaceId: null }); // append at the project's top level
+```
+
+Omit `beforeWorkspaceId` to append under the destination parent. The daemon assigns a floating-point `siblingOrder` between the neighboring siblings and rebalances exhausted gaps. Workspace descriptors expose `parentWorkspaceId` and `siblingOrder`; list responses remain flat.
+
+Nesting organizes the sidebar. A workspace keeps its directory, branch, agents, and terminals when moved. Moves into a descendant or another project are rejected. Archiving a parent promotes its active children without archiving them. These actions require a host advertising `features.workspaceHierarchy`.
+
 ## Start an agent in a workspace
 
 Create through the workspace handle:

@@ -163,6 +163,13 @@ export interface PaseoWorkspaceArchiveResult {
   error: string | null;
 }
 
+export type PaseoWorkspaceMoveOptions = Omit<
+  Parameters<DaemonClient["moveWorkspace"]>[0],
+  "workspaceId"
+>;
+
+export type PaseoWorkspaceMoveResult = Awaited<ReturnType<DaemonClient["moveWorkspace"]>>;
+
 export type PaseoWorkspaceUpdate = Extract<
   SessionOutboundMessage,
   { type: "workspace_update" }
@@ -183,6 +190,7 @@ export interface PaseoWorkspaceHandle {
   current(): PaseoWorkspace | null;
   refresh(options?: { requestId?: string }): Promise<PaseoWorkspace | null>;
   setTitle(title: string | null, requestId?: string): Promise<{ title: string | null }>;
+  move(options: PaseoWorkspaceMoveOptions): Promise<PaseoWorkspaceMoveResult>;
   archive(requestId?: string): Promise<PaseoWorkspaceArchiveResult>;
   /**
    * Subscribes to already-emitted daemon workspace_update events for this id.
@@ -212,6 +220,10 @@ export interface PaseoWorkspaceActions {
     requestId?: string,
   ): Promise<PaseoWorkspaceHandle>;
   create(options: PaseoWorkspaceCreateOptions): Promise<PaseoWorkspaceHandle>;
+  move(
+    workspace: string | PaseoWorkspaceHandle,
+    options: PaseoWorkspaceMoveOptions,
+  ): Promise<PaseoWorkspaceMoveResult>;
   archive(
     workspace: string | PaseoWorkspaceHandle,
     requestId?: string,
@@ -728,6 +740,8 @@ export function createPaseoApi(
       },
       archive: (workspace, requestId) =>
         daemonClient.archiveWorkspace(resolveWorkspaceId(workspace), requestId),
+      move: (workspace, options) =>
+        daemonClient.moveWorkspace({ ...options, workspaceId: resolveWorkspaceId(workspace) }),
       subscribe: listenWorkspaces,
     },
     agents: {
@@ -841,6 +855,12 @@ function createWorkspaceHandleFactory(
       current: () => current,
       refresh,
       setTitle: (title, requestId) => daemonClient.setWorkspaceTitle(id, title, requestId),
+      move: async (options) => {
+        const result = await daemonClient.moveWorkspace({ ...options, workspaceId: id });
+        const moved = result.workspaces.find((entry) => entry.id === id);
+        if (moved) current = moved;
+        return result;
+      },
       archive: async (requestId) => {
         const result = await daemonClient.archiveWorkspace(id, requestId);
         if (current) {

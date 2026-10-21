@@ -624,6 +624,80 @@ test("workspace handles keep identity and refresh snapshots through existing dri
   await client.close();
 });
 
+test("workspace moves persist parent and sibling position and refresh the handle", async () => {
+  const { client, ws } = await connectClient({ workspaceHierarchy: true });
+  const workspace = client.workspaces.ref(createWorkspace());
+  const move = workspace.move({
+    parentWorkspaceId: "parent",
+    beforeWorkspaceId: "next-sibling",
+    requestId: "move-workspace",
+  });
+  expect(parseSentSessionMessage(ws.sent.at(-1))).toMatchObject({
+    type: "workspace.move.request",
+    requestId: "move-workspace",
+    workspaceId: "workspace_sdk",
+    parentWorkspaceId: "parent",
+    beforeWorkspaceId: "next-sibling",
+  });
+  ws.message(
+    sessionMessage({
+      type: "workspace.move.response",
+      payload: {
+        requestId: "move-workspace",
+        workspaceId: "workspace_sdk",
+        accepted: true,
+        workspaces: [createWorkspace({ parentWorkspaceId: "parent", siblingOrder: 1.5 })],
+        error: null,
+      },
+    }),
+  );
+  await expect(move).resolves.toMatchObject({ accepted: true });
+  expect(workspace.current()).toMatchObject({ parentWorkspaceId: "parent", siblingOrder: 1.5 });
+  await client.close();
+});
+
+test("a rejected workspace move preserves its previous parent and reports the daemon error", async () => {
+  const { client, ws } = await connectClient({ workspaceHierarchy: true });
+  const workspace = client.workspaces.ref(
+    createWorkspace({ parentWorkspaceId: null, siblingOrder: 3 }),
+  );
+  const move = workspace.move({ parentWorkspaceId: "descendant", requestId: "cycle" });
+  const rejection = expect(move).rejects.toThrow(
+    "A workspace cannot be moved under its descendant",
+  );
+  ws.message(
+    sessionMessage({
+      type: "workspace.move.response",
+      payload: {
+        requestId: "cycle",
+        workspaceId: "workspace_sdk",
+        accepted: false,
+        workspaces: [],
+        error: "A workspace cannot be moved under its descendant",
+      },
+    }),
+  );
+  await rejection;
+  expect(workspace.current()).toMatchObject({ parentWorkspaceId: null, siblingOrder: 3 });
+  await client.close();
+});
+
+test("unsupported hosts reject nested creation and moves without sending a mutation", async () => {
+  const { client, ws } = await connectClient({});
+  const sentCount = ws.sent.length;
+  await expect(
+    client.workspaces.move("workspace_sdk", { parentWorkspaceId: null }),
+  ).rejects.toThrow("Update this host");
+  await expect(
+    client.workspaces.create({
+      source: { kind: "directory", path: "/repo/sdk" },
+      parentWorkspaceId: "parent",
+    }),
+  ).rejects.toThrow("Update this host");
+  expect(ws.sent).toHaveLength(sentCount);
+  await client.close();
+});
+
 test("plugin-shaped PR workspace create and agent create use the existing daemon RPCs", async () => {
   const { client, ws } = await connectClient();
   const createdWorkspace = createWorkspace({ id: "workspace_fresh", name: "Issue 42" });

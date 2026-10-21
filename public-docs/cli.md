@@ -255,6 +255,9 @@ paseo workspace ls --background               # Also include background workspac
 paseo run --workspace <workspace-id> "implement authentication"
 paseo workspace rename <workspace-id> "Auth rework"
 paseo workspace rename <workspace-id> --reset   # back to the branch or directory name
+paseo workspace move <workspace-id> --parent <parent-id>
+paseo workspace move <workspace-id> --parent <parent-id> --before <sibling-id>
+paseo workspace move <workspace-id> --root       # append at the project's top level
 paseo workspace archive <workspace-id>
 ```
 

@@ -4,6 +4,38 @@ import { render } from "../../output/index.js";
 import { toWorkspaceRow, workspaceSchema, workspaceWithBackgroundSchema } from "./shared.js";
 
 describe("workspace inventory output", () => {
+  it("preserves nested placement and fractional sibling order in JSON output", () => {
+    const descriptor = {
+      id: "child",
+      projectId: "project",
+      projectDisplayName: "Project",
+      projectRootPath: "/tmp/project",
+      name: "Child",
+      workspaceKind: "directory",
+      projectKind: "directory",
+      workspaceDirectory: "/tmp/project",
+      parentWorkspaceId: "parent",
+      siblingOrder: 1.5,
+      status: "done",
+      statusEnteredAt: null,
+      archivingAt: null,
+      activityAt: null,
+      scripts: [],
+      gitRuntime: null,
+      githubRuntime: null,
+    } satisfies WorkspaceDescriptorPayload;
+    const result = {
+      type: "single" as const,
+      data: toWorkspaceRow(descriptor),
+      schema: workspaceSchema,
+    };
+    expect(JSON.parse(render(result, { format: "json" }))).toMatchObject({
+      workspaceId: "child",
+      parentWorkspaceId: "parent",
+      siblingOrder: 1.5,
+    });
+  });
+
   it.each([workspaceSchema, workspaceWithBackgroundSchema])(
     "preserves pinned, unpinned and unavailable metadata in structured output",
     (schema) => {

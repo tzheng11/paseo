@@ -477,6 +477,7 @@ export interface CreateAgentRequestOptions extends AgentConfigOverrides {
 export interface CreateWorkspaceRequestOptions {
   source: WorkspaceCreateRequest["source"];
   title?: string;
+  parentWorkspaceId?: string | null;
   /** Workspace discovery visibility; contents retain normal durability. */
   background?: boolean;
   callerAgentId?: string;
@@ -3198,6 +3199,25 @@ export class DaemonClient {
     return { pinnedAt: payload.pinnedAt };
   }
 
+  async moveWorkspace(input: {
+    workspaceId: string;
+    parentWorkspaceId: string | null;
+    beforeWorkspaceId?: string | null;
+    requestId?: string;
+  }) {
+    if (this.lastServerInfoMessage?.features?.workspaceHierarchy !== true) {
+      throw new Error("Update this host to organize nested workspaces.");
+    }
+    const { requestId, ...move } = input;
+    const payload = await this.sendCorrelatedSessionRequest({
+      requestId,
+      message: { type: "workspace.move.request", ...move },
+      responseType: "workspace.move.response",
+    });
+    if (!payload.accepted) throw new Error(payload.error ?? "Unable to move workspace.");
+    return payload;
+  }
+
   async setWorkspaceSuperpinned(
     workspaceId: string,
     superpinned: boolean,
@@ -4793,6 +4813,11 @@ export class DaemonClient {
     requestId?: string,
   ): Promise<WorkspaceCreatePayload> {
     const resolvedRequestId = this.createRequestId(requestId ?? input.requestId);
+    if (
+      input.parentWorkspaceId &&
+      this.lastServerInfoMessage?.features?.workspaceHierarchy !== true
+    )
+      throw new Error("Update this host to create nested workspaces.");
     if (input.background !== undefined || input.callerAgentId) this.requireBackgroundWorkspaces();
     if (input.agent?.background !== undefined)
       throw new Error("Configure background on the workspace, not its initial agent.");
@@ -4827,6 +4852,9 @@ export class DaemonClient {
           ? { idempotencyKey: input.idempotencyKey }
           : {}),
         ...(input.title !== undefined ? { title: input.title } : {}),
+        ...(input.parentWorkspaceId !== undefined
+          ? { parentWorkspaceId: input.parentWorkspaceId }
+          : {}),
         ...(input.background !== undefined ? { background: input.background } : {}),
         ...(input.callerAgentId ? { callerAgentId: input.callerAgentId } : {}),
         ...(input.firstAgentContext !== undefined

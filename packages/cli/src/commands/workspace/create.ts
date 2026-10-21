@@ -9,6 +9,7 @@ export interface WorkspaceCreateOptions extends CommandOptions {
   path?: string;
   project?: string;
   title?: string;
+  parent?: string;
   mode?: string;
   worktreeSlug?: string;
   newBranch?: string;
@@ -150,6 +151,7 @@ export async function runCreateCommand(
     const payload = await client.createWorkspace({
       source: buildWorkspaceSource(options),
       ...(options.title ? { title: options.title } : {}),
+      ...(options.parent ? { parentWorkspaceId: options.parent } : {}),
       ...(options.background !== undefined ? { background: options.background } : {}),
       ...(callerAgentId ? { callerAgentId } : {}),
     });
