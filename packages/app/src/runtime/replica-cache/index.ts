@@ -312,6 +312,8 @@ const StoredWorkspaceSchema = z.strictObject({
   title: z.string().nullable(),
   pinnedAt: z.string().nullable(),
   superpinnedAt: z.string().nullable().optional(),
+  parentWorkspaceId: z.string().nullable().optional(),
+  siblingOrder: z.number().optional(),
   // Optional because entries written before labels existed have none. A cached workspace that
   // dropped them painted its row without its chips and stayed that way: the directory cursor is
   // current on reconnect, so the daemon has nothing newer to send back.
@@ -386,12 +388,12 @@ const DirectoryCheckpointSchema = z.strictObject({
 // Revalidate directory contents once without evicting cached rows or timelines.
 const StoredDirectoryCheckpointSchema = z.strictObject({
   version: z.literal(1),
-  workspaceFieldsVersion: z.union([z.literal(1), z.literal(2)]).optional(),
+  workspaceFieldsVersion: z.union([z.literal(1), z.literal(2), z.literal(3)]).optional(),
   cursors: DirectoryCheckpointSchema,
 });
 
 function serializeDirectoryCheckpoint(cursors: DirectoryCheckpoint) {
-  return { version: 1 as const, workspaceFieldsVersion: 2 as const, cursors };
+  return { version: 1 as const, workspaceFieldsVersion: 3 as const, cursors };
 }
 
 function deserializeDirectoryCheckpoint(payload: string): DirectoryCheckpoint {
@@ -401,7 +403,9 @@ function deserializeDirectoryCheckpoint(payload: string): DirectoryCheckpoint {
   // Earlier workspace rows omitted Info values. Refresh that baseline even when
   // its cursor is current, preserving other cached directories and timelines.
   // COMPAT(workspaceSuperpinCache): older rows omitted superpinnedAt while their cursor stayed current.
-  if (stored.workspaceFieldsVersion !== 2) delete cursors.workspaces;
+  // COMPAT(workspaceHierarchyCache): added in v0.12.0; remove after 2027-04-21.
+  // Earlier rows discarded hierarchy while retaining a cursor that could suppress its refetch.
+  if (stored.workspaceFieldsVersion !== 3) delete cursors.workspaces;
   return cursors;
 }
 
@@ -715,6 +719,8 @@ function serializeWorkspace(workspace: WorkspaceDescriptor): StoredWorkspace {
     title: workspace.title ?? null,
     pinnedAt: workspace.pinnedAt ?? null,
     superpinnedAt: workspace.superpinnedAt ?? null,
+    parentWorkspaceId: workspace.parentWorkspaceId ?? null,
+    siblingOrder: workspace.siblingOrder,
     labels: workspace.labels,
     fieldValues: workspace.fieldValues ?? {},
     status: workspace.status,

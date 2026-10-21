@@ -306,6 +306,83 @@ async function expectLegacyWorkspaceRefresh({
 }
 
 describe("ReplicaCache", () => {
+  it.each([
+    { parentWorkspaceId: null, siblingOrder: 0 },
+    { parentWorkspaceId: "parent-workspace", siblingOrder: 1536.5 },
+  ])(
+    "retains workspace hierarchy across cache reopen ($parentWorkspaceId, $siblingOrder)",
+    async (hierarchy) => {
+      const storage = new MemoryStorage();
+      const writer = createCache(storage);
+      const baseline = directory({ workspaces: { generation: "g", afterSeq: 12 } });
+      baseline.workspaces.set(
+        "workspace-1",
+        normalizeWorkspaceDescriptor({ ...workspacePayload(), ...hierarchy }),
+      );
+      commitDirectory(writer, SERVER_ID, baseline);
+      await writer.flush();
+
+      const reader = createCache(storage);
+      expect((await reader.readWorkspace(SERVER_ID, "workspace-1"))?.workspace).toMatchObject(
+        hierarchy,
+      );
+      const restored = await reader.readDirectory(SERVER_ID);
+      expect(restored.workspaces.get("workspace-1")).toMatchObject(hierarchy);
+      expect(restored.checkpoint).toEqual(baseline.checkpoint);
+    },
+  );
+
+  it("refreshes version-2 workspace cursors that cached no hierarchy while preserving other replicas", async () => {
+    const storage = new MemoryStorage();
+    const writer = createCache(storage);
+    const baseline = directory({
+      workspaces: { generation: "g", afterSeq: 12 },
+      agents: { generation: "g", afterSeq: 9 },
+      projects: { generation: "g", afterSeq: 4 },
+    });
+    const hierarchy = { parentWorkspaceId: "parent-workspace", siblingOrder: 1536.5 };
+    baseline.workspaces.set(
+      "workspace-1",
+      normalizeWorkspaceDescriptor({ ...workspacePayload(), ...hierarchy }),
+    );
+    commitDirectory(writer, SERVER_ID, baseline);
+    writer.commitTimeline(SERVER_ID, "agent-1", timeline());
+    await writer.flush();
+    for (const row of storage.rows.values()) {
+      if (row.kind === "workspace") {
+        const payload = JSON.parse(row.payload);
+        delete payload.parentWorkspaceId;
+        delete payload.siblingOrder;
+        row.payload = JSON.stringify(payload);
+      }
+      if (row.kind === "checkpoint")
+        row.payload = JSON.stringify({
+          version: 1,
+          workspaceFieldsVersion: 2,
+          cursors: baseline.checkpoint,
+        });
+    }
+
+    const reader = createCache(storage);
+    const restored = await reader.readDirectory(SERVER_ID);
+    expect(restored.checkpoint).toEqual({
+      agents: baseline.checkpoint.agents,
+      projects: baseline.checkpoint.projects,
+    });
+    expect(restored.workspaces.get("workspace-1")?.parentWorkspaceId).toBeNull();
+    expect(restored.workspaces.get("workspace-1")?.siblingOrder).toBeUndefined();
+    expect(restored.agents).toEqual(baseline.agents);
+    expect(restored.projects).toEqual(baseline.projects);
+    expect(await reader.readTimeline(SERVER_ID, "agent-1")).toEqual(timeline());
+
+    reader.replaceDirectoryBaseline(SERVER_ID, baseline);
+    await reader.flush();
+    const reopened = await createCache(storage).readDirectory(SERVER_ID);
+    expect(reopened.workspaces.get("workspace-1")).toMatchObject(hierarchy);
+    expect(reopened.checkpoint).toEqual(baseline.checkpoint);
+    const checkpoints = await storage.read(SERVER_ID, ["checkpoint"]);
+    expect(checkpoints.map((row) => JSON.parse(row.payload).workspaceFieldsVersion)).toEqual([3]);
+  });
   it.each([true, false, undefined])(
     "preserves background visibility (%s) when reopening a cached workspace",
     async (background) => {
