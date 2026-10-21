@@ -1,6 +1,6 @@
 import { isWeb } from "@/constants/platform";
 import { useCallback, useEffect, useMemo, useRef } from "react";
-import { Text, View, ScrollView } from "react-native";
+import { View, ScrollView } from "react-native";
 import { GripVertical } from "lucide-react-native";
 import { withUnistyles } from "react-native-unistyles";
 import {
@@ -43,6 +43,7 @@ import { workspaceDropPosition, type WorkspaceTreeDrop } from "./drop-target";
 import { resolveWorkspaceKeyboardDrop } from "./keyboard-drop";
 import {
   WorkspaceTreeRowChrome,
+  WorkspaceTreeDragPreview,
   foregroundMutedColorMapping,
   workspaceTreeStyles,
   type WorkspaceTreeRowProps,
@@ -191,8 +192,8 @@ function WebTreeDragSurface({
       {children}
       <DragOverlay dropAnimation={null}>
         {active ? (
-          <View style={workspaceTreeStyles.ghost}>
-            <Text style={workspaceTreeStyles.ghostText}>{active.name}</Text>
+          <View testID="workspace-tree-drag-preview" style={workspaceTreeStyles.ghost}>
+            <WorkspaceTreeDragPreview name={active.name} />
           </View>
         ) : null}
       </DragOverlay>

@@ -41,6 +41,12 @@ export function WorkspaceTreeRowChrome({
   const accessibilityValue = useMemo(() => ({ now: depth }), [depth]);
   const collapseVisual = collapsed ? expandIcon : collapseIcon;
   const target = drag.drop?.targetWorkspaceKey === workspace.workspaceKey ? drag.drop : null;
+  const blocked =
+    drag.rejection?.targetWorkspaceKey === workspace.workspaceKey ? drag.rejection : null;
+  const targetName = target
+    ? (drag.workspaces.find((item) => item.workspaceKey === workspace.workspaceKey)?.name ??
+      workspace.name)
+    : workspace.name;
   return (
     <View
       style={[
@@ -68,14 +74,35 @@ export function WorkspaceTreeRowChrome({
         )}
       </View>
       <View style={styles.content}>{children}</View>
-      {target ? <WorkspaceTreeDropIndicator drop={target} /> : null}
+      {target ? <WorkspaceTreeDropIndicator drop={target} targetName={targetName} /> : null}
+      {blocked ? (
+        <View
+          pointerEvents="none"
+          testID="workspace-tree-drop-blocked"
+          accessibilityRole="alert"
+          accessibilityLiveRegion="polite"
+          style={[styles.inside, styles.blocked]}
+        >
+          <Text numberOfLines={2} style={[styles.dropLabel, styles.blockedText]}>
+            {blocked.message}
+          </Text>
+        </View>
+      ) : null}
     </View>
   );
 }
-export function WorkspaceTreeDropIndicator({ drop }: { drop: WorkspaceTreeDrop }) {
+export function WorkspaceTreeDropIndicator({
+  drop,
+  targetName,
+}: {
+  drop: WorkspaceTreeDrop;
+  targetName: string;
+}) {
   return (
     <View
       pointerEvents="none"
+      accessibilityRole="text"
+      accessibilityLiveRegion="polite"
       testID={`workspace-tree-drop-${drop.position}`}
       style={
         drop.position === "inside"
@@ -83,8 +110,40 @@ export function WorkspaceTreeDropIndicator({ drop }: { drop: WorkspaceTreeDrop }
           : [styles.line, drop.position === "before" ? styles.before : styles.after]
       }
     >
-      {drop.position === "inside" ? <Text style={styles.dropLabel}>Nest workspace</Text> : null}
+      {drop.position === "inside" ? (
+        <Text numberOfLines={2} style={styles.dropLabel}>
+          Nest under “{targetName}”
+        </Text>
+      ) : null}
     </View>
+  );
+}
+const dropActionLabels = { inside: "Nest under", before: "Move before", after: "Move after" };
+export function WorkspaceTreeDragPreview({ name }: { name: string }) {
+  const drag = useWorkspaceTreeDrag();
+  const target = drag.drop
+    ? drag.workspaces.find((workspace) => workspace.workspaceKey === drag.drop?.targetWorkspaceKey)
+    : null;
+  const action = drag.drop
+    ? `${dropActionLabels[drag.drop.position]} “${target?.name ?? "workspace"}”`
+    : null;
+  const message = drag.rejection?.message ?? action;
+  return (
+    <>
+      <Text numberOfLines={1} style={workspaceTreeStyles.ghostText}>
+        {name}
+      </Text>
+      {message ? (
+        <Text
+          numberOfLines={3}
+          accessibilityLiveRegion="polite"
+          testID="workspace-tree-drag-feedback"
+          style={[workspaceTreeStyles.ghostFeedback, drag.rejection && styles.blockedText]}
+        >
+          {message}
+        </Text>
+      ) : null}
+    </>
   );
 }
 export const workspaceTreeStyles = StyleSheet.create((theme) => ({
@@ -97,10 +156,13 @@ export const workspaceTreeStyles = StyleSheet.create((theme) => ({
   },
   ghost: {
     padding: theme.spacing[2],
+    gap: theme.spacing[1],
+    maxWidth: 320,
     backgroundColor: theme.colors.surface2,
     borderRadius: theme.borderRadius.md,
   },
   ghostText: { fontSize: theme.fontSize.sm, color: theme.colors.foreground },
+  ghostFeedback: { fontSize: theme.fontSize.sm, color: theme.colors.foregroundMuted },
 }));
 const styles = StyleSheet.create((theme) => ({
   row: { position: "relative", flexDirection: "row", alignItems: "center" },
@@ -129,9 +191,16 @@ const styles = StyleSheet.create((theme) => ({
     justifyContent: "flex-end",
   },
   dropLabel: {
+    maxWidth: "100%",
     fontSize: theme.fontSize.sm,
     color: theme.colors.accent,
     paddingHorizontal: theme.spacing[2],
     backgroundColor: theme.colors.surfaceSidebar,
   },
+  blocked: {
+    borderColor: theme.colors.destructive,
+    alignItems: "stretch",
+    justifyContent: "center",
+  },
+  blockedText: { color: theme.colors.destructive, flexShrink: 1, textAlign: "center" },
 }));
