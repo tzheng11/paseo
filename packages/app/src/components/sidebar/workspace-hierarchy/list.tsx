@@ -149,6 +149,7 @@ export function WorkspaceHierarchyList({
     if (activeAncestorPath) expand(activeAncestorPath.split("\u0000"));
   }, [activeKey, activeAncestorPath, expand]);
   const mutation = useMutation({
+    networkMode: "always",
     mutationFn: async (move: WorkspaceTreeMove) => {
       const runtime = getHostRuntimeStore();
       const client = runtime.getClient(move.serverId);

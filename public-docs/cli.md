@@ -246,6 +246,9 @@ paseo run --workspace <workspace-id> --no-wait "review the checkout flow"
 
 Exact workspace and agent IDs remain accessible regardless of listing visibility.
 
+Add `--parent <workspace-id>` to create a child in the same project and host. Use `workspace move`
+to change its parent or sibling position later; omit `--before` to append.
+
 Then list, use, rename, or archive it:
 
 ```bash

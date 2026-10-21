@@ -31,10 +31,16 @@ Use the [CLI project commands](/docs/cli#projects) to register, list, rename, or
 
 ## Nest and order workspaces
 
+Use **Project** grouping and **Manual** sort to drag workspaces. If a project uses A–Z or Last
+Activity, select **Use manual order** first. The host must support workspace hierarchy.
+
 Drag a workspace onto another workspace to make it a child. Drag above or below a row to place it
 before or after that workspace. You can reorder children and nest them further, or drag a child
 beside a top-level workspace to move it back to the project level. The sidebar shows where the
 workspace will land before you release it.
+
+You can also focus a workspace and press Space to pick it up. Use Up/Down to reorder and
+Right/Left to nest or outdent. Press Space to save, or Escape to cancel.
 
 Use the arrow beside a parent to collapse or expand its children. Nesting stays within one project
 on one host. You cannot move a workspace underneath itself or one of its descendants.
