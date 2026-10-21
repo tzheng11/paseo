@@ -45,6 +45,9 @@ Right/Left to nest or outdent. Press Space to save, or Escape to cancel.
 Use the arrow beside a parent to collapse or expand its children. Nesting stays within one project
 on one host. You cannot move a workspace underneath itself or one of its descendants.
 
+Large projects initially show 20 top-level workspaces and their children. Use **Show more** to see
+the remaining roots. Opening a child keeps its parent tree visible even beyond that limit.
+
 The hierarchy and manual sibling order are saved on the host and shared with your other clients.
 Nesting organizes the sidebar: each workspace keeps its own working directory, branch, and sessions.
 Archiving a parent keeps its children active and moves them up one level.
