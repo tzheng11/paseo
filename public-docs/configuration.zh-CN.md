@@ -68,7 +68,7 @@ daemon 会在应用任何内容之前校验整个文件。它会应用运行时�
 paseo daemon restart
 ```
 
-运行时安全的设置包括：中继启用、MCP 设置、浏览器工具、主机名、CORS 来源、受信任的代理、Git 进程限制、Agent 和终端配置、Provider 定义、元数据生成、应用基础 URL、Provider 目录超时，以及全局插件开关。删除其中某个设置会应用该字段缺省时的行为；删除某个 Provider 会把它从之后的启动中移除。
+运行时安全的设置包括：中继启用、MCP 设置、浏览器工具、主机名、CORS 来源、受信任的代理、Git 进程限制、Agent 和终端配置、Provider 定义、元数据生成、应用基础 URL、Provider 目录超时、空闲卸载时间，以及全局插件开关。删除其中某个设置会应用该字段缺省时的行为；删除某个 Provider 会把它从之后的启动中移除。
 
 当你删除 `daemon.relay.enabled` 时，新的主目录会保持中继关闭。如果 daemon 启动时其配置就已经省略了这个字段，它会为了兼容而保持旧版的中继开启行为。编辑较旧的配置时，请显式设置 `daemon.relay.enabled`。
 
@@ -81,6 +81,10 @@ paseo daemon restart
 Agent Provider，包括 Paseo 自带的一等 Provider 和你在 `agents.providers` 下添加的自定义条目，都在单独的页面中介绍。
 
 心智模型见 [Provider](/docs/providers)，Paseo 可以启动的全部 Agent 见[支持的 Provider](/docs/supported-providers)。要让 Claude 指向兼容 Anthropic 的端点（Z.AI、Alibaba/Qwen）、使用多个配置、自定义二进制文件、ACP Agent，以及了解 `additionalModels` 的合并行为，见[自定义 Provider](/docs/custom-providers)。完整的字段参考在 GitHub 上的 [docs/custom-providers.md](https://github.com/getpaseo/paseo/blob/main/docs/custom-providers.md)。
+
+## 空闲 Agent 运行时 {#idle-agent-runtimes}
+
+将 `agents.idleUnloadAfterMinutes` 设为 daemon 释放 Agent 的 Provider 进程前所需的空闲分钟数。默认值为 120；设为 0 可以禁用。此设置可以通过 `paseo reload` 应用，无需重启。Agent 仍会列为空闲，并在下次发送消息、读取时间线或附加时恢复会话。哪些检查会保留有后台工作或活动状态不确定的 Agent，见[运行时驻留](https://github.com/getpaseo/paseo/blob/main/docs/agent-lifecycle.md#runtime-residency)。
 
 ## worktree {#worktrees}
 

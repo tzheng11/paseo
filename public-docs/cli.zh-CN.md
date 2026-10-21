@@ -22,6 +22,20 @@ paseo stop <id>                      # Stop an agent
 paseo usage                          # Show account quotas and balances
 ```
 
+## 列出 Agent {#listing-agents}
+
+```bash
+paseo ls -g --json                  # All non-archived agents across directories
+paseo ls -g --background --json     # Also include background workspace agents
+paseo ls -a --json                  # Include archived and background agents
+```
+
+Agent 列表会读取 daemon 的每一页，包括超过 200 个 Agent 的清单。JSON 输出仍然是一个数组。如果任意一页失败或续页信息无效，命令会以状态 `1` 退出，并向 stderr 写入错误，不会输出不完整的数组。成功但结果为空时返回 `[]`。
+
+列表会遍历匹配的目录条目，而不是读取一个原子快照：遍历期间创建、删除或更改 Agent 都可能影响结果。
+
+`stop --all`、`stop --cwd`、`permit ls` 和 worktree 的 Agent 关联也会读取每一页。重新加载、归档和分离会直接按完整的 Agent UUID 查询；前缀和标题会搜索所有页，包括已归档的 Agent。有歧义的前缀或标题会被拒绝。找不到完整 UUID 时，不会回退到标题查找。
+
 ## 账号用量 {#account-usage}
 
 显示主机用量来源中的账号配额和余额：
@@ -125,6 +139,37 @@ paseo run --output-schema '{"type":"object","properties":{"summary":{"type":"str
 
 旧的 `run --background` 和 `-d` 别名仍然表示 `--no-wait`。它们已被弃用，不会出现在帮助中，并会向 stderr 输出警告。请在脚本中使用 `--no-wait`。工作区的可见性通过 `workspace create --background` 单独选择；本版本不会改变 `run --background` 的含义。
 
+## 重新加载 Agent {#reloading-agents}
+
+使用 `paseo agent reload <id-or-name>` 执行[运行时重新加载](../docs/agent-lifecycle.md#idle-only-reload)。添加 `--only-if-idle` 可以在 Agent 有活动工作时拒绝重新加载。这需要主机支持原子的仅空闲重新加载。
+
+维护 Claude 或 Codex 凭据时，可以保留现有时间线，并跳过 daemon 端的 Provider 历史回放：
+
+```bash
+paseo agent reload <full-agent-uuid> --only-if-idle --preserve-history --operation-id <uuid> --json
+paseo agent reload-status <uuid> --json
+```
+
+这三个维护参数必须一起使用。在发送重新加载请求之前，先选择并保存操作 UUID。响应包含 `agentId`、`operationId` 和 `status`，状态为 `pending`、`completed`、`refused`、`failed` 或 `unknown`，还可能包含 `reasonCode`、`reason` 和 `retryable`。
+
+`reload-status` 查询持久保存的操作记录。未知操作返回 `status: "unknown"` 和 `reasonCode: "NOT_FOUND"`，不包含 Agent ID。超时或连接丢失会以错误退出；继续分派工作之前，请先查询已保存的操作 UUID。不支持凭据维护的主机会对重新加载请求返回结构化拒绝，并对状态查询返回更新提示。
+
+对于已有的 `RELOAD_CLEANUP_UNCONFIRMED`，本地维护人员可以在不重放操作的情况下确认清理结果。先协调一个无活动工作的时段，并通过 daemon 和 Provider 进程各自的管理者停止它们。此命令不会关闭进程或发送信号：
+
+```bash
+paseo agent reload-reconcile-cleanup <original-operation-uuid> --home <paseo-home> \
+  --agent-id <original-agent-uuid> --retired-worker-pid <captured-worker-pid> \
+  --expected-receipt-sha256 <original-file-hash> --launch-contract <inspection.json> --json
+```
+
+检查文件需要 `version: 1`（仅使用内置启动方式时）、未更改的 `config.json` 的 `configSha256`、`builtinProviderLaunchesVerified: true`、`noRenamedOrMarkerLosingWrappers: true`、`inspectedBy`，以及与源码绑定的 `evidence` 引用。它记录维护人员的实际检查，不会为任意 Provider 覆盖项作出保证。
+已检查的透明代理需要 `version: 2` 和 `inspectedWrappers: [{provider: "codex", path: "/absolute/frame-proxy.py", sha256: "<64 hex>"}]`。每个条目必须与该 Provider 的单一路径命令覆盖项和未更改的普通文件匹配；符号链接、相对路径、含空白的路径，以及配置的解释器或 shell 前缀路径都会被拒绝。
+检查应覆盖事故期间的启动路径，包括之前的覆盖项。代理及其分离的原生子进程都必须已退出。旧版工具会拒绝版本 2，而不会忽略其中的包装程序证据。目前需要 macOS。存在活动的 daemon、工作进程、Provider 根进程或代理，进程清单不完整，源码或记录改变，或存在不支持的不确定状态时，都会拒绝确认。
+
+版本 3 允许经过验证、与当前操作无关的已签名应用或独立 daemon 进程树，见[历史归属检查](../docs/agent-lifecycle.md#offline-cleanup-reconciliation)。冻结的操作系统证据会在预检、清理、确认和回滚时用相同条件重新检查；它不会免除停用历史写入进程的要求，也不保证之后的会话独占。更早的工具会拒绝版本 3。
+
+原始 UUID、凭据代次和时间会保留。最终结果是 `failed`、`retryable: true` 和 `RELOAD_CLEANUP_RECONCILED`，不会伪造为 `completed`。旁边的证据文件让重复确认保持幂等。重启匹配的 daemon 并回读原始 UUID 后，兼容的 Fleet 读取者会恢复其正常的有界队列。
+
 ## 项目 {#projects}
 
 把当前目录注册为项目，然后列出 daemon 知道的项目：
@@ -195,12 +240,15 @@ paseo run --workspace <workspace-id> --no-wait "review the checkout flow"
 
 ```bash
 paseo workspace ls
+paseo workspace ls --json                     # Includes pin metadata
 paseo workspace ls --background               # Also include background workspaces
 paseo run --workspace <workspace-id> "implement authentication"
 paseo workspace rename <workspace-id> "Auth rework"
 paseo workspace rename <workspace-id> --reset   # back to the branch or directory name
 paseo workspace archive <workspace-id>
 ```
+
+工作区 JSON 行包含 daemon 返回的 `pinnedAt`：时间戳表示已置顶，`null` 表示未置顶，字段省略则表示主机没有提供置顶元数据。不要把字段省略视为未置顶。`--background` 在包含后台工作区的同时保留相同元数据。
 
 当 Paseo 无法从源检出推断代码托管平台时，为 PR 检出添加 `--forge <name>`。setup 钩子和服务见 [Git worktree](/docs/worktrees)。
 
@@ -266,7 +314,7 @@ paseo plugin remove my-plugin
 
 `paseo plugin ls [id]` 不会联系远程。`paseo plugin logs <id>` 返回插件最近的 daemon 端 stdout 和 stderr。添加 `--json` 获得结构化条目，或运行 `paseo --host <target> plugin logs <id>` 查看另一个 daemon。安装、信任、生命周期和日志保留行为见[插件参考](/docs/plugins/reference)。
 
-## 列出 Agent {#listing-agents}
+## 列出 Agent {#listing-agents-1}
 
 ```bash
 paseo ls                    # Non-archived agents in active workspaces
