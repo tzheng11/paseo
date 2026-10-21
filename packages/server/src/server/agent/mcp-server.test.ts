@@ -7843,3 +7843,75 @@ it("reports an unloaded idle agent through MCP status and listings without loadi
     vi.useRealTimers();
   }
 });
+
+it("creates, moves and lists ordered workspace hierarchy through MCP", async () => {
+  const logger = createTestLogger();
+  const directory = await mkdtemp(join(tmpdir(), "paseo-mcp-hierarchy-"));
+  try {
+    const registry = new FileBackedWorkspaceRegistry(join(directory, "workspaces.json"), logger);
+    const makeRecord = (workspaceId: string, parentWorkspaceId: string | null = null) =>
+      createPersistedWorkspaceRecord({
+        workspaceId,
+        projectId: "project",
+        parentWorkspaceId,
+        cwd: directory,
+        kind: "directory",
+        displayName: workspaceId,
+        createdAt: "2026-10-21T00:00:00.000Z",
+        updatedAt: "2026-10-21T00:00:00.000Z",
+      });
+    await registry.upsert(makeRecord("parent"));
+    const emitted: string[][] = [];
+    const { agentManager, agentStorage } = createTestDeps();
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      providerSnapshotManager: createOpenCodeManager().manager,
+      workspaceRegistry: registry,
+      logger,
+      createDirectoryWorkspace: async (_cwd, _title, projectId, context) => {
+        expect(projectId).toBe("project");
+        await registry.upsert(makeRecord("child", context?.parentWorkspaceId));
+        const workspace = await registry.get("child");
+        if (!workspace) throw new Error("Expected child workspace");
+        return workspace;
+      },
+      emitWorkspaceUpdatesForWorkspaceIds: async (ids) => {
+        emitted.push([...ids]);
+      },
+    });
+    const created = await invokeToolWithParsedInput(registeredTool(server, "create_workspace"), {
+      isolation: "local",
+      path: directory,
+      parentWorkspaceId: "parent",
+    });
+    expect(created.structuredContent).toMatchObject({
+      workspaceId: "child",
+      parentWorkspaceId: "parent",
+      siblingOrder: 1024,
+    });
+    const moved = await invokeToolWithParsedInput(registeredTool(server, "move_workspace"), {
+      workspaceId: "child",
+      parentWorkspaceId: null,
+      beforeWorkspaceId: "parent",
+    });
+    expect(moved.structuredContent).toMatchObject({
+      workspaces: [{ workspaceId: "child", parentWorkspaceId: null, siblingOrder: 0 }],
+    });
+    expect(emitted).toEqual([["child"]]);
+    const listed = await invokeToolWithParsedInput(registeredTool(server, "list_workspaces"), {});
+    expect(listed.structuredContent.workspaces).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ workspaceId: "child", parentWorkspaceId: null, siblingOrder: 0 }),
+      ]),
+    );
+    await expect(
+      invokeToolWithParsedInput(registeredTool(server, "move_workspace"), {
+        workspaceId: "parent",
+        parentWorkspaceId: "parent",
+      }),
+    ).rejects.toThrow("cycle");
+  } finally {
+    await removeTempDir(directory);
+  }
+});

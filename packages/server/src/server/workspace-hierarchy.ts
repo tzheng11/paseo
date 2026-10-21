@@ -125,6 +125,29 @@ export function appendWorkspaceToHierarchy(
   );
 }
 
+export function parentForRestoredWorkspace(
+  records: ReadonlyMap<string, PersistedWorkspaceRecord>,
+  workspace: PersistedWorkspaceRecord,
+): string | null {
+  const seen = new Set([workspace.workspaceId]);
+  let cursor = workspace.parentWorkspaceId ?? null;
+  while (cursor !== null && !seen.has(cursor)) {
+    seen.add(cursor);
+    const parent = records.get(cursor);
+    if (!parent || parent.projectId !== workspace.projectId) return null;
+    if (!parent.archivedAt) {
+      try {
+        validateParent(records, workspace, cursor);
+        return cursor;
+      } catch {
+        return null;
+      }
+    }
+    cursor = parent.parentWorkspaceId ?? null;
+  }
+  return null;
+}
+
 export function promoteWorkspaceChildren(
   records: ReadonlyMap<string, PersistedWorkspaceRecord>,
   workspace: PersistedWorkspaceRecord,
@@ -137,7 +160,7 @@ export function promoteWorkspaceChildren(
       : null;
   const staged = new Map(records);
   const changed = new Map<string, PersistedWorkspaceRecord>();
-  const children = siblings(records, { ...workspace, workspaceId: "" }, workspace.workspaceId);
+  const children = siblings(records, workspace, workspace.workspaceId);
   for (const child of children) {
     for (const next of moveWorkspaceInHierarchy(staged, {
       workspaceId: child.workspaceId,
@@ -155,18 +178,25 @@ export function promoteWorkspaceChildren(
 export function normalizeLegacyWorkspaceHierarchy(
   records: Map<string, PersistedWorkspaceRecord>,
 ): void {
+  const groupKey = (workspace: PersistedWorkspaceRecord) =>
+    JSON.stringify([workspace.projectId, workspace.parentWorkspaceId ?? null]);
+  const maximumByGroup = new Map<string, number>();
+  for (const workspace of records.values()) {
+    const key = groupKey(workspace);
+    maximumByGroup.set(key, Math.max(maximumByGroup.get(key) ?? 0, workspace.siblingOrder ?? 0));
+  }
   const ordered = [...records.values()].sort((left, right) =>
     left.workspaceId.localeCompare(right.workspaceId),
   );
   for (const workspace of ordered) {
     if (workspace.parentWorkspaceId !== undefined && workspace.siblingOrder !== undefined) continue;
-    const parentWorkspaceId = workspace.parentWorkspaceId ?? null;
-    const peers = siblings(records, workspace, parentWorkspaceId);
-    const maximum = Math.max(0, ...peers.map((peer) => peer.siblingOrder ?? 0));
+    const key = groupKey(workspace);
+    const siblingOrder = workspace.siblingOrder ?? (maximumByGroup.get(key) ?? 0) + ORDER_SPACING;
+    maximumByGroup.set(key, Math.max(maximumByGroup.get(key) ?? 0, siblingOrder));
     records.set(workspace.workspaceId, {
       ...workspace,
-      parentWorkspaceId,
-      siblingOrder: workspace.siblingOrder ?? maximum + ORDER_SPACING,
+      parentWorkspaceId: workspace.parentWorkspaceId ?? null,
+      siblingOrder,
     });
   }
 }

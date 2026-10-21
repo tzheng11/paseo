@@ -11,6 +11,7 @@ import {
 
 import {
   appendWorkspaceToHierarchy,
+  parentForRestoredWorkspace,
   moveWorkspaceInHierarchy,
   promoteWorkspaceChildren,
   normalizeLegacyWorkspaceHierarchy,
@@ -601,19 +602,28 @@ export class FileBackedWorkspaceRegistry
     let rebalanced: PersistedWorkspaceRecord[] = [];
     const workspace = await this.mutateCache((records) => {
       const existing = records.get(record.workspaceId);
-      // Placement refreshes must preserve concurrent hierarchy edits.
-      const next = existing
+      // Placement refreshes must preserve concurrent hierarchy edits. Restoring
+      // appends under the closest surviving active ancestor in this same commit.
+      let next = existing
         ? {
             ...record,
             parentWorkspaceId: existing.parentWorkspaceId ?? null,
             siblingOrder: existing.siblingOrder,
           }
-        : (() => {
-            const appended = appendWorkspaceToHierarchy(records, record);
-            rebalanced = appended.filter((entry) => entry.workspaceId !== record.workspaceId);
-            for (const entry of rebalanced) records.set(entry.workspaceId, entry);
-            return appended.find((entry) => entry.workspaceId === record.workspaceId)!;
-          })();
+        : record;
+      if (!existing || (existing.archivedAt && !record.archivedAt)) {
+        if (existing)
+          next = { ...next, parentWorkspaceId: parentForRestoredWorkspace(records, existing) };
+        const appended = appendWorkspaceToHierarchy(records, next);
+        rebalanced = appended.filter((entry) => entry.workspaceId !== record.workspaceId);
+        for (const entry of rebalanced) records.set(entry.workspaceId, entry);
+        const appendedWorkspace = appended.find(
+          (entry) => entry.workspaceId === record.workspaceId,
+        );
+        if (!appendedWorkspace)
+          throw new Error("Workspace hierarchy append did not produce its workspace");
+        next = appendedWorkspace;
+      }
       const parsed = PersistedWorkspaceRecordSchema.parse(next);
       records.set(parsed.workspaceId, parsed);
       return parsed;

@@ -463,7 +463,7 @@ export function createWorkspaceProvisioningService(deps: {
     }
     if (!next) return workspace;
     await workspaceRegistry.upsert(next);
-    return next;
+    return (await workspaceRegistry.get(next.workspaceId)) ?? next;
   }
 
   async function refreshWorkspaceRecord(

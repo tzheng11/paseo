@@ -9872,3 +9872,131 @@ test.each(["refresh_agent_request", "agent.reload_idle.request"] as const)(
     });
   },
 );
+
+test("workspace.move persists hierarchy before responding and broadcasts canonical descriptors", async () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "session-hierarchy-"));
+  try {
+    const registry = new FileBackedWorkspaceRegistry(
+      path.join(directory, "workspaces.json"),
+      createTestLogger(),
+    );
+    for (const workspaceId of ["parent", "child"])
+      await registry.upsert(
+        createPersistedWorkspaceRecord({
+          workspaceId,
+          projectId: "project",
+          cwd: directory,
+          kind: "directory",
+          displayName: workspaceId,
+          createdAt: "2026-10-21T00:00:00.000Z",
+          updatedAt: "2026-10-21T00:00:00.000Z",
+        }),
+      );
+    const emitted: SessionOutboundMessage[] = [];
+    const session = createSessionForWorkspaceTests({
+      workspaceRegistry: registry,
+      paseoHome: directory,
+      onMessage: (message) => emitted.push(message),
+    });
+    await session.handleMessage({
+      type: "fetch_workspaces_request",
+      requestId: "subscribe",
+      subscribe: { subscriptionId: "hierarchy" },
+    });
+    emitted.length = 0;
+    await session.handleMessage({
+      type: "workspace.move.request",
+      requestId: "move",
+      workspaceId: "child",
+      parentWorkspaceId: "parent",
+    });
+    expect(findByType(emitted, "workspace.move.response")?.payload).toMatchObject({
+      accepted: true,
+      error: null,
+      workspaces: [{ id: "child", parentWorkspaceId: "parent", siblingOrder: 1024 }],
+    });
+    expect(
+      filterByType(emitted, "workspace_update").some(
+        (message) =>
+          message.payload.kind === "upsert" &&
+          message.payload.workspace.parentWorkspaceId === "parent",
+      ),
+    ).toBe(true);
+    const reloaded = new FileBackedWorkspaceRegistry(
+      path.join(directory, "workspaces.json"),
+      createTestLogger(),
+    );
+    expect(await reloaded.get("child")).toMatchObject({
+      parentWorkspaceId: "parent",
+      siblingOrder: 1024,
+    });
+    emitted.length = 0;
+    await session.handleMessage({
+      type: "workspace.move.request",
+      requestId: "cycle",
+      workspaceId: "parent",
+      parentWorkspaceId: "child",
+    });
+    expect(findByType(emitted, "workspace.move.response")?.payload).toMatchObject({
+      accepted: false,
+      workspaces: [],
+    });
+    expect(await registry.get("parent")).toMatchObject({ parentWorkspaceId: null });
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("workspace creation hierarchy returns assigned parent and order with inferred project membership", async () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "session-hierarchy-create-"));
+  try {
+    const registry = new FileBackedWorkspaceRegistry(
+      path.join(directory, "workspaces.json"),
+      createTestLogger(),
+    );
+    const projects = new FileBackedProjectRegistry(
+      path.join(directory, "projects.json"),
+      createTestLogger(),
+    );
+    await projects.upsert(
+      createPersistedProjectRecord({
+        projectId: "project",
+        rootPath: directory,
+        kind: "non_git",
+        displayName: "project",
+        createdAt: "2026-10-21T00:00:00.000Z",
+        updatedAt: "2026-10-21T00:00:00.000Z",
+      }),
+    );
+    await registry.upsert(
+      createPersistedWorkspaceRecord({
+        workspaceId: "parent",
+        projectId: "project",
+        cwd: directory,
+        kind: "directory",
+        displayName: "Parent",
+        createdAt: "2026-10-21T00:00:00.000Z",
+        updatedAt: "2026-10-21T00:00:00.000Z",
+      }),
+    );
+    const emitted: SessionOutboundMessage[] = [];
+    const session = createSessionForWorkspaceTests({
+      workspaceRegistry: registry,
+      projectRegistry: projects,
+      paseoHome: directory,
+      onMessage: (message) => emitted.push(message),
+    });
+    await session.handleMessage({
+      type: "workspace.create.request",
+      requestId: "nested-create",
+      source: { kind: "directory", path: directory },
+      parentWorkspaceId: "parent",
+    });
+    expect(findByType(emitted, "workspace.create.response")?.payload).toMatchObject({
+      error: null,
+      workspace: { projectId: "project", parentWorkspaceId: "parent", siblingOrder: 1024 },
+    });
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

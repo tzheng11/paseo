@@ -658,3 +658,215 @@ describe("superpin persistence", () => {
     ).toMatchObject(writes[2]);
   });
 });
+
+describe("ordered workspace hierarchy", () => {
+  let hierarchyDir: string;
+  let registry: FileBackedWorkspaceRegistry;
+  const logger = createTestLogger();
+  function record(
+    workspaceId: string,
+    parentWorkspaceId: string | null = null,
+    projectId = "project",
+  ) {
+    return createPersistedWorkspaceRecord({
+      workspaceId,
+      parentWorkspaceId,
+      projectId,
+      cwd: `/tmp/${workspaceId}`,
+      kind: "directory",
+      displayName: workspaceId,
+      createdAt: "2026-10-21T00:00:00.000Z",
+      updatedAt: "2026-10-21T00:00:00.000Z",
+    });
+  }
+  beforeEach(() => {
+    hierarchyDir = mkdtempSync(path.join(os.tmpdir(), "workspace-hierarchy-"));
+    registry = new FileBackedWorkspaceRegistry(path.join(hierarchyDir, "workspaces.json"), logger);
+  });
+  afterEach(() => rmSync(hierarchyDir, { recursive: true, force: true }));
+
+  test("appends concurrent creations with unique durable ranks and preserves parentage on reload", async () => {
+    await registry.upsert(record("parent"));
+    await Promise.all(["a", "b", "c"].map((id) => registry.upsert(record(id, "parent"))));
+    const children = (await registry.list()).filter(
+      (entry) => entry.parentWorkspaceId === "parent",
+    );
+    expect(children.map((entry) => entry.siblingOrder)).toEqual([1024, 2048, 3072]);
+    const reloaded = new FileBackedWorkspaceRegistry(
+      path.join(hierarchyDir, "workspaces.json"),
+      logger,
+    );
+    expect(await reloaded.get("b")).toMatchObject({
+      parentWorkspaceId: "parent",
+      siblingOrder: 2048,
+    });
+  });
+
+  test("moves and orders a subtree without moving descendants or losing parentage to stale metadata", async () => {
+    for (const id of ["a", "b", "c"]) await registry.upsert(record(id));
+    await registry.upsert(record("grandchild", "c"));
+    const stale = await registry.get("c");
+    const [moved] = await registry.move({
+      workspaceId: "c",
+      parentWorkspaceId: null,
+      beforeWorkspaceId: "b",
+    });
+    expect(moved?.siblingOrder).toBe(1536);
+    await registry.move({ workspaceId: "c", parentWorkspaceId: "a" });
+    expect(await registry.get("grandchild")).toMatchObject({ parentWorkspaceId: "c" });
+    if (!stale) throw new Error("Expected workspace");
+    await registry.upsert({ ...stale, title: "Refreshed" });
+    expect(await registry.get("c")).toMatchObject({ parentWorkspaceId: "a", title: "Refreshed" });
+    await registry.move({ workspaceId: "c", parentWorkspaceId: null, beforeWorkspaceId: "a" });
+    expect((await registry.get("c"))?.siblingOrder).toBeLessThan(
+      (await registry.get("a"))?.siblingOrder ?? 0,
+    );
+  });
+
+  test("rejects invalid parents, cycles and sibling insertion targets without mutation", async () => {
+    await registry.upsert(record("root"));
+    await registry.upsert(record("child", "root"));
+    await registry.upsert(record("other", null, "different-project"));
+    await registry.upsert(record("archived"));
+    await registry.archive("archived", "2026-10-21T01:00:00.000Z");
+    const before = await registry.list();
+    for (const input of [
+      { workspaceId: "root", parentWorkspaceId: "root" },
+      { workspaceId: "root", parentWorkspaceId: "child" },
+      { workspaceId: "child", parentWorkspaceId: "missing" },
+      { workspaceId: "child", parentWorkspaceId: "archived" },
+      { workspaceId: "child", parentWorkspaceId: "other" },
+      { workspaceId: "root", parentWorkspaceId: null, beforeWorkspaceId: "child" },
+    ])
+      await expect(registry.move(input)).rejects.toThrow();
+    expect(await registry.list()).toEqual(before);
+  });
+
+  test("serializes competing moves so concurrent requests cannot create a cycle", async () => {
+    await registry.upsert(record("a"));
+    await registry.upsert(record("b"));
+    const outcomes = await Promise.allSettled([
+      registry.move({ workspaceId: "a", parentWorkspaceId: "b" }),
+      registry.move({ workspaceId: "b", parentWorkspaceId: "a" }),
+    ]);
+    expect(outcomes.map((entry) => entry.status)).toEqual(["fulfilled", "rejected"]);
+    expect(await registry.get("a")).toMatchObject({ parentWorkspaceId: "b" });
+    expect(await registry.get("b")).toMatchObject({ parentWorkspaceId: null });
+  });
+
+  test.each(["precision", "duplicates"])(
+    "rebalances %s exhausted ranks atomically before inserting",
+    async (mode) => {
+      for (const id of ["a", "b", "c"]) await registry.upsert(record(id));
+      await registry.update("a", (entry) => ({ ...entry, siblingOrder: 1 }));
+      await registry.update("b", (entry) => ({
+        ...entry,
+        siblingOrder: mode === "precision" ? 1 + Number.EPSILON : 1,
+      }));
+      const changed = await registry.move({
+        workspaceId: "c",
+        parentWorkspaceId: null,
+        beforeWorkspaceId: "b",
+      });
+      expect(changed).toHaveLength(3);
+      const ranks = new Map(
+        (await registry.list()).map((entry) => [entry.workspaceId, entry.siblingOrder]),
+      );
+      expect(ranks.get("a")).toBe(1024);
+      expect(ranks.get("c")).toBe(1536);
+      expect(ranks.get("b")).toBe(2048);
+    },
+  );
+
+  test("archive and removal promote direct children and publish every affected workspace", async () => {
+    await registry.upsert(record("root"));
+    await registry.upsert(record("parent", "root"));
+    await registry.upsert(record("child", "parent"));
+    await registry.upsert(record("grandchild", "child"));
+    const publications: string[] = [];
+    registry.subscribeToMutations((mutation) => {
+      publications.push(`${mutation.kind}:${mutation.workspaceId}`);
+    });
+    await registry.archive("parent", "2026-10-21T01:00:00.000Z");
+    expect(await registry.get("child")).toMatchObject({ parentWorkspaceId: "root" });
+    expect(await registry.get("grandchild")).toMatchObject({ parentWorkspaceId: "child" });
+    expect(publications).toEqual(["archive:parent", "upsert:child"]);
+    await registry.remove("root");
+    expect(await registry.get("child")).toMatchObject({ parentWorkspaceId: null });
+  });
+
+  test("loads missing hierarchy fields as deterministic roots and persists them on the next write", async () => {
+    const file = path.join(hierarchyDir, "legacy.json");
+    const legacy = [record("b"), record("a")].map((entry) => {
+      const { parentWorkspaceId: _parent, siblingOrder: _order, ...rest } = entry;
+      return rest;
+    });
+    await writeJsonFileAtomic(file, legacy);
+    const legacyRegistry = new FileBackedWorkspaceRegistry(file, logger);
+    expect(await legacyRegistry.get("a")).toMatchObject({
+      parentWorkspaceId: null,
+      siblingOrder: 1024,
+    });
+    expect(await legacyRegistry.get("b")).toMatchObject({
+      parentWorkspaceId: null,
+      siblingOrder: 2048,
+    });
+    await legacyRegistry.update("a", (entry) => ({ ...entry, title: "Renamed" }));
+    const reloaded = new FileBackedWorkspaceRegistry(file, logger);
+    expect(await reloaded.get("b")).toMatchObject({ parentWorkspaceId: null, siblingOrder: 2048 });
+  });
+  test.each(["archive", "remove"])(
+    "restores archived children after parent %s under a surviving ancestor or root",
+    async (operation) => {
+      await registry.upsert(record("root"));
+      await registry.upsert(record("parent", "root"));
+      await registry.upsert(record("child", "parent"));
+      await registry.archive("child", "2026-10-21T01:00:00.000Z");
+      if (operation === "archive") await registry.archive("parent", "2026-10-21T02:00:00.000Z");
+      else await registry.remove("parent");
+      const child = await registry.get("child");
+      if (!child) throw new Error("Expected child");
+      await registry.upsert({ ...child, archivedAt: null });
+      expect(await registry.get("child")).toMatchObject({
+        archivedAt: null,
+        parentWorkspaceId: operation === "archive" ? "root" : null,
+      });
+    },
+  );
+  test("a failed disk write leaves hierarchy and its publications unchanged", async () => {
+    let failWrite = false;
+    const failing = new FileBackedWorkspaceRegistry(
+      path.join(hierarchyDir, "failure.json"),
+      logger,
+      {
+        writeRecords: async (file, records) => {
+          if (failWrite) throw new Error("Disk write failed");
+          await writeJsonFileAtomic(file, records);
+        },
+      },
+    );
+    await failing.upsert(record("parent"));
+    await failing.upsert(record("child"));
+    const publications: string[] = [];
+    failing.subscribeToMutations((mutation) => {
+      publications.push(mutation.workspaceId);
+    });
+    failWrite = true;
+    await expect(
+      failing.move({ workspaceId: "child", parentWorkspaceId: "parent" }),
+    ).rejects.toThrow("Disk write failed");
+    expect(await failing.get("child")).toMatchObject({
+      parentWorkspaceId: null,
+      siblingOrder: 2048,
+    });
+    expect(publications).toEqual([]);
+    const reloaded = new FileBackedWorkspaceRegistry(
+      path.join(hierarchyDir, "failure.json"),
+      logger,
+    );
+    expect(await reloaded.get("child")).toMatchObject({
+      parentWorkspaceId: null,
+      siblingOrder: 2048,
+    });
+  });
+});

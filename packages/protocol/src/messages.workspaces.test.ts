@@ -1315,3 +1315,44 @@ test("3fdb71dd-7bc7-81a5-9326-ed66ac77df7c@aeb84a4a9ae2#unpinned superpin reques
   };
   expect(SessionOutboundMessageSchema.parse(response)).toEqual(response);
 });
+
+describe("workspace hierarchy protocol", () => {
+  test("accepts append, sibling insertion and detach requests", () => {
+    for (const input of [
+      { parentWorkspaceId: "parent" },
+      { parentWorkspaceId: "parent", beforeWorkspaceId: "sibling" },
+      { parentWorkspaceId: null, beforeWorkspaceId: null },
+    ])
+      expect(
+        SessionInboundMessageSchema.parse({
+          type: "workspace.move.request",
+          requestId: "move",
+          workspaceId: "child",
+          ...input,
+        }),
+      ).toMatchObject(input);
+  });
+  test("accepts move results and optional parent creation without changing old requests", () => {
+    expect(
+      SessionOutboundMessageSchema.parse({
+        type: "workspace.move.response",
+        payload: {
+          requestId: "move",
+          workspaceId: "child",
+          accepted: false,
+          workspaces: [],
+          error: "Cycle",
+        },
+      }).type,
+    ).toBe("workspace.move.response");
+    const input = {
+      type: "workspace.create.request",
+      requestId: "create",
+      source: { kind: "directory", path: "/tmp/project" },
+    };
+    expect(WorkspaceCreateRequestSchema.parse(input)).not.toHaveProperty("parentWorkspaceId");
+    expect(
+      WorkspaceCreateRequestSchema.parse({ ...input, parentWorkspaceId: "parent" }),
+    ).toMatchObject({ parentWorkspaceId: "parent" });
+  });
+});
