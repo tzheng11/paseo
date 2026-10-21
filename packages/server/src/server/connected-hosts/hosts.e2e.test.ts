@@ -1311,6 +1311,56 @@ test("cancelling a logical scope during admission settles it and releases its ow
 });
 
 test(
+  "agent MCP preserves remote workspace hierarchy and fractional ranks",
+  { timeout: 30000 },
+  async () => {
+    const a = await daemon();
+    const b = await daemon();
+    const origin = await api(a);
+    const destination = await api(b);
+    await origin.paseo.hosts.add({ connection: `127.0.0.1:${b.port}` });
+    const serverId = (await online(origin.paseo)).hosts[0]!.serverId!;
+    const parent = await destination.paseo.workspaces.create({
+      source: { kind: "directory", path: b.staticDir },
+      title: "Remote parent",
+    });
+    const mcp = new Client({ name: "workspace-hierarchy", version: "1" });
+    cleanup.push(() => mcp.close());
+    await mcp.connect(
+      new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${a.port}/mcp/agents`)),
+    );
+
+    const created = await mcp.callTool({
+      name: "create_workspace",
+      arguments: {
+        serverId,
+        isolation: "local",
+        path: b.staticDir,
+        title: "Remote child",
+        parentWorkspaceId: parent.id,
+        siblingOrder: 0.125,
+      },
+    });
+    expect(created.isError, JSON.stringify(created)).not.toBe(true);
+    const { workspaceId } = z.object({ workspaceId: z.string() }).parse(created.structuredContent);
+    const saved = await destination.paseo.workspaces.ref(workspaceId).refresh();
+    const listing = await mcp.callTool({ name: "list_workspaces", arguments: { serverId } });
+    expect(listing.isError, JSON.stringify(listing)).not.toBe(true);
+    const listed = z
+      .object({ workspaces: z.array(z.object({ workspaceId: z.string() }).passthrough()) })
+      .parse(listing.structuredContent)
+      .workspaces.find((workspace) => workspace.workspaceId === workspaceId);
+    const expectedHierarchy = { parentWorkspaceId: parent.id, siblingOrder: 0.125 };
+
+    expect({ created: created.structuredContent, saved, listed }).toMatchObject({
+      created: expectedHierarchy,
+      saved: expectedHierarchy,
+      listed: expectedHierarchy,
+    });
+  },
+);
+
+test(
   "agent MCP discovers hosts, creates children on self and B, and notifies their parent",
   { timeout: 30000 },
   async () => {

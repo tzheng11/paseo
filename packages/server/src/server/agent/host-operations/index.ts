@@ -305,6 +305,8 @@ export function createHostResolver(input: {
                     },
               title: args.title as string | undefined,
               background: args.background as boolean | undefined,
+              parentWorkspaceId: args.parentWorkspaceId as string | null | undefined,
+              siblingOrder: args.siblingOrder as number | undefined,
             });
             if (response.error || !response.workspace)
               throw new Error(response.error ?? "Workspace creation failed");
@@ -363,6 +365,9 @@ function workspaceSummary(workspace: FetchWorkspacesEntry) {
     kind: workspace.workspaceKind === "checkout" ? "local_checkout" : workspace.workspaceKind,
     title: workspace.title,
     background: workspace.background,
+    // COMPAT(workspaceHierarchy): old connected hosts omit hierarchy; remove after 2027-04-21.
+    parentWorkspaceId: workspace.parentWorkspaceId ?? null,
+    siblingOrder: workspace.siblingOrder ?? 0,
   };
 }
 
