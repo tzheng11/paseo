@@ -85,7 +85,7 @@ function resolvePinnedRootDrop(
     pinnedOrderOnly: true,
   };
 }
-function effectiveParentId(
+export function effectiveParentId(
   workspaces: readonly SidebarWorkspacePlacement[],
   workspace: SidebarWorkspacePlacement,
 ): string | null {

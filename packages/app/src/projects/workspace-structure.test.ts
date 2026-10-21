@@ -65,6 +65,52 @@ describe("buildWorkspaceStructureProjects", () => {
     });
   });
 
+  test("keeps persisted sibling order stable when older hosts omit ranks", () => {
+    const key = "remote:github.com/acme/app";
+    const sessions = [
+      {
+        serverId: "old",
+        projects: [project({ id: "old-project", key, root: "/old/app" })],
+        workspaces: [
+          { ...workspace("old-d", "old-project", "/old/app"), name: "D" },
+          { ...workspace("old-b", "old-project", "/old/app"), name: "B" },
+        ],
+      },
+      {
+        serverId: "new",
+        projects: [project({ id: "new-project", key, root: "/new/app" })],
+        workspaces: [
+          {
+            ...workspace("rank-zero", "new-project", "/new/app"),
+            name: "D",
+            siblingOrder: 0,
+          },
+          {
+            ...workspace("rank-one", "new-project", "/new/app"),
+            name: "B",
+            siblingOrder: 1,
+          },
+        ],
+      },
+    ];
+    const orders = [sessions, sessions.toReversed()].map(
+      (orderedSessions) =>
+        buildWorkspaceStructureProjects({ sessions: orderedSessions })[0]!.workspaceKeys,
+    );
+
+    for (const order of orders) {
+      expect(order.filter((workspaceKey) => workspaceKey.startsWith("new:"))).toEqual([
+        "new:rank-zero",
+        "new:rank-one",
+      ]);
+      expect(order.filter((workspaceKey) => workspaceKey.startsWith("old:"))).toEqual([
+        "old:old-b",
+        "old:old-d",
+      ]);
+    }
+    expect(orders[0]).toEqual(orders[1]);
+  });
+
   test("groups the same project key across hosts and keeps host-local ids", () => {
     const key = "remote:github.com/acme/app";
     const result = buildWorkspaceStructureProjects({

@@ -20,6 +20,7 @@ import {
   type WorkspaceTreeProviderProps,
 } from "./controller";
 import { workspaceDropPosition } from "./drop-target";
+import { measureWorkspaceTreeRows, type WorkspaceRowGeometry } from "./native-geometry";
 import {
   WorkspaceTreeRowChrome,
   foregroundMutedColorMapping,
@@ -28,12 +29,6 @@ import {
 } from "./row-chrome";
 const frameStyle = { flex: 1 };
 const ThemedGrip = withUnistyles(GripVertical);
-interface RowGeometry {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
 interface NativeDragRegistry {
   register: (key: string, view: View | null) => void;
   start: (key: string, x: number, y: number) => void;
@@ -57,7 +52,11 @@ function NativeTreeDragSurface({ children }: { children: ReactNode }) {
   dragRef.current = drag;
   const nodes = useRef(new Map<string, View>());
   const recomputeTargetRef = useRef<((x: number, y: number) => void) | null>(null);
-  const rects = useRef(new Map<string, RowGeometry>());
+  const rects = useRef(new Map<string, WorkspaceRowGeometry>());
+  const dragSession = useRef(0);
+  const dragActive = useRef(false);
+  const measurementSequence = useRef(0);
+  const appliedMeasurement = useRef(0);
   const frame = useRef<View>(null);
   const frameOrigin = useRef({ x: 0, y: 0, height: 0 });
   const scroll = useRef<ScrollView | null>(null);
@@ -66,16 +65,35 @@ function NativeTreeDragSurface({ children }: { children: ReactNode }) {
   const pointerRef = useRef<{ x: number; y: number } | null>(null);
   const [pointer, setPointer] = useState<{ x: number; y: number } | null>(null);
   const measure = useCallback(() => {
+    if (!dragActive.current) return;
+    const session = dragSession.current;
+    const sequence = ++measurementSequence.current;
+    const isCurrent = () =>
+      dragActive.current &&
+      dragSession.current === session &&
+      sequence > appliedMeasurement.current;
     frame.current?.measureInWindow((x, y, _width, height) => {
-      frameOrigin.current = { x, y, height };
+      if (
+        dragActive.current &&
+        dragSession.current === session &&
+        sequence >= appliedMeasurement.current
+      )
+        frameOrigin.current = { x, y, height };
     });
-    for (const [key, view] of nodes.current)
-      view.measureInWindow((x, y, width, height) => {
-        rects.current.set(key, { x, y, width, height });
-        const currentPoint = pointerRef.current;
-        if (currentPoint) recomputeTargetRef.current?.(currentPoint.x, currentPoint.y);
-      });
+    measureWorkspaceTreeRows(nodes.current, isCurrent, (next) => {
+      appliedMeasurement.current = sequence;
+      rects.current = next;
+      const currentPoint = pointerRef.current;
+      if (currentPoint) recomputeTargetRef.current?.(currentPoint.x, currentPoint.y);
+    });
   }, []);
+  useEffect(
+    () => () => {
+      dragActive.current = false;
+      dragSession.current += 1;
+    },
+    [],
+  );
   useEffect(() => {
     if (!drag.activeWorkspaceKey) return;
     measure();
@@ -91,17 +109,19 @@ function NativeTreeDragSurface({ children }: { children: ReactNode }) {
   }, []);
   const start = useCallback(
     (key: string, x: number, y: number) => {
-      measure();
-      dragRef.current.start(key);
+      dragSession.current += 1;
+      dragActive.current = true;
       setPointer({ x, y });
       pointerRef.current = { x, y };
+      dragRef.current.start(key);
+      measure();
     },
     [measure],
   );
   const move = useCallback((x: number, y: number) => {
     setPointer((previous) => (previous?.x === x && previous?.y === y ? previous : { x, y }));
     pointerRef.current = { x, y };
-    let target: { key: string; rect: RowGeometry } | null = null;
+    let target: { key: string; rect: WorkspaceRowGeometry } | null = null;
     for (const [key, rect] of rects.current) {
       if (
         y >= rect.y &&
@@ -122,6 +142,9 @@ function NativeTreeDragSurface({ children }: { children: ReactNode }) {
   }, []);
   recomputeTargetRef.current = move;
   const end = useCallback((success: boolean) => {
+    dragActive.current = false;
+    dragSession.current += 1;
+    rects.current.clear();
     setPointer(null);
     pointerRef.current = null;
     if (success) dragRef.current.finish();

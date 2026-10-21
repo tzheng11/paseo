@@ -210,6 +210,11 @@ export const PASEO_TOOL_CATALOG = {
     context: field("title"),
     detail: { inputOrder: ["title", "workspaceId"] },
   },
+  move_workspace: {
+    label: "Move workspace",
+    context: field("workspaceId"),
+    detail: { inputOrder: ["workspaceId", "parentWorkspaceId", "beforeWorkspaceId"] },
+  },
   archive_workspace: {
     label: "Archive workspace",
     context: field("workspaceId"),

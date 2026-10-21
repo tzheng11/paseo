@@ -219,11 +219,14 @@ function compareWorkspaceStructureItems(
   left: WorkspaceStructureItem,
   right: WorkspaceStructureItem,
 ): number {
-  if (left.siblingOrder !== undefined && right.siblingOrder !== undefined) {
+  // Mixing rank comparisons with name comparisons would make mixed-version hosts non-transitive.
+  if (left.siblingOrder !== undefined) {
+    if (right.siblingOrder === undefined) return -1;
     return (
       left.siblingOrder - right.siblingOrder || left.workspaceId.localeCompare(right.workspaceId)
     );
   }
+  if (right.siblingOrder !== undefined) return 1;
   return (
     left.workspaceName.localeCompare(right.workspaceName, undefined, {
       numeric: true,

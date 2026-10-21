@@ -251,6 +251,72 @@ test("dragging nests and orders siblings, moves whole subtrees, and survives rel
   }
 });
 
+test("keyboard workspace dragging reorders, intentionally nests, and lifts out", async ({
+  page,
+}) => {
+  test.setTimeout(120_000);
+  const seeded = await seedWorkspace({ repoPrefix: "workspace-tree-keyboard-", title: "First" });
+  async function snapshot() {
+    const result = await seeded.client.fetchWorkspaces({ filter: { projectId: seeded.projectId } });
+    return result.entries;
+  }
+  const handle = () =>
+    page
+      .getByTestId(`workspace-tree-drag-${getServerId()}:${seeded.workspaceId}`)
+      .filter({ visible: true })
+      .first();
+  try {
+    const second = await seeded.client.createWorkspace({
+      source: { kind: "directory", path: seeded.repoPath, projectId: seeded.projectId },
+      title: "Second",
+    });
+    if (!second.workspace) throw new Error(second.error ?? "Workspace creation failed");
+    const secondId = second.workspace.id;
+    await gotoAppShell(page);
+    await waitForSidebarHydration(page);
+    await handle().focus();
+    await page.keyboard.press("Space");
+    await page.keyboard.press("ArrowDown");
+    await expect(page.getByTestId("workspace-tree-drop-after")).toBeVisible();
+    await page.keyboard.press("Space");
+    await expect
+      .poll(async () => {
+        const entries = await snapshot();
+        const first = entries.find((entry) => entry.id === seeded.workspaceId)!;
+        const next = entries.find((entry) => entry.id === secondId)!;
+        return first.parentWorkspaceId === null && first.siblingOrder! > next.siblingOrder!;
+      })
+      .toBe(true);
+
+    await handle().focus();
+    await page.keyboard.press("Space");
+    await page.keyboard.press("ArrowUp");
+    await page.keyboard.press("ArrowRight");
+    await expect(page.getByTestId("workspace-tree-drop-inside")).toBeVisible();
+    await page.keyboard.press("Space");
+    await expect
+      .poll(
+        async () =>
+          (await snapshot()).find((entry) => entry.id === seeded.workspaceId)?.parentWorkspaceId,
+      )
+      .toBe(secondId);
+
+    await handle().focus();
+    await page.keyboard.press("Space");
+    await page.keyboard.press("ArrowLeft");
+    await expect(page.getByTestId("workspace-tree-drop-after")).toBeVisible();
+    await page.keyboard.press("Space");
+    await expect
+      .poll(
+        async () =>
+          (await snapshot()).find((entry) => entry.id === seeded.workspaceId)?.parentWorkspaceId,
+      )
+      .toBe(null);
+  } finally {
+    await seeded.cleanup();
+  }
+});
+
 test("a rejected drag stays visible and can be retried against the real daemon", async ({
   page,
 }) => {
