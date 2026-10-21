@@ -112,6 +112,59 @@ async function visibleWorkspaceIds(list: Locator) {
     );
 }
 
+async function persistedHierarchy(page: Page, workspaceIds: string[]) {
+  return page.evaluate(
+    async ({ serverId, ids }) => {
+      const databaseName = "paseo-replica-row-store";
+      if (!(await indexedDB.databases()).some((database) => database.name === databaseName)) {
+        return null;
+      }
+      const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open(databaseName);
+        request.addEventListener("upgradeneeded", () => request.transaction?.abort());
+        request.addEventListener("success", () => resolve(request.result));
+        request.addEventListener("error", () => reject(request.error));
+      });
+      try {
+        if (!database.objectStoreNames.contains("rows")) return null;
+        const rows = await new Promise<
+          Array<{
+            serverId: string;
+            kind: string;
+            id: string;
+            payload: string;
+          }>
+        >((resolve, reject) => {
+          const transaction = database.transaction("rows", "readonly");
+          const request = transaction.objectStore("rows").getAll();
+          transaction.addEventListener("complete", () => resolve(request.result));
+          transaction.addEventListener("error", () => reject(transaction.error));
+          transaction.addEventListener("abort", () => reject(transaction.error));
+        });
+        const hostRows = rows.filter((row) => row.serverId === serverId);
+        const checkpoint = hostRows.find((row) => row.kind === "checkpoint");
+        return {
+          workspaceFieldsVersion: checkpoint
+            ? JSON.parse(checkpoint.payload).workspaceFieldsVersion
+            : undefined,
+          workspaces: ids.map((id) => {
+            const row = hostRows.find((entry) => entry.kind === "workspace" && entry.id === id);
+            const workspace = row ? JSON.parse(row.payload) : undefined;
+            return {
+              id,
+              parentWorkspaceId: workspace?.parentWorkspaceId,
+              siblingOrder: workspace?.siblingOrder,
+            };
+          }),
+        };
+      } finally {
+        database.close();
+      }
+    },
+    { serverId: getServerId(), ids: workspaceIds },
+  );
+}
+
 test("dragging nests workspaces, orders siblings with fractional positions, and survives reload", async ({
   page,
 }, testInfo) => {
@@ -159,8 +212,25 @@ test("dragging nests workspaces, orders siblings with fractional positions, and 
       .poll(() => visibleWorkspaceIds(list))
       .toEqual([project.workspaceId, first, third, second]);
 
+    const children = [first, third, second];
+    const expectedCache = {
+      workspaceFieldsVersion: 3,
+      workspaces: await Promise.all(
+        children.map(async (id) => {
+          const workspace = await readWorkspace(client, project, id);
+          return {
+            id,
+            parentWorkspaceId: workspace?.parentWorkspaceId,
+            siblingOrder: workspace?.siblingOrder,
+          };
+        }),
+      ),
+    };
+    // Reload only after the app has committed the hierarchy and cursor together.
+    await expect.poll(() => persistedHierarchy(page, children)).toEqual(expectedCache);
     await page.reload();
     await waitForSidebarHydration(page);
+    await expect.poll(() => persistedHierarchy(page, children)).toEqual(expectedCache);
     await expect
       .poll(() => visibleWorkspaceIds(list))
       .toEqual([project.workspaceId, first, third, second]);
