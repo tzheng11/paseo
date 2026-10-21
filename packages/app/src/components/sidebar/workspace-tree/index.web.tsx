@@ -7,6 +7,7 @@ import {
   DndContext,
   DragOverlay,
   KeyboardSensor,
+  defaultKeyboardCoordinateGetter,
   MouseSensor,
   TouchSensor,
   closestCenter,
@@ -19,6 +20,7 @@ import {
   type DragStartEvent,
   type DragEndEvent,
   type CollisionDetection,
+  type KeyboardCoordinateGetter,
 } from "@dnd-kit/core";
 import {
   SortableContext,
@@ -31,13 +33,14 @@ import type {
   DraggableListProps,
   DraggableListDragHandleProps,
 } from "@/components/draggable-list.types";
-import { getEventCoordinates } from "@dnd-kit/utilities";
+import { getEventCoordinates, isKeyboardEvent } from "@dnd-kit/utilities";
 import {
   WorkspaceTreeController,
   useWorkspaceTreeDrag,
   type WorkspaceTreeProviderProps,
 } from "./controller";
-import { workspaceDropPosition } from "./drop-target";
+import { workspaceDropPosition, type WorkspaceTreeDrop } from "./drop-target";
+import { resolveWorkspaceKeyboardDrop } from "./keyboard-drop";
 import {
   WorkspaceTreeRowChrome,
   foregroundMutedColorMapping,
@@ -45,6 +48,12 @@ import {
   type WorkspaceTreeRowProps,
 } from "./row-chrome";
 const ThemedGrip = withUnistyles(GripVertical);
+const treeAccessibility = {
+  screenReaderInstructions: {
+    draggable:
+      "Press Space to pick up. Use Up and Down to reorder. For workspaces, use Right to nest and Left to lift out. Press Space to drop or Escape to cancel.",
+  },
+};
 const treeCollisionDetection: CollisionDetection = (args) => {
   const kind = args.active.data.current?.kind;
   const scoped = {
@@ -59,14 +68,23 @@ const treeCollisionDetection: CollisionDetection = (args) => {
 export function WorkspaceTreeProvider(props: WorkspaceTreeProviderProps) {
   return (
     <WorkspaceTreeController {...props}>
-      <WebTreeDragSurface>{props.children}</WebTreeDragSurface>
+      <WebTreeDragSurface pinnedRootKeys={props.pinnedRootKeys}>
+        {props.children}
+      </WebTreeDragSurface>
     </WorkspaceTreeController>
   );
 }
-function WebTreeDragSurface({ children }: { children: React.ReactNode }) {
+function WebTreeDragSurface({
+  children,
+  pinnedRootKeys,
+}: {
+  children: React.ReactNode;
+  pinnedRootKeys?: ReadonlySet<string>;
+}) {
   const drag = useWorkspaceTreeDrag();
   const origin = useRef<{ x: number; y: number } | null>(null);
   const pointer = useRef<{ x: number; y: number } | null>(null);
+  const keyboardDrop = useRef<WorkspaceTreeDrop | null>(null);
   useEffect(() => {
     if (!isWeb) return;
     const trackPointer = (event: MouseEvent | TouchEvent) => {
@@ -79,14 +97,49 @@ function WebTreeDragSurface({ children }: { children: React.ReactNode }) {
       document.removeEventListener("touchmove", trackPointer, true);
     };
   }, []);
+  const keyboardCoordinates = useCallback<KeyboardCoordinateGetter>(
+    (event, args) => {
+      if (args.context.active?.data.current?.kind === "project")
+        return defaultKeyboardCoordinateGetter(event, args);
+      if (!["ArrowUp", "ArrowDown", "ArrowRight", "ArrowLeft"].includes(event.code)) return;
+      event.preventDefault();
+      const targets = args.context.droppableContainers
+        .getEnabled()
+        .filter((container) => container.data.current?.kind === "workspace")
+        .flatMap((container) => {
+          const rect = args.context.droppableRects.get(container.id);
+          return rect ? [{ key: String(container.id), rect }] : [];
+        })
+        .sort((left, right) => left.rect.top - right.rect.top);
+      const next = resolveWorkspaceKeyboardDrop({
+        code: event.code,
+        workspaces: drag.workspaces,
+        workspaceKey: String(args.active),
+        targetKeys: targets.map((target) => target.key),
+        currentDrop: keyboardDrop.current,
+        pinnedRootKeys,
+      });
+      if (!next) return;
+      const target = targets.find((item) => item.key === next.targetWorkspaceKey);
+      if (!target) return;
+      keyboardDrop.current = next;
+      drag.hover(next.targetWorkspaceKey, next.position);
+      return { x: target.rect.left, y: target.rect.top };
+    },
+    [drag, pinnedRootKeys],
+  );
   const sensors = useSensors(
     useSensor(MouseSensor, { activationConstraint: { distance: 6 } }),
     useSensor(TouchSensor, { activationConstraint: { delay: 220, tolerance: 6 } }),
-    useSensor(KeyboardSensor),
+    useSensor(KeyboardSensor, { coordinateGetter: keyboardCoordinates }),
   );
   const updateTarget = useCallback(
     (event: DragMoveEvent) => {
       if (event.active.data.current?.kind === "project") return;
+      if (isKeyboardEvent(event.activatorEvent)) {
+        const next = keyboardDrop.current;
+        return drag.hover(next?.targetWorkspaceKey ?? "", next?.position ?? "inside");
+      }
       if (!event.over) return drag.hover("", "inside");
       const targetNode: HTMLDivElement | undefined = event.over.data.current?.elementRef?.current;
       // dnd-kit caches row geometry across scroll frames. Use the viewport's
@@ -102,6 +155,7 @@ function WebTreeDragSurface({ children }: { children: React.ReactNode }) {
   const onDragStart = useCallback(
     (event: DragStartEvent) => {
       if (event.active.data.current?.kind === "project") return;
+      keyboardDrop.current = null;
       origin.current = getEventCoordinates(event.activatorEvent);
       pointer.current = origin.current;
       drag.start(String(event.active.id));
@@ -127,6 +181,7 @@ function WebTreeDragSurface({ children }: { children: React.ReactNode }) {
     <DndContext
       sensors={sensors}
       collisionDetection={treeCollisionDetection}
+      accessibility={treeAccessibility}
       onDragStart={onDragStart}
       onDragMove={updateTarget}
       onDragOver={updateTarget}
