@@ -2992,6 +2992,8 @@ export class Session {
         return this.handleProjectRemoveRequest(msg);
       case "workspace.field.value.set.request":
         return this.handleWorkspaceFieldValueSetRequest(msg);
+      case "workspace.move.request":
+        return this.handleWorkspaceMoveRequest(msg);
       case "workspace.title.set.request":
         return this.handleWorkspaceTitleSetRequest(msg.workspaceId, msg.title, msg.requestId);
       case "workspace.superpin.set.request":
@@ -3759,6 +3761,42 @@ export class Session {
           accepted: false,
           removedWorkspaceIds: [],
           error: getErrorMessageOr(error, "Failed to remove project"),
+        },
+      });
+    }
+  }
+
+  private async handleWorkspaceMoveRequest(
+    request: Extract<SessionInboundMessage, { type: "workspace.move.request" }>,
+  ): Promise<void> {
+    const { workspaceId, requestId, parentWorkspaceId, beforeWorkspaceId } = request;
+    try {
+      const workspace = await this.workspaceRegistry.move(workspaceId, {
+        parentWorkspaceId,
+        beforeWorkspaceId,
+      });
+      await this.emitWorkspaceUpdatesForWorkspaceIds([workspaceId]);
+      this.emit({
+        type: "workspace.move.response",
+        payload: {
+          requestId,
+          workspaceId,
+          accepted: true,
+          parentWorkspaceId: workspace.parentWorkspaceId ?? null,
+          siblingOrder: workspace.siblingOrder ?? 0,
+          error: null,
+        },
+      });
+    } catch (error) {
+      this.emit({
+        type: "workspace.move.response",
+        payload: {
+          requestId,
+          workspaceId,
+          accepted: false,
+          parentWorkspaceId,
+          siblingOrder: null,
+          error: getErrorMessageOr(error, "Failed to move workspace"),
         },
       });
     }
@@ -5804,6 +5842,8 @@ export class Session {
 
     return {
       id: workspace.workspaceId,
+      parentWorkspaceId: workspace.parentWorkspaceId,
+      siblingOrder: workspace.siblingOrder,
       projectId: workspace.projectId,
       projectDisplayName: resolvedProjectRecord
         ? resolveProjectDisplayName(resolvedProjectRecord)
@@ -5896,6 +5936,8 @@ export class Session {
     const projectRecord = await this.projectRegistry.get(result.workspace.projectId);
     return {
       id: result.workspace.workspaceId,
+      parentWorkspaceId: result.workspace.parentWorkspaceId,
+      siblingOrder: result.workspace.siblingOrder,
       projectId: result.workspace.projectId,
       projectDisplayName: projectRecord
         ? resolveProjectDisplayName(projectRecord)
@@ -6980,6 +7022,8 @@ export class Session {
         expectsInitialAgent: Boolean(request.firstAgentContext),
         workspaceId,
         background: request.background,
+        parentWorkspaceId: request.parentWorkspaceId,
+        siblingOrder: request.siblingOrder,
         callerWorkspaceId: await this.getCallerWorkspaceId(request.callerAgentId),
       },
     );
@@ -7044,6 +7088,8 @@ export class Session {
         firstAgentContext: request.firstAgentContext,
         title: request.title,
         background: request.background,
+        parentWorkspaceId: request.parentWorkspaceId,
+        siblingOrder: request.siblingOrder,
         callerWorkspaceId: await this.getCallerWorkspaceId(request.callerAgentId),
       },
       source.baseBranch

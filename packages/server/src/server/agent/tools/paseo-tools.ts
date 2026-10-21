@@ -138,7 +138,7 @@ export interface PaseoToolHostDependencies {
   listActiveWorkspaces?: ArchiveDependencies["listActiveWorkspaces"];
   archiveWorkspaceRecord?: ArchiveDependencies["archiveWorkspaceRecord"];
   emitWorkspaceUpdatesForWorkspaceIds?: ArchiveDependencies["emitWorkspaceUpdatesForWorkspaceIds"];
-  workspaceRegistry?: Pick<WorkspaceRegistry, "get" | "list" | "upsert">;
+  workspaceRegistry?: Pick<WorkspaceRegistry, "get" | "list" | "upsert" | "move">;
   setWorkspaceFieldValue?: (
     input: Parameters<typeof setWorkspaceFieldValueTransaction>[1],
   ) => Promise<string>;
@@ -147,7 +147,12 @@ export interface PaseoToolHostDependencies {
     cwd: string,
     title?: string | null,
     projectId?: string,
-    context?: { background?: boolean; callerWorkspaceId?: string },
+    context?: {
+      background?: boolean;
+      callerWorkspaceId?: string;
+      parentWorkspaceId?: string | null;
+      siblingOrder?: number;
+    },
   ) => Promise<PersistedWorkspaceRecord>;
   workspaceScripts?: Pick<WorkspaceScriptsService, "list" | "launch" | "stop">;
   markWorkspaceArchiving?: ArchiveDependencies["markWorkspaceArchiving"];
@@ -216,6 +221,8 @@ const WorkspaceAutomationSummarySchema = z.object({
   kind: z.enum(["directory", "local_checkout", "worktree"]),
   title: z.string().nullable(),
   background: z.boolean().optional(),
+  parentWorkspaceId: z.string().nullable(),
+  siblingOrder: z.number().finite(),
 });
 
 function toWorkspaceAutomationSummary(workspace: PersistedWorkspaceRecord) {
@@ -227,6 +234,8 @@ function toWorkspaceAutomationSummary(workspace: PersistedWorkspaceRecord) {
     kind: workspace.kind,
     title: workspace.title,
     background: workspace.background,
+    parentWorkspaceId: workspace.parentWorkspaceId ?? null,
+    siblingOrder: workspace.siblingOrder ?? 0,
   };
 }
 
@@ -1379,6 +1388,16 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
           ),
         projectId: z.string().optional().describe("Existing project id to own the workspace."),
         title: z.string().trim().min(1).optional(),
+        parentWorkspaceId: z
+          .string()
+          .trim()
+          .min(1)
+          .nullable()
+          .optional()
+          .describe(
+            "Parent workspace id within the same project. Omit or use null for the project root.",
+          ),
+        siblingOrder: z.number().finite().optional().describe("Order among sibling workspaces."),
         background: z
           .boolean()
           .optional()
@@ -1423,6 +1442,8 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       path,
       projectId,
       title,
+      parentWorkspaceId,
+      siblingOrder,
       background,
       mode,
       worktreeSlug,
@@ -1456,6 +1477,8 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         workspace = await options.createDirectoryWorkspace(cwd, title, projectId, {
           background,
           callerWorkspaceId: resolveCallerAgent()?.workspaceId,
+          parentWorkspaceId,
+          siblingOrder,
         });
       } else {
         let cwd =
@@ -1489,6 +1512,8 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
             ...(title ? { title } : {}),
             background,
             callerWorkspaceId: resolveCallerAgent()?.workspaceId,
+            parentWorkspaceId,
+            siblingOrder,
           },
         );
         if (!result.ok) {
@@ -1624,6 +1649,45 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
           }),
         };
       }
+    },
+  );
+
+  registerTool(
+    "move_workspace",
+    {
+      title: "Move workspace",
+      description:
+        "Move a workspace under a parent or to the project root, optionally before a sibling.",
+      inputSchema: {
+        workspaceId: z.string().trim().min(1),
+        parentWorkspaceId: z
+          .string()
+          .trim()
+          .min(1)
+          .nullable()
+          .describe("Destination parent workspace id, or null for the project root."),
+        beforeWorkspaceId: z
+          .string()
+          .trim()
+          .min(1)
+          .nullable()
+          .optional()
+          .describe("Place before this workspace in the destination; omit or use null to append."),
+      },
+      outputSchema: WorkspaceAutomationSummarySchema.shape,
+    },
+    async ({ workspaceId, parentWorkspaceId, beforeWorkspaceId }) => {
+      if (!options.workspaceRegistry) {
+        throw new Error("Workspace registry is not configured");
+      }
+      const workspace = await options.workspaceRegistry.move(workspaceId, {
+        parentWorkspaceId,
+        beforeWorkspaceId,
+      });
+      return {
+        content: [],
+        structuredContent: ensureValidJson(toWorkspaceAutomationSummary(workspace)),
+      };
     },
   );
 

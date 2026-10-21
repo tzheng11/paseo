@@ -28,6 +28,7 @@ import type {
   SessionOutboundMessage,
   WorkspaceDescriptorPayload,
   WorkspaceCreateRequest,
+  WorkspaceMoveRequest,
 } from "@getpaseo/protocol/messages";
 import { DaemonClient, type CreateAgentRequestOptions } from "./daemon-client.js";
 import {
@@ -170,6 +171,16 @@ export type PaseoWorkspaceUpdate = Extract<
 
 export type PaseoWorkspaceUpdateHandler = (update: PaseoWorkspaceUpdate) => void;
 
+export type PaseoWorkspaceMoveOptions = Pick<
+  WorkspaceMoveRequest,
+  "parentWorkspaceId" | "beforeWorkspaceId"
+>;
+
+export interface PaseoWorkspaceMoveResult {
+  parentWorkspaceId: string | null;
+  siblingOrder: number;
+}
+
 export interface PaseoWorkspaceHandle {
   readonly id: string;
   readonly projectId: string | null;
@@ -183,6 +194,7 @@ export interface PaseoWorkspaceHandle {
   current(): PaseoWorkspace | null;
   refresh(options?: { requestId?: string }): Promise<PaseoWorkspace | null>;
   setTitle(title: string | null, requestId?: string): Promise<{ title: string | null }>;
+  move(input: PaseoWorkspaceMoveOptions, requestId?: string): Promise<PaseoWorkspaceMoveResult>;
   archive(requestId?: string): Promise<PaseoWorkspaceArchiveResult>;
   /**
    * Subscribes to already-emitted daemon workspace_update events for this id.
@@ -212,6 +224,11 @@ export interface PaseoWorkspaceActions {
     requestId?: string,
   ): Promise<PaseoWorkspaceHandle>;
   create(options: PaseoWorkspaceCreateOptions): Promise<PaseoWorkspaceHandle>;
+  move(
+    workspace: string | PaseoWorkspaceHandle,
+    input: PaseoWorkspaceMoveOptions,
+    requestId?: string,
+  ): Promise<PaseoWorkspaceMoveResult>;
   archive(
     workspace: string | PaseoWorkspaceHandle,
     requestId?: string,
@@ -728,6 +745,8 @@ export function createPaseoApi(
       },
       archive: (workspace, requestId) =>
         daemonClient.archiveWorkspace(resolveWorkspaceId(workspace), requestId),
+      move: (workspace, input, requestId) =>
+        daemonClient.moveWorkspace(resolveWorkspaceId(workspace), input, requestId),
       subscribe: listenWorkspaces,
     },
     agents: {
@@ -841,6 +860,11 @@ function createWorkspaceHandleFactory(
       current: () => current,
       refresh,
       setTitle: (title, requestId) => daemonClient.setWorkspaceTitle(id, title, requestId),
+      move: async (input, requestId) => {
+        const result = await daemonClient.moveWorkspace(id, input, requestId);
+        if (current) current = { ...current, ...result };
+        return result;
+      },
       archive: async (requestId) => {
         const result = await daemonClient.archiveWorkspace(id, requestId);
         if (current) {

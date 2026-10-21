@@ -8316,3 +8316,84 @@ test("measures an outbound message in UTF-8 bytes against the daemon's message l
   expect(mock.sent).toHaveLength(1);
   expect(client.getConnectionState().status).toBe("connected");
 });
+
+test("workspace hierarchy sends correlated moves and reports daemon rejection", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "hierarchy",
+    logger: createMockLogger(),
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+  const connected = client.connect();
+  mock.triggerOpen({ features: { workspaceHierarchy: true } });
+  await connected;
+  const pending = client.moveWorkspace(
+    "child",
+    { parentWorkspaceId: "parent", beforeWorkspaceId: "last" },
+    "move-success",
+  );
+  expect(parseSentFrame(mock.sent[0])).toEqual({
+    type: "workspace.move.request",
+    workspaceId: "child",
+    parentWorkspaceId: "parent",
+    beforeWorkspaceId: "last",
+    requestId: "move-success",
+  });
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "workspace.move.response",
+      payload: {
+        requestId: "move-success",
+        workspaceId: "child",
+        accepted: true,
+        parentWorkspaceId: "parent",
+        siblingOrder: 0.5,
+        error: null,
+      },
+    }),
+  );
+  await expect(pending).resolves.toEqual({ parentWorkspaceId: "parent", siblingOrder: 0.5 });
+  const rejected = client.moveWorkspace("parent", { parentWorkspaceId: "child" }, "move-cycle");
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "workspace.move.response",
+      payload: {
+        requestId: "move-cycle",
+        workspaceId: "parent",
+        accepted: false,
+        parentWorkspaceId: "child",
+        siblingOrder: null,
+        error: "A workspace cannot be its own ancestor",
+      },
+    }),
+  );
+  await expect(rejected).rejects.toThrow("own ancestor");
+});
+
+test("workspace hierarchy requires a capable host before creating or moving", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "hierarchy-legacy",
+    logger: createMockLogger(),
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+  const connected = client.connect();
+  mock.triggerOpen({ features: {} });
+  await connected;
+  await expect(client.moveWorkspace("child", { parentWorkspaceId: null })).rejects.toThrow(
+    "Update the host",
+  );
+  await expect(
+    client.createWorkspace({
+      source: { kind: "directory", path: "/repo" },
+      parentWorkspaceId: "parent",
+    }),
+  ).rejects.toThrow("Update the host");
+  expect(mock.sent).toHaveLength(0);
+});

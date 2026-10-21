@@ -762,6 +762,7 @@ function createPaseoWorktreeForMcpTest(options: {
     existsOnDisk: async () => true,
     get: async (workspaceId: string) => workspaces.get(workspaceId) ?? null,
     list: async () => Array.from(workspaces.values()),
+    move: unexpectedWorkspaceMove,
     update: async (workspaceId, updater) => {
       const workspace = workspaces.get(workspaceId);
       if (!workspace) return null;
@@ -859,10 +860,19 @@ function createPaseoWorktreeForMcpTest(options: {
   };
 }
 
+async function unexpectedWorkspaceMove(): Promise<never> {
+  throw new Error("Unexpected workspace move");
+}
+
 // Typed in-memory workspace port for catalogue tests without workspace setup.
 function createAgentMcpServer(options: Parameters<typeof createAgentMcpServerWithDependencies>[0]) {
   return createAgentMcpServerWithDependencies({
-    workspaceRegistry: { get: async () => null, list: async () => [], upsert: async () => {} },
+    workspaceRegistry: {
+      get: async () => null,
+      list: async () => [],
+      upsert: async () => {},
+      move: unexpectedWorkspaceMove,
+    },
     ...options,
   });
 }
@@ -2455,6 +2465,8 @@ describe("create_agent MCP tool", () => {
         }),
         workspaceRegistry: {
           get: async (workspaceId) => workspaceRecords.get(workspaceId) ?? null,
+          list: async () => Array.from(workspaceRecords.values()),
+          move: unexpectedWorkspaceMove,
           upsert: async (record) => {
             workspaceRecords.set(record.workspaceId, record);
           },
@@ -3369,6 +3381,8 @@ describe("create_agent MCP tool", () => {
       cwd: "/tmp/paseo/worktrees/repo/feature",
       kind: "worktree",
       displayName: "feature",
+      parentWorkspaceId: "ws-parent",
+      siblingOrder: 1.5,
       createdAt: "2026-07-17T00:00:00.000Z",
       updatedAt: "2026-07-17T00:00:00.000Z",
     });
@@ -3380,6 +3394,7 @@ describe("create_agent MCP tool", () => {
         get: vi.fn(async () => workspace),
         list: vi.fn(async () => [workspace]),
         upsert: vi.fn(async () => undefined),
+        move: unexpectedWorkspaceMove,
       },
       logger,
     });
@@ -3388,13 +3403,24 @@ describe("create_agent MCP tool", () => {
     const response = await tool.handler({});
 
     expect(response.structuredContent.workspaces).toEqual([
-      expect.objectContaining({ workspaceId: "ws-feature", isolation: "worktree" }),
+      expect.objectContaining({
+        workspaceId: "ws-feature",
+        isolation: "worktree",
+        parentWorkspaceId: "ws-parent",
+        siblingOrder: 1.5,
+      }),
     ]);
   });
 
   it("creates an background local workspace and leaves it out of list_workspaces", async () => {
     const { agentManager, agentStorage } = createTestDeps();
-    const createCalls: Array<{ cwd: string; context: { background?: boolean } | undefined }> = [];
+    interface WorkspaceCreateCall {
+      cwd: string;
+      context: Parameters<
+        NonNullable<Parameters<typeof createAgentMcpServer>[0]["createDirectoryWorkspace"]>
+      >[3];
+    }
+    const createCalls: WorkspaceCreateCall[] = [];
     const backgroundWorkspace = createPersistedWorkspaceRecord({
       workspaceId: "ws-background",
       projectId: "project-1",
@@ -3404,6 +3430,8 @@ describe("create_agent MCP tool", () => {
       createdAt: "2026-07-17T00:00:00.000Z",
       updatedAt: "2026-07-17T00:00:00.000Z",
       background: true,
+      parentWorkspaceId: "ws-parent",
+      siblingOrder: 2,
     });
     const server = await createAgentMcpServer({
       agentManager,
@@ -3413,6 +3441,7 @@ describe("create_agent MCP tool", () => {
         get: vi.fn(async () => backgroundWorkspace),
         list: vi.fn(async () => [backgroundWorkspace]),
         upsert: vi.fn(async () => undefined),
+        move: unexpectedWorkspaceMove,
       },
       createDirectoryWorkspace: async (cwd, _title, _projectId, context) => {
         createCalls.push({ cwd, context });
@@ -3425,12 +3454,87 @@ describe("create_agent MCP tool", () => {
       isolation: "local",
       path: process.cwd(),
       background: true,
+      parentWorkspaceId: "ws-parent",
+      siblingOrder: 2,
     });
     expect(created.structuredContent.workspaceId).toBe("ws-background");
-    expect(createCalls).toEqual([{ cwd: process.cwd(), context: { background: true } }]);
+    expect(createCalls).toEqual([
+      {
+        cwd: process.cwd(),
+        context: { background: true, parentWorkspaceId: "ws-parent", siblingOrder: 2 },
+      },
+    ]);
 
     const listed = await registeredTool(server, "list_workspaces").handler({});
     expect(listed.structuredContent.workspaces).toEqual([]);
+  });
+
+  it("moves a workspace hierarchy through the workspace registry", async () => {
+    const { agentManager, agentStorage } = createTestDeps();
+    const workspace = createPersistedWorkspaceRecord({
+      workspaceId: "ws-child",
+      projectId: "project-1",
+      cwd: process.cwd(),
+      kind: "directory",
+      displayName: "child",
+      createdAt: "2026-07-17T00:00:00.000Z",
+      updatedAt: "2026-07-17T00:00:00.000Z",
+      parentWorkspaceId: "ws-parent",
+      siblingOrder: 1,
+    });
+    const calls: Array<Parameters<WorkspaceRegistry["move"]>> = [];
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      providerSnapshotManager: createOpenCodeManager().manager,
+      workspaceRegistry: {
+        get: async () => workspace,
+        list: async () => [workspace],
+        upsert: async () => {},
+        move: async (...args) => {
+          calls.push(args);
+          return workspace;
+        },
+      },
+      logger,
+    });
+    const response = await invokeToolWithParsedInput(registeredTool(server, "move_workspace"), {
+      workspaceId: "ws-child",
+      parentWorkspaceId: "ws-parent",
+      beforeWorkspaceId: "ws-sibling",
+    });
+    expect(calls).toEqual([
+      ["ws-child", { parentWorkspaceId: "ws-parent", beforeWorkspaceId: "ws-sibling" }],
+    ]);
+    expect(response.structuredContent).toMatchObject({
+      workspaceId: "ws-child",
+      parentWorkspaceId: "ws-parent",
+      siblingOrder: 1,
+    });
+  });
+
+  it("requires an explicit hierarchy parent and preserves workspace move errors", async () => {
+    const { agentManager, agentStorage } = createTestDeps();
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      providerSnapshotManager: createOpenCodeManager().manager,
+      workspaceRegistry: {
+        get: async () => null,
+        list: async () => [],
+        upsert: async () => {},
+        move: async () => {
+          throw new Error("Workspace ws-missing not found");
+        },
+      },
+      logger,
+    });
+    const tool = registeredTool(server, "move_workspace");
+    const parsed = await tool.inputSchema.safeParseAsync({ workspaceId: "ws-missing" });
+    expect(parsed.success).toBe(false);
+    await expect(
+      invokeToolWithParsedInput(tool, { workspaceId: "ws-missing", parentWorkspaceId: null }),
+    ).rejects.toThrow("Workspace ws-missing not found");
   });
 
   it("accepts custom provider IDs in create_agent input validation", async () => {
@@ -5472,6 +5576,8 @@ describe("rename_workspace MCP tool", () => {
       providerSnapshotManager: createOpenCodeManager().manager,
       workspaceRegistry: {
         get: async (workspaceId) => workspaces.get(workspaceId) ?? null,
+        list: async () => Array.from(workspaces.values()),
+        move: unexpectedWorkspaceMove,
         upsert: async (record) => {
           upsertedWorkspaces.push(record);
           workspaces.set(record.workspaceId, record);
@@ -5543,6 +5649,8 @@ describe("rename_workspace MCP tool", () => {
       providerSnapshotManager: createOpenCodeManager().manager,
       workspaceRegistry: {
         get: async (workspaceId) => workspaces.get(workspaceId) ?? null,
+        list: async () => Array.from(workspaces.values()),
+        move: unexpectedWorkspaceMove,
         upsert: async (record) => {
           upsertedWorkspaces.push(record);
           workspaces.set(record.workspaceId, record);
@@ -5604,6 +5712,8 @@ describe("rename_workspace MCP tool", () => {
       providerSnapshotManager: createOpenCodeManager().manager,
       workspaceRegistry: {
         get: async (workspaceId) => workspaces.get(workspaceId) ?? null,
+        list: async () => Array.from(workspaces.values()),
+        move: unexpectedWorkspaceMove,
         upsert: async (record) => {
           upsertedWorkspaces.push(record);
           workspaces.set(record.workspaceId, record);

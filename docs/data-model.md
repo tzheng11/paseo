@@ -492,10 +492,26 @@ workspace together with its owning project.
 
 Array of workspace records. A workspace is a specific working directory within a project.
 
+Workspace hierarchy is organizational and host-local. A parent must belong to the same project;
+changing it keeps the workspace's directory, agents, and worktree ownership. Hierarchy moves
+validate ancestry and update ordering inside one registry mutation, so concurrent moves cannot
+form a cycle. Ordinary record refreshes preserve these fields. Archiving a workspace keeps its
+children active; the sidebar presents children of an unavailable parent at the top level.
+
+Sibling ranks are finite floating-point numbers shared by clients. A move inserts between ranks;
+the registry renumbers that sibling group atomically when the gap no longer has a representable
+midpoint. Expanded and collapsed workspace preferences stay on the client.
+
+Client directory replicas persist parent IDs and ranks alongside their sync checkpoint. The
+checkpoint format changes when older cached projections cannot represent hierarchy; retaining
+an old cursor would prevent the daemon from sending those already-acknowledged fields again.
+
 | Field                          | Type                                                         | Description                                                                                                                                                                                   |
 | ------------------------------ | ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `workspaceId`                  | `string`                                                     | Opaque stable identifier (`wks_<hex>`), generated independently of the directory. MUST NOT be treated as a path; compare by exact equality. Use the `cwd` field for directory access.         |
 | `projectId`                    | `string`                                                     | FK to Project.projectId; the workspace's stable project membership                                                                                                                            |
+| `parentWorkspaceId`            | `string \| null`                                             | Parent workspace in the same project and host; null means top level. Legacy records default to null.                                                                                          |
+| `siblingOrder`                 | `number`                                                     | Finite floating-point rank within the parent; legacy ties resolve by workspace ID.                                                                                                            |
 | `cwd`                          | `string`                                                     | Exact execution directory selected for agents, files, scripts, and setup                                                                                                                      |
 | `kind`                         | `"local_checkout" \| "worktree" \| "directory"`              | Mutable checkout classification                                                                                                                                                               |
 | `displayName`                  | `string`                                                     | The human name (the generated/derived title). Decoupled from `branch` by construction.                                                                                                        |

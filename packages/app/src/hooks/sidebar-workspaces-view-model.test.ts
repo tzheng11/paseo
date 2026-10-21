@@ -3,6 +3,11 @@ import type { Agent, WorkspaceDescriptor } from "@/stores/session-store";
 import type { WorkspaceStructureProject } from "@/projects/workspace-structure";
 import { buildWorkspaceAgentActivityIndex } from "@/utils/workspace-agent-activity";
 import {
+  flattenWorkspaceTree,
+  getWorkspaceAncestorKeys,
+  getWorkspaceDescendantKeys,
+} from "@/components/sidebar/workspace-tree/model";
+import {
   appendMissingOrderKeys,
   applyStoredOrdering,
   buildSidebarWorkspaceEntries,
@@ -92,6 +97,88 @@ describe("createSidebarWorkspaceEntry workspace directory label", () => {
 interface OrderedItem {
   key: string;
 }
+
+describe("workspace hierarchy", () => {
+  function node(id: string, parentWorkspaceId: string | null, siblingOrder = 0) {
+    return {
+      workspaceKey: `srv:${id}`,
+      serverId: "srv",
+      workspaceId: id,
+      projectViewKey: "project",
+      projectName: "Project",
+      projectKind: "git" as const,
+      workspaceKind: "worktree" as const,
+      name: id,
+      parentWorkspaceId,
+      siblingOrder,
+    };
+  }
+
+  it("keeps entire subtrees together and orders children by their persisted rank", () => {
+    const rows = flattenWorkspaceTree(
+      [
+        node("parent", null),
+        node("last", "parent", 8),
+        node("first", "parent", 2),
+        node("grandchild", "first"),
+        node("other-root", null),
+      ],
+      new Set(),
+    );
+    expect(rows.map((row) => [row.workspace.workspaceId, row.depth, row.hasChildren])).toEqual([
+      ["parent", 0, true],
+      ["first", 1, true],
+      ["grandchild", 2, false],
+      ["last", 1, false],
+      ["other-root", 0, false],
+    ]);
+  });
+
+  it("collapses descendants while keeping following roots reachable", () => {
+    const workspaces = [
+      node("parent", null),
+      node("child", "parent"),
+      node("grandchild", "child"),
+      node("other", null),
+    ];
+    expect(
+      flattenWorkspaceTree(workspaces, new Set(["srv:parent"])).map(
+        (row) => row.workspace.workspaceId,
+      ),
+    ).toEqual(["parent", "other"]);
+    expect(getWorkspaceDescendantKeys(workspaces, "srv:parent")).toEqual(
+      new Set(["srv:child", "srv:grandchild"]),
+    );
+    expect(getWorkspaceAncestorKeys(workspaces, "srv:grandchild")).toEqual([
+      "srv:child",
+      "srv:parent",
+    ]);
+  });
+
+  it("keeps orphans and corrupt ancestor cycles visible exactly once", () => {
+    const workspaces = [
+      node("a", "b"),
+      node("b", "a"),
+      node("orphan", "missing"),
+      node("self", "self"),
+    ];
+    const rows = flattenWorkspaceTree(workspaces, new Set());
+    expect(rows.map((row) => row.workspace.workspaceId)).toEqual(["a", "b", "orphan", "self"]);
+    expect(rows.map((row) => row.depth)).toEqual([0, 1, 0, 0]);
+  });
+
+  it("scopes parent identity to the host and project", () => {
+    const parent = node("parent", null);
+    const foreignHost = {
+      ...node("child", "parent"),
+      serverId: "other",
+      workspaceKey: "other:child",
+    };
+    const foreignProject = { ...node("other-project", "parent"), projectViewKey: "other-project" };
+    const rows = flattenWorkspaceTree([parent, foreignHost, foreignProject], new Set());
+    expect(rows.map((row) => row.depth)).toEqual([0, 0, 0]);
+  });
+});
 
 function item(key: string): OrderedItem {
   return { key };

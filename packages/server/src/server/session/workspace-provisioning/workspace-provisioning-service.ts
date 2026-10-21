@@ -52,6 +52,8 @@ export interface CreateWorktreeWorkspaceInput {
   title: string | null;
   expectsInitialAgent?: boolean;
   untrustedSource?: UntrustedWorkspaceSource;
+  parentWorkspaceId?: string | null;
+  siblingOrder?: number;
   background?: boolean;
   callerWorkspaceId?: string;
 }
@@ -70,6 +72,8 @@ export interface WorkspaceProvisioningService {
     context?: {
       expectsInitialAgent?: boolean;
       workspaceId?: string;
+      parentWorkspaceId?: string | null;
+      siblingOrder?: number;
       background?: boolean;
       callerWorkspaceId?: string;
     },
@@ -242,12 +246,19 @@ export function createWorkspaceProvisioningService(deps: {
     context?: {
       expectsInitialAgent?: boolean;
       workspaceId?: string;
+      parentWorkspaceId?: string | null;
+      siblingOrder?: number;
       background?: boolean;
       callerWorkspaceId?: string;
     },
   ): Promise<PersistedWorkspaceRecord> {
     const normalizedCwd = resolve(cwd);
     const checkout = await workspaceGitService.getCheckout(normalizedCwd);
+    projectId =
+      projectId ??
+      (context?.parentWorkspaceId
+        ? (await workspaceRegistry.get(context.parentWorkspaceId))?.projectId
+        : undefined);
     const project = projectId
       ? await refreshProjectKind(await requireActiveProject(projectId), normalizedCwd, checkout)
       : // COMPAT(workspaceCreateMissingProjectId): added in v0.1.107, remove after 2027-01-15.
@@ -261,12 +272,15 @@ export function createWorkspaceProvisioningService(deps: {
       createdAt: timestamp,
       updatedAt: timestamp,
       background: await resolveBackground(context),
+      parentWorkspaceId: context?.parentWorkspaceId,
+      siblingOrder: context?.siblingOrder,
     });
     await workspaceRegistry.upsert(workspace, {
       expectsInitialAgent: context?.expectsInitialAgent,
     });
-    emitWorkspaceCreated(workspace);
-    return workspace;
+    const stored = (await workspaceRegistry.get(workspace.workspaceId)) ?? workspace;
+    emitWorkspaceCreated(stored);
+    return stored;
   }
 
   async function createWorkspaceForWorktree(
@@ -278,7 +292,11 @@ export function createWorkspaceProvisioningService(deps: {
     const worktreeRoot = resolve(input.worktreeRoot);
     const project = await resolveSourceProjectForWorktree({
       sourceCwd,
-      projectId: input.projectId,
+      projectId:
+        input.projectId ??
+        (input.parentWorkspaceId
+          ? (await workspaceRegistry.get(input.parentWorkspaceId))?.projectId
+          : undefined),
       repoRoot,
     });
     const timestamp = new Date().toISOString();
@@ -298,12 +316,15 @@ export function createWorkspaceProvisioningService(deps: {
       updatedAt: timestamp,
       ...(input.untrustedSource ? { untrustedSource: input.untrustedSource } : {}),
       background: await resolveBackground(input),
+      parentWorkspaceId: input.parentWorkspaceId,
+      siblingOrder: input.siblingOrder,
     });
     await workspaceRegistry.upsert(workspace, {
       expectsInitialAgent: input.expectsInitialAgent,
     });
-    emitWorkspaceCreated(workspace);
-    return workspace;
+    const stored = (await workspaceRegistry.get(workspace.workspaceId)) ?? workspace;
+    emitWorkspaceCreated(stored);
+    return stored;
   }
 
   function emitWorkspaceCreated(workspace: PersistedWorkspaceRecord): void {

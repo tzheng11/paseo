@@ -121,6 +121,7 @@ import type {
   PaseoConfigRaw,
   PaseoConfigRevision,
   WorkspaceCreateRequest,
+  WorkspaceMoveRequest,
   WorkspaceRecoveryState,
   PluginListItem,
   PluginLogEntry,
@@ -474,7 +475,14 @@ export interface CreateAgentRequestOptions extends AgentConfigOverrides {
   labels?: Record<string, string>;
 }
 
+export type WorkspaceMoveOptions = Pick<
+  WorkspaceMoveRequest,
+  "parentWorkspaceId" | "beforeWorkspaceId"
+>;
+
 export interface CreateWorkspaceRequestOptions {
+  parentWorkspaceId?: string | null;
+  siblingOrder?: number;
   source: WorkspaceCreateRequest["source"];
   title?: string;
   /** Workspace discovery visibility; contents retain normal durability. */
@@ -3158,6 +3166,28 @@ export class DaemonClient {
     return { value: payload.value };
   }
 
+  async moveWorkspace(
+    workspaceId: string,
+    input: WorkspaceMoveOptions,
+    requestId?: string,
+  ): Promise<{ parentWorkspaceId: string | null; siblingOrder: number }> {
+    this.requireWorkspaceHierarchy();
+    const payload = await this.sendNamespacedCorrelatedSessionRequest<"workspace.move.response">({
+      requestId,
+      message: { type: "workspace.move.request", workspaceId, ...input },
+    });
+    if (!payload.accepted || payload.siblingOrder === null) {
+      throw new Error(payload.error ?? "Workspace move rejected");
+    }
+    return { parentWorkspaceId: payload.parentWorkspaceId, siblingOrder: payload.siblingOrder };
+  }
+
+  private requireWorkspaceHierarchy(): void {
+    if (this.lastServerInfoMessage?.features?.workspaceHierarchy !== true) {
+      throw new Error("Update the host to organize nested workspaces.");
+    }
+  }
+
   async setWorkspaceTitle(
     workspaceId: string,
     title: string | null,
@@ -4794,6 +4824,8 @@ export class DaemonClient {
   ): Promise<WorkspaceCreatePayload> {
     const resolvedRequestId = this.createRequestId(requestId ?? input.requestId);
     if (input.background !== undefined || input.callerAgentId) this.requireBackgroundWorkspaces();
+    if (input.parentWorkspaceId !== undefined || input.siblingOrder !== undefined)
+      this.requireWorkspaceHierarchy();
     if (input.agent?.background !== undefined)
       throw new Error("Configure background on the workspace, not its initial agent.");
     const result = await this.creations.createWorkspace({
@@ -4820,6 +4852,10 @@ export class DaemonClient {
       requestId,
       message: {
         type: "workspace.create.request",
+        ...(input.parentWorkspaceId !== undefined
+          ? { parentWorkspaceId: input.parentWorkspaceId }
+          : {}),
+        ...(input.siblingOrder !== undefined ? { siblingOrder: input.siblingOrder } : {}),
         source: input.source,
         // COMPAT(workspaceRequestReceipts): added in v0.8.0; remove after 2027-03-15 once the daemon floor supports workspace receipts.
         ...(this.lastServerInfoMessage?.features?.workspaceRequestReceipts &&

@@ -34,6 +34,43 @@ function project(projectKey: string, workspaces: SidebarWorkspacePlacement[]): S
 }
 
 describe("splitPinnedSidebarGroups", () => {
+  it("hoists a pinned parent's whole subtree without duplicating pinned descendants", () => {
+    const parent = { ...placement("s1:parent"), workspaceId: "parent", siblingOrder: 1 };
+    const child = {
+      ...placement("s1:child"),
+      workspaceId: "child",
+      parentWorkspaceId: "parent",
+      siblingOrder: 2,
+    };
+    const grandchild = {
+      ...placement("s1:grandchild"),
+      workspaceId: "grandchild",
+      parentWorkspaceId: "child",
+      siblingOrder: 3,
+    };
+    const other = { ...placement("s1:other"), workspaceId: "other", siblingOrder: 4 };
+    const result = splitPinnedSidebarGroups({
+      projects: [project("p1", [parent, child, grandchild, other])],
+      keys: {
+        pinnedWorkspaceKeys: [parent.workspaceKey, child.workspaceKey],
+        superpinnedAtByKey: {},
+        pinnedAtByKey: {
+          [parent.workspaceKey]: "2026-01-01T00:00:00Z",
+          [child.workspaceKey]: "2026-02-01T00:00:00Z",
+        },
+      },
+      pinnedWorkspaceOrder: [],
+    });
+    expect(result.pinnedChats.map((workspace) => workspace.workspaceId)).toEqual([
+      "parent",
+      "child",
+      "grandchild",
+    ]);
+    expect(
+      result.unpinnedProjects[0]?.workspaces.map((workspace) => workspace.workspaceId),
+    ).toEqual(["other"]);
+  });
+
   it("keeps the project shell reachable when every chat is pinned", () => {
     const only = placement("w1");
     const projects = [project("p1", [only])];
@@ -186,4 +223,40 @@ it(`${ORDER_KEY} sorts daemon time then host and ID, ignoring saved pin order`, 
   expect([...maps.values()].filter((w) => w.superpinnedAt === "2026-10-18T02:00:00Z")).toHaveLength(
     3,
   );
+});
+
+it("keeps superpin daemon order until a separate subtree reorder is saved", () => {
+  const parent = Object.assign(placement("s1:parent"), { workspaceId: "parent", siblingOrder: 1 });
+  const child = Object.assign(placement("s1:child"), {
+    workspaceId: "child",
+    parentWorkspaceId: "parent",
+    siblingOrder: 1,
+  });
+  const newer = Object.assign(placement("s1:newer"), { workspaceId: "newer", siblingOrder: 2 });
+  const input = {
+    projects: [project("p1", [parent, child, newer])],
+    keys: {
+      pinnedWorkspaceKeys: [parent.workspaceKey, newer.workspaceKey],
+      pinnedAtByKey: {},
+      superpinnedAtByKey: {
+        [parent.workspaceKey]: "2026-10-18T01:00:00Z",
+        [newer.workspaceKey]: "2026-10-18T02:00:00Z",
+      },
+    },
+    pinnedWorkspaceOrder: [parent.workspaceKey, newer.workspaceKey],
+  };
+  expect(
+    splitPinnedSidebarGroups(input).superpinnedChats.map((workspace) => workspace.workspaceId),
+  ).toEqual(["newer", "parent", "child"]);
+  const reordered = splitPinnedSidebarGroups({
+    ...input,
+    superpinnedWorkspaceOrder: [parent.workspaceKey, newer.workspaceKey],
+  });
+  expect(reordered.superpinnedChats.map((workspace) => workspace.workspaceId)).toEqual([
+    "parent",
+    "child",
+    "newer",
+  ]);
+  expect(reordered.pinnedChats).toEqual([]);
+  expect(reordered.unpinnedProjects[0]?.workspaces).toEqual([]);
 });
