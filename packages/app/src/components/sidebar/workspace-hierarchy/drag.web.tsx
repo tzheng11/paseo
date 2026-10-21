@@ -118,6 +118,7 @@ function projectEvent(
 
 export function WorkspaceTreeDrag({
   rows,
+  displayRows,
   collapsedKeys,
   disabled,
   canDrag,
@@ -129,8 +130,8 @@ export function WorkspaceTreeDrag({
   const keyboardDrop = useRef<WorkspaceTreeDrop | null>(null);
   const activeKey = drag?.activeKey;
   const visible = useMemo(
-    () => visibleWorkspaceTreeRows({ rows, collapsedKeys, draggingKey: activeKey }),
-    [rows, collapsedKeys, activeKey],
+    () => visibleWorkspaceTreeRows({ rows: displayRows, collapsedKeys, draggingKey: activeKey }),
+    [displayRows, collapsedKeys, activeKey],
   );
   const ids = useMemo(() => visible.map((row) => row.workspace.workspaceKey), [visible]);
   const keyboardCoordinates = useCallback<KeyboardCoordinateGetter>(

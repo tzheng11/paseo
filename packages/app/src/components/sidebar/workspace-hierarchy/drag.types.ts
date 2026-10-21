@@ -12,6 +12,7 @@ export interface WorkspaceTreeRenderInput {
 }
 export interface WorkspaceTreeDragProps {
   rows: WorkspaceTreeRow[];
+  displayRows: WorkspaceTreeRow[];
   collapsedKeys: ReadonlySet<string>;
   disabled: boolean;
   canDrag: (row: WorkspaceTreeRow) => boolean;

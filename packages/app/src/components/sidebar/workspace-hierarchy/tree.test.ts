@@ -4,6 +4,7 @@ import {
   buildWorkspaceTree,
   projectWorkspaceTreeDrop,
   visibleWorkspaceTreeRows,
+  workspaceTreeRowsForRoots,
   workspaceTreeDescendants,
   type WorkspaceTreeItem,
 } from "./tree";
@@ -29,6 +30,41 @@ function workspace(
 }
 
 describe("workspace hierarchy", () => {
+  it("limits whole root subtrees and includes an active descendant beyond the first 20 roots", () => {
+    const roots = Array.from({ length: 25 }, (_, index) => workspace(`root-${index}`, null, index));
+    const rows = buildWorkspaceTree([
+      ...roots,
+      workspace("last-visible-child", "root-19"),
+      workspace("last-visible-grandchild", "last-visible-child"),
+      workspace("active-child", "root-24"),
+      workspace("active-grandchild", "active-child"),
+    ]);
+    const rootKeys = new Set(roots.slice(0, 20).map((root) => root.workspaceKey));
+    const limited = workspaceTreeRowsForRoots({ rows, rootKeys, activeKey: null });
+    expect(
+      limited.filter((row) => row.depth === 0).map((row) => row.workspace.workspaceId),
+    ).toEqual(roots.slice(0, 20).map((root) => root.workspaceId));
+    expect(limited.slice(-3).map((row) => row.workspace.workspaceId)).toEqual([
+      "root-19",
+      "last-visible-child",
+      "last-visible-grandchild",
+    ]);
+    const withActive = workspaceTreeRowsForRoots({
+      rows,
+      rootKeys,
+      activeKey: "host:active-grandchild",
+    });
+    expect(withActive.length).toBe(25);
+    expect(withActive.slice(-3).map((row) => row.workspace.workspaceId)).toEqual([
+      "root-24",
+      "active-child",
+      "active-grandchild",
+    ]);
+    const allRootKeys = new Set(roots.map((root) => root.workspaceKey));
+    expect(workspaceTreeRowsForRoots({ rows, rootKeys: allRootKeys, activeKey: null })).toEqual(
+      rows,
+    );
+  });
   it("supports keyboard sibling reorder, nesting and unparenting", () => {
     const rows = buildWorkspaceTree([workspace("parent"), workspace("child"), workspace("other")]);
     const input = { rows, visibleRows: rows, overKey: null };

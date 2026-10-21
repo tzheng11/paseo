@@ -125,6 +125,31 @@ export function visibleWorkspaceTreeRows(input: {
   });
 }
 
+/** Limit whole root forests so children never outlive or get cut off from a visible parent. */
+export function workspaceTreeRowsForRoots(input: {
+  rows: readonly WorkspaceTreeRow[];
+  rootKeys: ReadonlySet<string>;
+  activeKey: string | null;
+}): WorkspaceTreeRow[] {
+  let currentRoot: string | null = null;
+  let activeRoot: string | null = null;
+  for (const row of input.rows) {
+    if (row.depth === 0) currentRoot = row.workspace.workspaceKey;
+    if (row.workspace.workspaceKey === input.activeKey) {
+      activeRoot = currentRoot;
+      break;
+    }
+  }
+  let include = false;
+  return input.rows.filter((row) => {
+    if (row.depth === 0) {
+      const key = row.workspace.workspaceKey;
+      include = input.rootKeys.has(key) || key === activeRoot;
+    }
+    return include;
+  });
+}
+
 export function projectWorkspaceTreeDrop(input: {
   rows: readonly WorkspaceTreeRow[];
   activeKey: string;

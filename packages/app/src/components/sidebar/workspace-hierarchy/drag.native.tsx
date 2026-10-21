@@ -69,6 +69,7 @@ function NativeWorkspaceTreeRow({
 /** The row's existing hold gesture arms this responder; ordinary touches keep native scrolling. */
 export function WorkspaceTreeDrag({
   rows,
+  displayRows,
   collapsedKeys,
   disabled,
   canDrag,
@@ -81,7 +82,11 @@ export function WorkspaceTreeDrag({
   const origin = useRef({ x: 0, y: 0 });
   const dragRef = useRef<NativeDrag | null>(null);
   const [drag, setDrag] = useState<NativeDrag | null>(null);
-  const visible = visibleWorkspaceTreeRows({ rows, collapsedKeys, draggingKey: drag?.activeKey });
+  const visible = visibleWorkspaceTreeRows({
+    rows: displayRows,
+    collapsedKeys,
+    draggingKey: drag?.activeKey,
+  });
   const latest = useRef({ rows, onMove, visible });
   latest.current = { rows, onMove, visible };
   const update = useCallback((event: GestureResponderEvent, offsetX: number, offsetY: number) => {

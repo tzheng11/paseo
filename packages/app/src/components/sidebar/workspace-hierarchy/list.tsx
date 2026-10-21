@@ -20,6 +20,7 @@ import { WorkspaceTreeDrag } from "./drag";
 import { useWorkspaceTreeStore } from "./state";
 import {
   buildWorkspaceTree,
+  workspaceTreeRowsForRoots,
   WORKSPACE_TREE_INDENT,
   type WorkspaceTreeMove,
   type WorkspaceTreeRow,
@@ -29,6 +30,8 @@ import { useSidebarOrderStore } from "@/stores/sidebar-order-store";
 import { WorkspaceTreeRowContext } from "./row-context";
 import type { Theme } from "@/styles/theme";
 import { collapsedWorkspaceTreeEntries } from "./presentation";
+import { useLimitedSidebarGroup } from "@/components/sidebar/use-limited-sidebar-group";
+import { SidebarGroupToggleRow } from "@/components/sidebar/sidebar-group-toggle-row";
 
 const ThemedLoadingSpinner = withUnistyles(LoadingSpinner);
 function spinnerColor(theme: Theme) {
@@ -133,6 +136,17 @@ export function WorkspaceHierarchyList({
   const activeKey = activeWorkspaceSelection
     ? `${activeWorkspaceSelection.serverId}:${activeWorkspaceSelection.workspaceId}`
     : null;
+  const roots = useMemo(() => rows.filter((row) => row.depth === 0), [rows]);
+  const {
+    visibleItems: visibleRoots,
+    expanded,
+    canToggle,
+    toggleExpanded,
+  } = useLimitedSidebarGroup(roots);
+  const displayRows = useMemo(() => {
+    const rootKeys = new Set(visibleRoots.map((row) => row.workspace.workspaceKey));
+    return workspaceTreeRowsForRoots({ rows, rootKeys, activeKey });
+  }, [rows, visibleRoots, activeKey]);
   const activeAncestorPath = useMemo(() => {
     if (!activeKey) return "";
     const byKey = new Map(rows.map((row) => [row.workspace.workspaceKey, row]));
@@ -209,6 +223,7 @@ export function WorkspaceHierarchyList({
     <>
       <WorkspaceTreeDrag
         rows={rows}
+        displayRows={displayRows}
         collapsedKeys={collapsedKeys}
         disabled={isPending || !manualOrder}
         canDrag={canDrag}
@@ -216,6 +231,13 @@ export function WorkspaceHierarchyList({
         renderRow={renderRow}
         testID={`sidebar-workspace-list-${project.viewKey}`}
       />
+      {canToggle ? (
+        <SidebarGroupToggleRow
+          expanded={expanded}
+          onPress={toggleExpanded}
+          testID={`sidebar-project-show-more-${project.viewKey}`}
+        />
+      ) : null}
       {!manualOrder ? (
         <View style={styles.feedback}>
           <Text style={styles.message}>Use manual order to drag workspaces.</Text>
