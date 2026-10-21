@@ -139,7 +139,7 @@ async function createPaseoWorktreeWithPriority(
       {
         cwd: createdWorktree.repoRoot,
         worktreePath: createdWorktree.worktree.worktreePath,
-        ...(input.runSetup === false ? { teardownCwds: [] } : {}),
+        teardownCwds: [],
         paseoHome: input.paseoHome,
         worktreesBaseRoot: input.worktreesRoot,
       },

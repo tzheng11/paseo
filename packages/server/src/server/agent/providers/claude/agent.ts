@@ -1185,7 +1185,7 @@ function buildClaudePlanPermissionActions(
     },
   ];
 
-  if (resumeMode === "bypassPermissions") {
+  if (resumeMode === "bypassPermissions" || resumeMode === "auto") {
     actions.push({
       id: "implement_resume",
       label: `Implement with ${getClaudeModeLabel(resumeMode)}`,
@@ -2917,11 +2917,11 @@ class ClaudeAgentSession implements AgentSession {
     if (response.behavior === "allow") {
       if (pending.request.kind === "plan") {
         const selectedActionId = response.selectedActionId;
+        const resumeMode = this.planResumeMode;
         const shouldResumePriorMode =
-          selectedActionId === "implement_resume" && this.planResumeMode === "bypassPermissions";
-        const targetMode: PermissionMode = shouldResumePriorMode
-          ? "bypassPermissions"
-          : "acceptEdits";
+          selectedActionId === "implement_resume" &&
+          (resumeMode === "bypassPermissions" || resumeMode === "auto");
+        const targetMode: PermissionMode = shouldResumePriorMode ? resumeMode : "acceptEdits";
         await this.setMode(targetMode);
         this.pushToolCall(
           mapClaudeCompletedToolCall({
@@ -3015,15 +3015,8 @@ class ClaudeAgentSession implements AgentSession {
     } catch (error) {
       this.logger.warn({ err: error }, "Claude query close did not settle cleanly");
     }
-    const query = this.query;
-    await this.awaitWithTimeout(
-      Promise.resolve().then(() => query?.interrupt?.()),
-      "close query interrupt",
-    );
-    await this.awaitWithTimeout(
-      Promise.resolve().then(() => query?.return?.()),
-      "close query return",
-    );
+    // close() terminates the SDK query. Its control plane cannot answer
+    // interrupt/return after close, so continue directly to process-tree cleanup.
     this.query = null;
     this.input = null;
     // Terminate the entire process tree (claude + MCP children) to prevent
@@ -6767,6 +6760,11 @@ function convertClaudeHistoryEntryPreamble(
     return { shortCircuit: [] };
   }
   if (entry.type === "user" && isSyntheticHistoryUserEntry(entry)) {
+    return { shortCircuit: [] };
+  }
+  // Only user and assistant records are conversation turns. Claude Code 2.1.x also journals each
+  // API request as `api-request-blob` records whose message replays the system context.
+  if (entry.type !== "user" && entry.type !== "assistant") {
     return { shortCircuit: [] };
   }
 
