@@ -16,6 +16,7 @@ import {
   useState,
   useEffect,
   useRef,
+  useContext,
   type ReactElement,
   type MutableRefObject,
   type Ref,
@@ -154,6 +155,8 @@ import type { HostBadgeModel } from "@/hosts/appearance";
 import { useHostBadges } from "@/hosts/use-host-badges";
 import { useSidebarRowItems } from "@/components/sidebar/display-preferences/model";
 import { PullRequestStateIcon } from "@/git/pull-request-state-icon";
+import { WorkspaceHierarchyList } from "@/components/sidebar/workspace-hierarchy/list";
+import { WorkspaceTreeRowContext } from "@/components/sidebar/workspace-hierarchy/row-context";
 
 const workspaceKeyExtractor = (workspace: SidebarWorkspacePlacement) => workspace.workspaceKey;
 
@@ -1081,6 +1084,11 @@ function WorkspaceRowInner({
   onTogglePin,
   reserveIdleStatusIndicatorSpace = true,
 }: WorkspaceRowInnerProps) {
+  const treeSource = useContext(WorkspaceTreeRowContext);
+  const isPinnedTreeSource = treeSource && Boolean(workspace.pinnedAt || workspace.superpinnedAt);
+  const rowTestID = isPinnedTreeSource
+    ? `sidebar-workspace-tree-source-row-${workspace.workspaceKey}`
+    : `sidebar-workspace-row-${workspace.workspaceKey}`;
   const isCompact = useIsCompactFormFactor();
   const [isPressed, setIsPressed] = useState(false);
   const isTouchPlatform = platformIsNative || isCompact;
@@ -1166,7 +1174,7 @@ function WorkspaceRowInner({
               onTouchMove={interaction.handleTouchMove}
               onPressOut={handleWorkspacePressOut}
               onPress={handlePress}
-              testID={`sidebar-workspace-row-${workspace.workspaceKey}`}
+              testID={rowTestID}
             >
               <SidebarWorkspaceRowContent
                 workspace={workspace}
@@ -1629,6 +1637,15 @@ function ProjectBlock({
     enabled: selectionEnabled,
   });
 
+  const projectServerIds = useMemo(
+    () => project.hosts.map((host) => host.serverId),
+    [project.hosts],
+  );
+  const hierarchySupportByServerId = useHostFeatureMap(projectServerIds, "workspaceHierarchy");
+  const hasWorkspaceHierarchy = projectServerIds.some(
+    (serverId) => hierarchySupportByServerId.get(serverId) === true,
+  );
+
   const renderWorkspaceRow = useCallback(
     (
       item: SidebarWorkspacePlacement,
@@ -1758,7 +1775,17 @@ function ProjectBlock({
 
   let projectChildren = null;
   if (!collapsed) {
-    if (project.workspaces.length > 0) {
+    if (project.workspaces.length > 0 && hasWorkspaceHierarchy) {
+      projectChildren = (
+        <WorkspaceHierarchyList
+          project={project}
+          workspaceEntriesByKey={workspaceEntriesByKey}
+          hierarchySupportByServerId={hierarchySupportByServerId}
+          activeWorkspaceSelection={activeWorkspaceSelection}
+          renderWorkspace={renderWorkspaceRow}
+        />
+      );
+    } else if (project.workspaces.length > 0) {
       projectChildren = (
         <>
           <DraggableList

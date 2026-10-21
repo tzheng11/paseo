@@ -27,9 +27,12 @@ export interface PinnedSidebarGroups {
 function projectWithoutPinnedWorkspaces(
   project: SidebarProjectEntry,
   pinnedWorkspaceKeys: ReadonlySet<string>,
+  preservePinnedServerIds?: ReadonlySet<string>,
 ): SidebarProjectEntry {
   const workspaces = project.workspaces.filter(
-    (workspace) => !pinnedWorkspaceKeys.has(workspace.workspaceKey),
+    (workspace) =>
+      !pinnedWorkspaceKeys.has(workspace.workspaceKey) ||
+      preservePinnedServerIds?.has(workspace.serverId),
   );
   // Keep the project even when every chat moved to Pinned. The project row owns
   // its settings and new-workspace actions; chats are not its ownership boundary.
@@ -130,6 +133,7 @@ export function splitPinnedSidebarGroups(input: {
   projects: SidebarProjectEntry[];
   keys: PinnedSidebarKeys;
   pinnedWorkspaceOrder: string[];
+  preservePinnedServerIds?: ReadonlySet<string>;
 }): PinnedSidebarGroups {
   const { projects, keys, pinnedWorkspaceOrder } = input;
   if (keys.pinnedWorkspaceKeys.length === 0) {
@@ -147,7 +151,9 @@ export function splitPinnedSidebarGroups(input: {
         else pinnedChats.push(workspace);
       }
     }
-    unpinnedProjects.push(projectWithoutPinnedWorkspaces(project, pinnedWorkspaceKeySet));
+    unpinnedProjects.push(
+      projectWithoutPinnedWorkspaces(project, pinnedWorkspaceKeySet, input.preservePinnedServerIds),
+    );
   }
 
   pinnedChats.sort((a, b) =>

@@ -47,6 +47,38 @@ function workspaceIds(workspaces: readonly SidebarWorkspacePlacement[]): string[
   return workspaces.map((workspace) => workspace.workspaceId);
 }
 
+describe("workspace hierarchy projection", () => {
+  it("keeps pinned parents in their tree and gives their shortcut one target", () => {
+    const input = projectionInput();
+    const child = input.workspaceEntriesByKey.get("srv:unpinned")!;
+    input.workspaceEntriesByKey.set(child.workspaceKey, { ...child, parentWorkspaceId: "pinned" });
+    const projection = buildSidebarProjection({ ...input, hierarchyServerIds: new Set(["srv"]) });
+    expect(workspaceIds(projection.pinnedGroups.pinnedChats)).toEqual(["pinned"]);
+    expect(workspaceIds(projection.pinnedGroups.unpinnedProjects[0]!.workspaces)).toEqual([
+      "pinned",
+      "unpinned",
+    ]);
+    expect(projection.shortcutModel.shortcutTargets.map((target) => target.workspaceId)).toEqual([
+      "pinned",
+      "unpinned",
+    ]);
+  });
+
+  it("excludes collapsed descendants from keyboard navigation", () => {
+    const input = projectionInput({ pinnedCollapsed: true });
+    const child = input.workspaceEntriesByKey.get("srv:unpinned")!;
+    input.workspaceEntriesByKey.set(child.workspaceKey, { ...child, parentWorkspaceId: "pinned" });
+    const projection = buildSidebarProjection({
+      ...input,
+      hierarchyServerIds: new Set(["srv"]),
+      collapsedWorkspaceKeys: new Set(["srv:pinned"]),
+    });
+    expect(projection.shortcutModel.shortcutTargets.map((target) => target.workspaceId)).toEqual([
+      "pinned",
+    ]);
+  });
+});
+
 function makeProject(
   workspaces: SidebarWorkspacePlacement[],
   viewKey = "project",

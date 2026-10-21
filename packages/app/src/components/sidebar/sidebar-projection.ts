@@ -23,6 +23,7 @@ import {
   type SidebarShortcutSection,
 } from "@/utils/sidebar-shortcuts";
 import { statusWorkspaceGroups, type SidebarWorkspaceGroup } from "./sidebar-labels";
+import { buildWorkspaceTree, visibleWorkspaceTreeRows } from "./workspace-hierarchy/tree";
 
 export interface SidebarProjection {
   pinnedGroups: PinnedSidebarGroups;
@@ -52,6 +53,8 @@ export interface SidebarProjectionInput {
   pinnedCollapsed: boolean;
   collapsedProjectKeys: ReadonlySet<string>;
   collapsedWorkspaceGroupKeys: ReadonlySet<string>;
+  collapsedWorkspaceKeys?: ReadonlySet<string>;
+  hierarchyServerIds?: ReadonlySet<string>;
   t: TFunction;
 }
 
@@ -60,6 +63,7 @@ export function buildSidebarProjection(input: SidebarProjectionInput): SidebarPr
     projects: input.projects,
     keys: input.pinnedKeys,
     pinnedWorkspaceOrder: input.pinnedWorkspaceOrder,
+    preservePinnedServerIds: input.hierarchyServerIds,
   });
   pinnedGroups.pinnedChats = sortSidebarWorkspaces({
     workspaces: pinnedGroups.pinnedChats,
@@ -97,10 +101,32 @@ export function buildSidebarProjection(input: SidebarProjectionInput): SidebarPr
   }
   if (input.groupMode === "project") {
     sections.push(
-      ...pinnedGroups.unpinnedProjects.map((project) => ({
-        workspaces: project.workspaces,
-        collapsed: input.collapsedProjectKeys.has(project.viewKey),
-      })),
+      ...pinnedGroups.unpinnedProjects.map((project) => {
+        const hierarchy = project.workspaces.some((workspace) =>
+          input.hierarchyServerIds?.has(workspace.serverId),
+        );
+        if (!hierarchy)
+          return {
+            workspaces: project.workspaces,
+            collapsed: input.collapsedProjectKeys.has(project.viewKey),
+          };
+        const workspaces = project.workspaces.map((workspace) => ({
+          ...workspace,
+          parentWorkspaceId:
+            input.workspaceEntriesByKey.get(workspace.workspaceKey)?.parentWorkspaceId ?? null,
+          siblingOrder: input.workspaceEntriesByKey.get(workspace.workspaceKey)?.siblingOrder,
+        }));
+        const mode = input.workspaceSortModeByProject?.[project.viewKey] ?? "manual";
+        const rows = buildWorkspaceTree(workspaces, mode !== "manual");
+        const visible = visibleWorkspaceTreeRows({
+          rows,
+          collapsedKeys: input.collapsedWorkspaceKeys ?? new Set(),
+        });
+        return {
+          workspaces: visible.map((row) => row.workspace),
+          collapsed: input.collapsedProjectKeys.has(project.viewKey),
+        };
+      }),
     );
   } else {
     sections.push(

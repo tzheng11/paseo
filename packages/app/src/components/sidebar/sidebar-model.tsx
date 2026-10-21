@@ -18,6 +18,8 @@ import { useSidebarOrderStore } from "@/stores/sidebar-order-store";
 import { useAppSettings } from "@/hooks/use-settings";
 import type { SidebarShortcutModel } from "@/utils/sidebar-shortcuts";
 import { buildSidebarProjection } from "./sidebar-projection";
+import { useHostFeatureMap } from "@/runtime/host-features";
+import { useWorkspaceTreeStore } from "./workspace-hierarchy/state";
 import type { SidebarProjectIconTarget } from "@/utils/sidebar-project-row-model";
 import { filterWorkspacesByLabels, type SidebarWorkspaceGroup } from "./sidebar-labels";
 import { filterWorkspacesByProjects, resolveActiveProjectFilters } from "./sidebar-project-filter";
@@ -61,6 +63,20 @@ export function SidebarModelProvider({
     settings: { workspaceTitleSource },
   } = useAppSettings();
   const list = useSidebarWorkspacesList({ enabled: active });
+  const serverIds = useMemo(
+    () => [...new Set(list.workspacePlacements.map((workspace) => workspace.serverId))],
+    [list.workspacePlacements],
+  );
+  const hierarchySupport = useHostFeatureMap(serverIds, "workspaceHierarchy");
+  const hierarchyServerIds = useMemo(
+    () => new Set(serverIds.filter((serverId) => hierarchySupport.get(serverId) === true)),
+    [serverIds, hierarchySupport],
+  );
+  const collapsedWorkspaceKeysList = useWorkspaceTreeStore((state) => state.collapsedKeys);
+  const collapsedWorkspaceKeys = useMemo(
+    () => new Set(collapsedWorkspaceKeysList),
+    [collapsedWorkspaceKeysList],
+  );
   const showBackground = useSidebarViewStore((state) => state.showBackground);
   const groupMode = useSidebarViewStore((state) => state.groupMode);
   const labelFilter = useSidebarViewStore((state) => state.labelFilter);
@@ -109,7 +125,10 @@ export function SidebarModelProvider({
       (project) => (workspaceSortModeByProject[project.viewKey] ?? "manual") !== "manual",
     );
   const needsWorkspaceEntries =
-    groupMode !== "project" || hasActiveLabelFilter || hasAutomaticWorkspaceSort;
+    groupMode !== "project" ||
+    hasActiveLabelFilter ||
+    hasAutomaticWorkspaceSort ||
+    hierarchyServerIds.size > 0;
   const workspaceEntriesByKey = useSidebarWorkspaceEntries(
     list.workspacePlacements,
     active !== false || needsWorkspaceEntries,
@@ -173,11 +192,15 @@ export function SidebarModelProvider({
       pinnedCollapsed,
       collapsedProjectKeys,
       collapsedWorkspaceGroupKeys,
+      collapsedWorkspaceKeys,
+      hierarchyServerIds,
       t,
     }),
     [
       collapsedProjectKeys,
       collapsedWorkspaceGroupKeys,
+      collapsedWorkspaceKeys,
+      hierarchyServerIds,
       groupMode,
       list.projectNamesByViewKey,
       filteredProjects,

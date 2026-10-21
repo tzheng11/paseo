@@ -118,6 +118,8 @@ export interface WorkspaceDescriptor {
   title?: string | null;
   pinnedAt?: string | null;
   superpinnedAt?: string | null;
+  parentWorkspaceId?: string | null;
+  siblingOrder?: number;
   labels?: string[];
   fieldValues?: WorkspaceDescriptorPayload["fieldValues"];
   status: WorkspaceDescriptorPayload["status"];
@@ -159,6 +161,9 @@ export function normalizeWorkspaceDescriptor(
     pinnedAt: payload.pinnedAt ?? null,
     // COMPAT(workspaceSuperpinning): older daemons omit the field.
     superpinnedAt: payload.superpinnedAt ?? null,
+    // COMPAT(workspaceHierarchy): added in v0.12.0, remove after 2027-04-21.
+    parentWorkspaceId: payload.parentWorkspaceId ?? null,
+    siblingOrder: payload.siblingOrder,
     // COMPAT(workspaceLabels): old daemons omit assignments.
     labels: payload.labels ?? [],
     // COMPAT(workspaceFields): added in v0.11.3; remove fallback after 2027-04-14.
