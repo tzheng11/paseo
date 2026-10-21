@@ -1,6 +1,7 @@
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { WorkspaceTabDescriptor } from "@/screens/workspace/workspace-tabs-types";
 import { i18n } from "@/i18n/i18next";
+import { getPanelManifest } from "@/panels/panel-manifest";
 
 export interface BulkClosableTabGroups {
   archiveAgentTabs: Array<{ tabId: string; agentId: string }>;
@@ -61,6 +62,7 @@ export function classifyBulkClosableTabs(
   };
 
   for (const tab of tabs) {
+    if (getPanelManifest(tab.target.kind).permanent) continue;
     if (tab.target.kind === "agent") {
       const agentTab = { tabId: tab.tabId, agentId: tab.target.agentId };
       if (resolveAgentCloseKind(tab.target.agentId) === "layout-only") {

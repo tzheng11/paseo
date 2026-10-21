@@ -196,6 +196,14 @@ export const PASEO_TOOL_CATALOG = {
     detail: { inputOrder: WORKSPACE_FIELDS, outputFields: ["workspaceId", "projectId"] },
   },
   list_workspaces: { label: "List workspaces" },
+  get_workspace_fields: {
+    label: "Read workspace Info",
+    detail: { inputOrder: ["workspaceId", "keys"] },
+  },
+  set_workspace_field: {
+    label: "Update workspace Info",
+    detail: { inputOrder: ["workspaceId", "fieldKey", "value", "expectedValue"] },
+  },
   rename_workspace: {
     label: "Rename workspace",
     context: field("title"),

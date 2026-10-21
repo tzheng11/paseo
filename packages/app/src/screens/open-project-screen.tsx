@@ -64,6 +64,7 @@ export function OpenProjectScreen() {
     <View style={styles.container}>
       <MenuHeader borderless />
       <ScrollView
+        testID="open-project-scroll"
         style={styles.scroll}
         contentContainerStyle={styles.scrollContent}
         dataSet={WINDOW_CONTENT_DATASET}

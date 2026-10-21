@@ -6,7 +6,7 @@ import { createAgentTabFromMenu } from "./workspace-tabs";
 
 // ─── Navigation ────────────────────────────────────────────────────────────
 
-/** Navigate to a workspace and wait for the tab bar to appear. */
+/** Navigate to a workspace and wait for its tab navigation to appear. */
 export async function gotoWorkspace(page: Page, workspaceId: string): Promise<void> {
   const route = buildHostWorkspaceRoute(getServerId(), workspaceId);
   await page.goto(route);
@@ -15,10 +15,14 @@ export async function gotoWorkspace(page: Page, workspaceId: string): Promise<vo
 
 // ─── Tab bar queries ───────────────────────────────────────────────────────
 
-/** Wait for the workspace tab bar to be visible. */
+/** Wait for the desktop tab strip or compact tab switcher to be visible. */
 export async function waitForTabBar(page: Page): Promise<void> {
   await expect(
-    page.getByTestId("workspace-tabs-row").filter({ visible: true }).first(),
+    page
+      .getByTestId("workspace-tabs-row")
+      .or(page.getByRole("button", { name: /Switch tabs/ }))
+      .filter({ visible: true })
+      .first(),
   ).toBeVisible({
     timeout: 30_000,
   });

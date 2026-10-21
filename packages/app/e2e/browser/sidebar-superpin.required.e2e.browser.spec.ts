@@ -529,6 +529,18 @@ for (const viewport of [
         gate.holdNextClientRequest("fetch_workspaces_request");
         gate.restore();
         await gate.waitForHeldClientRequest();
+        // Hold both the live directory subscription and the mutation's read-back.
+        // Releasing only the read-back would let retry succeed without live updates.
+        await expect
+          .poll(() => {
+            const modes = new Set<string>();
+            for (const request of gate.getHeldClientRequests()) {
+              if (request)
+                modes.add(request.subscribe === undefined ? "read-back" : "subscription");
+            }
+            return [...modes].sort();
+          })
+          .toEqual(["read-back", "subscription"]);
         await openRowMenu(page, seed.workspaceId);
         const retry = page.getByTestId(`sidebar-workspace-menu-superpin-${key(seed.workspaceId)}`);
         await expect(retry).toHaveAttribute("aria-disabled", "true");

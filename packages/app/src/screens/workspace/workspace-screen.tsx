@@ -173,7 +173,7 @@ import {
 } from "@/screens/workspace/workspace-pane-content";
 import { useMountedTabSet } from "@/screens/workspace/use-mounted-tab-set";
 import { SheetTabs } from "@/screens/workspace/sheet-tabs";
-import type { PaneHost } from "@/panels/panel-manifest";
+import { getPanelManifest, type PaneHost } from "@/panels/panel-manifest";
 import { WorkspaceFocusProvider } from "@/workspace/focus";
 import { DiffDocumentWorkspaceCacheProvider } from "@/git/diff-document/workspace-cache";
 import type { NewTabSelection } from "@/workspace-tabs/new-tab";
@@ -2300,7 +2300,10 @@ function WorkspaceScreenContent({
       title: string;
       logLabel: string;
     }): Promise<boolean> => {
-      const { tabsToClose, title, logLabel } = input;
+      const { title, logLabel } = input;
+      const tabsToClose = input.tabsToClose.filter(
+        (tab) => !getPanelManifest(tab.target.kind).permanent,
+      );
       if (tabsToClose.length === 0) {
         return true;
       }

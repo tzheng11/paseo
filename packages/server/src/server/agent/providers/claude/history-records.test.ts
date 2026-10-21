@@ -1,4 +1,4 @@
-import { appendFile, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, test, expect } from "vitest";
@@ -18,6 +18,34 @@ async function transcript(contents: string): Promise<string> {
   await writeFile(filePath, contents);
   return filePath;
 }
+
+test("an empty regular transcript has no history records", async () => {
+  const filePath = await transcript("");
+  const records = readClaudeHistoryRecords(filePath, new AbortController().signal);
+  expect(await records.next()).toEqual({ done: true, value: undefined });
+});
+
+test("a directory transcript is rejected before the empty-file fast path", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "claude-history-directory-"));
+  directories.push(directory);
+  const filePath = path.join(directory, "history.jsonl");
+  await mkdir(filePath);
+  const records = readClaudeHistoryRecords(filePath, new AbortController().signal);
+  await expect(records.next()).rejects.toMatchObject({
+    code: "EISDIR",
+    path: filePath,
+    message: expect.stringContaining("EISDIR"),
+  });
+});
+
+test("a symbolic link to a regular transcript preserves its history", async () => {
+  const filePath = await transcript('{"message":"linked"}\n');
+  const linkedPath = path.join(path.dirname(filePath), "linked-history.jsonl");
+  await symlink(filePath, linkedPath, "file");
+  const records = readClaudeHistoryRecords(linkedPath, new AbortController().signal);
+  expect(await records.next()).toEqual({ done: false, value: { message: "linked" } });
+  expect(await records.next()).toEqual({ done: true, value: undefined });
+});
 
 test("streamed history preserves valid CRLF and unterminated rows while skipping partial writes", async () => {
   const filePath = await transcript(

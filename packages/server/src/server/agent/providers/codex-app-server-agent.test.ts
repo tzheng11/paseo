@@ -187,6 +187,8 @@ function createProviderWithFakeAppServer(
   const provider = new CodexAppServerAgentClient(createTestLogger(), options?.runtimeSettings, {
     customProvider: options?.customProvider,
   });
+  // This provider owns the injected app-server below, not a machine-installed Codex CLI.
+  vi.spyOn(provider, "isAvailable").mockResolvedValue(true);
   const internals = castInternals<{
     goalsEnabledPromise: Promise<boolean> | null;
     autoReviewEnabledPromise: Promise<boolean> | null;

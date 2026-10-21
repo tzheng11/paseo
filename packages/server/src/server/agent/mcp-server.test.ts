@@ -5322,13 +5322,17 @@ describe("send_agent_prompt MCP tool to an OMP child", () => {
       expect(response.structuredContent).toMatchObject({
         success: true,
         disposition: "out_of_band",
-        status: "running",
       });
+      // Out-of-band acknowledgement admits the command. Its turn-start event
+      // reaches the public lifecycle through the cooperative session-event queue.
+      await vi.waitFor(() => expect(agentManager.getAgent(childId)?.lifecycle).toBe("running"));
       await vi.waitFor(() => {
         expect(ompSession.prompts).toEqual([
           { message: "check the build", imageCount: 0, streamingBehavior: "followUp" },
         ]);
       });
+      expect(ompSession.abortRequested).toBe(false);
+      expect(parentClient.sessions[0]!.prompts).toHaveLength(0);
 
       ompSession.beginTurn();
       ompSession.streamAssistantText("Build is green");

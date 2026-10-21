@@ -45,6 +45,14 @@ describe("Paseo tool display", () => {
     expect(display(`mcp__paseo__${tool}`, input)).toEqual({ displayName: label, summary });
   });
 
+  it.each([
+    ["get_workspace_fields", "Read workspace Info"],
+    ["set_workspace_field", "Update workspace Info"],
+  ])("presents the fork's %s tool with its workspace Info label", (tool, label) => {
+    expect(PASEO_TOOL_NAMES).toContain(tool);
+    expect(display(`mcp__paseo__${tool}`, {})).toEqual({ displayName: label });
+  });
+
   it("omits the summary when a call has no context", () => {
     expect(display("mcp__paseo__list_agents", {})).toEqual({ displayName: "List agents" });
   });

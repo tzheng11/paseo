@@ -7,7 +7,7 @@ async function openProjectHome(page: Page) {
 }
 
 async function scrollToHomeFooter(page: Page) {
-  await page.mouse.move(160, 350);
+  await page.getByTestId("open-project-scroll").hover();
   await page.mouse.wheel(0, 1500);
 }
 
@@ -31,12 +31,16 @@ test("home actions remain reachable on a short phone screen", async ({ page }, t
   await page.screenshot({ path: testInfo.outputPath("home-scrolled.png") });
 });
 
-test("home actions fit on a desktop screen without overlap", async ({ page }) => {
+test("home actions remain reachable on a desktop screen without overlap", async ({
+  page,
+}, testInfo) => {
   await page.setViewportSize({ width: 1280, height: 900 });
   await openProjectHome(page);
+  await scrollToHomeFooter(page);
   await expectHomeActionsReachable(page);
   await expect(page.getByTestId("open-project-setup-providers")).toHaveCSS(
     "-webkit-app-region",
     "none",
   );
+  await page.screenshot({ path: testInfo.outputPath("home-scrolled-desktop.png") });
 });
