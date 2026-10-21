@@ -36,4 +36,13 @@ npm run test:e2e -- --grep 'keyboard workspace dragging reorders, intentionally 
 # 1 passed (22.7s; case 3.7s)
 ```
 
-Browser web was exercised. Native devices and macOS, Windows, and Linux desktop packages are not established by this isolated screenshot proof.
+Browser web was exercised for the drag/drop flows above. Native iOS/Android devices and Windows/Linux desktop packages were not exercised. The macOS package smoke is documented below.
+
+
+## macOS packaged app smoke
+
+![Isolated packaged macOS welcome screen](desktop-macos-welcome.png)
+
+The macOS ARM64 package for source `4660bf8d15a5061bd08213450866d58432517eea` passed deep strict signature verification across its native chain (23 signed Mach-O files). Packaged `node-pty`, `msgpackr-extract`, and `sherpa-onnx-node` loaded, and packaged esbuild executed under Electron 44.2.0 / Node 24.20.0.
+
+A real isolated Electron GUI reached the welcome route with its native bridge available, zero page or console errors, a verified browser PID matching the exact packaged executable, and a clean exit with code 0. Desktop daemon management was disabled for this smoke; its user data and daemon home were disposable. The screenshot shows that isolated welcome route. Interactive nesting coverage comes from the browser cases above.
