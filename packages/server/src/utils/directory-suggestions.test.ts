@@ -9,6 +9,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -1084,8 +1085,12 @@ describe("home-tree scan cost", () => {
   const CHAINS = 40;
   let scanRoot: string;
   let searchProcess: SearchProcess | null = null;
+  let fixtureSetup: Promise<void> | null = null;
+  let stopFixtureSetup = false;
 
   beforeEach(() => {
+    fixtureSetup = null;
+    stopFixtureSetup = false;
     scanRoot = realpathSync.native(mkdtempSync(path.join(tmpdir(), "directory-scan-cost-")));
     for (let chain = 0; chain < CHAINS; chain += 1) {
       const segments: string[] = [];
@@ -1095,12 +1100,16 @@ describe("home-tree scan cost", () => {
   });
 
   afterEach(async () => {
+    stopFixtureSetup = true;
     try {
+      // A test timeout must not let pending fixture writes race directory removal.
+      await fixtureSetup?.catch(() => undefined);
       if (searchProcess) {
         searchProcess.child.kill();
         await searchProcess.exited;
       }
     } finally {
+      fixtureSetup = null;
       searchProcess = null;
       rmSync(scanRoot, { recursive: true, force: true });
     }
@@ -1121,24 +1130,41 @@ describe("home-tree scan cost", () => {
     return stopPathContainmentMetrics();
   }
 
-  // Creating the 27,000-directory fixture alone takes about 20 s on Windows
-  // runners under parallel load, and it has crossed the default 30 s deadline.
-  // The heap bound is enforced by the child's --max-old-space-size and its own
-  // 20 s timeout, so the test deadline only has to cover fixture setup.
-  it("finishes overlapping broad-tree searches within a bounded heap", async () => {
-    const broadRoot = path.join(scanRoot, "broad");
-    mkdirSync(broadRoot);
-    for (let branch = 0; branch < 30; branch += 1) {
-      const branchRoot = path.join(broadRoot, `branch-${branch}`);
-      mkdirSync(branchRoot);
-      for (let group = 0; group < 30; group += 1) {
-        const groupRoot = path.join(branchRoot, `group-${group}`);
-        mkdirSync(groupRoot);
-        for (let leaf = 0; leaf < 30; leaf += 1) {
-          mkdirSync(path.join(groupRoot, `leaf-${leaf}`));
+  async function createBroadTree(root: string): Promise<void> {
+    await mkdir(root);
+    let parents = [root];
+    for (const level of ["branch", "group", "leaf"]) {
+      const children: string[] = [];
+      for (const parent of parents) {
+        for (let child = 0; child < 30; child += 1) {
+          children.push(path.join(parent, `${level}-${child}`));
         }
       }
+      const workers = Array.from({ length: 4 }, async (_, worker) => {
+        for (let index = worker; index < children.length; index += 4) {
+          if (stopFixtureSetup) return;
+          await mkdir(children[index]);
+        }
+      });
+      // Settle every worker even when one fails, so teardown can safely remove the tree.
+      const settled = await Promise.allSettled(workers);
+      const failed = settled.find((result) => result.status === "rejected");
+      if (failed?.status === "rejected") throw failed.reason;
+      if (stopFixtureSetup) throw new Error("Broad-tree fixture setup cancelled during teardown");
+      parents = children;
     }
+  }
+
+  // Keep the full 30³-leaf tree: eager traversal retains its unvisited siblings across
+  // all 14 searches. Bounded async setup avoids serial Windows metadata overhead and
+  // blocking Vitest's clock; the child's heap and 20 s search deadline stay unchanged.
+  it("finishes overlapping broad-tree searches within a bounded heap", async () => {
+    const broadRoot = path.join(scanRoot, "broad");
+    const fixtureStartedAt = performance.now();
+    fixtureSetup = createBroadTree(broadRoot);
+    await fixtureSetup;
+    const fixtureMs = performance.now() - fixtureStartedAt;
+    console.info("directory-search-heap-fixture-ready", { fixtureMs });
     // A smaller real tree and explicit heap budget keep the million-directory repro cheap in CI.
     const moduleUrl = new URL("./directory-suggestions.ts", import.meta.url).href;
     const source = `
@@ -1160,6 +1186,7 @@ describe("home-tree scan cost", () => {
       ));
       process.stdout.write(JSON.stringify(results));
     `;
+    const searchStartedAt = performance.now();
     const child = spawn(
       process.execPath,
       [
@@ -1189,6 +1216,10 @@ describe("home-tree scan cost", () => {
     });
     searchProcess = { child, exited };
     const exit = await exited;
+    console.info("directory-search-heap-proof", {
+      fixtureMs,
+      searchMs: performance.now() - searchStartedAt,
+    });
     expect({ ...exit, outOfMemory: stderr.includes("heap out of memory") }).toEqual({
       code: 0,
       signal: null,
