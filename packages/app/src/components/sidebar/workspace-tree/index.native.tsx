@@ -9,7 +9,7 @@ import {
   type ReactNode,
   type ComponentProps,
 } from "react";
-import { Text, View, type NativeSyntheticEvent, type NativeScrollEvent } from "react-native";
+import { View, type NativeSyntheticEvent, type NativeScrollEvent } from "react-native";
 import { GripVertical } from "lucide-react-native";
 import { NestableScrollContainer } from "react-native-draggable-flatlist";
 import { Gesture, GestureDetector, type ScrollView } from "react-native-gesture-handler";
@@ -23,6 +23,7 @@ import { workspaceDropPosition } from "./drop-target";
 import { measureWorkspaceTreeRows, type WorkspaceRowGeometry } from "./native-geometry";
 import {
   WorkspaceTreeRowChrome,
+  WorkspaceTreeDragPreview,
   foregroundMutedColorMapping,
   workspaceTreeStyles,
   type WorkspaceTreeRowProps,
@@ -192,6 +193,7 @@ function NativeTreeDragSurface({ children }: { children: ReactNode }) {
         {active && pointer ? (
           <View
             pointerEvents="none"
+            testID="workspace-tree-drag-preview"
             style={[
               workspaceTreeStyles.ghost,
               {
@@ -202,7 +204,7 @@ function NativeTreeDragSurface({ children }: { children: ReactNode }) {
               },
             ]}
           >
-            <Text style={workspaceTreeStyles.ghostText}>{active.name}</Text>
+            <WorkspaceTreeDragPreview name={active.name} />
           </View>
         ) : null}
       </View>

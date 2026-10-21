@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { SidebarWorkspacePlacement } from "@/hooks/use-sidebar-workspaces-list";
 import { shouldPinWorkspaceAfterDrop, reorderPinnedWorkspaceSubtree } from "./pin-placement";
-import { resolveWorkspaceTreeDrop, type WorkspaceTreeDrop } from "./drop-target";
+import {
+  resolveWorkspaceTreeDrop,
+  resolveWorkspaceTreeDropResult,
+  type WorkspaceTreeDrop,
+} from "./drop-target";
 
 function workspace(id: string, parent: string | null, order: number): SidebarWorkspacePlacement {
   return {
@@ -101,6 +105,73 @@ describe("workspace tree drops", () => {
         pinnedRootKeys,
       }),
     ).toBeNull();
+  });
+  it("explains a blocked cross-project nesting target without blocking pinned root ordering", () => {
+    const other = { ...workspace("x", null, 0), projectViewKey: "other" };
+    const input = {
+      workspaces: [...workspaces, other],
+      workspaceKey: "host:a",
+      targetWorkspaceKey: "host:x",
+      pinnedRootKeys: new Set(["host:a", "host:x"]),
+    };
+    expect(resolveWorkspaceTreeDropResult({ ...input, position: "inside" })).toEqual({
+      drop: null,
+      rejection: {
+        targetWorkspaceKey: "host:x",
+        message: "Use a workspace in the same project to nest",
+      },
+    });
+    expect(resolveWorkspaceTreeDropResult({ ...input, position: "before" })).toMatchObject({
+      drop: { pinnedOrderOnly: true, position: "before" },
+      rejection: null,
+    });
+  });
+  it("explains cross-host nesting and descendant cycles", () => {
+    const remote = {
+      ...workspace("remote", null, 0),
+      serverId: "remote",
+      workspaceKey: "remote:remote",
+    };
+    expect(
+      resolveWorkspaceTreeDropResult({
+        workspaces: [...workspaces, remote],
+        workspaceKey: "host:a",
+        targetWorkspaceKey: "remote:remote",
+        position: "inside",
+      }),
+    ).toEqual({
+      drop: null,
+      rejection: {
+        targetWorkspaceKey: "remote:remote",
+        message: "Use a workspace on the same host to nest",
+      },
+    });
+    expect(
+      resolveWorkspaceTreeDropResult({
+        workspaces,
+        workspaceKey: "host:a",
+        targetWorkspaceKey: "host:d",
+        position: "inside",
+      }),
+    ).toEqual({
+      drop: null,
+      rejection: {
+        targetWorkspaceKey: "host:d",
+        message: "A workspace cannot be moved into one of its children",
+      },
+    });
+  });
+  it("keeps self hover and leaving the list quiet", () => {
+    for (const targetWorkspaceKey of ["host:a", ""]) {
+      expect(
+        resolveWorkspaceTreeDropResult({
+          workspaces,
+          workspaceKey: "host:a",
+          targetWorkspaceKey,
+          position: "inside",
+        }),
+      ).toEqual({ drop: null, rejection: null });
+    }
   });
   it("inserts next to an orphan displayed at the root", () => {
     const orphan = workspace("orphan", "archived-parent", 0.5);

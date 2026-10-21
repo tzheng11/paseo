@@ -9,19 +9,42 @@ export interface WorkspaceTreeDrop {
   beforeWorkspaceId: string | null;
   pinnedOrderOnly?: boolean;
 }
-
-export function resolveWorkspaceTreeDrop(input: {
+export interface WorkspaceTreeDropRejection {
+  targetWorkspaceKey: string;
+  message: string;
+}
+interface WorkspaceTreeDropInput {
   workspaces: readonly SidebarWorkspacePlacement[];
   workspaceKey: string;
   targetWorkspaceKey: string;
   position: WorkspaceDropPosition;
   pinnedRootKeys?: ReadonlySet<string>;
-}): WorkspaceTreeDrop | null {
+}
+export function resolveWorkspaceTreeDrop(input: WorkspaceTreeDropInput): WorkspaceTreeDrop | null {
+  return resolveWorkspaceTreeDropResult(input).drop;
+}
+export function resolveWorkspaceTreeDropResult(input: WorkspaceTreeDropInput): {
+  drop: WorkspaceTreeDrop | null;
+  rejection: WorkspaceTreeDropRejection | null;
+} {
   const source = input.workspaces.find((item) => item.workspaceKey === input.workspaceKey);
   const target = input.workspaces.find((item) => item.workspaceKey === input.targetWorkspaceKey);
-  if (!source || !target || source.workspaceKey === target.workspaceKey) return null;
+  if (!source || !target || source.workspaceKey === target.workspaceKey)
+    return { drop: null, rejection: null };
   if (source.serverId !== target.serverId || source.projectViewKey !== target.projectViewKey) {
-    return resolvePinnedRootDrop(input, source, target);
+    const drop = resolvePinnedRootDrop(input, source, target);
+    if (drop) return { drop, rejection: null };
+    const scope = source.serverId !== target.serverId ? "host" : "project";
+    return {
+      drop: null,
+      rejection: {
+        targetWorkspaceKey: target.workspaceKey,
+        message:
+          input.position === "inside"
+            ? `Use a workspace ${scope === "host" ? "on" : "in"} the same ${scope} to nest`
+            : `Reorder workspaces within the same ${scope}`,
+      },
+    };
   }
   const parentWorkspaceId =
     input.position === "inside" ? target.workspaceId : effectiveParentId(input.workspaces, target);
@@ -33,7 +56,14 @@ export function resolveWorkspaceTreeDrop(input: {
   const seen = new Set<string>();
   let parent = parentWorkspaceId;
   while (parent) {
-    if (parent === source.workspaceId || seen.has(parent)) return null;
+    if (parent === source.workspaceId || seen.has(parent))
+      return {
+        drop: null,
+        rejection: {
+          targetWorkspaceKey: target.workspaceKey,
+          message: "A workspace cannot be moved into one of its children",
+        },
+      };
     seen.add(parent);
     parent = byId.get(parent)?.parentWorkspaceId ?? null;
   }
@@ -57,11 +87,14 @@ export function resolveWorkspaceTreeDrop(input: {
     beforeWorkspaceId = siblings[targetIndex + 1]?.workspaceId ?? null;
   }
   return {
-    workspaceKey: source.workspaceKey,
-    targetWorkspaceKey: target.workspaceKey,
-    position: input.position,
-    parentWorkspaceId,
-    beforeWorkspaceId,
+    drop: {
+      workspaceKey: source.workspaceKey,
+      targetWorkspaceKey: target.workspaceKey,
+      position: input.position,
+      parentWorkspaceId,
+      beforeWorkspaceId,
+    },
+    rejection: null,
   };
 }
 

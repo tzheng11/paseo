@@ -251,6 +251,132 @@ test("dragging nests and orders siblings, moves whole subtrees, and survives rel
   }
 });
 
+test("workspace nesting names its target, confirms persistence, and explains blocked drops", async ({
+  page,
+}, testInfo) => {
+  test.setTimeout(120_000);
+  const seeded = await seedWorkspace({ repoPrefix: "workspace-tree-feedback-", title: "Parent" });
+  const other = await seedWorkspace({
+    repoPrefix: "workspace-tree-other-",
+    title: "Other project",
+  });
+  const held = { release: null as (() => void) | null, captured: false };
+  await page.routeWebSocket(daemonWsRoutePattern(), (browser) => {
+    const server = browser.connectToServer();
+    browser.onMessage((message) => server.send(message));
+    server.onMessage((message) => {
+      const raw = typeof message === "string" ? message : message.toString("utf8");
+      const envelope = JSON.parse(raw);
+      if (envelope.message?.type === "workspace.move.response" && !held.captured) {
+        held.captured = true;
+        held.release = () => {
+          held.release = null;
+          browser.send(message);
+        };
+        return;
+      }
+      browser.send(message);
+    });
+  });
+  const node = (id: string) =>
+    page
+      .getByTestId(`workspace-tree-node-${getServerId()}:${id}`)
+      .filter({ visible: true })
+      .first();
+  async function beginDrag(id: string, targetId: string) {
+    const source = page
+      .getByTestId(`sidebar-workspace-row-${getServerId()}:${id}`)
+      .filter({ visible: true })
+      .first();
+    await source.scrollIntoViewIfNeeded();
+    const from = await visibleBoundingBox(source);
+    const target = await visibleBoundingBox(node(targetId));
+    await page.mouse.move(from.x + from.width / 2, from.y + from.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(from.x + from.width / 2 + 8, from.y + from.height / 2, { steps: 2 });
+    await page.mouse.move(target.x + target.width / 2, target.y + target.height / 2, { steps: 8 });
+  }
+  async function indent(childId: string) {
+    const parent = await visibleBoundingBox(node(seeded.workspaceId));
+    const child = await visibleBoundingBox(node(childId));
+    return child.x - parent.x;
+  }
+  try {
+    const created = await seeded.client.createWorkspace({
+      source: { kind: "directory", path: seeded.repoPath, projectId: seeded.projectId },
+      title: "Child",
+    });
+    if (!created.workspace) throw new Error(created.error ?? "Workspace creation failed");
+    const childId = created.workspace.id;
+    const parentId = async () =>
+      (
+        await seeded.client.fetchWorkspaces({ filter: { projectId: seeded.projectId } })
+      ).entries.find((workspace) => workspace.id === childId)?.parentWorkspaceId;
+    await gotoAppShell(page);
+    await waitForSidebarHydration(page);
+    await beginDrag(childId, seeded.workspaceId);
+    await expect(page.getByTestId("workspace-tree-drop-inside")).toContainText(
+      "Nest under “Parent”",
+    );
+    await expect(page.getByTestId("workspace-tree-drag-feedback")).toHaveText(
+      "Nest under “Parent”",
+    );
+    await page.screenshot({
+      path: testInfo.outputPath("workspace-nesting-target.png"),
+      animations: "disabled",
+    });
+    await page.mouse.up();
+    await expect.poll(() => held.release !== null).toBe(true);
+    await expect(page.getByTestId("workspace-tree-move-pending")).toBeVisible();
+    await expect(page.getByTestId("workspace-tree-move-success")).toHaveCount(0);
+    held.release?.();
+    await expect(page.getByTestId("workspace-tree-move-success")).toContainText(
+      "Nested “Child” under “Parent”",
+    );
+    await expect.poll(parentId).toBe(seeded.workspaceId);
+    await expect.poll(() => indent(childId)).toBe(16);
+    await page.mouse.move(1200, 900);
+    await page.screenshot({
+      path: testInfo.outputPath("workspace-nesting-confirmed.png"),
+      animations: "disabled",
+    });
+    await page.reload();
+    await waitForSidebarHydration(page);
+    await expect.poll(() => indent(childId)).toBe(16);
+    await beginDrag(childId, other.workspaceId);
+    const message = "Use a workspace in the same project to nest";
+    const blocked = page.getByTestId("workspace-tree-drop-blocked");
+    const reason = blocked.getByText(message, { exact: true });
+    await expect(reason).toBeVisible();
+    const overlayBounds = await visibleBoundingBox(blocked);
+    const reasonBounds = await visibleBoundingBox(reason);
+    expect(reasonBounds.y).toBeGreaterThanOrEqual(overlayBounds.y);
+    expect(reasonBounds.y + reasonBounds.height).toBeLessThanOrEqual(
+      overlayBounds.y + overlayBounds.height,
+    );
+    const previewReason = page.getByTestId("workspace-tree-drag-feedback");
+    await expect(previewReason).toHaveText(message);
+    const previewBounds = await visibleBoundingBox(page.getByTestId("workspace-tree-drag-preview"));
+    const feedbackBounds = await visibleBoundingBox(previewReason);
+    expect(feedbackBounds.y).toBeGreaterThanOrEqual(previewBounds.y);
+    expect(feedbackBounds.y + feedbackBounds.height).toBeLessThanOrEqual(
+      previewBounds.y + previewBounds.height,
+    );
+    await page.screenshot({
+      path: testInfo.outputPath("workspace-nesting-blocked.png"),
+      animations: "disabled",
+    });
+    await page.mouse.up();
+    await expect(page.getByTestId("workspace-tree-move-blocked")).toContainText(message);
+    await expect(parentId()).resolves.toBe(seeded.workspaceId);
+    await expect(page.getByTestId("workspace-tree-move-error")).toHaveCount(0);
+  } finally {
+    held.release?.();
+    await seeded.cleanup();
+    await other.cleanup();
+  }
+});
+
 test("keyboard workspace dragging reorders, intentionally nests, and lifts out", async ({
   page,
 }) => {

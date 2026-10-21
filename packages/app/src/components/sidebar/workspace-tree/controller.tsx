@@ -16,10 +16,12 @@ import { Button } from "@/components/ui/button";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import type { SidebarWorkspacePlacement } from "@/hooks/use-sidebar-workspaces-list";
 import { useSidebarCollapsedSectionsStore } from "@/stores/sidebar-collapsed-sections-store";
+import { useToast } from "@/contexts/toast-context";
 import {
-  resolveWorkspaceTreeDrop,
+  resolveWorkspaceTreeDropResult,
   type WorkspaceDropPosition,
   type WorkspaceTreeDrop,
+  type WorkspaceTreeDropRejection,
 } from "./drop-target";
 
 export interface WorkspaceTreeProviderProps {
@@ -34,6 +36,7 @@ interface TreeDragController {
   activeWorkspaceKey: string | null;
   activeSubtreeKeys: ReadonlySet<string>;
   drop: WorkspaceTreeDrop | null;
+  rejection: WorkspaceTreeDropRejection | null;
   pending: boolean;
   enabled: (workspace: SidebarWorkspacePlacement) => boolean;
   start: (workspaceKey: string) => void;
@@ -54,11 +57,14 @@ export function WorkspaceTreeController({
 }: WorkspaceTreeProviderProps) {
   const [activeWorkspaceKey, setActiveWorkspaceKey] = useState<string | null>(null);
   const [drop, setDrop] = useState<WorkspaceTreeDrop | null>(null);
+  const [rejection, setRejection] = useState<WorkspaceTreeDropRejection | null>(null);
   const [pending, setPending] = useState(false);
   const [failure, setFailure] = useState<{ drop: WorkspaceTreeDrop; message: string } | null>(null);
   const activeRef = useRef<string | null>(null);
   const dropRef = useRef<WorkspaceTreeDrop | null>(null);
+  const rejectionRef = useRef<WorkspaceTreeDropRejection | null>(null);
   const pendingRef = useRef(false);
+  const toast = useToast();
   const submit = useCallback(
     async (next: WorkspaceTreeDrop) => {
       if (pendingRef.current) return;
@@ -72,6 +78,16 @@ export function WorkspaceTreeController({
             .getState()
             .setWorkspaceCollapsed(next.targetWorkspaceKey, false);
         }
+        const source = workspaces.find((workspace) => workspace.workspaceKey === next.workspaceKey);
+        const target = workspaces.find(
+          (workspace) => workspace.workspaceKey === next.targetWorkspaceKey,
+        );
+        toast.show(
+          next.position === "inside"
+            ? `Nested “${source?.name ?? "Workspace"}” under “${target?.name ?? "workspace"}”`
+            : "Workspace order updated",
+          { variant: "success", durationMs: 4000, testID: "workspace-tree-move-success" },
+        );
       } catch (error) {
         setFailure({
           drop: next,
@@ -82,13 +98,15 @@ export function WorkspaceTreeController({
         setPending(false);
       }
     },
-    [onMove],
+    [onMove, toast, workspaces],
   );
   const cancel = useCallback(() => {
     activeRef.current = null;
     dropRef.current = null;
+    rejectionRef.current = null;
     setActiveWorkspaceKey(null);
     setDrop(null);
+    setRejection(null);
   }, []);
   const start = useCallback((key: string) => {
     if (pendingRef.current) return;
@@ -99,30 +117,45 @@ export function WorkspaceTreeController({
   const hover = useCallback(
     (targetWorkspaceKey: string, position: WorkspaceDropPosition) => {
       const source = activeRef.current;
-      const next = source
-        ? resolveWorkspaceTreeDrop({
+      const result = source
+        ? resolveWorkspaceTreeDropResult({
             workspaces,
             workspaceKey: source,
             targetWorkspaceKey,
             position,
             pinnedRootKeys,
           })
-        : null;
+        : { drop: null, rejection: null };
+      const next = result.drop;
       dropRef.current = next;
+      rejectionRef.current = result.rejection;
       setDrop((previous) =>
         previous?.targetWorkspaceKey === next?.targetWorkspaceKey &&
         previous?.position === next?.position
           ? previous
           : next,
       );
+      setRejection((previous) =>
+        previous?.targetWorkspaceKey === result.rejection?.targetWorkspaceKey &&
+        previous?.message === result.rejection?.message
+          ? previous
+          : result.rejection,
+      );
     },
     [pinnedRootKeys, workspaces],
   );
   const finish = useCallback(() => {
     const next = dropRef.current;
+    const blocked = rejectionRef.current;
     cancel();
     if (next) void submit(next);
-  }, [cancel, submit]);
+    else if (blocked)
+      toast.show(blocked.message, {
+        variant: "warning",
+        durationMs: 6000,
+        testID: "workspace-tree-move-blocked",
+      });
+  }, [cancel, submit, toast]);
   useEffect(() => {
     if (drop?.position !== "inside") return;
     const timer = setTimeout(() => {
@@ -153,6 +186,7 @@ export function WorkspaceTreeController({
       activeWorkspaceKey,
       activeSubtreeKeys,
       drop,
+      rejection,
       pending,
       enabled,
       start,
@@ -165,6 +199,7 @@ export function WorkspaceTreeController({
       activeWorkspaceKey,
       activeSubtreeKeys,
       drop,
+      rejection,
       pending,
       enabled,
       start,
