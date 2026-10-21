@@ -485,6 +485,29 @@ describe("normalizeWorkspaceDescriptor", () => {
     },
   );
 
+  it("retains fractional sibling ranks and parent ids at the directory boundary", () => {
+    const workspace = normalizeWorkspaceDescriptor({
+      id: "child",
+      parentWorkspaceId: "parent",
+      siblingOrder: 0.125,
+      projectId: "project",
+      projectDisplayName: "Project",
+      projectRootPath: "/repo",
+      workspaceDirectory: "/repo",
+      projectKind: "git",
+      workspaceKind: "local_checkout",
+      name: "Child",
+      status: "done",
+      statusEnteredAt: null,
+      activityAt: null,
+      archivingAt: null,
+      diffStat: null,
+      scripts: [],
+    });
+    expect(workspace.parentWorkspaceId).toBe("parent");
+    expect(workspace.siblingOrder).toBe(0.125);
+  });
+
   it("normalizes workspace scripts and invalid activity timestamps", () => {
     const scripts = [
       {

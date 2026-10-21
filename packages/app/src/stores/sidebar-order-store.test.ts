@@ -21,11 +21,39 @@ describe("migrateSidebarOrderState", () => {
     expect(migrated).toEqual({
       projectOrder: ["project-a"],
       pinnedWorkspaceOrder: [],
+      superpinnedWorkspaceOrder: [],
       pinnedWorkspaceSortMode: "manual",
       workspaceSortModeByProject: {},
       workspaceOrderByProject: {
         "project-a": ["host-a:main", "host-a:feature", "host-b:main"],
       },
+    });
+  });
+
+  it("preserves superpin manual order across validated storage, migration, and hydration", async () => {
+    const options = useSidebarOrderStore.persist.getOptions();
+    if (!options.storage) throw new Error("Missing sidebar storage");
+    const storageName = options.name;
+    if (!storageName) throw new Error("Missing sidebar storage name");
+    useSidebarOrderStore.getState().setSuperpinnedWorkspaceOrder(["host:b", "host:a", "host:b"]);
+    const saved = await options.storage.getItem(storageName);
+    expect(saved?.state).toMatchObject({ superpinnedWorkspaceOrder: ["host:b", "host:a"] });
+    expect(migrateSidebarOrderState(saved?.state).superpinnedWorkspaceOrder).toEqual([
+      "host:b",
+      "host:a",
+    ]);
+    useSidebarOrderStore.setState({ superpinnedWorkspaceOrder: [] });
+    if (!saved) throw new Error("Sidebar state was not persisted");
+    await options.storage.setItem(storageName, saved);
+    await useSidebarOrderStore.persist.rehydrate();
+    expect(useSidebarOrderStore.getState().superpinnedWorkspaceOrder).toEqual(["host:b", "host:a"]);
+    expect(migrateSidebarOrderState(null)).toEqual({
+      projectOrder: [],
+      pinnedWorkspaceOrder: [],
+      superpinnedWorkspaceOrder: [],
+      pinnedWorkspaceSortMode: "manual",
+      workspaceOrderByProject: {},
+      workspaceSortModeByProject: {},
     });
   });
 

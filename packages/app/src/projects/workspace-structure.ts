@@ -18,6 +18,10 @@ export interface WorkspaceStructureProject {
   iconWorkingDir: string;
   hosts: WorkspaceStructureHostPlacement[];
   workspaceKeys: string[];
+  workspaceHierarchy?: Record<
+    string,
+    Pick<WorkspaceDescriptor, "parentWorkspaceId" | "siblingOrder">
+  >;
 }
 
 export interface WorkspaceStructure {
@@ -38,7 +42,15 @@ interface ProjectDraft {
   projectKind: WorkspaceDescriptor["projectKind"];
   iconWorkingDir: string;
   hosts: Map<string, WorkspaceStructureHostPlacement>;
-  workspaces: Array<{ workspaceId: string; workspaceName: string; workspaceKey: string }>;
+  workspaces: WorkspaceStructureItem[];
+}
+
+interface WorkspaceStructureItem {
+  workspaceId: string;
+  workspaceName: string;
+  workspaceKey: string;
+  parentWorkspaceId?: string | null;
+  siblingOrder?: number;
 }
 
 /** The single app boundary that turns host-local projects into grouped display projects. */
@@ -87,22 +99,29 @@ export function buildWorkspaceStructureProjects(input: {
         workspaceId: workspace.id,
         workspaceName: workspace.name,
         workspaceKey: `${session.serverId}:${workspace.id}`,
+        parentWorkspaceId: workspace.parentWorkspaceId,
+        siblingOrder: workspace.siblingOrder,
       });
     }
   }
 
   return Array.from(byProject.values())
-    .map((draft) => ({
-      viewKey: draft.viewKey,
-      projectKey: draft.projectKey,
-      projectName: draft.projectName,
-      projectKind: draft.projectKind,
-      iconWorkingDir: draft.iconWorkingDir,
-      hosts: Array.from(draft.hosts.values()),
-      workspaceKeys: draft.workspaces
-        .sort(compareWorkspaceStructureItems)
-        .map((workspace) => workspace.workspaceKey),
-    }))
+    .map((draft) =>
+      Object.assign(
+        {
+          viewKey: draft.viewKey,
+          projectKey: draft.projectKey,
+          projectName: draft.projectName,
+          projectKind: draft.projectKind,
+          iconWorkingDir: draft.iconWorkingDir,
+          hosts: Array.from(draft.hosts.values()),
+          workspaceKeys: draft.workspaces
+            .sort(compareWorkspaceStructureItems)
+            .map((workspace) => workspace.workspaceKey),
+        },
+        workspaceHierarchy(draft.workspaces),
+      ),
+    )
     .sort(
       (left, right) =>
         left.projectName.localeCompare(right.projectName, undefined, {
@@ -197,13 +216,41 @@ function getOrCreate<K, V>(map: Map<K, V>, key: K, create: () => V): V {
 }
 
 function compareWorkspaceStructureItems(
-  left: { workspaceId: string; workspaceName: string },
-  right: { workspaceId: string; workspaceName: string },
+  left: WorkspaceStructureItem,
+  right: WorkspaceStructureItem,
 ): number {
+  // Mixing rank comparisons with name comparisons would make mixed-version hosts non-transitive.
+  if (left.siblingOrder !== undefined) {
+    if (right.siblingOrder === undefined) return -1;
+    return (
+      left.siblingOrder - right.siblingOrder || left.workspaceId.localeCompare(right.workspaceId)
+    );
+  }
+  if (right.siblingOrder !== undefined) return 1;
   return (
     left.workspaceName.localeCompare(right.workspaceName, undefined, {
       numeric: true,
       sensitivity: "base",
     }) || left.workspaceId.localeCompare(right.workspaceId, undefined, { sensitivity: "base" })
   );
+}
+
+function workspaceHierarchy(
+  workspaces: readonly WorkspaceStructureItem[],
+): Pick<WorkspaceStructureProject, "workspaceHierarchy"> {
+  const entries = workspaces
+    .filter(
+      (workspace) => workspace.siblingOrder !== undefined || workspace.parentWorkspaceId != null,
+    )
+    .map(
+      (workspace) =>
+        [
+          workspace.workspaceKey,
+          {
+            parentWorkspaceId: workspace.parentWorkspaceId ?? null,
+            siblingOrder: workspace.siblingOrder,
+          },
+        ] as const,
+    );
+  return entries.length > 0 ? { workspaceHierarchy: Object.fromEntries(entries) } : {};
 }

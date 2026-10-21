@@ -18,7 +18,6 @@ import { seedWorkspace } from "../support/helpers/seed-client";
 import { expectWorkspaceHeader } from "../support/helpers/workspace-ui";
 import { getServerId } from "../support/helpers/server-id";
 import { getE2EDaemonPort } from "../support/helpers/daemon-port";
-import { projectEquivalenceViewKey } from "../support/helpers/project-view-key";
 import { escapeRegex } from "../support/helpers/regex";
 import { openFilesPanel } from "../support/helpers/workspace-tabs";
 import { seedMockAgentWorkspace } from "../support/helpers/mock-agent";
@@ -188,7 +187,7 @@ async function simulateDamagedLegacyDirectoryCache(
             }
             const stored = JSON.parse(checkpoint.payload);
             // Accept either writer so this fixture also reproduces on the unfixed client.
-            const cursors = stored.version === 1 ? stored.cursors : stored;
+            const cursors = stored.version === 1 || stored.version === 2 ? stored.cursors : stored;
             if (!cursors.workspaces?.generation) {
               transaction.abort();
               return;
@@ -564,9 +563,6 @@ test.describe("Half-screen desktop layout", () => {
       }
 
       await gotoAppShell(page);
-      await page
-        .getByTestId(`sidebar-project-show-more-${projectEquivalenceViewKey(workspace.projectKey)}`)
-        .click();
       await waitForSidebarWorkspace(page, lastWorkspaceId);
 
       const sidebarScroll = page.getByTestId("sidebar-project-workspace-list-scroll");
@@ -624,7 +620,9 @@ test.describe("Half-screen desktop layout", () => {
     await expect(page.getByTestId("sidebar-settings")).not.toBeVisible();
   });
 
-  test("keeps app navigation beside the Explorer pane", async ({ page }) => {
+  test("yields app navigation to Explorer and restores it when Explorer closes", async ({
+    page,
+  }) => {
     const workspace = await seedWorkspace({ repoPrefix: "sidebar-half-screen-explorer-" });
 
     try {
@@ -636,7 +634,7 @@ test.describe("Half-screen desktop layout", () => {
       const explorerToggle = page.getByTestId("workspace-explorer-toggle").first();
       await expect(page.getByTestId("workspace-tab-files").filter({ visible: true })).toBeVisible();
       await expect(explorerToggle).toHaveAccessibleName("Close Explorer sidebar");
-      await expect(page.getByTestId("sidebar-global-new-workspace")).toBeVisible();
+      await expect(page.getByTestId("sidebar-global-new-workspace")).not.toBeVisible();
       await expect(page.getByTestId("workspace-explorer-sidebar")).toBeVisible();
       await expect(
         page

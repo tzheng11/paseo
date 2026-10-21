@@ -580,7 +580,36 @@ test("createWorkspaceForDirectory always mints a fresh workspace even when one a
   const second = await provisioning.createWorkspaceForDirectory(repo);
 
   expect(second.workspaceId).not.toBe(first.workspaceId);
+  expect(first.siblingOrder).toBe(0);
+  expect(second.siblingOrder).toBe(1);
+  expect(second).toEqual(await workspaceRegistry.get(second.workspaceId));
   expect(await workspaceRegistry.list()).toHaveLength(2);
+});
+
+test("worktree creation returns the committed append rank and parent membership", async () => {
+  const repo = path.join(tmpDir, "repo");
+  gitRoots.add(repo);
+  const parent = await provisioning.createWorkspaceForDirectory(repo);
+  const create = (name: string) =>
+    provisioning.createWorkspaceForWorktree({
+      sourceCwd: repo,
+      repoRoot: repo,
+      cwd: path.join(tmpDir, name),
+      worktreeRoot: path.join(tmpDir, name),
+      branch: name,
+      baseBranch: "main",
+      title: name,
+      parentWorkspaceId: parent.workspaceId,
+    });
+  const first = await create("first");
+  const second = await create("second");
+  expect(first.siblingOrder).toBe(0);
+  expect(second).toMatchObject({
+    siblingOrder: 1,
+    parentWorkspaceId: parent.workspaceId,
+    projectId: parent.projectId,
+  });
+  expect(second).toEqual(await workspaceRegistry.get(second.workspaceId));
 });
 
 test("directory creation persists the live branch and a trimmed title", async () => {

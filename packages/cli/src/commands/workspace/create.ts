@@ -9,6 +9,8 @@ export interface WorkspaceCreateOptions extends CommandOptions {
   path?: string;
   project?: string;
   title?: string;
+  parent?: string;
+  siblingOrder?: string;
   mode?: string;
   worktreeSlug?: string;
   newBranch?: string;
@@ -136,6 +138,7 @@ export async function runCreateCommand(
   options: WorkspaceCreateOptions,
   _command: Command,
 ): Promise<SingleResult<WorkspaceRow>> {
+  const hierarchy = resolveWorkspaceHierarchy(options);
   const host = getDaemonHost({ target: options.daemonTarget });
   const client = await connectToDaemon({ target: options.daemonTarget }).catch((error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
@@ -150,6 +153,7 @@ export async function runCreateCommand(
     const payload = await client.createWorkspace({
       source: buildWorkspaceSource(options),
       ...(options.title ? { title: options.title } : {}),
+      ...hierarchy,
       ...(options.background !== undefined ? { background: options.background } : {}),
       ...(callerAgentId ? { callerAgentId } : {}),
     });
@@ -164,4 +168,31 @@ export async function runCreateCommand(
   } finally {
     await client.close().catch(() => undefined);
   }
+}
+
+export function resolveWorkspaceHierarchy(
+  options: Pick<WorkspaceCreateOptions, "parent" | "siblingOrder">,
+) {
+  const parentWorkspaceId = options.parent?.trim();
+  if (options.parent !== undefined && !parentWorkspaceId) {
+    throw {
+      code: "INVALID_OPTIONS",
+      message: "--parent must be a workspace id",
+    } satisfies CommandError;
+  }
+  const siblingOrder =
+    options.siblingOrder === undefined ? undefined : Number(options.siblingOrder);
+  if (
+    options.siblingOrder !== undefined &&
+    (!options.siblingOrder.trim() || !Number.isFinite(siblingOrder))
+  ) {
+    throw {
+      code: "INVALID_OPTIONS",
+      message: "--sibling-order must be a finite number",
+    } satisfies CommandError;
+  }
+  return {
+    ...(parentWorkspaceId !== undefined ? { parentWorkspaceId } : {}),
+    ...(siblingOrder !== undefined ? { siblingOrder } : {}),
+  };
 }

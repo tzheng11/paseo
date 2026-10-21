@@ -23,6 +23,7 @@ import {
   type SidebarShortcutSection,
 } from "@/utils/sidebar-shortcuts";
 import { statusWorkspaceGroups, type SidebarWorkspaceGroup } from "./sidebar-labels";
+import { flattenWorkspaceTree } from "./workspace-tree/model";
 
 export interface SidebarProjection {
   pinnedGroups: PinnedSidebarGroups;
@@ -43,6 +44,7 @@ export interface SidebarProjectionInput {
   projects: SidebarProjectEntry[];
   pinnedKeys: PinnedSidebarKeys;
   pinnedWorkspaceOrder: string[];
+  superpinnedWorkspaceOrder?: string[];
   pinnedWorkspaceSortMode?: PinnedWorkspaceSortMode;
   workspaceTitleSource?: WorkspaceTitleSource;
   workspaceSortModeByProject?: Readonly<Record<string, SidebarWorkspaceSortMode>>;
@@ -52,6 +54,7 @@ export interface SidebarProjectionInput {
   pinnedCollapsed: boolean;
   collapsedProjectKeys: ReadonlySet<string>;
   collapsedWorkspaceGroupKeys: ReadonlySet<string>;
+  collapsedWorkspaceKeys?: ReadonlySet<string>;
   t: TFunction;
 }
 
@@ -60,6 +63,7 @@ export function buildSidebarProjection(input: SidebarProjectionInput): SidebarPr
     projects: input.projects,
     keys: input.pinnedKeys,
     pinnedWorkspaceOrder: input.pinnedWorkspaceOrder,
+    superpinnedWorkspaceOrder: input.superpinnedWorkspaceOrder,
   });
   pinnedGroups.pinnedChats = sortSidebarWorkspaces({
     workspaces: pinnedGroups.pinnedChats,
@@ -80,7 +84,11 @@ export function buildSidebarProjection(input: SidebarProjectionInput): SidebarPr
       }),
     };
   });
-  const pinnedWorkspaceKeys = new Set(input.pinnedKeys.pinnedWorkspaceKeys);
+  const pinnedWorkspaceKeys = new Set(
+    [...pinnedGroups.superpinnedChats, ...pinnedGroups.pinnedChats].map(
+      (workspace) => workspace.workspaceKey,
+    ),
+  );
   const unpinnedWorkspaces = Array.from(input.workspaceEntriesByKey.values()).filter(
     (workspace) => !pinnedWorkspaceKeys.has(workspace.workspaceKey),
   );
@@ -90,15 +98,29 @@ export function buildSidebarProjection(input: SidebarProjectionInput): SidebarPr
   const workspaceGroups = buildWorkspaceGroups(input, unpinnedWorkspaces);
 
   const sections: SidebarShortcutSection[] = [];
+  const collapsedWorkspaces = input.collapsedWorkspaceKeys ?? new Set<string>();
   if (!input.collapsedWorkspaceGroupKeys.has("section:superpinned"))
-    sections.push({ workspaces: pinnedGroups.superpinnedChats });
+    sections.push({
+      workspaces: flattenWorkspaceTree(pinnedGroups.superpinnedChats, collapsedWorkspaces).map(
+        (row) => row.workspace,
+      ),
+    });
   if (!input.pinnedCollapsed) {
-    sections.push({ workspaces: pinnedGroups.pinnedChats });
+    const workspaces = flattenWorkspaceTree(
+      pinnedGroups.pinnedChats,
+      collapsedWorkspaces,
+      (input.pinnedWorkspaceSortMode ?? "manual") === "manual",
+    ).map((row) => row.workspace);
+    sections.push({ workspaces });
   }
   if (input.groupMode === "project") {
     sections.push(
       ...pinnedGroups.unpinnedProjects.map((project) => ({
-        workspaces: project.workspaces,
+        workspaces: flattenWorkspaceTree(
+          project.workspaces,
+          collapsedWorkspaces,
+          (input.workspaceSortModeByProject?.[project.viewKey] ?? "manual") === "manual",
+        ).map((row) => row.workspace),
         collapsed: input.collapsedProjectKeys.has(project.viewKey),
       })),
     );

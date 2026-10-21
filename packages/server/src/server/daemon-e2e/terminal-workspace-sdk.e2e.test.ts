@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, expect, test } from "vitest";
-import { createPaseoClient, type PaseoClient } from "@getpaseo/client";
+import { createPaseoClient, type PaseoClient, type PaseoWorkspaceUpdate } from "@getpaseo/client";
 import { DaemonClient } from "../test-utils/daemon-client.js";
 import { createTestPaseoDaemon, type TestPaseoDaemon } from "../test-utils/paseo-daemon.js";
 
@@ -269,3 +269,65 @@ test.runIf(process.platform !== "win32")(
     expect((await sdk.terminals.list({ workspaceId })).entries).toEqual([]);
   },
 );
+
+test("workspace hierarchy persists creation and fractional moves across subscribed SDK clients", async () => {
+  const parent = await sdk.workspaces.create({
+    source: { kind: "directory", path: cwd },
+    title: "Parent",
+  });
+  const first = await sdk.workspaces.create({
+    source: { kind: "directory", path: cwd },
+    parentWorkspaceId: parent.id,
+    siblingOrder: 0,
+    title: "First",
+  });
+  const last = await sdk.workspaces.create({
+    source: { kind: "directory", path: cwd },
+    parentWorkspaceId: parent.id,
+    siblingOrder: 10,
+    title: "Last",
+  });
+  const moving = await sdk.workspaces.create({
+    source: { kind: "directory", path: cwd },
+    title: "Moving",
+  });
+  const updates: PaseoWorkspaceUpdate[] = [];
+  const stop = sdk.workspaces.subscribe((update) => {
+    updates.push(update);
+  });
+  const listing = await sdk.workspaces.list({ subscribe: {} });
+  expect(listing.entries.find((workspace) => workspace.id === first.id)).toMatchObject({
+    parentWorkspaceId: parent.id,
+    siblingOrder: 0,
+    projectId: parent.projectId,
+  });
+  expect(
+    await sdk.workspaces.move(moving, { parentWorkspaceId: parent.id, beforeWorkspaceId: last.id }),
+  ).toEqual({ parentWorkspaceId: parent.id, siblingOrder: 5 });
+  expect(updates).toContainEqual(
+    expect.objectContaining({
+      kind: "upsert",
+      workspace: expect.objectContaining({
+        id: moving.id,
+        parentWorkspaceId: parent.id,
+        siblingOrder: 5,
+      }),
+    }),
+  );
+  expect(await sdk.workspaces.ref(moving.id).refresh()).toMatchObject({
+    parentWorkspaceId: parent.id,
+    siblingOrder: 5,
+    workspaceDirectory: cwd,
+  });
+  await expect(parent.move({ parentWorkspaceId: moving.id })).rejects.toThrow("own ancestor");
+  await parent.archive();
+  const survivors = await sdk.workspaces.list();
+  expect(survivors.entries.map((workspace) => workspace.id).sort()).toEqual(
+    [first.id, last.id, moving.id].sort(),
+  );
+  expect(survivors.entries.find((workspace) => workspace.id === moving.id)).toMatchObject({
+    parentWorkspaceId: parent.id,
+  });
+  stop();
+  await listing.subscription.release();
+});

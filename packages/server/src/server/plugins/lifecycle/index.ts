@@ -1,4 +1,4 @@
-import type { AgentStreamEvent, AgentTimelineItem } from "../../agent/agent-sdk-types.js";
+import type { AgentTimelineItem, AgentStreamEvent } from "../../agent/agent-sdk-types.js";
 import { z } from "zod";
 import { CreateAgentRequestMessageSchema } from "@getpaseo/protocol/messages";
 import type {

@@ -10,6 +10,52 @@ import {
 } from "./messages.js";
 
 describe("workspace message schemas", () => {
+  test("parses hierarchy moves and rejects non-finite sibling ordering", () => {
+    const request = {
+      type: "workspace.move.request",
+      requestId: "move",
+      workspaceId: "child",
+      parentWorkspaceId: "parent",
+      beforeWorkspaceId: "sibling",
+    };
+    expect(SessionInboundMessageSchema.parse(request)).toEqual(request);
+    const response = {
+      type: "workspace.move.response",
+      payload: {
+        requestId: "move",
+        workspaceId: "child",
+        accepted: true,
+        parentWorkspaceId: "parent",
+        siblingOrder: 0.5,
+        error: null,
+      },
+    };
+    expect(SessionOutboundMessageSchema.parse(response)).toEqual(response);
+    expect(
+      SessionOutboundMessageSchema.safeParse({
+        ...response,
+        payload: { ...response.payload, siblingOrder: Infinity },
+      }).success,
+    ).toBe(false);
+    expect(
+      WorkspaceCreateRequestSchema.parse({
+        type: "workspace.create.request",
+        requestId: "create",
+        source: { kind: "directory", path: "/repo" },
+        parentWorkspaceId: "parent",
+        siblingOrder: -0.5,
+      }),
+    ).toMatchObject({ parentWorkspaceId: "parent", siblingOrder: -0.5 });
+    expect(
+      WorkspaceCreateRequestSchema.safeParse({
+        type: "workspace.create.request",
+        requestId: "create",
+        source: { kind: "directory", path: "/repo" },
+        siblingOrder: NaN,
+      }).success,
+    ).toBe(false);
+  });
+
   test("parses mark-unread request and response", () => {
     expect(
       SessionInboundMessageSchema.parse({

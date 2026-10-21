@@ -2,6 +2,7 @@ import { promises as fs } from "node:fs";
 
 import type { Logger } from "pino";
 import { z } from "zod";
+import type { WorkspaceMoveRequest } from "@getpaseo/protocol/messages";
 
 import {
   MAX_WORKSPACE_FIELD_VALUE_LENGTH,
@@ -58,6 +59,9 @@ const PersistedWorkspaceRecordSchema = z
   .object({
     workspaceId: z.string(),
     projectId: z.string(),
+    // COMPAT(workspaceHierarchy): added in v0.12.0; remove optional parsing after 2027-04-21.
+    parentWorkspaceId: z.string().nullable().optional(),
+    siblingOrder: z.number().finite().optional(),
     cwd: z.string(),
     kind: z.enum(["local_checkout", "worktree", "directory"]),
     displayName: z.string(),
@@ -179,11 +183,17 @@ export interface ProjectRegistry {
   subscribeToMutations?(listener: (mutation: ProjectMutation) => void | Promise<void>): () => void;
 }
 
+export type WorkspaceMoveInput = Pick<
+  WorkspaceMoveRequest,
+  "parentWorkspaceId" | "beforeWorkspaceId"
+>;
+
 export interface WorkspaceRegistry {
   initialize(): Promise<void>;
   existsOnDisk(): Promise<boolean>;
   list(): Promise<PersistedWorkspaceRecord[]>;
   get(workspaceId: string): Promise<PersistedWorkspaceRecord | null>;
+  move(workspaceId: string, input: WorkspaceMoveInput): Promise<PersistedWorkspaceRecord>;
   update(
     workspaceId: string,
     updater: (record: PersistedWorkspaceRecord) => PersistedWorkspaceRecord,
@@ -208,6 +218,7 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
   protected readonly logger: Logger;
   private readonly schema: z.ZodType<TRecord, unknown>;
   private readonly getId: (record: TRecord) => string;
+  private readonly normalizeRecord: (record: TRecord) => TRecord;
   private loaded = false;
   private readonly cache = new Map<string, TRecord>();
   private mutationQueue: Promise<void> = Promise.resolve();
@@ -219,12 +230,14 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
     logger: Logger;
     schema: z.ZodType<TRecord, unknown>;
     getId: (record: TRecord) => string;
+    normalizeRecord?: (record: TRecord) => TRecord;
     component: string;
     writeRecords?: (filePath: string, records: readonly TRecord[]) => Promise<void>;
   }) {
     this.filePath = options.filePath;
     this.schema = options.schema;
     this.getId = options.getId;
+    this.normalizeRecord = options.normalizeRecord ?? ((record) => record);
     this.logger = options.logger.child({
       module: "workspace-registry",
       component: options.component,
@@ -322,7 +335,7 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
       const raw = await fs.readFile(this.filePath, "utf8");
       const parsed = z.array(this.schema).parse(JSON.parse(raw));
       for (const record of parsed) {
-        this.cache.set(this.getId(record), record);
+        this.cache.set(this.getId(record), this.normalizeRecord(record));
       }
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
@@ -557,6 +570,11 @@ export class FileBackedWorkspaceRegistry
       logger,
       schema: PersistedWorkspaceRecordSchema,
       getId: (record) => record.workspaceId,
+      normalizeRecord: (record) => ({
+        ...record,
+        parentWorkspaceId: record.parentWorkspaceId ?? null,
+        siblingOrder: record.siblingOrder ?? 0,
+      }),
       component: "workspaces",
       writeRecords: options?.writeRecords,
     });
@@ -584,14 +602,125 @@ export class FileBackedWorkspaceRegistry
     record: PersistedWorkspaceRecord,
     context?: WorkspaceMutationContext,
   ): Promise<void> {
-    const workspace = PersistedWorkspaceRecordSchema.parse(record);
-    await super.upsert(workspace);
+    const rebalanced: PersistedWorkspaceRecord[] = [];
+    const workspace = await this.mutateCache((records) => {
+      const previous = records.get(record.workspaceId);
+      // Full-record metadata refreshes may have started before a concurrent move.
+      // Existing hierarchy is owned exclusively by move(), never by those stale snapshots.
+      const parentWorkspaceId = previous
+        ? (previous.parentWorkspaceId ?? null)
+        : (record.parentWorkspaceId ?? null);
+      if (
+        !previous ||
+        previous.projectId !== record.projectId ||
+        (previous.parentWorkspaceId ?? null) !== parentWorkspaceId
+      ) {
+        validateWorkspaceParent(records, record.workspaceId, record.projectId, parentWorkspaceId);
+      }
+      const siblings = workspaceSiblings(records, record, parentWorkspaceId);
+      const lastOrder = siblings.at(-1)?.siblingOrder ?? 0;
+      let siblingOrder = previous ? (previous.siblingOrder ?? 0) : record.siblingOrder;
+      if (siblingOrder === undefined) {
+        siblingOrder = siblings.length ? lastOrder + 1 : 0;
+        if (!Number.isFinite(siblingOrder) || (siblings.length > 0 && siblingOrder <= lastOrder)) {
+          for (let index = 0; index < siblings.length; index++) {
+            const updated = {
+              ...siblings[index],
+              siblingOrder: index,
+              updatedAt: record.updatedAt,
+            };
+            records.set(updated.workspaceId, updated);
+            rebalanced.push(updated);
+          }
+          siblingOrder = siblings.length;
+        }
+      }
+      const next = PersistedWorkspaceRecordSchema.parse({
+        ...record,
+        parentWorkspaceId,
+        siblingOrder,
+      });
+      records.set(next.workspaceId, next);
+      return next;
+    });
+    await Promise.all(
+      rebalanced.map((updated) =>
+        this.notifyMutation({
+          kind: "upsert",
+          workspaceId: updated.workspaceId,
+          workspace: updated,
+        }),
+      ),
+    );
     await this.notifyMutation({
       kind: "upsert",
       workspaceId: workspace.workspaceId,
       workspace,
       ...(context?.expectsInitialAgent ? { expectsInitialAgent: true } : {}),
     });
+  }
+
+  async move(workspaceId: string, input: WorkspaceMoveInput): Promise<PersistedWorkspaceRecord> {
+    const changed: PersistedWorkspaceRecord[] = [];
+    const workspace = await this.mutateCache((records) => {
+      const existing = records.get(workspaceId);
+      if (!existing || existing.archivedAt)
+        throw new Error(`Active workspace not found: ${workspaceId}`);
+      validateWorkspaceParent(records, workspaceId, existing.projectId, input.parentWorkspaceId);
+      const siblings = workspaceSiblings(records, existing, input.parentWorkspaceId);
+      const beforeId = input.beforeWorkspaceId ?? null;
+      const index =
+        beforeId === null
+          ? siblings.length
+          : siblings.findIndex((item) => item.workspaceId === beforeId);
+      if (index < 0)
+        throw new Error("The before workspace must be an active sibling in the destination");
+      const timestamp = new Date().toISOString();
+      const orderAt = (position: number) => siblings[position]?.siblingOrder ?? 0;
+      const calculateOrder = () => {
+        if (!siblings.length) return 0;
+        if (index === 0) return orderAt(0) - 1;
+        if (index === siblings.length) return orderAt(index - 1) + 1;
+        return orderAt(index - 1) / 2 + orderAt(index) / 2;
+      };
+      let siblingOrder = calculateOrder();
+      const hasTies = siblings.some(
+        (sibling, position) => position > 0 && (sibling.siblingOrder ?? 0) <= orderAt(position - 1),
+      );
+      if (
+        hasTies ||
+        !Number.isFinite(siblingOrder) ||
+        (index > 0 && siblingOrder <= orderAt(index - 1)) ||
+        (index < siblings.length && siblingOrder >= orderAt(index))
+      ) {
+        for (let position = 0; position < siblings.length; position++) {
+          const next = { ...siblings[position], siblingOrder: position, updatedAt: timestamp };
+          siblings[position] = next;
+          records.set(next.workspaceId, next);
+          changed.push(next);
+        }
+        siblingOrder = calculateOrder();
+      }
+      const next = PersistedWorkspaceRecordSchema.parse({
+        ...existing,
+        parentWorkspaceId: input.parentWorkspaceId,
+        siblingOrder,
+        updatedAt: timestamp,
+      });
+      records.set(workspaceId, next);
+      changed.push(next);
+      return next;
+    });
+    await Promise.all(
+      changed.map((updated) =>
+        this.notifyMutation({
+          kind: "upsert",
+          workspaceId: updated.workspaceId,
+          workspace: updated,
+        }),
+      ),
+    );
+    return workspace;
   }
 
   override async archive(
@@ -699,6 +828,8 @@ export function resolveProjectDisplayName(record: PersistedProjectRecord): strin
 export function createPersistedWorkspaceRecord(input: {
   workspaceId: string;
   projectId: string;
+  parentWorkspaceId?: string | null;
+  siblingOrder?: number;
   cwd: string;
   kind: PersistedWorkspaceKind;
   displayName: string;
@@ -722,6 +853,7 @@ export function createPersistedWorkspaceRecord(input: {
   return PersistedWorkspaceRecordSchema.parse({
     ...rest,
     background: background ?? false,
+    parentWorkspaceId: input.parentWorkspaceId ?? null,
     title: input.title ?? null,
     branch: input.branch ?? null,
     worktreeRoot: input.worktreeRoot ?? null,
@@ -746,4 +878,56 @@ export function resolveWorkspaceName(input: {
 
 export function resolveWorkspaceDisplayName(record: PersistedWorkspaceRecord): string {
   return resolveWorkspaceName({ title: record.title, derivedDisplayName: record.displayName });
+}
+
+function workspaceSiblings(
+  records: ReadonlyMap<string, PersistedWorkspaceRecord>,
+  workspace: PersistedWorkspaceRecord,
+  parentWorkspaceId: string | null,
+): PersistedWorkspaceRecord[] {
+  return [...records.values()]
+    .filter(
+      (candidate) =>
+        candidate.workspaceId !== workspace.workspaceId &&
+        !candidate.archivedAt &&
+        candidate.projectId === workspace.projectId &&
+        effectiveWorkspaceParent(records, candidate) === parentWorkspaceId,
+    )
+    .sort(
+      (left, right) =>
+        (left.siblingOrder ?? 0) - (right.siblingOrder ?? 0) ||
+        left.workspaceId.localeCompare(right.workspaceId),
+    );
+}
+
+function effectiveWorkspaceParent(
+  records: ReadonlyMap<string, PersistedWorkspaceRecord>,
+  workspace: PersistedWorkspaceRecord,
+): string | null {
+  const parentId = workspace.parentWorkspaceId ?? null;
+  if (parentId === null) return null;
+  const parent = records.get(parentId);
+  return parent && !parent.archivedAt && parent.projectId === workspace.projectId ? parentId : null;
+}
+
+function validateWorkspaceParent(
+  records: ReadonlyMap<string, PersistedWorkspaceRecord>,
+  workspaceId: string,
+  projectId: string,
+  parentWorkspaceId: string | null,
+): void {
+  const visited = new Set([workspaceId]);
+  let ancestorId = parentWorkspaceId;
+  while (ancestorId !== null) {
+    if (visited.has(ancestorId)) throw new Error("A workspace cannot be its own ancestor");
+    visited.add(ancestorId);
+    const parent = records.get(ancestorId);
+    if (ancestorId === parentWorkspaceId && (!parent || parent.archivedAt))
+      throw new Error(`Active parent workspace not found: ${ancestorId}`);
+    // Archive is record-scoped. Active ancestors can themselves have a missing or archived parent.
+    if (!parent) break;
+    if (parent.projectId !== projectId)
+      throw new Error("Parent and child workspaces must belong to the same project");
+    ancestorId = parent.parentWorkspaceId ?? null;
+  }
 }

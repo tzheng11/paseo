@@ -7,6 +7,8 @@ import { createTempDirectory, createTempGitRepo } from "./workspace";
 
 export interface SeedWorkspaceDescriptor {
   id: string;
+  parentWorkspaceId?: string | null;
+  siblingOrder?: number;
   name: string;
   projectId: string;
   projectDisplayName: string;
@@ -60,6 +62,10 @@ export interface SeedDaemonClient {
     superpinned: boolean,
   ): Promise<{ pinnedAt: string | null; superpinnedAt: string | null }>;
   setWorkspaceTitle(workspaceId: string, title: string | null): Promise<{ title: string | null }>;
+  moveWorkspace(
+    workspaceId: string,
+    options: { parentWorkspaceId: string | null; beforeWorkspaceId?: string | null },
+  ): Promise<{ parentWorkspaceId: string | null; siblingOrder: number }>;
   clearWorkspaceAttention(workspaceId: string): Promise<void>;
   setWorkspaceLabel(input: {
     workspaceId: string;
@@ -81,6 +87,8 @@ export interface SeedDaemonClient {
           worktreeSlug?: string;
         };
     title?: string;
+    parentWorkspaceId?: string | null;
+    siblingOrder?: number;
     background?: boolean;
   }): Promise<{
     workspace: SeedWorkspaceDescriptor | null;

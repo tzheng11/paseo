@@ -3,8 +3,8 @@ import {
   formatAgentMessage,
   formatSystemNotificationPrompt,
 } from "./agent-messages/index.js";
-import { expect, test, vi } from "vitest";
-import { spawn, execFileSync } from "node:child_process";
+import { expect, test, vi, onTestFinished } from "vitest";
+import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -34,9 +34,6 @@ import { archiveAgentCommand } from "./lifecycle-command.js";
 import { archiveWorkspaceContents } from "../workspace-archive-service.js";
 import { buildVoiceModeSystemPrompt } from "../voice-config.js";
 import { attachAgentStoragePersistence } from "../persistence-hooks.js";
-import { runAsyncWorktreeBootstrap } from "../worktree-bootstrap.js";
-import { createStub } from "../test-utils/class-mocks.js";
-import type { TerminalManager } from "../../terminal/terminal-manager.js";
 import {
   appendTimelineItemIfAgentKnown,
   emitLiveTimelineItemIfAgentKnown,
@@ -13868,40 +13865,19 @@ test("unloaded identity supports metadata, attention, retained history and expli
   }
 });
 
-test("ISS-4420 rereview P1: deleted setup target stops bootstrap without rejection", async () => {
+test("deleted background timeline targets return without rejection", async () => {
   const h = await idleUnloadHarness(0);
-  let deleted = false;
   try {
-    execFileSync("git", ["init", "-b", "main"], { cwd: h.agent.cwd, stdio: "pipe" });
-    writeFileSync(
-      join(h.agent.cwd, "paseo.json"),
-      JSON.stringify({ worktree: { setup: ["echo setup-progress"] } }),
-    );
+    await h.manager.closeAgent(h.agent.id);
+    await h.manager.deleteAgentState(h.agent.id);
+    await h.storage.remove(h.agent.id);
     await expect(
-      runAsyncWorktreeBootstrap({
+      emitLiveTimelineItemIfAgentKnown({
+        agentManager: h.manager,
         agentId: h.agent.id,
-        workspaceId: "idle-test",
-        worktree: { branchName: "main", worktreePath: h.agent.cwd },
-        terminalManager: null,
-        logger,
-        appendTimelineItem: (item) =>
-          appendTimelineItemIfAgentKnown({ agentManager: h.manager, agentId: h.agent.id, item }),
-        emitLiveTimelineItem: async (item) => {
-          if (!deleted) {
-            deleted = true;
-            await h.manager.closeAgent(h.agent.id);
-            await h.manager.deleteAgentState(h.agent.id);
-            await h.storage.remove(h.agent.id);
-          }
-          return emitLiveTimelineItemIfAgentKnown({
-            agentManager: h.manager,
-            agentId: h.agent.id,
-            item,
-          });
-        },
+        item: { type: "assistant_message", text: "Late background output" },
       }),
-    ).resolves.toBeUndefined();
-    expect(deleted).toBe(true);
+    ).resolves.toBe(false);
     expect(await h.storage.get(h.agent.id)).toBeNull();
     expect(h.manager.getAgent(h.agent.id)).toBeNull();
     expect(h.sessions).toHaveLength(1);
@@ -13954,98 +13930,43 @@ test.each(["killed", "archived", "deleted"] as const)(
   },
 );
 
-test.each([
-  {
-    status: "completed",
-    command: "echo setup-progress",
-    terminalStatuses: ["completed"],
-    terminalInputs: [[{ type: "input", data: "echo terminal-ready\r" }]],
-  },
-  { status: "failed", command: "exit 1", terminalStatuses: [], terminalInputs: [] },
-])(
-  "ISS-4420 idle writer: setup $status after unload retains its row and expected terminal startup",
-  async ({ status, command, terminalStatuses, terminalInputs }) => {
-    vi.useFakeTimers({ toFake: ["Date"] });
-    const h = await idleUnloadHarness();
-    const input = vi.fn();
-    const terminal = {
-      id: "setup-terminal",
-      name: "Setup terminal",
-      send: input,
-      getState: () => ({ scrollback: [], grid: [[{ char: "$" }]] }),
-    };
-    const createTerminal = vi.fn(async () => terminal);
-    const liveWrites: boolean[] = [];
-    let unloaded = false;
-    try {
-      execFileSync("git", ["init", "-b", "main"], { cwd: h.agent.cwd, stdio: "pipe" });
-      writeFileSync(
-        join(h.agent.cwd, "paseo.json"),
-        JSON.stringify({
-          worktree: {
-            setup: [command],
-            terminals: [{ name: "Setup terminal", command: "echo terminal-ready" }],
-          },
-        }),
-      );
-      await runAsyncWorktreeBootstrap({
-        agentId: h.agent.id,
-        workspaceId: "idle-test",
-        worktree: { branchName: "main", worktreePath: h.agent.cwd },
-        terminalManager: createStub<TerminalManager>({ registerCwdEnv: () => {}, createTerminal }),
-        logger,
-        appendTimelineItem: (item) =>
-          appendTimelineItemIfAgentKnown({ agentManager: h.manager, agentId: h.agent.id, item }),
-        emitLiveTimelineItem: async (item) => {
-          if (!unloaded) {
-            vi.setSystemTime(Date.now() + 180_000);
-            await h.manager.unloadIdleAgents();
-            expect(h.manager.getAgent(h.agent.id)).toBeNull();
-            unloaded = true;
-          }
-          const written = await emitLiveTimelineItemIfAgentKnown({
-            agentManager: h.manager,
-            agentId: h.agent.id,
-            item,
-          });
-          liveWrites.push(written);
-          return written;
-        },
-      });
-      expect(unloaded).toBe(true);
-      expect(liveWrites.length).toBeGreaterThan(0);
-      expect(liveWrites.every(Boolean)).toBe(true);
-      expect(h.manager.getAgent(h.agent.id)).toBeNull();
-      expect(h.sessions).toHaveLength(1);
-      expect(createTerminal).toHaveBeenCalledTimes(terminalInputs.length);
-      expect(input.mock.calls).toEqual(terminalInputs);
-      await ensureAgentLoaded(h.agent.id, {
+test("background timeline writers persist rows after idle unload without resuming", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  const h = await idleUnloadHarness();
+  try {
+    vi.setSystemTime(Date.now() + 180_000);
+    await h.manager.unloadIdleAgents();
+    expect(h.manager.getAgent(h.agent.id)).toBeNull();
+    const item: AgentTimelineItem = { type: "assistant_message", text: "Late background output" };
+    expect(
+      await emitLiveTimelineItemIfAgentKnown({
         agentManager: h.manager,
-        agentStorage: h.storage,
-        logger,
-      });
-      expect(h.resumes[0]?.sessionId).toBe(h.agent.persistence?.sessionId);
-      const refetch = await h.manager.fetchTimelineAsync(h.agent.id, { limit: 0 });
-      expect(refetch.rows.map((row) => row.item)).toContainEqual(
-        expect.objectContaining({
-          type: "tool_call",
-          name: "paseo_worktree_setup",
-          status,
-        }),
-      );
-      expect(
-        refetch.rows.flatMap((row) =>
-          row.item.type === "tool_call" && row.item.name === "paseo_worktree_terminals"
-            ? [row.item.status]
-            : [],
-        ),
-      ).toEqual(terminalStatuses);
-    } finally {
-      await h.close();
-      vi.useRealTimers();
-    }
-  },
-);
+        agentId: h.agent.id,
+        item,
+      }),
+    ).toBe(true);
+    expect(
+      await appendTimelineItemIfAgentKnown({
+        agentManager: h.manager,
+        agentId: h.agent.id,
+        item,
+      }),
+    ).toBe(true);
+    expect(h.manager.getAgent(h.agent.id)).toBeNull();
+    expect(h.sessions).toHaveLength(1);
+    await ensureAgentLoaded(h.agent.id, {
+      agentManager: h.manager,
+      agentStorage: h.storage,
+      logger,
+    });
+    expect(h.resumes[0]?.sessionId).toBe(h.agent.persistence?.sessionId);
+    const refetch = await h.manager.fetchTimelineAsync(h.agent.id, { limit: 0 });
+    expect(refetch.rows.map((row) => row.item)).toContainEqual(item);
+  } finally {
+    await h.close();
+    vi.useRealTimers();
+  }
+});
 
 test("ISS-4420 rereview P2b: persisted-only updates preserve credentials and runtime metadata with production persistence attached", async () => {
   const h = await idleUnloadHarness(0);
@@ -14443,3 +14364,184 @@ test("idle unload retains the runtime when its idle snapshot cannot persist", as
     vi.useRealTimers();
   }
 });
+test.each([
+  {
+    event: {
+      type: "turn_completed",
+      provider: "codex",
+      turnId: "hook-turn",
+    } satisfies AgentStreamEvent,
+    outcome: { kind: "completed" },
+  },
+  {
+    event: {
+      type: "turn_failed",
+      provider: "codex",
+      turnId: "hook-turn",
+      error: "Failed",
+      code: "test",
+    } satisfies AgentStreamEvent,
+    outcome: { kind: "failed", error: { message: "Failed", code: "test" } },
+  },
+  {
+    event: {
+      type: "turn_canceled",
+      provider: "codex",
+      turnId: "hook-turn",
+      reason: "Stopped",
+    } satisfies AgentStreamEvent,
+    outcome: { kind: "canceled", reason: "Stopped" },
+  },
+])(
+  "lifecycle hooks receive a bounded conversation for $event.type without materializing timeline items",
+  async ({ event: terminalEvent, outcome }) => {
+    class CountingTimelineStore extends InMemoryAgentTimelineStore {
+      itemReads = 0;
+      override getItems(agentId: string): AgentTimelineItem[] {
+        this.itemReads += 1;
+        return super.getItems(agentId);
+      }
+    }
+    const workdir = mkdtempSync(join(tmpdir(), "agent-hook-payload-"));
+    const client = new SessionRecordingAgentClient();
+    const timelineStore = new CountingTimelineStore();
+    const events: Array<{ name: string; event: unknown }> = [];
+    const manager = new AgentManager({
+      clients: { codex: client },
+      registry: new AgentStorage(join(workdir, "agents"), logger),
+      logger,
+      timelineStore,
+      pluginLifecycle: {
+        before: async (_name, request) => request,
+        emit: (name, event) => {
+          events.push({ name, event });
+        },
+      },
+    });
+    onTestFinished(async () => {
+      await manager.closeAgent(manager.listAgents()[0]!.id);
+      await manager.flush();
+      rmSync(workdir, { recursive: true, force: true });
+    });
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.appendTimelineItem(agent.id, {
+      type: "assistant_message",
+      text: "A long conversation".repeat(10_000),
+    });
+    expect(manager.getTimeline(agent.id)).toHaveLength(1);
+    const readsBeforeDispatch = timelineStore.itemReads;
+    const session = client.sessions[0]!;
+    session.pushEvent({ type: "turn_started", provider: "codex", turnId: "hook-turn" });
+    await expect
+      .poll(() => events.filter(({ name }) => name === "agent.turn_started").length)
+      .toBe(1);
+    expect(timelineStore.itemReads).toBe(readsBeforeDispatch);
+    session.pushEvent(terminalEvent);
+    await expect
+      .poll(() => events.filter(({ name }) => name === "agent.turn_ended").length)
+      .toBe(1);
+    expect(timelineStore.itemReads).toBe(readsBeforeDispatch);
+    const expectedTimeline = manager.getTimeline(agent.id);
+    expect(events.filter(({ name }) => name === "agent.turn_ended")).toEqual([
+      {
+        name: "agent.turn_ended",
+        event: {
+          agent: {
+            id: agent.id,
+            workspaceId: null,
+            parentAgentId: null,
+            provider: "codex",
+            cwd: workdir,
+            title: null,
+          },
+          turnId: "hook-turn",
+          outcome,
+          timeline: expectedTimeline,
+          timelineGap: null,
+          providerHistoryGap: undefined,
+        },
+      },
+    ]);
+    expect(timelineStore.itemReads).toBe(readsBeforeDispatch + 1);
+  },
+);
+
+test.each(["live", "history", "accepted"] as const)(
+  "batched agent entries retain their identities through %s ingestion",
+  async (ingestion) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-batch-provenance-"));
+    const entries = [
+      {
+        id: "report",
+        source: { kind: "agent-message" as const, agentId: "worker", serverId: "remote-host" },
+        text: "Result <ready>",
+      },
+      {
+        id: "finish",
+        source: {
+          kind: "agent-notification" as const,
+          agentId: "worker",
+          serverId: "remote-host",
+          event: "finished" as const,
+        },
+        text: "Worker finished",
+      },
+    ];
+    const prompt = entries.map(formatAgentMessage).join("\n\n");
+    const item: AgentTimelineItem = {
+      type: "user_message",
+      text: prompt,
+      clientMessageId: "report",
+      messageId: "provider-batch",
+    };
+    const codex = fakeCodexEmitting(
+      ingestion === "history" ? { historyItems: [item] } : { turnItems: [item] },
+    );
+    const manager = new AgentManager({ clients: { codex }, logger });
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    try {
+      if (ingestion === "history")
+        await manager.hydrateTimelineFromProvider(agent.id, { force: true });
+      else if (ingestion === "accepted") {
+        for await (const _event of manager.streamAgent(agent.id, prompt, {
+          clientMessageId: "report",
+        })) {
+        }
+      } else await manager.runAgent(agent.id, { text: "start" });
+      expect(
+        manager
+          .getTimeline(agent.id)
+          .filter((row) => row.type === "tool_call")
+          .map((row) => ({ callId: row.callId, agentMessage: row.agentMessage })),
+      ).toEqual([
+        {
+          callId: "paseo-agent-message:report",
+          agentMessage: {
+            event: "message",
+            sender: { id: "worker", serverId: "remote-host" },
+            text: "Result <ready>",
+          },
+        },
+        {
+          callId: "paseo-agent-message:finish",
+          agentMessage: {
+            event: "finished",
+            sender: { id: "worker", serverId: "remote-host" },
+            text: "Worker finished",
+          },
+        },
+      ]);
+      expect(manager.getTimeline(agent.id).filter((row) => row.type === "user_message")).toEqual(
+        [],
+      );
+      expect(manager.getAgent(agent.id)?.lastUserMessageAt).toBeNull();
+    } finally {
+      await manager.closeAgent(agent.id);
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);

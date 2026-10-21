@@ -104,6 +104,8 @@ export interface Agent {
 
 export interface WorkspaceDescriptor {
   id: string;
+  parentWorkspaceId?: string | null;
+  siblingOrder?: number;
   projectId: string;
   projectDisplayName: string;
   projectCustomName?: string | null;
@@ -111,6 +113,7 @@ export interface WorkspaceDescriptor {
   projectRootPath: string;
   workspaceDirectory: string;
   worktreeSlug?: WorkspaceDescriptorPayload["worktreeSlug"];
+  setupStatus?: WorkspaceDescriptorPayload["setupStatus"];
   projectKind: WorkspaceDescriptorPayload["projectKind"];
   workspaceKind: WorkspaceDescriptorPayload["workspaceKind"];
   background?: boolean;
@@ -141,6 +144,9 @@ export function normalizeWorkspaceDescriptor(
       : null;
   return {
     id: normalizeWorkspaceOpaqueId(payload.id) ?? payload.id,
+    // COMPAT(workspaceHierarchy): added in v0.11.2, remove after 2027-04-21 once daemon floor supports hierarchy.
+    parentWorkspaceId: payload.parentWorkspaceId ?? null,
+    siblingOrder: payload.siblingOrder,
     projectId: payload.projectId,
     projectDisplayName: payload.projectDisplayName,
     projectCustomName: payload.projectCustomName ?? null,
@@ -151,6 +157,8 @@ export function normalizeWorkspaceDescriptor(
     // usable directory" (older daemons may omit it; the wire field is optional).
     workspaceDirectory: normalizeWorkspacePath(payload.workspaceDirectory) ?? "",
     worktreeSlug: payload.worktreeSlug,
+    // COMPAT(workspaceSetupObservation): added in v0.12.0, old hosts omit metadata; remove after 2027-04-19.
+    setupStatus: payload.setupStatus ?? null,
     projectKind: payload.projectKind,
     workspaceKind: payload.workspaceKind,
     background: payload.background ?? false,
@@ -238,8 +246,6 @@ function preserveMapIdentity<Key, Value>(
 }
 
 export type ExplorerEntryKind = "file" | "directory";
-export type ExplorerFileKind = "text" | "image" | "binary";
-export type ExplorerEncoding = "utf-8" | "base64" | "none";
 
 export interface ExplorerEntry {
   name: string;
@@ -249,19 +255,6 @@ export interface ExplorerEntry {
   modifiedAt: string;
 }
 
-export interface ExplorerFile {
-  path: string;
-  kind: ExplorerFileKind;
-  encoding: ExplorerEncoding;
-  content?: string;
-  // TextDecoder removes a leading UTF-8 BOM; retain this bit so file writes can restore it.
-  hasBom: boolean;
-  mimeType?: string;
-  size: number;
-  modifiedAt: string;
-  revision?: string;
-}
-
 export interface ExplorerDirectory {
   path: string;
   entries: ExplorerEntry[];
@@ -269,12 +262,11 @@ export interface ExplorerDirectory {
 
 interface ExplorerRequestState {
   path: string;
-  mode: "list" | "file";
+  mode: "list";
 }
 
 export interface AgentFileExplorerState {
   directories: Map<string, ExplorerDirectory>;
-  files: Map<string, ExplorerFile>;
   isLoading: boolean;
   lastError: string | null;
   pendingRequest: ExplorerRequestState | null;

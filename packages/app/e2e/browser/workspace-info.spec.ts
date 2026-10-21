@@ -288,7 +288,7 @@ test("compact non-git workspace supports both fields and keyboard editing withou
   try {
     await gotoWorkspace(page, workspace.workspaceId);
     await page.getByTestId("workspace-explorer-toggle").filter({ visible: true }).click();
-    await page.getByTestId("explorer-tab-info").filter({ visible: true }).click();
+    await page.getByTestId("workspace-tab-info").filter({ visible: true }).click();
     const content = page.getByTestId("workspace-info-content").filter({ visible: true });
     await expect(content).toBeVisible();
     await expect(

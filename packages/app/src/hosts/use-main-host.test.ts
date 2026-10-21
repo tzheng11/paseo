@@ -1,4 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+// UUID generation is a platform boundary; policy tests do not need Expo's native/AES runtime.
+vi.mock("expo-crypto", async () => {
+  const { randomUUID, webcrypto } = await import("node:crypto");
+  return { randomUUID, getRandomValues: webcrypto.getRandomValues.bind(webcrypto) };
+});
+
 import { DaemonConnectionError } from "@getpaseo/client/internal/daemon-client";
 import type { MainHostChoice, MainHostProvenance } from "@getpaseo/protocol/fleet/main-host";
 import {

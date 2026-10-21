@@ -27,6 +27,8 @@ export interface SidebarWorkspacePlacement {
   workspaceDirectory?: string;
   projectKind: WorkspaceStructureProject["projectKind"];
   workspaceKind: WorkspaceDescriptor["workspaceKind"];
+  parentWorkspaceId?: string | null;
+  siblingOrder?: number;
   background?: boolean;
   name: string;
 }
@@ -166,6 +168,8 @@ export function createSidebarWorkspaceEntry(input: {
       input.workspace.worktreeSlug ?? shortenPath(input.workspace.workspaceDirectory),
     projectKind: input.workspace.projectKind,
     workspaceKind: input.workspace.workspaceKind,
+    parentWorkspaceId: input.workspace.parentWorkspaceId,
+    siblingOrder: input.workspace.siblingOrder,
     background: input.workspace.background,
     name: input.workspace.name,
     title: input.workspace.title ?? null,
@@ -321,6 +325,7 @@ function createStructuralWorkspaceEntry(input: {
     workspaceDirectory: undefined,
     projectKind: input.project.projectKind,
     workspaceKind: "checkout",
+    ...input.project.workspaceHierarchy?.[input.workspaceKey],
     name: identity.workspaceId,
   };
 }
@@ -453,6 +458,7 @@ export function buildSidebarProjectsFromStructure(input: {
       iconWorkingDir: project.iconWorkingDir,
       hosts: project.hosts,
       workspaceKeys: project.workspaceKeys,
+      workspaceHierarchy: project.workspaceHierarchy,
     })),
   });
 }

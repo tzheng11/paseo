@@ -81,6 +81,248 @@ describe("workspace registries", () => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
+  test("moves workspaces between parents and persists fractional sibling ordering", async () => {
+    const create = (
+      workspaceId: string,
+      siblingOrder?: number,
+      parentWorkspaceId: string | null = null,
+    ) =>
+      createPersistedWorkspaceRecord({
+        workspaceId,
+        projectId: "project",
+        cwd: "/tmp/project",
+        kind: "directory",
+        displayName: workspaceId,
+        parentWorkspaceId,
+        siblingOrder,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      });
+    await workspaceRegistry.upsert(create("parent"));
+    await workspaceRegistry.upsert(create("first", 0, "parent"));
+    await workspaceRegistry.upsert(create("last", 2, "parent"));
+    await workspaceRegistry.upsert(create("moving"));
+    expect(
+      await workspaceRegistry.move("moving", {
+        parentWorkspaceId: "parent",
+        beforeWorkspaceId: "last",
+      }),
+    ).toMatchObject({ parentWorkspaceId: "parent", siblingOrder: 1 });
+    const restarted = new FileBackedWorkspaceRegistry(
+      path.join(tmpDir, "projects", "workspaces.json"),
+      logger,
+    );
+    expect(await restarted.get("moving")).toMatchObject({
+      parentWorkspaceId: "parent",
+      siblingOrder: 1,
+    });
+    expect(await workspaceRegistry.move("moving", { parentWorkspaceId: null })).toMatchObject({
+      parentWorkspaceId: null,
+      siblingOrder: 1,
+    });
+  });
+
+  test("rejects concurrent cycles, invalid parents and non-sibling anchors without changing ownership", async () => {
+    const create = (workspaceId: string, projectId = "project") =>
+      createPersistedWorkspaceRecord({
+        workspaceId,
+        projectId,
+        cwd: "/tmp/project",
+        kind: "directory",
+        displayName: workspaceId,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      });
+    await workspaceRegistry.upsert(create("a"));
+    await workspaceRegistry.upsert(create("b"));
+    await workspaceRegistry.upsert(create("other", "another-project"));
+    const outcomes = await Promise.allSettled([
+      workspaceRegistry.move("a", { parentWorkspaceId: "b" }),
+      workspaceRegistry.move("b", { parentWorkspaceId: "a" }),
+    ]);
+    expect(outcomes.map((outcome) => outcome.status)).toEqual(["fulfilled", "rejected"]);
+    await expect(workspaceRegistry.move("a", { parentWorkspaceId: "a" })).rejects.toThrow(
+      "own ancestor",
+    );
+    await expect(workspaceRegistry.move("a", { parentWorkspaceId: "missing" })).rejects.toThrow(
+      "Active parent workspace not found",
+    );
+    await expect(workspaceRegistry.move("a", { parentWorkspaceId: "other" })).rejects.toThrow(
+      "same project",
+    );
+    await expect(
+      workspaceRegistry.move("a", { parentWorkspaceId: null, beforeWorkspaceId: "other" }),
+    ).rejects.toThrow("active sibling");
+    await workspaceRegistry.archive("b", "2026-01-02T00:00:00.000Z");
+    await expect(workspaceRegistry.move("other", { parentWorkspaceId: "b" })).rejects.toThrow(
+      "Active parent workspace not found",
+    );
+    expect(await workspaceRegistry.get("a")).toMatchObject({
+      parentWorkspaceId: "b",
+      cwd: "/tmp/project",
+      projectId: "project",
+    });
+  });
+
+  test("rebalances exhausted fractional orders atomically and publishes every changed sibling", async () => {
+    const create = (workspaceId: string, siblingOrder: number) =>
+      createPersistedWorkspaceRecord({
+        workspaceId,
+        projectId: "project",
+        cwd: "/tmp/project",
+        kind: "directory",
+        displayName: workspaceId,
+        siblingOrder,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      });
+    await workspaceRegistry.upsert(create("first", 1));
+    await workspaceRegistry.upsert(create("last", 1 + Number.EPSILON));
+    await workspaceRegistry.upsert(create("moving", 3));
+    const published: string[] = [];
+    workspaceRegistry.subscribeToMutations((mutation) => {
+      published.push(mutation.workspaceId);
+    });
+    expect(
+      await workspaceRegistry.move("moving", {
+        parentWorkspaceId: null,
+        beforeWorkspaceId: "last",
+      }),
+    ).toMatchObject({ siblingOrder: 0.5 });
+    expect(published.sort()).toEqual(["first", "last", "moving"]);
+    const restarted = new FileBackedWorkspaceRegistry(
+      path.join(tmpDir, "projects", "workspaces.json"),
+      logger,
+    );
+    expect(
+      (await restarted.list()).map((record) => [record.workspaceId, record.siblingOrder]),
+    ).toEqual([
+      ["first", 0],
+      ["last", 1],
+      ["moving", 0.5],
+    ]);
+  });
+
+  test("normalizes legacy records and rebalances ties in their visible id order", async () => {
+    const create = (workspaceId: string) => ({
+      workspaceId,
+      projectId: "project",
+      cwd: "/tmp/project",
+      kind: "directory",
+      displayName: workspaceId,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      archivedAt: null,
+    });
+    await writeJsonFileAtomic(path.join(tmpDir, "projects", "workspaces.json"), [
+      create("b"),
+      create("a"),
+      create("moving"),
+    ]);
+    expect(await workspaceRegistry.get("a")).toMatchObject({
+      parentWorkspaceId: null,
+      siblingOrder: 0,
+    });
+    await workspaceRegistry.move("moving", { parentWorkspaceId: null, beforeWorkspaceId: "b" });
+    expect(await workspaceRegistry.get("a")).toMatchObject({ siblingOrder: 0 });
+    expect(await workspaceRegistry.get("moving")).toMatchObject({ siblingOrder: 0.5 });
+    expect(await workspaceRegistry.get("b")).toMatchObject({ siblingOrder: 1 });
+  });
+
+  test("preserves descendants when a parent is archived and allows moves beneath a surviving child", async () => {
+    for (const [workspaceId, parentWorkspaceId] of [
+      ["parent", null],
+      ["child", "parent"],
+      ["moving", null],
+    ] as const) {
+      await workspaceRegistry.upsert(
+        createPersistedWorkspaceRecord({
+          workspaceId,
+          parentWorkspaceId,
+          projectId: "project",
+          cwd: "/tmp/project",
+          kind: "directory",
+          displayName: workspaceId,
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        }),
+      );
+    }
+    await workspaceRegistry.archive("parent", "2026-01-02T00:00:00.000Z");
+    await workspaceRegistry.move("moving", { parentWorkspaceId: "child" });
+    expect(await workspaceRegistry.get("child")).toMatchObject({
+      parentWorkspaceId: "parent",
+      archivedAt: null,
+    });
+    expect(await workspaceRegistry.get("moving")).toMatchObject({
+      parentWorkspaceId: "child",
+      archivedAt: null,
+    });
+  });
+
+  test("orders root moves around promoted orphans without rewriting their parent pointers", async () => {
+    for (const [workspaceId, parentWorkspaceId] of [
+      ["parent", null],
+      ["orphan", "parent"],
+      ["moving", null],
+    ] as const) {
+      await workspaceRegistry.upsert(
+        createPersistedWorkspaceRecord({
+          workspaceId,
+          parentWorkspaceId,
+          projectId: "project",
+          cwd: "/tmp/project",
+          kind: "directory",
+          displayName: workspaceId,
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        }),
+      );
+    }
+    await workspaceRegistry.archive("parent", "2026-01-02T00:00:00.000Z");
+    expect(
+      await workspaceRegistry.move("moving", {
+        parentWorkspaceId: null,
+        beforeWorkspaceId: "orphan",
+      }),
+    ).toMatchObject({ parentWorkspaceId: null, siblingOrder: -1 });
+    expect(await workspaceRegistry.get("orphan")).toMatchObject({
+      parentWorkspaceId: "parent",
+      siblingOrder: 0,
+    });
+    expect(
+      await workspaceRegistry.move("orphan", {
+        parentWorkspaceId: null,
+        beforeWorkspaceId: "moving",
+      }),
+    ).toMatchObject({ parentWorkspaceId: null, siblingOrder: -2 });
+  });
+
+  test("metadata upserts preserve a newer hierarchy move", async () => {
+    for (const workspaceId of ["parent", "moving"]) {
+      await workspaceRegistry.upsert(
+        createPersistedWorkspaceRecord({
+          workspaceId,
+          projectId: "project",
+          cwd: "/tmp/project",
+          kind: "directory",
+          displayName: workspaceId,
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        }),
+      );
+    }
+    const beforeMove = await workspaceRegistry.get("moving");
+    if (!beforeMove) throw new Error("Missing workspace fixture");
+    await workspaceRegistry.move("moving", { parentWorkspaceId: "parent" });
+    await workspaceRegistry.upsert({ ...beforeMove, title: "Metadata refreshed" });
+    expect(await workspaceRegistry.get("moving")).toMatchObject({
+      title: "Metadata refreshed",
+      parentWorkspaceId: "parent",
+      siblingOrder: 0,
+    });
+  });
+
   test("creates, updates, archives, deletes, and lists project records", async () => {
     await projectRegistry.initialize();
     await projectRegistry.upsert(
