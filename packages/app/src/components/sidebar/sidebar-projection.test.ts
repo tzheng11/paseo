@@ -6,6 +6,8 @@ import type {
   SidebarWorkspacePlacement,
 } from "@/hooks/use-sidebar-workspaces-list";
 import { buildSidebarProjection } from "./sidebar-projection";
+import { buildWorkspaceTree } from "./workspace-hierarchy/tree";
+import { collapsedWorkspaceTreeEntries } from "./workspace-hierarchy/presentation";
 
 function makeWorkspace(
   id: string,
@@ -48,6 +50,26 @@ function workspaceIds(workspaces: readonly SidebarWorkspacePlacement[]): string[
 }
 
 describe("workspace hierarchy projection", () => {
+  it("keeps a hidden descendant's attention visible on a collapsed parent", () => {
+    const parent = makeWorkspace("parent", "done");
+    const child = makeWorkspace("child", "running");
+    const grandchild = makeWorkspace("grandchild", "needs_input");
+    const workspaces = [
+      parent.entry,
+      { ...child.entry, parentWorkspaceId: "parent" },
+      { ...grandchild.entry, parentWorkspaceId: "child" },
+    ];
+    const rows = buildWorkspaceTree(workspaces);
+    const entries = new Map(workspaces.map((workspace) => [workspace.workspaceKey, workspace]));
+    const projected = collapsedWorkspaceTreeEntries({
+      rows,
+      entries,
+      collapsedKeys: new Set(["srv:parent"]),
+    });
+    expect(projected.get("srv:parent")?.statusBucket).toBe("needs_input");
+    expect(projected.get("srv:child")?.statusBucket).toBe("running");
+    expect(entries.get("srv:parent")?.statusBucket).toBe("done");
+  });
   it("keeps pinned parents in their tree and gives their shortcut one target", () => {
     const input = projectionInput();
     const child = input.workspaceEntriesByKey.get("srv:unpinned")!;

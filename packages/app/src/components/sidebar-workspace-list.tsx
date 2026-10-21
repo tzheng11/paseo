@@ -1653,12 +1653,15 @@ function ProjectBlock({
         drag?: () => void;
         isDragging?: boolean;
         dragHandleProps?: DraggableListDragHandleProps;
+        workspaceEntry?: SidebarWorkspaceEntry;
       },
     ) => {
       return (
         <MemoWorkspaceRowItem
           workspace={item}
-          workspaceEntry={workspaceEntriesByKey.get(item.workspaceKey) ?? null}
+          workspaceEntry={
+            input?.workspaceEntry ?? workspaceEntriesByKey.get(item.workspaceKey) ?? null
+          }
           hostBadge={hostBadgeByServerId.get(item.serverId) ?? null}
           shortcutNumber={shortcutIndexByWorkspaceKey.get(item.workspaceKey) ?? null}
           showShortcutBadge={showShortcutBadges}

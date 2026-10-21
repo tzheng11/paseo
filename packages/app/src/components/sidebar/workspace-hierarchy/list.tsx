@@ -28,6 +28,7 @@ import type { WorkspaceTreeRenderInput } from "./drag.types";
 import { useSidebarOrderStore } from "@/stores/sidebar-order-store";
 import { WorkspaceTreeRowContext } from "./row-context";
 import type { Theme } from "@/styles/theme";
+import { collapsedWorkspaceTreeEntries } from "./presentation";
 
 const ThemedLoadingSpinner = withUnistyles(LoadingSpinner);
 function spinnerColor(theme: Theme) {
@@ -45,6 +46,7 @@ interface WorkspaceHierarchyListProps {
       drag: () => void;
       isDragging: boolean;
       dragHandleProps?: DraggableListDragHandleProps;
+      workspaceEntry?: SidebarWorkspaceEntry;
     },
   ) => ReactElement;
 }
@@ -54,11 +56,13 @@ function WorkspaceHierarchyRow({
   collapsed,
   toggle,
   renderWorkspace,
+  workspaceEntry,
 }: {
   input: WorkspaceTreeRenderInput;
   collapsed: boolean;
   toggle: (key: string) => void;
   renderWorkspace: WorkspaceHierarchyListProps["renderWorkspace"];
+  workspaceEntry: SidebarWorkspaceEntry | undefined;
 }) {
   const { row } = input;
   const key = row.workspace.workspaceKey;
@@ -89,7 +93,7 @@ function WorkspaceHierarchyRow({
       </View>
       <View style={styles.content}>
         <WorkspaceTreeRowContext.Provider value>
-          {renderWorkspace(row.workspace, input)}
+          {renderWorkspace(row.workspace, { ...input, workspaceEntry })}
         </WorkspaceTreeRowContext.Provider>
       </View>
     </View>
@@ -182,16 +186,23 @@ export function WorkspaceHierarchyList({
     (row: WorkspaceTreeRow) => hierarchySupportByServerId.get(row.workspace.serverId) === true,
     [hierarchySupportByServerId],
   );
+  const displayedEntries = useMemo(
+    () => collapsedWorkspaceTreeEntries({ rows, entries: workspaceEntriesByKey, collapsedKeys }),
+    [rows, workspaceEntriesByKey, collapsedKeys],
+  );
   const renderRow = useCallback(
-    (input: WorkspaceTreeRenderInput) => (
-      <WorkspaceHierarchyRow
-        input={input}
-        collapsed={collapsedKeys.has(input.row.workspace.workspaceKey)}
-        toggle={toggle}
-        renderWorkspace={renderWorkspace}
-      />
-    ),
-    [collapsedKeys, toggle, renderWorkspace],
+    (input: WorkspaceTreeRenderInput) => {
+      return (
+        <WorkspaceHierarchyRow
+          input={input}
+          workspaceEntry={displayedEntries.get(input.row.workspace.workspaceKey)}
+          collapsed={collapsedKeys.has(input.row.workspace.workspaceKey)}
+          toggle={toggle}
+          renderWorkspace={renderWorkspace}
+        />
+      );
+    },
+    [collapsedKeys, toggle, renderWorkspace, displayedEntries],
   );
   return (
     <>

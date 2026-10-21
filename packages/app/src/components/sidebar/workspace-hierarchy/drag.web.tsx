@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState, type ReactElement } from "react";
+import { useCallback, useMemo, useRef, useState, type ReactElement } from "react";
 import { View } from "react-native";
 import {
   DndContext,
@@ -12,23 +12,26 @@ import {
   type DragEndEvent,
   type DragStartEvent,
   type DndContextProps,
+  type KeyboardCoordinateGetter,
 } from "@dnd-kit/core";
-import { SortableContext, sortableKeyboardCoordinates, useSortable } from "@dnd-kit/sortable";
+import { SortableContext, useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import {
   projectWorkspaceTreeDrop,
   visibleWorkspaceTreeRows,
   workspaceTreeDropPosition,
+  WORKSPACE_TREE_INDENT,
   type WorkspaceTreeDrop,
   type WorkspaceTreeRow,
 } from "./tree";
 import type { WorkspaceTreeDragProps, WorkspaceTreeDragState } from "./drag.types";
 import { WorkspaceTreeDropIndicator } from "./drop-indicator";
+import { workspaceTreeKeyboardDrop } from "./keyboard";
 
 const TREE_ACCESSIBILITY: DndContextProps["accessibility"] = {
   screenReaderInstructions: {
     draggable:
-      "Press Space to move a workspace. Use arrows to select its position. Press Space to save, or Escape to cancel.",
+      "Press Space to move a workspace. Up and Down reorder, Right nests under a workspace, and Left moves out of its parent. Press Space to save, or Escape to cancel.",
   },
 };
 
@@ -87,7 +90,12 @@ function DragRow({
 }
 function noop() {}
 
-function projectEvent(rows: WorkspaceTreeRow[], event: DragMoveEvent): WorkspaceTreeDrop | null {
+function projectEvent(
+  rows: WorkspaceTreeRow[],
+  event: DragMoveEvent,
+  keyboardDrop: WorkspaceTreeDrop | null,
+): WorkspaceTreeDrop | null {
+  if (event.activatorEvent instanceof KeyboardEvent) return keyboardDrop;
   if (!event.over) return null;
   const { activatorEvent } = event;
   let startY: number | null = null;
@@ -118,31 +126,63 @@ export function WorkspaceTreeDrag({
   testID,
 }: WorkspaceTreeDragProps): ReactElement {
   const [drag, setDrag] = useState<WorkspaceTreeDragState | null>(null);
-  const sensors = useSensors(
-    useSensor(MouseSensor, { activationConstraint: { distance: 6 } }),
-    useSensor(TouchSensor, { activationConstraint: { delay: 180, tolerance: 8 } }),
-    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
-  );
+  const keyboardDrop = useRef<WorkspaceTreeDrop | null>(null);
   const activeKey = drag?.activeKey;
   const visible = useMemo(
     () => visibleWorkspaceTreeRows({ rows, collapsedKeys, draggingKey: activeKey }),
     [rows, collapsedKeys, activeKey],
   );
   const ids = useMemo(() => visible.map((row) => row.workspace.workspaceKey), [visible]);
-  const start = useCallback(
-    (event: DragStartEvent) => setDrag({ activeKey: String(event.active.id), drop: null }),
-    [],
+  const keyboardCoordinates = useCallback<KeyboardCoordinateGetter>(
+    (event, args) => {
+      const active = String(args.active);
+      const overKey =
+        keyboardDrop.current?.targetKey ??
+        (args.context.over ? String(args.context.over.id) : null);
+      const drop = workspaceTreeKeyboardDrop({
+        rows,
+        visibleRows: visible,
+        activeKey: active,
+        overKey,
+        code: event.code,
+      });
+      if (!drop) return;
+      const rect = args.context.droppableRects.get(drop.targetKey);
+      const activeRect = args.context.draggingNodeRect;
+      const source = rows.find((row) => row.workspace.workspaceKey === active);
+      if (!rect || !activeRect || !source) return;
+      event.preventDefault();
+      keyboardDrop.current = drop;
+      const fraction = { before: 0.125, inside: 0.5, after: 0.875 }[drop.position];
+      return {
+        x: activeRect.left + (drop.depth - source.depth) * WORKSPACE_TREE_INDENT,
+        y: rect.top + rect.height * fraction - activeRect.height / 2,
+      };
+    },
+    [rows, visible],
   );
+  const sensors = useSensors(
+    useSensor(MouseSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 180, tolerance: 8 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: keyboardCoordinates }),
+  );
+  const start = useCallback((event: DragStartEvent) => {
+    keyboardDrop.current = null;
+    setDrag({ activeKey: String(event.active.id), drop: null });
+  }, []);
   const cancel = useCallback(() => setDrag(null), []);
   const updateDrop = useCallback(
     (event: DragMoveEvent) => {
-      setDrag({ activeKey: String(event.active.id), drop: projectEvent(rows, event) });
+      setDrag({
+        activeKey: String(event.active.id),
+        drop: projectEvent(rows, event, keyboardDrop.current),
+      });
     },
     [rows],
   );
   const finish = useCallback(
     (event: DragEndEvent) => {
-      const drop = projectEvent(rows, event);
+      const drop = projectEvent(rows, event, keyboardDrop.current);
       setDrag(null);
       if (drop) onMove(drop.move);
     },

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { workspaceTreeKeyboardDrop } from "./keyboard";
 import {
   buildWorkspaceTree,
   projectWorkspaceTreeDrop,
@@ -28,6 +29,45 @@ function workspace(
 }
 
 describe("workspace hierarchy", () => {
+  it("supports keyboard sibling reorder, nesting and unparenting", () => {
+    const rows = buildWorkspaceTree([workspace("parent"), workspace("child"), workspace("other")]);
+    const input = { rows, visibleRows: rows, overKey: null };
+    expect(
+      workspaceTreeKeyboardDrop({ ...input, activeKey: "host:parent", code: "ArrowDown" })?.move,
+    ).toEqual({
+      serverId: "host",
+      workspaceId: "parent",
+      parentWorkspaceId: null,
+      beforeWorkspaceId: "other",
+    });
+    expect(
+      workspaceTreeKeyboardDrop({ ...input, activeKey: "host:child", code: "ArrowRight" })?.move,
+    ).toEqual({
+      serverId: "host",
+      workspaceId: "child",
+      parentWorkspaceId: "parent",
+      beforeWorkspaceId: null,
+    });
+    const nested = buildWorkspaceTree([
+      workspace("parent"),
+      workspace("child", "parent"),
+      workspace("other"),
+    ]);
+    expect(
+      workspaceTreeKeyboardDrop({
+        rows: nested,
+        visibleRows: nested,
+        overKey: null,
+        activeKey: "host:child",
+        code: "ArrowLeft",
+      })?.move,
+    ).toEqual({
+      serverId: "host",
+      workspaceId: "child",
+      parentWorkspaceId: null,
+      beforeWorkspaceId: "other",
+    });
+  });
   it("sorts siblings using host order and renders descendants immediately after their parent", () => {
     const rows = buildWorkspaceTree([
       workspace("last", null, 5),
