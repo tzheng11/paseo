@@ -459,7 +459,7 @@ it("injects parent-minted terminal activity env through the worker", async () =>
       cwd,
       ...nodeTerminalCommand(`
         require("node:fs").writeFileSync(
-          ${JSON.stringify(envPath)},
+          ${JSON.stringify(`${envPath}.next`)},
           JSON.stringify({
             terminalId: process.env.PASEO_TERMINAL_ID,
             token: process.env.PASEO_ACTIVITY_TOKEN,
@@ -467,6 +467,10 @@ it("injects parent-minted terminal activity env through the worker", async () =>
             hookCli: process.env.PASEO_HOOK_CLI,
             path: process.env.PATH ?? process.env.Path,
           }),
+        );
+        require("node:fs").renameSync(
+          ${JSON.stringify(`${envPath}.next`)},
+          ${JSON.stringify(envPath)},
         );
         setInterval(() => {}, 1000);
       `),
