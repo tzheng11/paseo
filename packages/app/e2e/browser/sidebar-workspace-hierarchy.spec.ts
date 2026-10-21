@@ -329,3 +329,53 @@ test("a move made while disconnected shows an error and succeeds when retried af
     await project.cleanup();
   }
 });
+
+test("keyboard controls nest, outdent, and reorder workspaces", async ({ page }, testInfo) => {
+  const project = await seedWorkspace({ repoPrefix: "workspace-tree-keyboard-", title: "Parent" });
+  const client = await connectDaemonClient<HierarchyClient>({
+    clientIdPrefix: "hierarchy-keyboard",
+  });
+  try {
+    const child = await createWorkspace(project, "Keyboard child");
+    const other = await createWorkspace(project, "Another workspace");
+    await gotoAppShell(page);
+    await waitForSidebarHydration(page);
+    const list = projectList(page, project);
+
+    await treeRow(list, child).focus();
+    await page.keyboard.press("Space");
+    await page.keyboard.press("ArrowRight");
+    await expect(treeRow(list, project.workspaceId)).toHaveAttribute(
+      "data-drop-position",
+      "inside",
+    );
+    await page.keyboard.press("Space");
+    await expect
+      .poll(async () => (await readWorkspace(client, project, child))?.parentWorkspaceId)
+      .toBe(project.workspaceId);
+    await expect(treeRow(list, child)).toHaveAttribute("data-depth", "1");
+
+    await treeRow(list, child).focus();
+    await page.keyboard.press("Space");
+    await page.keyboard.press("ArrowLeft");
+    await expect(treeRow(list, project.workspaceId)).toHaveAttribute("data-drop-position", "after");
+    await page.keyboard.press("Space");
+    await expect
+      .poll(async () => (await readWorkspace(client, project, child))?.parentWorkspaceId)
+      .toBeNull();
+    await expect(treeRow(list, child)).toHaveAttribute("data-depth", "0");
+
+    await treeRow(list, project.workspaceId).focus();
+    await page.keyboard.press("Space");
+    await page.keyboard.press("ArrowDown");
+    await expect(treeRow(list, child)).toHaveAttribute("data-drop-position", "after");
+    await page.keyboard.press("Space");
+    await expect.poll(() => visibleWorkspaceIds(list)).toEqual([child, project.workspaceId, other]);
+    await movePointerAwayFromWorkspaceHoverCard(page);
+    await expectWorkspaceHoverCardClosed(page);
+    await page.screenshot({ path: testInfo.outputPath("keyboard-workspace-order.png") });
+  } finally {
+    await client.close();
+    await project.cleanup();
+  }
+});
