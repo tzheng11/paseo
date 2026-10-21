@@ -1,4 +1,5 @@
 import type { Locator, Page } from "@playwright/test";
+import { buildHostWorkspaceRoute } from "@/utils/host-routes";
 import { expect, test } from "../support/fixtures";
 import { gotoAppShell } from "../support/helpers/app";
 import { connectDaemonClient } from "../support/helpers/daemon-client-loader";
@@ -372,6 +373,65 @@ test("keyboard controls nest, outdent, and reorder workspaces", async ({ page },
     await movePointerAwayFromWorkspaceHoverCard(page);
     await expectWorkspaceHoverCardClosed(page);
     await page.screenshot({ path: testInfo.outputPath("keyboard-workspace-order.png") });
+  } finally {
+    await client.close();
+    await project.cleanup();
+  }
+});
+
+test("large workspace trees limit roots, retain whole subtrees, and keep a selected hidden child accessible", async ({
+  page,
+}, testInfo) => {
+  test.setTimeout(120_000);
+  const project = await seedWorkspace({ repoPrefix: "workspace-tree-limit-", title: "Root 01" });
+  const client = await connectDaemonClient<HierarchyClient>({ clientIdPrefix: "hierarchy-limit" });
+  try {
+    const roots = [project.workspaceId];
+    for (let index = 2; index <= 22; index++) {
+      roots.push(await createWorkspace(project, `Root ${String(index).padStart(2, "0")}`));
+    }
+    const firstChild = await createWorkspace(project, "First visible child");
+    const firstGrandchild = await createWorkspace(project, "First visible grandchild");
+    const hiddenChild = await createWorkspace(project, "Hidden child");
+    const hiddenGrandchild = await createWorkspace(project, "Selected hidden grandchild");
+    await client.moveWorkspace({ workspaceId: firstChild, parentWorkspaceId: roots[0]! });
+    await client.moveWorkspace({ workspaceId: firstGrandchild, parentWorkspaceId: firstChild });
+    await client.moveWorkspace({ workspaceId: hiddenChild, parentWorkspaceId: roots[21]! });
+    await client.moveWorkspace({ workspaceId: hiddenGrandchild, parentWorkspaceId: hiddenChild });
+    await gotoAppShell(page);
+    await waitForSidebarHydration(page);
+    const list = projectList(page, project);
+    const rows = list.locator('[data-testid^="sidebar-workspace-tree-row-"]');
+    const toggle = page.getByTestId(
+      `sidebar-project-show-more-${projectEquivalenceViewKey(project.projectKey)}`,
+    );
+    await expect(rows).toHaveCount(22);
+    await expect(treeRow(list, firstGrandchild)).toHaveAttribute("data-depth", "2");
+    await expect(treeRow(list, roots[21]!)).toHaveCount(0);
+    await expect(toggle).toHaveText("Show more");
+
+    await toggle.click();
+    await expect(rows).toHaveCount(26);
+    await expect(treeRow(list, hiddenGrandchild)).toHaveAttribute("data-depth", "2");
+    await expect(toggle).toHaveText("Show less");
+    await toggle.click();
+    await expect(rows).toHaveCount(22);
+    await expect(treeRow(list, hiddenGrandchild)).toHaveCount(0);
+
+    await page.goto(buildHostWorkspaceRoute(getServerId(), hiddenGrandchild));
+    await waitForSidebarHydration(page);
+    await expect(page.getByTestId("workspace-header-title")).toHaveText(
+      "Selected hidden grandchild",
+    );
+    await expect(rows).toHaveCount(25);
+    await expect(treeRow(list, roots[21]!)).toHaveAttribute("data-depth", "0");
+    await expect(treeRow(list, hiddenChild)).toHaveAttribute("data-depth", "1");
+    await expect(treeRow(list, hiddenGrandchild)).toHaveAttribute("data-depth", "2");
+    await expect(treeRow(list, firstGrandchild)).toHaveAttribute("data-depth", "2");
+    await workspaceRow(list, hiddenGrandchild).scrollIntoViewIfNeeded();
+    await movePointerAwayFromWorkspaceHoverCard(page);
+    await expectWorkspaceHoverCardClosed(page);
+    await page.screenshot({ path: testInfo.outputPath("large-tree-selected-descendant.png") });
   } finally {
     await client.close();
     await project.cleanup();
