@@ -6232,7 +6232,13 @@ export class AgentManager {
       "agent.manager.dispatch_stream",
     );
     this.dispatch({ type: "agent_stream", agentId, event, ...metadata });
-    if (this.pluginLifecycle && agent && !agent.internal && event.type !== "timeline") {
+    if (
+      this.pluginLifecycle &&
+      agent &&
+      !agent.internal &&
+      event.type !== "timeline" &&
+      this.timelineStore.has(agentId)
+    ) {
       let window: HistoryWindows<AgentTimelineItem> | undefined;
       const getWindow = () =>
         (window ??= this.timelineStore.readWindows(agentId, DEFAULT_HISTORY_WINDOWS));
