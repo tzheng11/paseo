@@ -86,7 +86,10 @@ async function dragWorkspace(
   await page.mouse.down();
   await page.mouse.move(sourcePoint.x, sourcePoint.y + 8, { steps: 2 });
   await page.mouse.move(targetPoint.x, targetPoint.y, { steps: 8 });
-  await expect(treeRow(list, targetId)).toHaveAttribute("data-drop-position", position);
+  await expect(treeRow(list, targetId)).toHaveAttribute(
+    "data-drop-position",
+    position === "child" ? "inside" : position,
+  );
   await page.mouse.up();
   await expect(page.getByTestId("workspace-tree-move-pending")).toHaveCount(0);
   await expect(page.getByTestId("workspace-tree-move-error")).toHaveCount(0);
