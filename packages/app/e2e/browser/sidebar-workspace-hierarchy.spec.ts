@@ -9,11 +9,7 @@ import {
   movePointerAwayFromWorkspaceHoverCard,
 } from "../support/helpers/sidebar";
 import { getServerId } from "../support/helpers/server-id";
-import {
-  expectReconnectingToastGone,
-  expectReconnectingToastVisible,
-  waitForSidebarHydration,
-} from "../support/helpers/workspace-ui";
+import { waitForSidebarHydration } from "../support/helpers/workspace-ui";
 
 interface HierarchyWorkspace {
   id: string;
@@ -300,9 +296,11 @@ test("a move made while disconnected shows an error and succeeds when retried af
     await waitForSidebarHydration(page);
     const list = projectList(page, project);
     await expect(workspaceRow(list, child)).toBeVisible();
+    const hostRow = page.getByTestId(`hosts-overview-row-${getServerId()}`);
+    await expect(hostRow).toContainText("0 / 2");
 
     await page.context().setOffline(true);
-    await expectReconnectingToastVisible(page, { timeout: 65_000 });
+    await expect(hostRow).toContainText("Offline", { timeout: 65_000 });
     await dragWorkspace(list, child, project.workspaceId, "child", 0, false);
     const error = page.getByTestId("workspace-tree-move-error");
     await expect(error).toContainText("host is disconnected");
@@ -313,7 +311,7 @@ test("a move made while disconnected shows an error and succeeds when retried af
     await page.screenshot({ path: testInfo.outputPath("disconnected-workspace-move-error.png") });
 
     await page.context().setOffline(false);
-    await expectReconnectingToastGone(page);
+    await expect(hostRow).toContainText("0 / 2", { timeout: 30_000 });
     await page.getByTestId("workspace-tree-move-retry").click();
     await expect
       .poll(async () => (await readWorkspace(client, project, child))?.parentWorkspaceId)
