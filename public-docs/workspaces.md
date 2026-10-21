@@ -29,6 +29,20 @@ Each workspace is a separate place to work. You can keep one for your main check
 
 Use the [CLI project commands](/docs/cli#projects) to register, list, rename, or delete projects.
 
+## Nest and order workspaces
+
+Drag a workspace onto another workspace to make it a child. Drag above or below a row to place it
+before or after that workspace. You can reorder children and nest them further, or drag a child
+beside a top-level workspace to move it back to the project level. The sidebar shows where the
+workspace will land before you release it.
+
+Use the arrow beside a parent to collapse or expand its children. Nesting stays within one project
+on one host. You cannot move a workspace underneath itself or one of its descendants.
+
+The hierarchy and manual sibling order are saved on the host and shared with your other clients.
+Nesting organizes the sidebar: each workspace keeps its own working directory, branch, and sessions.
+Archiving a parent keeps its children active and moves them up one level.
+
 ## Pinned workspaces
 
 Pin a workspace to keep it in the Pinned section above the project list. The menu beside Pinned

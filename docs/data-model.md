@@ -496,6 +496,8 @@ Array of workspace records. A workspace is a specific working directory within a
 | ------------------------------ | ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `workspaceId`                  | `string`                                                     | Opaque stable identifier (`wks_<hex>`), generated independently of the directory. MUST NOT be treated as a path; compare by exact equality. Use the `cwd` field for directory access.         |
 | `projectId`                    | `string`                                                     | FK to Project.projectId; the workspace's stable project membership                                                                                                                            |
+| `parentWorkspaceId`            | `string \| null`                                             | Parent in the same host-local project; null means a project-level workspace.                                                                                                                  |
+| `siblingOrder`                 | `number`                                                     | Finite floating-point position among workspaces with the same parent.                                                                                                                         |
 | `cwd`                          | `string`                                                     | Exact execution directory selected for agents, files, scripts, and setup                                                                                                                      |
 | `kind`                         | `"local_checkout" \| "worktree" \| "directory"`              | Mutable checkout classification                                                                                                                                                               |
 | `displayName`                  | `string`                                                     | The human name (the generated/derived title). Decoupled from `branch` by construction.                                                                                                        |
@@ -515,6 +517,10 @@ Array of workspace records. A workspace is a specific working directory within a
 | `untrustedSource`              | `{ kind: "change_request", forge, number, headRepository }?` | Provenance captured when a cross-repository change request creates the workspace. Missing means repository automation is allowed; explicit setup removes the field.                           |
 
 > **Opaque-ID invariant:** `workspaceId` is opaque identity, never a filesystem path. Filesystem and git operations take `cwd`/`workspaceDirectory` only — never the id. A compatibility-only first-materialization bootstrap still groups pre-registry agent records by path and Git remote so existing installs retain their legacy records. That grouping never runs against a live registry, and its keys are not runtime project or workspace identity.
+
+Workspace hierarchy belongs to the host registry so moving or ordering a workspace is visible to
+every client. It does not imply filesystem containment or ownership of another workspace's sessions.
+See [Workspaces](../public-docs/workspaces.md#nest-and-order-workspaces) for the sidebar behavior.
 
 Superpins require a pin. Registry loading repairs an orphaned superpin using its timestamp as
 `pinnedAt`. The separate `workspace.superpin.set.request` requires `workspace.manage`; clients
