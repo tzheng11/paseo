@@ -45,7 +45,7 @@ async function quickDragFirstRowAfterSecond(
 
   const page = rows.page();
   const source = { x: sourceBox.x + sourceBox.width / 2, y: sourceBox.y + sourceBox.height / 2 };
-  const target = { x: targetBox.x + targetBox.width / 2, y: targetBox.y + targetBox.height / 2 };
+  const target = { x: targetBox.x + targetBox.width / 2, y: targetBox.y + targetBox.height * 0.88 };
 
   await page.mouse.move(source.x, source.y);
   const trailingScrim = rows.nth(0).getByTestId("sidebar-workspace-trailing-scrim");
@@ -171,9 +171,7 @@ test("pinned A–Z sorting persists, follows renames, and restores manual order"
   }
 });
 
-test("project sorts are independent, persist, and restore the dragged manual order", async ({
-  page,
-}) => {
+test("project sorts are independent, persist, and restore manual order", async ({ page }) => {
   test.setTimeout(120_000);
   const first = await seedWorkspace({
     title: "Zeta project workspace",
@@ -221,7 +219,21 @@ test("project sorts are independent, persist, and restore the dragged manual ord
     await firstSort.click();
     await page.getByTestId(`${firstSortId}-alphabetical`).click();
     await expect.poll(() => rowTestIds(rows)).toEqual([alphaId, zetaId]);
-    await quickDragFirstRowAfterSecond(rows, pressWorkspaceRow);
+    const alphaTreeRow = page.getByTestId(
+      `sidebar-workspace-tree-row-${getServerId()}:${firstAlpha.workspace.id}`,
+    );
+    await expect(alphaTreeRow).toHaveAttribute("aria-disabled", "true");
+    const source = await visibleBoundingBox(rows.nth(0));
+    const target = await visibleBoundingBox(rows.nth(1));
+    await page.mouse.move(source.x + source.width / 2, source.y + source.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(target.x + target.width / 2, target.y + target.height * 0.88, {
+      steps: 4,
+    });
+    await page.mouse.up();
+    await expect(firstSort).toContainText("A–Z");
+    await expect.poll(() => rowTestIds(rows)).toEqual([alphaId, zetaId]);
+    await page.getByTestId("workspace-tree-use-manual-order").click();
     await expect(firstSort).toContainText("Manual");
     await expect.poll(() => rowTestIds(rows)).toEqual([zetaId, alphaId]);
 
