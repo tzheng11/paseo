@@ -4,8 +4,16 @@ import { gotoAppShell } from "../support/helpers/app";
 import { connectDaemonClient } from "../support/helpers/daemon-client-loader";
 import { projectEquivalenceViewKey } from "../support/helpers/project-view-key";
 import { seedWorkspace, type SeededWorkspace } from "../support/helpers/seed-client";
+import {
+  expectWorkspaceHoverCardClosed,
+  movePointerAwayFromWorkspaceHoverCard,
+} from "../support/helpers/sidebar";
 import { getServerId } from "../support/helpers/server-id";
-import { waitForSidebarHydration } from "../support/helpers/workspace-ui";
+import {
+  expectReconnectingToastGone,
+  expectReconnectingToastVisible,
+  waitForSidebarHydration,
+} from "../support/helpers/workspace-ui";
 
 interface HierarchyWorkspace {
   id: string;
@@ -65,6 +73,7 @@ async function dragWorkspace(
   targetId: string,
   position: "before" | "child" | "after",
   horizontalOffset = 0,
+  expectSuccess = true,
 ) {
   const source = workspaceRow(list, sourceId);
   const target = workspaceRow(list, targetId);
@@ -95,7 +104,7 @@ async function dragWorkspace(
   );
   await page.mouse.up();
   await expect(page.getByTestId("workspace-tree-move-pending")).toHaveCount(0);
-  await expect(page.getByTestId("workspace-tree-move-error")).toHaveCount(0);
+  if (expectSuccess) await expect(page.getByTestId("workspace-tree-move-error")).toHaveCount(0);
 }
 
 async function visibleWorkspaceIds(list: Locator) {
@@ -165,7 +174,8 @@ test("dragging nests workspaces, orders siblings with fractional positions, and 
         project.workspaceId,
       );
     }
-    await page.mouse.move(1100, 800);
+    await movePointerAwayFromWorkspaceHoverCard(page);
+    await expectWorkspaceHoverCardClosed(page);
     await page.screenshot({ path: testInfo.outputPath("nested-workspace-sibling-order.png") });
 
     await dragWorkspace(list, second, project.workspaceId, "after", -24);
@@ -234,7 +244,8 @@ test("nested children collapse and remain accessible when their parent is archiv
       .toBe(child);
     await workspaceRow(list, child).click();
     await expect(page.getByTestId("workspace-header-title")).toHaveText("Child survives archive");
-    await page.mouse.move(1100, 800);
+    await movePointerAwayFromWorkspaceHoverCard(page);
+    await expectWorkspaceHoverCardClosed(page);
     await page.screenshot({ path: testInfo.outputPath("children-after-parent-archive.png") });
   } finally {
     await client.close();
@@ -274,5 +285,47 @@ test("hierarchy rejects cycles and parents from another project without changing
   } finally {
     await client.close();
     await Promise.all([project.cleanup(), other.cleanup()]);
+  }
+});
+
+test("a move made while disconnected shows an error and succeeds when retried after reconnecting", async ({
+  page,
+}, testInfo) => {
+  test.setTimeout(150_000);
+  const project = await seedWorkspace({ repoPrefix: "workspace-tree-retry-", title: "Parent" });
+  const client = await connectDaemonClient<HierarchyClient>({ clientIdPrefix: "hierarchy-retry" });
+  try {
+    const child = await createWorkspace(project, "Move after reconnecting");
+    await gotoAppShell(page);
+    await waitForSidebarHydration(page);
+    const list = projectList(page, project);
+    await expect(workspaceRow(list, child)).toBeVisible();
+
+    await page.context().setOffline(true);
+    await expectReconnectingToastVisible(page, { timeout: 65_000 });
+    await dragWorkspace(list, child, project.workspaceId, "child", 0, false);
+    const error = page.getByTestId("workspace-tree-move-error");
+    await expect(error).toContainText("host is disconnected");
+    await expect(treeRow(list, child)).toHaveAttribute("data-depth", "0");
+    expect((await readWorkspace(client, project, child))?.parentWorkspaceId).toBeNull();
+    await movePointerAwayFromWorkspaceHoverCard(page);
+    await expectWorkspaceHoverCardClosed(page);
+    await page.screenshot({ path: testInfo.outputPath("disconnected-workspace-move-error.png") });
+
+    await page.context().setOffline(false);
+    await expectReconnectingToastGone(page);
+    await page.getByTestId("workspace-tree-move-retry").click();
+    await expect
+      .poll(async () => (await readWorkspace(client, project, child))?.parentWorkspaceId)
+      .toBe(project.workspaceId);
+    await expect(error).toHaveCount(0);
+    await expect(treeRow(list, child)).toHaveAttribute("data-depth", "1");
+    await movePointerAwayFromWorkspaceHoverCard(page);
+    await expectWorkspaceHoverCardClosed(page);
+    await page.screenshot({ path: testInfo.outputPath("retried-workspace-move.png") });
+  } finally {
+    await page.context().setOffline(false);
+    await client.close();
+    await project.cleanup();
   }
 });
