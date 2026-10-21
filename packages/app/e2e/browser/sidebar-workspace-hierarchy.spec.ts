@@ -71,20 +71,23 @@ async function dragWorkspace(
   await expect(source).toBeVisible();
   await expect(target).toBeVisible();
   const sourceBox = await source.boundingBox();
-  const targetBox = await target.boundingBox();
-  if (!sourceBox || !targetBox) throw new Error("Expected visible workspace drag targets");
+  if (!sourceBox) throw new Error("Expected a visible workspace drag source");
   const sourcePoint = {
     x: sourceBox.x + Math.min(100, sourceBox.width / 2),
     y: sourceBox.y + sourceBox.height / 2,
-  };
-  const targetPoint = {
-    x: targetBox.x + Math.min(100, targetBox.width / 2) + horizontalOffset,
-    y: targetBox.y + targetBox.height * { before: 0.12, child: 0.5, after: 0.88 }[position],
   };
   const page = list.page();
   await page.mouse.move(sourcePoint.x, sourcePoint.y);
   await page.mouse.down();
   await page.mouse.move(sourcePoint.x, sourcePoint.y + 8, { steps: 2 });
+  await expect(treeRow(list, sourceId)).toHaveCSS("opacity", "0.55");
+  // Dragging a parent hides its descendants, which moves later drop targets.
+  const targetBox = await target.boundingBox();
+  if (!targetBox) throw new Error("Expected a visible workspace drop target");
+  const targetPoint = {
+    x: targetBox.x + Math.min(100, targetBox.width / 2) + horizontalOffset,
+    y: targetBox.y + targetBox.height * { before: 0.12, child: 0.5, after: 0.88 }[position],
+  };
   await page.mouse.move(targetPoint.x, targetPoint.y, { steps: 8 });
   await expect(treeRow(list, targetId)).toHaveAttribute(
     "data-drop-position",
@@ -191,12 +194,23 @@ test("nested children collapse and remain accessible when their parent is archiv
   try {
     const child = await createWorkspace(project, "Child survives archive");
     const grandchild = await createWorkspace(project, "Grandchild");
+    const destination = await createWorkspace(project, "Another parent");
     await gotoAppShell(page);
     await waitForSidebarHydration(page);
     const list = projectList(page, project);
     await dragWorkspace(list, child, project.workspaceId, "child");
     await dragWorkspace(list, grandchild, child, "child");
     await expect(treeRow(list, grandchild)).toHaveAttribute("data-depth", "2");
+
+    await dragWorkspace(list, child, destination, "child");
+    await expect(treeRow(list, child)).toHaveAttribute("data-parent-workspace-id", destination);
+    await expect(treeRow(list, grandchild)).toHaveAttribute("data-parent-workspace-id", child);
+    await expect(treeRow(list, grandchild)).toHaveAttribute("data-depth", "2");
+    await dragWorkspace(list, child, project.workspaceId, "child");
+    await expect(treeRow(list, child)).toHaveAttribute(
+      "data-parent-workspace-id",
+      project.workspaceId,
+    );
 
     const toggle = list.getByTestId(
       `sidebar-workspace-toggle-${getServerId()}:${project.workspaceId}`,
