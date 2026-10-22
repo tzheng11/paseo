@@ -3,13 +3,16 @@ import {
   type FileObservationCapacityFailure,
   type FileObservationCapacityRetry,
 } from "../capacity.js";
+import {
+  DEFAULT_NATIVE_MAX_TRACKED_ENTRIES,
+  resolveNativeInventoryLimit,
+} from "./native-recursive-limits.js";
 
 // These limits apply across every native observer service in this process.
 // Each of two admitted audits can additionally hold a candidate inventory and
 // a shallow directory snapshot, each capped at the backend's 250,000-entry
-// per-root limit. This bounds indexed and transient path entries to two million
-// across arbitrarily many roots; it does not bound bytes retained by the GC.
-const MAX_RETAINED_ENTRIES = 1_000_000;
+// per-root limit. The configured retained limit plus one million transient
+// entries bounds path counts independently of root count, not V8 heap bytes.
 const MAX_CONCURRENT_AUDITS = 2;
 
 export interface InventoryReservation {
@@ -46,7 +49,7 @@ export class NativeRecursiveResources {
 
   constructor(
     private readonly limits = {
-      maxTrackedEntries: MAX_RETAINED_ENTRIES,
+      maxTrackedEntries: DEFAULT_NATIVE_MAX_TRACKED_ENTRIES,
       maxConcurrentAudits: MAX_CONCURRENT_AUDITS,
     },
   ) {}
@@ -179,4 +182,7 @@ export class NativeRecursiveResources {
   }
 }
 
-export const nativeRecursiveResources = new NativeRecursiveResources();
+export const nativeRecursiveResources = new NativeRecursiveResources({
+  maxTrackedEntries: resolveNativeInventoryLimit(process.env),
+  maxConcurrentAudits: MAX_CONCURRENT_AUDITS,
+});

@@ -42,8 +42,9 @@ apply independently. A notice separates these ranges for clients without middle-
 On Codex 0.159.2+, local paginated history uses the native SQLite projection as a metadata index.
 The reader respects the provider's separate `CODEX_SQLITE_HOME`, asks it to index missing history
 through a metadata-only turn page, and selects item identifiers and UTF-8 sizes in a worker.
-Only selected items pass through the provider decoder. Native item anchors preserve cursor
-positions without requesting every intervening page. The same loader serves refresh, resume,
+Only selected items pass through the provider decoder. Fetch adjacent selected items in bounded
+small batches; never cross a turn, omitted range or oversized record to fill a batch. Native item
+anchors preserve cursor positions without requesting every intervening page. The same loader serves refresh, resume,
 archived reads and imports; it does not build a complete normalized replay before these reads.
 
 `agent.timeline.history.request` returns head/tail windows or a middle page. The omitted range
@@ -66,7 +67,11 @@ still traverses provider pages. Older binaries and other adapters can retain lar
 buffers. The projection row-cache budget does not cover explicit `limit: 0` responses.
 Turn-end hooks carry bounded projection edges, `timelineGap`, and `providerHistoryGap` when
 provider history is unloaded; they do not clone the complete timeline. Search and prompt indexing
-explicitly stream provider messages when the client supports middle pages. Results carry a
+explicitly stream provider messages when the client supports middle pages. The native Codex index
+selects message references before decoding, so tool output is never transferred just to discard it.
+Prompt outlines select only user messages; search includes assistant messages. Preserve positions
+in the complete provider history even when skipping items. Finish the metadata snapshot before
+provider decoding so a long stream does not pin a SQLite reader transaction. Results carry a
 provider index for loading their bounded window; that index never becomes a live stream cursor.
 Clients without middle-page support search their readable projection.
 
