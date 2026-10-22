@@ -1558,15 +1558,15 @@ test(
     const parentPrompts: string[] = [];
     const childStarted = Promise.withResolvers<void>();
     const finishChild = Promise.withResolvers<void>();
-    cleanup.push(async () => {
-      finishChild.resolve();
-    });
+    const finishParent = Promise.withResolvers<void>();
     const a = await daemon({
       agentClients: createTestAgentClients({
         onStartTurn: (prompt, config) => {
           if (config.title === "Batch parent")
             parentPrompts.push(typeof prompt === "string" ? prompt : JSON.stringify(prompt));
         },
+        // Receipts acknowledge dispatch, so keep the turn active until both writes settle.
+        beforeTurnComplete: () => finishParent.promise,
       }),
     });
     const b = await daemon({
@@ -1574,6 +1574,10 @@ test(
         onStartTurn: () => childStarted.resolve(),
         beforeTurnComplete: () => finishChild.promise,
       }),
+    });
+    cleanup.push(async () => {
+      finishChild.resolve();
+      finishParent.resolve();
     });
     const origin = await api(a);
     const destination = await api(b);
@@ -1687,6 +1691,8 @@ test(
     expect(parentPrompts[0]).toContain('event="finished"');
     expect(parentPrompts[0]).toContain(`source-agent-id="${child.id}"`);
     await expect.poll(receiptStates, { timeout: 10000 }).toEqual(["completed", "completed"]);
+    expect((await origin.client.fetchAgent(parent.id))?.agent.status).toBe("running");
+    finishParent.resolve();
     const timeline = await origin.client.fetchAgentTimeline(parent.id);
     const messages = timeline.entries.flatMap((row) =>
       row.item.type === "tool_call" && row.item.agentMessage ? [row.item.agentMessage] : [],
