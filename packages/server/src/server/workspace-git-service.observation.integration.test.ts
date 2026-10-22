@@ -136,7 +136,7 @@ test("initializing non-Git agents use no recursive inventory while explicit file
 }, 30_000);
 
 test("dormant checkouts retain metadata coverage while active checkout edits remain live", async () => {
-  const root = realpathSync(mkdtempSync(path.join(tmpdir(), "paseo-dormant-observation-")));
+  const root = realpathSync.native(mkdtempSync(path.join(tmpdir(), "paseo-dormant-observation-")));
   const repositories = ["first", "second", "third"].map((name) => path.join(root, name));
   for (const cwd of repositories) {
     mkdirSync(cwd);
@@ -154,7 +154,7 @@ test("dormant checkouts retain metadata coverage while active checkout edits rem
   const fileObserver: FileObserver = {
     async subscribe(directory, callback, options) {
       const subscription = await observer.subscribe(directory, callback, options);
-      const canonicalDirectory = realpathSync(directory);
+      const canonicalDirectory = realpathSync.native(directory);
       liveRoots.add(canonicalDirectory);
       return {
         updateIgnore: (paths) => subscription.updateIgnore(paths),
@@ -186,16 +186,16 @@ test("dormant checkouts retain metadata coverage while active checkout edits rem
   await vi.waitFor(
     () => {
       expect([...liveRoots].sort()).toEqual(
-        repositories.map((cwd) => path.join(cwd, ".git")).sort(),
+        repositories.map((cwd) => realpathSync.native(path.join(cwd, ".git"))).sort(),
       );
       expect(service.getMetrics().workingTreeWatchTargetCount).toBe(0);
     },
     { timeout: 10_000 },
   );
-  const hot = repositories[0]!;
+  const hot = realpathSync.native(repositories[0]!);
   const dormantBudget = observer.getDiagnostics().nativeTrackedFileCount;
   active = service.registerWorkspace({ cwd: hot }, () => {});
-  await vi.waitFor(() => expect(liveRoots.has(hot)).toBe(true), { timeout: 10_000 });
+  await vi.waitFor(() => expect([...liveRoots]).toContain(hot), { timeout: 10_000 });
   writeFileSync(path.join(hot, "tracked.txt"), "first edit\n");
   await vi.waitFor(() => expect(service.peekSnapshot(hot)?.git.isDirty).toBe(true), {
     timeout: 10_000,
@@ -204,7 +204,7 @@ test("dormant checkouts retain metadata coverage while active checkout edits rem
   active = null;
   await vi.waitFor(
     () => {
-      expect(liveRoots.has(hot)).toBe(false);
+      expect([...liveRoots]).not.toContain(hot);
       expect(service.getMetrics().workingTreeWatchTargetCount).toBe(0);
       expect(observer.getDiagnostics().nativeTrackedFileCount).toBeLessThanOrEqual(dormantBudget);
     },
@@ -214,7 +214,7 @@ test("dormant checkouts retain metadata coverage while active checkout edits rem
   expect(service.peekSnapshot(hot)?.git.isDirty).toBe(true);
   expect((await service.getSnapshot(hot, { includeForge: false })).git.isDirty).toBe(false);
   active = service.registerWorkspace({ cwd: hot }, () => {});
-  await vi.waitFor(() => expect(liveRoots.has(hot)).toBe(true), { timeout: 10_000 });
+  await vi.waitFor(() => expect([...liveRoots]).toContain(hot), { timeout: 10_000 });
   writeFileSync(path.join(hot, "tracked.txt"), "second edit\n");
   await vi.waitFor(() => expect(service.peekSnapshot(hot)?.git.isDirty).toBe(true), {
     timeout: 10_000,
