@@ -13,6 +13,7 @@ interface SurfaceRect {
 interface LayoutObservation {
   active: boolean;
   layoutShift: number;
+  commandCenterLayoutShift: number;
   startedAtMs: number;
   stoppedAtMs: number | null;
   layoutShiftEntryCount: number;
@@ -20,9 +21,12 @@ interface LayoutObservation {
     startedAtMs: number;
     value: number;
     hadRecentInput: boolean;
+    affectsCommandCenter: boolean;
     sources: Array<{
       nodeName: string | null;
       inCommandCenter: boolean;
+      containsCommandCenter: boolean;
+      connected: boolean;
       ancestry: Array<{
         tag: string;
         testId: string | null;
@@ -116,6 +120,7 @@ export async function startCommandCenterLayoutObservation(page: Page): Promise<v
     const observation: LayoutObservation = {
       active: true,
       layoutShift: 0,
+      commandCenterLayoutShift: 0,
       startedAtMs: performance.now(),
       stoppedAtMs: null,
       layoutShiftEntryCount: 0,
@@ -183,15 +188,36 @@ export async function startCommandCenterLayoutObservation(page: Page): Promise<v
             const value = shift.value ?? 0;
             observation.layoutShift += value;
             observation.layoutShiftEntryCount++;
-            // Retain attribution without changing the existing page-wide score or threshold.
+            const panel = document.querySelector(selectors.panel);
+            const elementOf = (node?: Node) =>
+              node instanceof Element ? node : node?.parentElement;
+            const sources = shift.sources ?? [];
+            // This oracle owns the palette. A background launcher or header can
+            // legitimately settle behind it. Count the full entry for mixed,
+            // ancestor, or unknown attribution; never divide its score or excuse
+            // a palette movement because it followed input.
+            const affectsCommandCenter =
+              !panel ||
+              sources.length === 0 ||
+              sources.some(({ node }) => {
+                const element = elementOf(node);
+                return (
+                  !element ||
+                  !element.isConnected ||
+                  panel.contains(element) ||
+                  element.contains(panel)
+                );
+              });
+            if (affectsCommandCenter) observation.commandCenterLayoutShift += value;
+            // Bound diagnostics independently of score accounting.
             if (observation.layoutShiftEntries.length >= 20) continue;
             observation.layoutShiftEntries.push({
               startedAtMs: entry.startTime,
               value,
               hadRecentInput: shift.hadRecentInput === true,
-              sources: (shift.sources ?? []).slice(0, 5).map((source) => {
-                const element =
-                  source.node instanceof Element ? source.node : source.node?.parentElement;
+              affectsCommandCenter,
+              sources: sources.slice(0, 5).map((source) => {
+                const element = elementOf(source.node);
                 const ancestry = [];
                 for (
                   let current = element;
@@ -216,6 +242,8 @@ export async function startCommandCenterLayoutObservation(page: Page): Promise<v
                   inCommandCenter: Boolean(
                     element?.closest('[data-testid="command-center-panel"]'),
                   ),
+                  containsCommandCenter: Boolean(panel && element?.contains(panel)),
+                  connected: element?.isConnected === true,
                   ancestry,
                   previousRect: rect(source.previousRect),
                   currentRect: rect(source.currentRect),
@@ -258,7 +286,9 @@ export async function expectStableCommandCenterLayout(page: Page): Promise<void>
       ).toBeLessThanOrEqual(1);
     }
   }
-  expect(observation.layoutShift, JSON.stringify(observation)).toBeLessThanOrEqual(0.001);
+  expect(observation.commandCenterLayoutShift, JSON.stringify(observation)).toBeLessThanOrEqual(
+    0.001,
+  );
 }
 
 export async function expectOneLineTruncatedFileResult(
