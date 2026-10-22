@@ -85,7 +85,7 @@ describe("pinned workspace tree drops", () => {
       }),
     ).toMatchObject({ parentWorkspaceKey: null, beforeWorkspaceKey: "host:o" });
   });
-  it("checks hidden descendants before crossing sections, but allows leaves", () => {
+  it("allows groups with hidden descendants to cross sections", () => {
     const target = { ...workspace("s"), sidebarSection: "superpinned" as const };
     expect(
       resolveWorkspaceTreeDropResult({
@@ -94,7 +94,10 @@ describe("pinned workspace tree drops", () => {
         allWorkspaces: [...workspaces, target],
         targetWorkspaceKey: target.workspaceKey,
       }),
-    ).toMatchObject({ drop: null, rejection: { message: expect.stringContaining("children") } });
+    ).toMatchObject({
+      drop: { pinSection: "superpinned", parentWorkspaceKey: "host:s" },
+      rejection: null,
+    });
     expect(
       resolveWorkspaceTreeDrop({
         ...input,
