@@ -7133,6 +7133,7 @@ export class Session {
         background: request.background,
         parentWorkspaceId: request.parentWorkspaceId,
         siblingOrder: request.siblingOrder,
+        sidebarPlacement: request.sidebarPlacement,
         callerWorkspaceId: await this.getCallerWorkspaceId(request.callerAgentId),
       },
     );
@@ -7199,6 +7200,7 @@ export class Session {
         background: request.background,
         parentWorkspaceId: request.parentWorkspaceId,
         siblingOrder: request.siblingOrder,
+        sidebarPlacement: request.sidebarPlacement,
         callerWorkspaceId: await this.getCallerWorkspaceId(request.callerAgentId),
       },
       source.baseBranch

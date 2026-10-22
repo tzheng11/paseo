@@ -173,6 +173,15 @@ const test = daemonTest.extend<{
           localStorage.setItem("@paseo:e2e", "1");
           localStorage.setItem("@paseo:e2e-seed-nonce", nonce);
 
+          // Most journeys exercise project controls. Give them an explicit preference;
+          // fresh production clients default to the ungrouped workspace tree.
+          if (!localStorage.getItem("sidebar-view")) {
+            localStorage.setItem(
+              "sidebar-view",
+              JSON.stringify({ state: { groupMode: "project" }, version: 7 }),
+            );
+          }
+
           const rawExtraHosts = localStorage.getItem(extraHostsKey);
           const extraHosts = rawExtraHosts ? JSON.parse(rawExtraHosts) : [];
 

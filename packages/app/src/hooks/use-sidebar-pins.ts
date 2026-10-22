@@ -186,12 +186,12 @@ export function splitPinnedSidebarGroups(input: {
   });
   const covered = new Set([...superpinned, ...pinned].map((workspace) => workspace.workspaceKey));
   return {
-    superpinnedChats: projectPinnedTree({
+    superpinnedChats: projectWorkspaceTree({
       workspaces: superRoots,
       section: "superpinned",
       tree: input.pinnedWorkspaceTree,
     }),
-    pinnedChats: projectPinnedTree({
+    pinnedChats: projectWorkspaceTree({
       workspaces: orderedRoots,
       section: "pinned",
       tree: input.pinnedWorkspaceTree,
@@ -204,7 +204,7 @@ interface PinnedTreeProjectionInput {
   section: PinnedWorkspaceSection;
   tree?: PinnedWorkspaceTree;
 }
-function projectPinnedTree({
+export function projectWorkspaceTree({
   workspaces,
   section,
   tree = {},

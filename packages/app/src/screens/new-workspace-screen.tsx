@@ -120,6 +120,11 @@ import {
 } from "./workspace/terminals/state";
 import { captureWorkspaceDraftCleanup } from "./new-workspace/background-handoff";
 import { useNewWorkspaceScreenPresence } from "./new-workspace/screen-presence";
+import { buildSidebarWorkspacePlacementModel } from "@/hooks/sidebar-workspaces-view-model";
+import { useSidebarWorkspaceEntries } from "@/hooks/use-sidebar-workspace-entries";
+import { useWorkspaceParentPicker } from "./new-workspace/parent-picker";
+import { buildChildWorkspacePlacement } from "./new-workspace/parent-selection";
+import { revealCreatedChildWorkspace } from "./new-workspace/parent-reveal";
 
 const WINDOW_CONTENT_DATASET = { "window-content": "" };
 
@@ -175,6 +180,7 @@ interface NewWorkspaceScreenProps {
   projectId?: string;
   displayName?: string;
   draftId?: string;
+  parentWorkspaceKey?: string;
 }
 
 // A terminal launch sends argv, not a message: there is nothing to attach and
@@ -303,6 +309,8 @@ async function createMultiplicityWorkspace(input: {
   ) => void;
   serverId: string;
   createFailedMessage: string;
+  sidebarPlacement?: CreateWorkspaceRequestOptions["sidebarPlacement"];
+  onWorkspaceCreated: () => void;
 }): Promise<WorkspaceCreationResult> {
   const projectId = getHostProjectId(input.project, input.serverId);
   if (!projectId) throw new Error("Project is not available on the selected host");
@@ -311,10 +319,20 @@ async function createMultiplicityWorkspace(input: {
     prompt: input.prompt,
     attachments: input.attachments,
   });
+  let workspaceRevealed = false;
+  const revealWorkspace = () => {
+    if (workspaceRevealed) return;
+    workspaceRevealed = true;
+    input.onWorkspaceCreated();
+  };
   const payload = await input.client.createWorkspace({
     idempotencyKey: input.idempotencyKey,
     agent: input.agent,
-    onEvent: input.onEvent,
+    onEvent: (snapshot) => {
+      if (snapshot.workspace) revealWorkspace();
+      input.onEvent?.(snapshot);
+    },
+    sidebarPlacement: input.sidebarPlacement,
     source: isWorktree
       ? {
           kind: "worktree",
@@ -338,6 +356,7 @@ async function createMultiplicityWorkspace(input: {
     ? { ...normalizedWorkspace, status: "running" as const, statusEnteredAt: new Date() }
     : normalizedWorkspace;
   input.mergeWorkspaces(input.serverId, [workspaceForInitialMerge]);
+  revealWorkspace();
   return { workspace: normalizedWorkspace, agent: payload.agent };
 }
 
@@ -861,6 +880,7 @@ export function NewWorkspaceScreen({
   projectId,
   displayName: displayNameProp,
   draftId,
+  parentWorkspaceKey,
 }: NewWorkspaceScreenProps) {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
@@ -905,16 +925,39 @@ export function NewWorkspaceScreen({
   const [pendingAction, setPendingAction] = useState<"chat" | "empty" | "terminal" | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
+  const [parentPickerOpen, setParentPickerOpen] = useState(false);
   const openAddProjectPicker = useOpenAddProject();
   const [isolationPickerOpen, setIsolationPickerOpen] = useState(false);
   const [pickerSearchQuery, setPickerSearchQuery] = useState("");
   const [debouncedPickerSearchQuery, setDebouncedPickerSearchQuery] = useState("");
   const pickerAnchorRef = useRef<View>(null);
   const projectPickerAnchorRef = useRef<View>(null);
+  const parentPickerAnchorRef = useRef<View>(null);
   const isolationPickerAnchorRef = useRef<View>(null);
   const hostPickerAnchorRef = useRef<View | null>(null);
   const isDraftHandoffActive = useIsNewWorkspaceDraftHandoffActive({ draftId, selectedServerId });
   const isStillOnCreateScreen = useNewWorkspaceScreenPresence();
+  const parentCatalogPlacements = useMemo(
+    () => buildSidebarWorkspacePlacementModel({ projects }).workspaces,
+    [projects],
+  );
+  const parentCatalogByKey = useSidebarWorkspaceEntries(parentCatalogPlacements);
+  const parentCatalog = useMemo(() => [...parentCatalogByKey.values()], [parentCatalogByKey]);
+  const parentPicker = useWorkspaceParentPicker({
+    parentWorkspaceKey,
+    workspaces: parentCatalog,
+    hosts: allHosts,
+    noParentLabel: t("newWorkspace.parent.none"),
+    unavailableLabel: t("newWorkspace.parent.unavailable"),
+  });
+  const openParentPicker = useCallback(() => setParentPickerOpen(true), []);
+  const selectParent = useCallback(
+    (key: string) => {
+      parentPicker.select(key);
+      setParentPickerOpen(false);
+    },
+    [parentPicker],
+  );
 
   // Launch target: what the composer submits to (chat agent, or a terminal
   // profile). Mirrors useWorkspaceIsolation's pattern below: the derived
@@ -1255,6 +1298,10 @@ export function NewWorkspaceScreen({
       }
       const connectedClient = withConnectedClient();
       const createsWorktree = !supportsWorkspaceMultiplicity || effectiveIsolation === "worktree";
+      const sidebarPlacement = buildChildWorkspacePlacement({
+        parentWorkspaceKey: parentPicker.selection.workspaceKey,
+        workspaces: parentCatalog,
+      });
       const checkoutStatusForCreate = createsWorktree
         ? await ensureCheckoutStatus({
             queryClient,
@@ -1284,6 +1331,12 @@ export function NewWorkspaceScreen({
         mergeWorkspaces,
         serverId: selectedServerId,
         createFailedMessage: t("newWorkspace.errors.createWorktreeFailed"),
+        sidebarPlacement,
+        onWorkspaceCreated: () =>
+          revealCreatedChildWorkspace({
+            placement: sidebarPlacement,
+            workspaces: parentCatalog,
+          }),
       });
       setCreationResult(normalizedWorkspace);
       return normalizedWorkspace;
@@ -1293,6 +1346,8 @@ export function NewWorkspaceScreen({
       creationResult,
       effectiveIsolation,
       mergeWorkspaces,
+      parentCatalog,
+      parentPicker.selection.workspaceKey,
       queryClient,
       selectedItem,
       selectedProject,
@@ -1503,6 +1558,16 @@ export function NewWorkspaceScreen({
       selectedServerId,
       onSelect: handleSelectWorkspaceHost,
       onAddHost: handleAddHost,
+    },
+    parent: {
+      anchorRef: parentPickerAnchorRef,
+      open: openParentPicker,
+      openState: parentPickerOpen,
+      onOpenChange: setParentPickerOpen,
+      options: parentPicker.options,
+      selectedOptionId: parentPicker.selectedOptionId,
+      triggerLabel: parentPicker.triggerLabel,
+      onSelect: selectParent,
     },
     isolation: {
       anchorRef: isolationPickerAnchorRef,

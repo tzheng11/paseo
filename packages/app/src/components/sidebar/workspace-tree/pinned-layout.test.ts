@@ -23,6 +23,37 @@ function workspace(
 }
 
 describe("pinned workspace layout", () => {
+  it("appends shared children after legacy sibling ranks without comparing section-root ranks", () => {
+    const parent = workspace("one", "parent", { sidebarSection: "unpinned", siblingOrder: 99999 });
+    const legacy = workspace("one", "legacy", {
+      sidebarSection: "unpinned",
+      parentWorkspaceId: "parent",
+      siblingOrder: 8192,
+    });
+    const newChild = workspace("two", "new", {
+      sidebarSection: "unpinned",
+      projectViewKey: "other",
+    });
+    const otherRoot = workspace("two", "root", {
+      sidebarSection: "unpinned",
+      siblingOrder: -99999,
+    });
+    const tree = { "two:new": { parentWorkspaceKey: parent.workspaceKey, siblingOrder: 9216 } };
+    const resolved = resolvePinnedWorkspaceTree([parent, newChild, otherRoot, legacy], tree);
+    expect(resolved.get(legacy.workspaceKey)).toEqual({
+      parentWorkspaceKey: parent.workspaceKey,
+      siblingOrder: 8192,
+    });
+    expect(resolved.get(newChild.workspaceKey)?.siblingOrder).toBeGreaterThan(
+      resolved.get(legacy.workspaceKey)!.siblingOrder,
+    );
+    expect(resolved.get(parent.workspaceKey)!.siblingOrder).toBeLessThan(
+      resolved.get(otherRoot.workspaceKey)!.siblingOrder,
+    );
+    expect(parent.siblingOrder).toBe(99999);
+    expect(otherRoot.siblingOrder).toBe(-99999);
+  });
+
   it("collects full-key descendants, reports missing members and leaves other pin sections alone", () => {
     const workspaces = [
       workspace("one", "parent"),
@@ -397,43 +428,71 @@ describe("pinned workspace layout", () => {
     },
   );
 
-  it("moves a full cross-host subtree between sections while preserving child ranks", () => {
+  it("keeps unrelated unpinned groups and Superpinned placements out of a drag write", () => {
     const workspaces = [
-      workspace("one", "parent"),
-      workspace("two", "hidden-child"),
-      workspace("two", "leaf", { projectViewKey: "another-project" }),
+      workspace("one", "source", { sidebarSection: "unpinned" }),
+      workspace("two", "parent", { sidebarSection: "unpinned" }),
+      workspace("two", "child", { sidebarSection: "unpinned", parentWorkspaceId: "parent" }),
       workspace("three", "priority", { sidebarSection: "superpinned" }),
     ];
-    const tree = {
-      "two:hidden-child": { parentWorkspaceKey: "one:parent", siblingOrder: 0.125 },
-      "two:leaf": { parentWorkspaceKey: "two:hidden-child", siblingOrder: 17 },
-    };
-    const move = (workspaceKey: string) =>
-      movePinnedWorkspaceTree({
-        tree,
-        workspaces,
-        workspaceKey,
-        parentWorkspaceKey: "three:priority",
-        beforeWorkspaceKey: null,
-        section: "superpinned",
-      });
-    const group = move("one:parent");
-    expect(group.ok).toBe(true);
-    if (!group.ok) return;
-    expect(group.tree["one:parent"]?.parentWorkspaceKey).toBe("three:priority");
-    expect(group.tree["two:hidden-child"]).toEqual(tree["two:hidden-child"]);
-    expect(group.tree["two:leaf"]).toEqual(tree["two:leaf"]);
-    const destination = workspaces.map((item) => ({
-      ...item,
-      sidebarSection: "superpinned" as const,
-    }));
-    const resolved = resolvePinnedWorkspaceTree(destination, group.tree);
-    expect(resolved.get("two:hidden-child")?.parentWorkspaceKey).toBe("one:parent");
-    expect(resolved.get("two:leaf")?.parentWorkspaceKey).toBe("two:hidden-child");
-    const leaf = move("two:leaf");
-    expect(leaf.ok).toBe(true);
-    if (!leaf.ok) return;
-    expect(leaf.tree["two:leaf"]?.parentWorkspaceKey).toBe("three:priority");
-    expect(workspaces[2]!.sidebarSection).toBe("pinned");
+    const tree = { "three:priority": { parentWorkspaceKey: null, siblingOrder: 99 } };
+    const result = movePinnedWorkspaceTree({
+      tree,
+      workspaces,
+      workspaceKey: "one:source",
+      parentWorkspaceKey: "two:parent",
+      beforeWorkspaceKey: null,
+      section: "unpinned",
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.tree["one:source"]?.parentWorkspaceKey).toBe("two:parent");
+    // Destination siblings need shared ranks when first imported into one order.
+    expect(result.tree["two:child"]?.parentWorkspaceKey).toBe("two:parent");
+    expect(result.tree).not.toHaveProperty("two:parent");
+    expect(result.tree["three:priority"]).toBe(tree["three:priority"]);
   });
+
+  it.each(["unpinned", "superpinned"] as const)(
+    "moves a full cross-host subtree to %s while preserving child ranks",
+    (section) => {
+      const workspaces = [
+        workspace("one", "parent"),
+        workspace("two", "hidden-child"),
+        workspace("two", "leaf", { projectViewKey: "another-project" }),
+        workspace("three", "priority", { sidebarSection: section }),
+      ];
+      const tree = {
+        "two:hidden-child": { parentWorkspaceKey: "one:parent", siblingOrder: 0.125 },
+        "two:leaf": { parentWorkspaceKey: "two:hidden-child", siblingOrder: 17 },
+      };
+      const move = (workspaceKey: string) =>
+        movePinnedWorkspaceTree({
+          tree,
+          workspaces,
+          workspaceKey,
+          parentWorkspaceKey: "three:priority",
+          beforeWorkspaceKey: null,
+          section,
+        });
+      const group = move("one:parent");
+      expect(group.ok).toBe(true);
+      if (!group.ok) return;
+      expect(group.tree["one:parent"]?.parentWorkspaceKey).toBe("three:priority");
+      expect(group.tree["two:hidden-child"]).toEqual(tree["two:hidden-child"]);
+      expect(group.tree["two:leaf"]).toEqual(tree["two:leaf"]);
+      const destination = workspaces.map((item) => ({
+        ...item,
+        sidebarSection: section,
+      }));
+      const resolved = resolvePinnedWorkspaceTree(destination, group.tree);
+      expect(resolved.get("two:hidden-child")?.parentWorkspaceKey).toBe("one:parent");
+      expect(resolved.get("two:leaf")?.parentWorkspaceKey).toBe("two:hidden-child");
+      const leaf = move("two:leaf");
+      expect(leaf.ok).toBe(true);
+      if (!leaf.ok) return;
+      expect(leaf.tree["two:leaf"]?.parentWorkspaceKey).toBe("three:priority");
+      expect(workspaces[2]!.sidebarSection).toBe("pinned");
+    },
+  );
 });

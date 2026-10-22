@@ -1,4 +1,4 @@
-export type PinnedWorkspaceSection = "pinned" | "superpinned";
+export type PinnedWorkspaceSection = "unpinned" | "pinned" | "superpinned";
 export interface PinnedWorkspaceTreePlacement {
   parentWorkspaceKey: string | null;
   siblingOrder: number;
@@ -77,39 +77,52 @@ function compareSiblingRanks(
   right: PinnedWorkspaceTreeItem,
   tree: PinnedWorkspaceTree,
   parents: ReadonlyMap<string, string | null>,
+  byKey: ReadonlyMap<string, PinnedWorkspaceTreeItem>,
   indices: ReadonlyMap<string, number>,
 ): number {
-  const l = savedRank(left, tree),
-    r = savedRank(right, tree);
+  const l = effectiveSiblingRank(left, tree, parents, byKey),
+    r = effectiveSiblingRank(right, tree, parents, byKey);
   if (l !== undefined || r !== undefined) {
     if (l === undefined) return 1;
     if (r === undefined) return -1;
     return l - r || left.workspaceKey.localeCompare(right.workspaceKey);
   }
-  // Legacy backend ranks are scoped to siblings, never compared between
-  // projects/hosts at the section root. Root arrays/recency define fallback.
-  if (parents.get(left.workspaceKey) !== null) {
-    const lLegacy = finite(left.siblingOrder),
-      rLegacy = finite(right.siblingOrder);
-    if (lLegacy !== rLegacy) return lLegacy ? -1 : 1;
-    if (lLegacy && rLegacy)
-      return (
-        left.siblingOrder! - right.siblingOrder! ||
-        left.workspaceKey.localeCompare(right.workspaceKey)
-      );
-  }
   return indices.get(left.workspaceKey)! - indices.get(right.workspaceKey)!;
+}
+
+function effectiveSiblingRank(
+  workspace: PinnedWorkspaceTreeItem,
+  tree: PinnedWorkspaceTree,
+  parents: ReadonlyMap<string, string | null>,
+  byKey: ReadonlyMap<string, PinnedWorkspaceTreeItem>,
+): number | undefined {
+  const saved = savedRank(workspace, tree);
+  if (saved !== undefined) return saved;
+  const parentKey = parents.get(workspace.workspaceKey);
+  const parent = parentKey ? byKey.get(parentKey) : undefined;
+  // Legacy child ranks share a scale only inside their original host/project
+  // group. Section roots retain their catalog/recency fallback across hosts.
+  const comparableLegacyGroup =
+    parent !== undefined &&
+    parent.serverId === workspace.serverId &&
+    parent.projectViewKey === workspace.projectViewKey &&
+    parentKey === `${workspace.serverId}:${workspace.parentWorkspaceId}`;
+  return comparableLegacyGroup && finite(workspace.siblingOrder)
+    ? workspace.siblingOrder
+    : undefined;
 }
 
 function siblingRanks(
   siblings: readonly PinnedWorkspaceTreeItem[],
   tree: PinnedWorkspaceTree,
+  parents: ReadonlyMap<string, string | null>,
+  byKey: ReadonlyMap<string, PinnedWorkspaceTreeItem>,
 ): number[] {
   let last: number | undefined;
   let normalize = false;
   const ranks: number[] = [];
   for (const workspace of siblings) {
-    const saved = savedRank(workspace, tree);
+    const saved = effectiveSiblingRank(workspace, tree, parents, byKey);
     const value = saved ?? (last === undefined ? 0 : last + STEP);
     if (!finite(value) || (saved === undefined && last !== undefined && value <= last))
       normalize = true;
@@ -150,8 +163,8 @@ export function resolvePinnedWorkspaceTree(
   }
   const result = new Map<string, PinnedWorkspaceTreePlacement>();
   for (const siblings of groups.values()) {
-    siblings.sort((left, right) => compareSiblingRanks(left, right, tree, parents, indices));
-    const ranks = siblingRanks(siblings, tree);
+    siblings.sort((left, right) => compareSiblingRanks(left, right, tree, parents, byKey, indices));
+    const ranks = siblingRanks(siblings, tree, parents, byKey);
     siblings.forEach((workspace, index) =>
       result.set(workspace.workspaceKey, {
         parentWorkspaceKey: parents.get(workspace.workspaceKey) ?? null,
@@ -343,7 +356,7 @@ export function movePinnedWorkspaceTree(
     input.parentWorkspaceKey !== null &&
     byKey.get(input.parentWorkspaceKey)?.sidebarSection !== input.section
   )
-    return { ok: false, reason: "Parent is no longer in this pinned section" };
+    return { ok: false, reason: "Parent is no longer in this workspace section" };
   if (createsRawCycle(input, byKey))
     return { ok: false, reason: "A workspace cannot be moved into one of its children" };
   const destination = input.workspaces.map((workspace) =>
@@ -369,7 +382,7 @@ export function movePinnedWorkspaceTree(
   let index = siblings.length;
   if (input.beforeWorkspaceKey !== null) {
     index = siblings.findIndex((workspace) => workspace.workspaceKey === input.beforeWorkspaceKey);
-    if (index < 0) return { ok: false, reason: "Sibling is no longer in this pinned group" };
+    if (index < 0) return { ok: false, reason: "Sibling is no longer in this workspace group" };
   }
   const previous = index > 0 ? next[siblings[index - 1]!.workspaceKey]?.siblingOrder : undefined;
   const following =
@@ -394,5 +407,12 @@ export function movePinnedWorkspaceTree(
       parentWorkspaceKey: input.parentWorkspaceKey,
       siblingOrder: order,
     };
-  return { ok: true, tree: next, siblingOrder: order, rebalanced };
+  // Seeding resolves legacy ranks for the calculation. Publish only this move's
+  // group, rather than assigning shared placements to unrelated workspaces.
+  const affected = new Set(movingKeys);
+  for (const sibling of siblings) affected.add(sibling.workspaceKey);
+  const tree = Object.fromEntries(
+    Object.entries(next).filter(([key]) => own(input.tree, key) || affected.has(key)),
+  );
+  return { ok: true, tree, siblingOrder: order, rebalanced };
 }

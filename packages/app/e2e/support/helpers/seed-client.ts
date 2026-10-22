@@ -20,6 +20,7 @@ export interface SeedWorkspaceDescriptor {
   fieldValues?: Record<string, string>;
   pinnedAt?: string | null;
   superpinnedAt?: string | null;
+  pinPlacement?: { parentWorkspaceKey: string | null; siblingOrder: number; revision: number };
 }
 
 interface SeedProjectDescriptor {
@@ -91,6 +92,11 @@ export interface SeedDaemonClient {
     title?: string;
     parentWorkspaceId?: string | null;
     siblingOrder?: number;
+    sidebarPlacement?: {
+      parentWorkspaceKey: string | null;
+      siblingOrder?: number;
+      section: "unpinned" | "pinned" | "superpinned";
+    };
     background?: boolean;
   }): Promise<{
     workspace: SeedWorkspaceDescriptor | null;

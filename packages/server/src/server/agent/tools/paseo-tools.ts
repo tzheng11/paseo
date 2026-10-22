@@ -1,6 +1,17 @@
+import {
+  resolveSidebarAutomationPlacement,
+  resolveSidebarAutomationCatalog,
+  sidebarAutomationSubtree,
+  type SidebarAutomationWorkspace,
+} from "../../workspace-sidebar-automation.js";
+import {
+  workspaceSidebarSection,
+  type WorkspaceSidebarPlacement,
+} from "../../workspace-pin-placement.js";
 import type { AgentMessageDelivery } from "../agent-messages/index.js";
 import {
   createHostResolver,
+  fetchAllAutomationWorkspaces,
   waitForPermissionChange,
   type HostOperation,
   type HostOperations,
@@ -15,7 +26,12 @@ import { AsyncLocalStorage } from "node:async_hooks";
 
 import type { AgentMode, AgentProvider, AgentSessionConfig } from "../agent-sdk-types.js";
 import type { AgentManager, ManagedAgent } from "../agent-manager.js";
-import { ActiveTurnBehaviorSchema, AgentProfileSchema } from "@getpaseo/protocol/messages";
+import {
+  ActiveTurnBehaviorSchema,
+  AgentProfileSchema,
+  WorkspacePinPlacementSchema,
+  WorkspaceSidebarSectionSchema,
+} from "@getpaseo/protocol/messages";
 import {
   WORKSPACE_FIELDS,
   WORKSPACE_FIELD_CATALOG_VERSION,
@@ -153,6 +169,13 @@ export interface PaseoToolHostDependencies {
   setWorkspaceFieldValue?: (
     input: Parameters<typeof setWorkspaceFieldValueTransaction>[1],
   ) => Promise<string>;
+  setWorkspacePinPlacement?: (input: {
+    workspaceId: string;
+    placement: { parentWorkspaceKey: string | null; siblingOrder: number };
+    section?: WorkspaceSidebarPlacement["section"];
+    sectionState?: { pinnedAt: string | null; superpinnedAt: string | null };
+    expectedRevision: number;
+  }) => Promise<NonNullable<PersistedWorkspaceRecord["pinPlacement"]>>;
   projectRegistry?: Pick<ProjectRegistry, "get" | "list">;
   createDirectoryWorkspace?: (
     cwd: string,
@@ -161,6 +184,7 @@ export interface PaseoToolHostDependencies {
     context?: {
       background?: boolean;
       callerWorkspaceId?: string;
+      sidebarPlacement?: WorkspaceSidebarPlacement;
       parentWorkspaceId?: string | null;
       siblingOrder?: number;
     },
@@ -220,11 +244,17 @@ const WorkspaceAutomationSummarySchema = z.object({
   background: z.boolean().optional(),
   parentWorkspaceId: z.string().nullable(),
   siblingOrder: z.number().finite(),
+  workspaceKey: z.string().optional(),
+  section: WorkspaceSidebarSectionSchema.optional(),
+  pinPlacement: WorkspacePinPlacementSchema.optional(),
 });
 
-function toWorkspaceAutomationSummary(workspace: PersistedWorkspaceRecord) {
+function toWorkspaceAutomationSummary(workspace: PersistedWorkspaceRecord, serverId?: string) {
   return {
     workspaceId: workspace.workspaceId,
+    ...(serverId ? { workspaceKey: `${serverId}:${workspace.workspaceId}` } : {}),
+    section: workspaceSidebarSection(workspace),
+    ...(workspace.pinPlacement ? { pinPlacement: workspace.pinPlacement } : {}),
     projectId: workspace.projectId,
     cwd: workspace.cwd,
     isolation: workspace.kind === "worktree" ? ("worktree" as const) : ("local" as const),
@@ -693,6 +723,7 @@ function createToolCatalog(
   const hostTools = new Map([
     ["create_agent", "createAgent"],
     ["create_workspace", "createWorkspace"],
+    ["move_workspace", "moveWorkspace"],
     ["list_workspaces", "listWorkspaces"],
     ["send_agent_prompt", "sendPrompt"],
     ["get_agent_status", "getStatus"],
@@ -711,6 +742,7 @@ function createToolCatalog(
       createAgent: (args, context) => localHostOperations.get("create_agent")!(args, context),
       createWorkspace: (args, context) =>
         localHostOperations.get("create_workspace")!(args, context),
+      moveWorkspace: (args, context) => localHostOperations.get("move_workspace")!(args, context),
       listWorkspaces: (args, context) => localHostOperations.get("list_workspaces")!(args, context),
       sendPrompt: (args, context) => localHostOperations.get("send_agent_prompt")!(args, context),
       getStatus: (args, context) => localHostOperations.get("get_agent_status")!(args, context),
@@ -748,6 +780,241 @@ function createToolCatalog(
       },
     },
   });
+  async function loadSidebarCatalog(requireComplete = true): Promise<SidebarAutomationWorkspace[]> {
+    const local = ((await options.workspaceRegistry?.list()) ?? [])
+      .filter((row) => !row.archivedAt)
+      .map((row) => ({
+        workspaceKey: `${options.serverId ?? "self"}:${row.workspaceId}`,
+        workspaceId: row.workspaceId,
+        projectId: row.projectId,
+        parentWorkspaceId: row.parentWorkspaceId,
+        siblingOrder: row.siblingOrder,
+        section: workspaceSidebarSection(row),
+        pinnedAt: row.pinnedAt,
+        superpinnedAt: row.superpinnedAt,
+        pinPlacement: row.pinPlacement,
+      }));
+    if (!options.hosts) return resolveSidebarAutomationCatalog(local);
+    const hosts = options.hosts();
+    const directory = await hosts.directory();
+    const destinations = directory.hosts.filter(
+      (host) => host.enabled && host.serverId && host.serverId !== options.serverId,
+    );
+    if (requireComplete && destinations.some((host) => host.status !== "online"))
+      throw new PaseoToolInputError(
+        "Reconnect all registered hosts before changing the shared workspace hierarchy, or supply a saved parent section and siblingOrder for child creation.",
+      );
+    const remote = await Promise.all(
+      destinations
+        .filter((host) => host.status === "online")
+        .map((host) =>
+          hosts.use(host.serverId!, async (client) => {
+            const rows = await fetchAllAutomationWorkspaces(client);
+            return rows.map((row) => ({
+              workspaceKey: `${host.serverId}:${row.id}`,
+              workspaceId: row.id,
+              projectId: row.projectId,
+              parentWorkspaceId: row.parentWorkspaceId,
+              siblingOrder: row.siblingOrder,
+              section: workspaceSidebarSection(row),
+              pinnedAt: row.pinnedAt,
+              superpinnedAt: row.superpinnedAt,
+              pinPlacement: row.pinPlacement,
+            }));
+          }),
+        ),
+    );
+    return resolveSidebarAutomationCatalog([...local, ...remote.flat()]);
+  }
+
+  async function prepareSidebarCreation(input: Record<string, unknown>) {
+    const callerWorkspaceId = resolveCallerAgent()?.workspaceId;
+    let parent: string | null | undefined;
+    if (input.parentWorkspaceKey !== undefined) parent = input.parentWorkspaceKey as string | null;
+    else if (input.parentWorkspaceId === undefined && callerWorkspaceId)
+      parent = `${options.serverId ?? "self"}:${callerWorkspaceId}`;
+    if (parent === undefined && input.section === undefined)
+      return { ...input, sidebarPlacement: undefined };
+    const explicitSnapshot = input.section !== undefined && input.siblingOrder !== undefined;
+    const rows = explicitSnapshot
+      ? ((await options.workspaceRegistry?.list()) ?? [])
+          .filter((row) => !row.archivedAt)
+          .map((row) => ({
+            workspaceKey: `${options.serverId ?? "self"}:${row.workspaceId}`,
+            workspaceId: row.workspaceId,
+            projectId: row.projectId,
+            parentWorkspaceId: row.parentWorkspaceId,
+            siblingOrder: row.siblingOrder,
+            section: workspaceSidebarSection(row),
+            pinPlacement: row.pinPlacement,
+          }))
+      : await loadSidebarCatalog();
+    const sidebarPlacement = resolveSidebarAutomationPlacement({
+      workspaces: rows,
+      parentWorkspaceKey: parent ?? null,
+      section: input.section as WorkspaceSidebarPlacement["section"] | undefined,
+      siblingOrder: input.siblingOrder as number | undefined,
+    });
+    return { ...input, sidebarPlacement };
+  }
+
+  async function executeSidebarMove(
+    input: Record<string, unknown>,
+    destination: string | undefined,
+    context: PaseoToolExecutionContext,
+  ) {
+    const rows = await loadSidebarCatalog();
+    const sourceKey = `${destination ?? options.serverId ?? "self"}:${input.workspaceId}`;
+    const source = rows.find((row) => row.workspaceKey === sourceKey);
+    if (!source)
+      throw new PaseoToolInputError("Workspace not found in the connected host catalog.");
+    const parentWorkspaceKey =
+      input.parentWorkspaceKey === undefined
+        ? (source.pinPlacement?.parentWorkspaceKey ?? null)
+        : (input.parentWorkspaceKey as string | null);
+    let section = input.section as WorkspaceSidebarPlacement["section"] | undefined;
+    if (section === undefined && parentWorkspaceKey === null) section = source.section;
+    const placement = resolveSidebarAutomationPlacement({
+      workspaces: rows,
+      movingWorkspaceKey: sourceKey,
+      parentWorkspaceKey,
+      section,
+      siblingOrder: input.siblingOrder as number | undefined,
+      beforeWorkspaceKey: input.beforeWorkspaceKey as string | null | undefined,
+    });
+    const changed =
+      source.section === placement.section
+        ? []
+        : sidebarAutomationSubtree(rows, sourceKey).filter((row) => row.workspaceKey !== sourceKey);
+    const updates = [
+      ...changed.map((row) => ({
+        row,
+        placement: {
+          parentWorkspaceKey: row.pinPlacement?.parentWorkspaceKey ?? null,
+          siblingOrder: row.pinPlacement?.siblingOrder ?? 0,
+          section: placement.section,
+        },
+      })),
+      { row: source, placement },
+    ];
+    // Check every affected owner before the first mutation. Cross-host writes use CAS and roll back only their own revisions.
+    const owners = [
+      ...new Set(
+        updates.map(({ row }) => row.workspaceKey.slice(0, row.workspaceKey.indexOf(":"))),
+      ),
+    ];
+    for (const owner of owners) {
+      if (owner === (options.serverId ?? "self")) {
+        if (!options.setWorkspacePinPlacement)
+          throw new Error("Workspace sidebar placement is not configured");
+      } else {
+        await options.hosts!().use(owner, async (client) => {
+          if (client.getLastServerInfoMessage()?.features?.workspaceSidebarPlacement !== true)
+            throw new Error(`Update host ${owner} to move child workspaces.`);
+        });
+      }
+    }
+    return commitSidebarMoves(updates, context);
+  }
+
+  async function commitSidebarMoves(
+    updates: {
+      row: SidebarAutomationWorkspace;
+      placement: WorkspaceSidebarPlacement & { siblingOrder: number };
+    }[],
+    context: PaseoToolExecutionContext,
+  ) {
+    const committed: typeof updates = [];
+    let result: PaseoToolResult | undefined;
+    let pendingWorkspaceKey: string | undefined;
+    try {
+      for (const update of updates) {
+        const owner = update.row.workspaceKey.slice(0, update.row.workspaceKey.indexOf(":"));
+        pendingWorkspaceKey = update.row.workspaceKey;
+        result = await hostResolver.use(owner, (host) =>
+          host.moveWorkspace(
+            {
+              workspaceId: update.row.workspaceId,
+              sidebarPlacement: update.placement,
+              expectedRevision: update.row.pinPlacement?.revision ?? 0,
+            },
+            context,
+          ),
+        );
+        committed.push(update);
+        pendingWorkspaceKey = undefined;
+      }
+      return result!;
+    } catch (error) {
+      const failedRollbacks: string[] =
+        error instanceof Error &&
+        "outcome" in error &&
+        error.outcome === "unknown" &&
+        pendingWorkspaceKey
+          ? [pendingWorkspaceKey]
+          : [];
+      for (const update of committed.toReversed()) {
+        const owner = update.row.workspaceKey.slice(0, update.row.workspaceKey.indexOf(":"));
+        try {
+          await hostResolver.use(owner, (host) =>
+            host.moveWorkspace(
+              {
+                workspaceId: update.row.workspaceId,
+                sidebarPlacement: {
+                  parentWorkspaceKey: update.row.pinPlacement?.parentWorkspaceKey ?? null,
+                  siblingOrder: update.row.pinPlacement?.siblingOrder ?? 0,
+                  section: update.row.section,
+                },
+                sectionState: {
+                  pinnedAt: update.row.pinnedAt ?? null,
+                  superpinnedAt: update.row.superpinnedAt ?? null,
+                },
+                expectedRevision: (update.row.pinPlacement?.revision ?? 0) + 1,
+              },
+              context,
+            ),
+          );
+        } catch {
+          failedRollbacks.push(update.row.workspaceKey);
+        }
+      }
+      if (failedRollbacks.length)
+        throw new Error(
+          `Workspace move failed; inspect these workspaces before retrying: ${failedRollbacks.join(", ")}. ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
+        );
+      throw error;
+    }
+  }
+
+  async function invokeHostTool(
+    name: string,
+    operation: keyof Pick<
+      HostOperations,
+      | "createAgent"
+      | "createWorkspace"
+      | "moveWorkspace"
+      | "listWorkspaces"
+      | "sendPrompt"
+      | "getStatus"
+      | "getActivity"
+      | "listAgents"
+    >,
+    input: Record<string, unknown>,
+    serverId: string | undefined,
+    context: PaseoToolExecutionContext,
+  ) {
+    const sharedMove =
+      name === "move_workspace" &&
+      (input.parentWorkspaceId === undefined ||
+        ["parentWorkspaceKey", "section", "siblingOrder", "beforeWorkspaceKey"].some(
+          (key) => input[key] !== undefined,
+        ));
+    if (sharedMove) return executeSidebarMove(input, serverId ?? options.serverId, context);
+    const prepared = name === "create_workspace" ? await prepareSidebarCreation(input) : input;
+    return hostResolver.use(serverId, (host) => host[operation](prepared, context));
+  }
+
   const registerTool = (
     name: string,
     config: PaseoToolConfig,
@@ -778,9 +1045,7 @@ function createToolCatalog(
       handler = async ({ serverId, ...input }, context) => {
         const destination = serverId ?? options.serverId;
         try {
-          const response = await hostResolver.use(serverId, (host) =>
-            host[operation](input, context),
-          );
+          const response = await invokeHostTool(name, operation, input, serverId, context);
           let childAgentId: string | undefined;
           if (name === "create_agent") {
             childAgentId = (response.structuredContent as { agentId: string }).agentId;
@@ -1458,7 +1723,25 @@ function createToolCatalog(
           .describe(
             "Parent workspace id within the same project. Omit or use null for the project root.",
           ),
-        siblingOrder: z.number().finite().optional().describe("Order among sibling workspaces."),
+        siblingOrder: z
+          .number()
+          .finite()
+          .optional()
+          .describe(
+            "Order among siblings; applies to universal sidebar placement when parentWorkspaceKey or section is supplied.",
+          ),
+        parentWorkspaceKey: z
+          .string()
+          .min(1)
+          .max(512)
+          .nullable()
+          .optional()
+          .describe(
+            "Universal parent key (serverId:workspaceId), across hosts. Omit to create below your calling workspace; null creates a root.",
+          ),
+        section: WorkspaceSidebarSectionSchema.optional().describe(
+          "Sidebar section. Children inherit their parent; needed with siblingOrder if a remote parent cannot be resolved.",
+        ),
         background: z
           .boolean()
           .optional()
@@ -1505,6 +1788,7 @@ function createToolCatalog(
       title,
       parentWorkspaceId,
       siblingOrder,
+      sidebarPlacement,
       background,
       mode,
       worktreeSlug,
@@ -1538,6 +1822,7 @@ function createToolCatalog(
         workspace = await options.createDirectoryWorkspace(cwd, title, projectId, {
           background,
           callerWorkspaceId: resolveCallerAgent()?.workspaceId,
+          sidebarPlacement,
           parentWorkspaceId,
           siblingOrder,
         });
@@ -1573,6 +1858,7 @@ function createToolCatalog(
             ...(title ? { title } : {}),
             background,
             callerWorkspaceId: resolveCallerAgent()?.workspaceId,
+            sidebarPlacement,
             parentWorkspaceId,
             siblingOrder,
           },
@@ -1585,7 +1871,9 @@ function createToolCatalog(
 
       return {
         content: [],
-        structuredContent: ensureValidJson(toWorkspaceAutomationSummary(workspace)),
+        structuredContent: ensureValidJson(
+          toWorkspaceAutomationSummary(workspace, options.serverId),
+        ),
       };
     },
   );
@@ -1606,7 +1894,7 @@ function createToolCatalog(
         .filter(
           (workspace) => !workspace.archivedAt && (includeBackground || !workspace.background),
         )
-        .map(toWorkspaceAutomationSummary);
+        .map((workspace) => toWorkspaceAutomationSummary(workspace, options.serverId));
       return {
         content: [],
         structuredContent: ensureValidJson({ workspaces }),
@@ -1718,7 +2006,7 @@ function createToolCatalog(
     {
       title: "Move workspace",
       description:
-        "Move a workspace under a parent or to the project root, optionally before a sibling.",
+        "Move or reorder a workspace in the universal sidebar hierarchy, including across hosts. Section changes include its complete subtree. Legacy parentWorkspaceId moves within a project.",
       inputSchema: {
         workspaceId: z.string().trim().min(1),
         parentWorkspaceId: z
@@ -1726,7 +2014,32 @@ function createToolCatalog(
           .trim()
           .min(1)
           .nullable()
-          .describe("Destination parent workspace id, or null for the project root."),
+          .optional()
+          .describe("Legacy same-project parent id, or null for its root."),
+        parentWorkspaceKey: z
+          .string()
+          .min(1)
+          .max(512)
+          .nullable()
+          .optional()
+          .describe(
+            "Universal destination parent key. Omit to retain the parent; null moves to the sidebar root.",
+          ),
+        siblingOrder: z
+          .number()
+          .finite()
+          .optional()
+          .describe("Explicit sidebar sibling rank; omit to append."),
+        section: WorkspaceSidebarSectionSchema.optional().describe(
+          "Destination root section; a child inherits its parent section.",
+        ),
+        beforeWorkspaceKey: z
+          .string()
+          .min(1)
+          .max(512)
+          .nullable()
+          .optional()
+          .describe("Place before this universal sibling key; omit or null to append."),
         beforeWorkspaceId: z
           .string()
           .trim()
@@ -1737,17 +2050,49 @@ function createToolCatalog(
       },
       outputSchema: WorkspaceAutomationSummarySchema.shape,
     },
-    async ({ workspaceId, parentWorkspaceId, beforeWorkspaceId }) => {
+    async ({
+      workspaceId,
+      parentWorkspaceId,
+      beforeWorkspaceId,
+      sidebarPlacement,
+      expectedRevision,
+      sectionState,
+    }) => {
       if (!options.workspaceRegistry) {
         throw new Error("Workspace registry is not configured");
       }
-      const workspace = await options.workspaceRegistry.move(workspaceId, {
-        parentWorkspaceId,
-        beforeWorkspaceId,
-      });
+      let workspace: PersistedWorkspaceRecord;
+      if (sidebarPlacement) {
+        if (!options.setWorkspacePinPlacement)
+          throw new Error("Workspace sidebar placement is not configured");
+        await options.setWorkspacePinPlacement({
+          workspaceId,
+          placement: {
+            parentWorkspaceKey: sidebarPlacement.parentWorkspaceKey,
+            siblingOrder: sidebarPlacement.siblingOrder,
+          },
+          section: sidebarPlacement.section,
+          sectionState,
+          expectedRevision,
+        });
+        const updated = await options.workspaceRegistry.get(workspaceId);
+        if (!updated) throw new Error("Workspace not found");
+        workspace = updated;
+      } else {
+        if (parentWorkspaceId === undefined)
+          throw new PaseoToolInputError(
+            "Specify parentWorkspaceKey, section, siblingOrder, beforeWorkspaceKey, or legacy parentWorkspaceId.",
+          );
+        workspace = await options.workspaceRegistry.move(workspaceId, {
+          parentWorkspaceId,
+          beforeWorkspaceId,
+        });
+      }
       return {
         content: [],
-        structuredContent: ensureValidJson(toWorkspaceAutomationSummary(workspace)),
+        structuredContent: ensureValidJson(
+          toWorkspaceAutomationSummary(workspace, options.serverId),
+        ),
       };
     },
   );

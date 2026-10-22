@@ -1,3 +1,4 @@
+import { setWorkspacePinPlacement } from "./workspace-pin-placement.js";
 import { MessageReceipts } from "./message-receipts/index.js";
 import { MainHostStore } from "./fleet/main-host-store.js";
 import type { PluginRegistries } from "@getpaseo/protocol/plugin-registry";
@@ -1469,6 +1470,11 @@ export async function createPaseoDaemon(
       return workspace;
     },
     setWorkspaceFieldValue: (input) => setWorkspaceFieldValue(workspaceRegistry, input),
+    setWorkspacePinPlacement: async (input) => {
+      const placement = await setWorkspacePinPlacement(workspaceRegistry, input, serverId);
+      await emitWorkspaceUpdatesExternal([input.workspaceId]);
+      return placement;
+    },
     workspaceScripts: createWorkspaceScriptsService({
       serviceProxy,
       scriptRuntimeStore,

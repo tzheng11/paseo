@@ -830,6 +830,7 @@ export function resolveProjectDisplayName(record: PersistedProjectRecord): strin
 }
 
 export function createPersistedWorkspaceRecord(input: {
+  pinPlacement?: PersistedWorkspaceRecord["pinPlacement"];
   workspaceId: string;
   projectId: string;
   parentWorkspaceId?: string | null;

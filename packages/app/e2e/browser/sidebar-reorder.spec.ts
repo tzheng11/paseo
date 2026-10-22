@@ -304,6 +304,60 @@ async function rowMenuAction(page: Page, workspaceKey: string, action: "pin" | "
   await page.getByTestId(`sidebar-workspace-menu-${action}-${workspaceKey}`).click();
 }
 
+test("None grouping nests and reorders ordinary workspaces across projects with shared placement", async ({
+  page,
+}, testInfo) => {
+  const parent = await seedWorkspace({ repoPrefix: "ungrouped-manager-", title: "Manager" });
+  const child = await seedWorkspace({ repoPrefix: "ungrouped-ic-", title: "IC" });
+  const parentKey = `${getServerId()}:${parent.workspaceId}`;
+  const childKey = `${getServerId()}:${child.workspaceId}`;
+  try {
+    await gotoAppShell(page);
+    await waitForSidebarHydration(page);
+    await openSidebarDisplayPage(page, "sidebar-display-grouping");
+    await page.getByTestId("sidebar-grouping-none").click();
+    const list = page.getByTestId("sidebar-ungrouped-list");
+    const childNode = list.getByTestId(`workspace-tree-node-${childKey}`);
+    const parentNode = list.getByTestId(`workspace-tree-node-${parentKey}`);
+    await expect(childNode).toBeVisible();
+    await dragWorkspace(page, childKey, parentKey, "inside");
+    await expect
+      .poll(async () => {
+        const row = (await child.client.fetchWorkspaces()).entries.find(
+          (entry) => entry.id === child.workspaceId,
+        );
+        return row?.pinPlacement?.parentWorkspaceKey;
+      })
+      .toBe(parentKey);
+    expect((await visibleBoundingBox(childNode)).x - (await visibleBoundingBox(parentNode)).x).toBe(
+      16,
+    );
+    const nested = (await child.client.fetchWorkspaces()).entries.find(
+      (entry) => entry.id === child.workspaceId,
+    )!;
+    expect(nested.parentWorkspaceId).toBeNull();
+    expect(nested.projectId).toBe(child.projectId);
+    await reloadPreservingHostRegistry(page);
+    await expect(childNode).toBeVisible({ timeout: 30_000 });
+    await dragWorkspace(page, childKey, parentKey, "before");
+    await expect
+      .poll(async () => {
+        const row = (await child.client.fetchWorkspaces()).entries.find(
+          (entry) => entry.id === child.workspaceId,
+        );
+        return row?.pinPlacement?.parentWorkspaceKey;
+      })
+      .toBeNull();
+    expect((await visibleBoundingBox(childNode)).y).toBeLessThan(
+      (await visibleBoundingBox(parentNode)).y,
+    );
+    await page.screenshot({ path: testInfo.outputPath("ungrouped-shared-reorder.png") });
+  } finally {
+    await parent.cleanup();
+    await child.cleanup();
+  }
+});
+
 test("pinned trees span hosts and projects, order siblings and subtrees, and survive reload while ordinary lists stay flat", async ({
   page,
 }, testInfo) => {

@@ -52,7 +52,7 @@ const ThemedGrip = withUnistyles(GripVertical);
 const treeAccessibility = {
   screenReaderInstructions: {
     draggable:
-      "Press Space to pick up. Use Up and Down to reorder. In Pinned and SuperPinned, use Right to nest and Left to lift out. Press Space to drop or Escape to cancel.",
+      "Press Space to pick up. Use Up and Down to reorder. In workspace trees, use Right to nest and Left to lift out. Press Space to drop or Escape to cancel.",
   },
 };
 const treeCollisionDetection: CollisionDetection = (args) => {

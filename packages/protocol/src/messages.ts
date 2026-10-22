@@ -1020,6 +1020,13 @@ export const WorkspaceFieldValueSetRequestSchema = z.object({
   requestId: z.string(),
 });
 
+export const WorkspaceSidebarSectionSchema = z.enum(["unpinned", "pinned", "superpinned"]);
+export const WorkspaceSidebarPlacementSchema = z.object({
+  parentWorkspaceKey: z.string().min(1).max(512).nullable(),
+  siblingOrder: z.number().finite().optional(),
+  section: WorkspaceSidebarSectionSchema,
+});
+
 export const WorkspacePinPlacementSchema = z.object({
   parentWorkspaceKey: z.string().min(1).max(512).nullable(),
   siblingOrder: z.number().finite(),
@@ -1030,6 +1037,10 @@ export const WorkspacePinPlacementSetRequestSchema = z.object({
   type: z.literal("workspace.pin.placement.set.request"),
   workspaceId: z.string(),
   placement: WorkspacePinPlacementSchema.omit({ revision: true }),
+  section: WorkspaceSidebarSectionSchema.optional(),
+  sectionState: z
+    .object({ pinnedAt: z.string().nullable(), superpinnedAt: z.string().nullable() })
+    .optional(),
   expectedRevision: z.number().int().nonnegative(),
   requestId: z.string(),
 });
@@ -2833,6 +2844,7 @@ export const WorkspaceCreateRequestSchema = z.object({
   title: z.string().optional(),
   parentWorkspaceId: z.string().nullable().optional(),
   siblingOrder: z.number().finite().optional(),
+  sidebarPlacement: WorkspaceSidebarPlacementSchema.optional(),
   // Optional prompt context for workspace-level name/branch generation.
   firstAgentContext: FirstAgentContextSchema.optional(),
   // Retained for wire parsing; public internal creation is no longer supported.
@@ -3812,6 +3824,7 @@ export const ServerInfoStatusPayloadSchema = z
         workspaceHierarchy: z.boolean().optional(),
         // COMPAT(universalPins): added in v0.13.0-beta.1; remove gate after 2027-04-22.
         workspacePinPlacement: z.boolean().optional(),
+        workspaceSidebarPlacement: z.boolean().optional(),
         providersSnapshot: z.boolean().optional(),
         connectedHosts: z.boolean().optional(),
         hostMultiplexing: z.boolean().optional(),
