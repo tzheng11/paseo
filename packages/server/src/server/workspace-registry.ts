@@ -3,6 +3,7 @@ import { promises as fs } from "node:fs";
 import type { Logger } from "pino";
 import { z } from "zod";
 import type { WorkspaceMoveRequest } from "@getpaseo/protocol/messages";
+import { WorkspacePinPlacementSchema } from "@getpaseo/protocol/messages";
 
 import {
   MAX_WORKSPACE_FIELD_VALUE_LENGTH,
@@ -59,6 +60,7 @@ const PersistedWorkspaceRecordSchema = z
   .object({
     workspaceId: z.string(),
     projectId: z.string(),
+    pinPlacement: WorkspacePinPlacementSchema.optional(),
     // COMPAT(workspaceHierarchy): added in v0.12.0; remove optional parsing after 2027-04-21.
     parentWorkspaceId: z.string().nullable().optional(),
     siblingOrder: z.number().finite().optional(),
@@ -637,6 +639,8 @@ export class FileBackedWorkspaceRegistry
       }
       const next = PersistedWorkspaceRecordSchema.parse({
         ...record,
+        // Full-record refreshes must preserve the placement written through its CAS RPC.
+        pinPlacement: previous?.pinPlacement ?? record.pinPlacement,
         parentWorkspaceId,
         siblingOrder,
       });

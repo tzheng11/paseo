@@ -106,6 +106,7 @@ export interface WorkspaceDescriptor {
   id: string;
   parentWorkspaceId?: string | null;
   siblingOrder?: number;
+  pinPlacement?: WorkspaceDescriptorPayload["pinPlacement"];
   projectId: string;
   projectDisplayName: string;
   projectCustomName?: string | null;
@@ -146,6 +147,7 @@ export function normalizeWorkspaceDescriptor(
     id: normalizeWorkspaceOpaqueId(payload.id) ?? payload.id,
     // COMPAT(workspaceHierarchy): added in v0.11.2, remove after 2027-04-21 once daemon floor supports hierarchy.
     parentWorkspaceId: payload.parentWorkspaceId ?? null,
+    pinPlacement: payload.pinPlacement,
     siblingOrder: payload.siblingOrder,
     projectId: payload.projectId,
     projectDisplayName: payload.projectDisplayName,
@@ -213,9 +215,14 @@ function preserveWorkspaceDescriptorIdentity(
   incoming: WorkspaceDescriptor,
   existing?: WorkspaceDescriptor | null,
 ): WorkspaceDescriptor {
-  if (existing && equal(existing, incoming)) {
-    return existing;
+  // An RPC acknowledgement may arrive before an older directory snapshot.
+  if (
+    existing?.pinPlacement &&
+    existing.pinPlacement.revision > (incoming.pinPlacement?.revision ?? 0)
+  ) {
+    incoming = { ...incoming, pinPlacement: existing.pinPlacement };
   }
+  if (existing && equal(existing, incoming)) return existing;
   return incoming;
 }
 
@@ -1546,7 +1553,13 @@ export const useSessionStore = create<SessionStore>()(
           }
           const nextWorkspaces =
             typeof workspaces === "function" ? workspaces(session.workspaces) : workspaces;
-          const preservedWorkspaces = preserveMapIdentity(session.workspaces, nextWorkspaces);
+          const reconciledWorkspaces = new Map(
+            Array.from(nextWorkspaces, ([id, workspace]) => [
+              id,
+              preserveWorkspaceDescriptorIdentity(workspace, session.workspaces.get(id)),
+            ]),
+          );
+          const preservedWorkspaces = preserveMapIdentity(session.workspaces, reconciledWorkspaces);
           if (session.workspaces === preservedWorkspaces) {
             return prev;
           }

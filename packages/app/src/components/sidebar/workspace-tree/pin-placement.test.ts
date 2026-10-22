@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { DaemonConnectionError } from "@getpaseo/client/internal/daemon-client";
+import { changedPinPlacements, saveSharedPinPlacements } from "./shared-pin-placement";
+import type { SidebarWorkspacePlacement } from "@/hooks/use-sidebar-workspaces-list";
 import { applyWorkspaceTreeMove } from "./pin-placement";
 import type { WorkspaceTreeDrop } from "./drop-target";
 const drop: WorkspaceTreeDrop = {
@@ -63,5 +65,72 @@ describe("client pinned layout membership", () => {
       }),
     ).rejects.toThrow("not confirmed");
     expect(client.setWorkspacePinned).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("shared pin placement commits", () => {
+  const workspace = (key: string): SidebarWorkspacePlacement => ({
+    workspaceKey: key,
+    workspaceId: key,
+    serverId: "host",
+    projectViewKey: "project",
+    projectName: "Project",
+    projectKind: "directory",
+    workspaceKind: "directory",
+    name: key,
+    pinPlacement: { parentWorkspaceKey: null, siblingOrder: 0, revision: 4 },
+  });
+  it("writes rebalance ranks before the source and carries captured revisions", async () => {
+    const workspaces = [workspace("source"), workspace("sibling")];
+    const updates = changedPinPlacements({
+      previous: {},
+      next: {
+        source: { parentWorkspaceKey: "remote:parent", siblingOrder: 512 },
+        sibling: { parentWorkspaceKey: null, siblingOrder: 1024 },
+      },
+      workspaces,
+    });
+    const calls: string[] = [];
+    const client = {
+      getLastServerInfoMessage: () => ({ features: { workspacePinPlacement: true } }),
+      setWorkspacePinPlacement: vi.fn(async (input) => {
+        calls.push(input.workspaceId);
+        expect(input.expectedRevision).toBe(4);
+        return { ...input.placement, revision: 5 };
+      }),
+    };
+    const accepted = vi.fn();
+    await saveSharedPinPlacements({
+      updates,
+      sourceWorkspaceKey: "source",
+      getClient: () => client as never,
+      accepted,
+    });
+    expect(calls).toEqual(["sibling", "source"]);
+    expect(accepted).toHaveBeenCalledTimes(2);
+  });
+  it("checks every owning host before performing any mutation", async () => {
+    const workspaces = [workspace("source"), { ...workspace("sibling"), serverId: "old-host" }];
+    const updates = changedPinPlacements({
+      previous: {},
+      next: Object.fromEntries(
+        workspaces.map((w) => [w.workspaceKey, { parentWorkspaceKey: null, siblingOrder: 1 }]),
+      ),
+      workspaces,
+    });
+    const client = {
+      getLastServerInfoMessage: () => ({ features: { workspacePinPlacement: true } }),
+      setWorkspacePinPlacement: vi.fn(),
+    };
+    const old = { getLastServerInfoMessage: () => ({ features: {} }) };
+    await expect(
+      saveSharedPinPlacements({
+        updates,
+        sourceWorkspaceKey: "source",
+        getClient: (id) => (id === "old-host" ? old : client) as never,
+        accepted: vi.fn(),
+      }),
+    ).rejects.toThrow("Update this host");
+    expect(client.setWorkspacePinPlacement).not.toHaveBeenCalled();
   });
 });

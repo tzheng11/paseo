@@ -46,6 +46,7 @@ import {
 } from "@/runtime/host-runtime";
 import {
   splitPinnedSidebarGroups,
+  sharedPinnedWorkspaceTree,
   usePinnedSidebarKeys,
   type PinnedSidebarGroups,
 } from "@/hooks/use-sidebar-pins";
@@ -109,13 +110,16 @@ import {
   type WorkspaceTreeDrop,
 } from "@/components/sidebar/workspace-tree";
 import { useSessionStore } from "@/stores/session-store";
+import {
+  changedPinPlacements,
+  requireSharedPinClients,
+  saveSharedPinPlacements,
+  acceptSharedPinPlacement,
+} from "@/components/sidebar/workspace-tree/shared-pin-placement";
 import { applyWorkspaceTreeMove } from "@/components/sidebar/workspace-tree/pin-placement";
 import { useSidebarModel } from "@/components/sidebar/sidebar-model";
 import { SidebarWorkspaceTreeList } from "@/components/sidebar/workspace-tree/list";
-import {
-  movePinnedWorkspaceTree,
-  resolvePinnedWorkspaceTree,
-} from "@/components/sidebar/workspace-tree/pinned-layout";
+import { movePinnedWorkspaceTree } from "@/components/sidebar/workspace-tree/pinned-layout";
 import { captureVisiblePinnedOrder } from "@/components/sidebar/workspace-tree/capture-pinned-order";
 import { PinnedSectionHeader } from "@/components/sidebar/pinned-section-header";
 import { ProjectWorkspaceSortMenu } from "@/components/sidebar/workspace-sort-menu";
@@ -1904,13 +1908,12 @@ export function SidebarWorkspaceList({
   const supportsMultiplicityByServerId = useHostFeatureMap(serverIds, "workspaceMultiplicity");
   const supportsPinningByServerId = useHostFeatureMap(serverIds, "workspacePinning");
   const supportsHierarchyByServerId = useHostFeatureMap(serverIds, "workspaceHierarchy");
+  const supportsPinPlacementByServerId = useHostFeatureMap(serverIds, "workspacePinPlacement");
   const { allProjects } = useSidebarModel();
-  const pinnedWorkspaceTree = useSidebarOrderStore((state) => state.pinnedWorkspaceTree);
+  const pinnedWorkspaceTree = useMemo(() => sharedPinnedWorkspaceTree(allProjects), [allProjects]);
   const fullPinnedKeys = usePinnedSidebarKeys(allProjects);
-  const pinnedWorkspaceOrder = useSidebarOrderStore((state) => state.pinnedWorkspaceOrder);
-  const superpinnedWorkspaceOrder = useSidebarOrderStore(
-    (state) => state.superpinnedWorkspaceOrder,
-  );
+  const pinnedWorkspaceOrder = useMemo<string[]>(() => [], []);
+  const superpinnedWorkspaceOrder = pinnedWorkspaceOrder;
   const fullPinnedGroups = useMemo(() => {
     return splitPinnedSidebarGroups({
       projects: allProjects,
@@ -2000,12 +2003,12 @@ export function SidebarWorkspaceList({
       const treeForDrop = (store: ReturnType<typeof useSidebarOrderStore.getState>) =>
         drop.pinSection === "pinned" && store.pinnedWorkspaceSortMode !== "manual"
           ? captureVisiblePinnedOrder({
-              tree: store.pinnedWorkspaceTree,
+              tree: pinnedWorkspaceTree,
               workspaces: fullHierarchyWorkspaces,
               visibleWorkspaces: hierarchyWorkspaces,
               section: "pinned",
             })
-          : store.pinnedWorkspaceTree;
+          : pinnedWorkspaceTree;
       const layoutInput = drop.pinSection
         ? {
             tree: treeForDrop(orderStore),
@@ -2016,10 +2019,17 @@ export function SidebarWorkspaceList({
             section: drop.pinSection,
           }
         : null;
-      if (layoutInput) {
-        const checked = movePinnedWorkspaceTree(layoutInput);
-        if (!checked.ok) throw new Error(checked.reason);
-      }
+      const next = layoutInput ? movePinnedWorkspaceTree(layoutInput) : null;
+      if (next && !next.ok) throw new Error(next.reason);
+      const updates = next?.ok
+        ? changedPinPlacements({
+            previous: pinnedWorkspaceTree,
+            next: next.tree,
+            workspaces: fullHierarchyWorkspaces,
+          })
+        : [];
+      const getClient = (serverId: string) => getHostRuntimeStore().getClient(serverId);
+      requireSharedPinClients(updates, getClient);
       const currentFields = () =>
         useSessionStore
           .getState()
@@ -2045,41 +2055,17 @@ export function SidebarWorkspaceList({
           },
         });
         if (layoutInput) {
-          const store = useSidebarOrderStore.getState();
-          const next = movePinnedWorkspaceTree({ ...layoutInput, tree: treeForDrop(store) });
-          if (!next.ok) throw new Error(next.reason);
-          const destination = fullHierarchyWorkspaces.map((item) =>
-            item.workspaceKey === workspace.workspaceKey
-              ? { ...item, sidebarSection: drop.pinSection }
-              : item,
-          );
-          const resolved = resolvePinnedWorkspaceTree(destination, next.tree);
-          const roots = destination
-            .filter(
-              (item) =>
-                item.sidebarSection === drop.pinSection &&
-                resolved.get(item.workspaceKey)?.parentWorkspaceKey === null,
-            )
-            .sort(
-              (left, right) =>
-                resolved.get(left.workspaceKey)!.siblingOrder -
-                resolved.get(right.workspaceKey)!.siblingOrder,
-            )
-            .map((item) => item.workspaceKey);
-          await store.setPinnedWorkspaceTree(next.tree, {
-            section: layoutInput.section,
-            keys: mergeWithRemainder({
-              currentOrder:
-                layoutInput.section === "superpinned"
-                  ? store.superpinnedWorkspaceOrder
-                  : store.pinnedWorkspaceOrder,
-              reorderedVisibleKeys: roots,
-            }),
+          await saveSharedPinPlacements({
+            updates,
+            sourceWorkspaceKey: workspace.workspaceKey,
+            getClient,
+            accepted: acceptSharedPinPlacement,
           });
+          orderStore.setPinnedWorkspaceSortMode("manual");
         } else orderStore.setWorkspaceSortMode(workspace.projectViewKey, "manual");
       });
     },
-    [fullHierarchyWorkspaces, hierarchyWorkspaces],
+    [fullHierarchyWorkspaces, hierarchyWorkspaces, pinnedWorkspaceTree],
   );
   // One fetch, one map, every mode — project mode paints icons on its headers and status mode
   // paints them on each row, all keyed by `projectViewKey`. The targets come from the projection
@@ -2148,6 +2134,7 @@ export function SidebarWorkspaceList({
       workspaces={hierarchyWorkspaces}
       allWorkspaces={fullHierarchyWorkspaces}
       supportedServerIds={supportsHierarchyByServerId}
+      supportedPinnedServerIds={supportsPinPlacementByServerId}
       onMove={handleWorkspaceMove}
     >
       {content}
