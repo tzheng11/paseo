@@ -78,6 +78,7 @@ import {
 } from "./file-observer/index.js";
 import { checkoutLiteFromGitSnapshot } from "./workspace-registry-model.js";
 import { createWatcherLivenessCanary } from "./watcher-liveness-canary.js";
+import { FileObservationCapacityError } from "./file-observer/capacity.js";
 
 const WORKSPACE_GIT_WATCH_DEBOUNCE_MS = 1_000;
 const BACKGROUND_GIT_FETCH_INTERVAL_MS = 180_000;
@@ -493,6 +494,9 @@ interface WorkingTreeWatchTarget {
   repoRoot: string | null;
   subscription: FileObserverSubscription | null;
   subscriptionSetupPromise: Promise<boolean> | null;
+  subscriptionClosePromise: Promise<void> | null;
+  capacityFailure: FileObservationCapacityError | null;
+  capacityRecoveryPromise: Promise<void> | null;
   ignoredDirectories: Set<string>;
   // What the live subscription actually accepted, as of the last successful
   // `updateIgnore`/subscribe — the full resolved ignore list (the watch root's
@@ -502,7 +506,7 @@ interface WorkingTreeWatchTarget {
   // comparing against this field instead of the last-computed value keeps a
   // skipped update from latching forever.
   appliedIgnoreList: string[];
-  ignoredDirectoriesRefreshPromise: Promise<void> | null;
+  ignoredDirectoriesRefreshPromise: Promise<boolean> | null;
   ignoredDirectoriesRefreshRequested: boolean;
   ignoredDirectoriesRefreshedAtMs: number | null;
   // Bounded two ways so a long-lived daemon over a churning tree cannot grow
@@ -1620,6 +1624,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       repoRoot,
       subscription: null,
       subscriptionSetupPromise: null,
+      subscriptionClosePromise: null,
+      capacityFailure: null,
+      capacityRecoveryPromise: null,
       ignoredDirectories: new Set(),
       appliedIgnoreList: [],
       ignoredDirectoriesRefreshPromise: null,
@@ -1810,6 +1817,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     target: WorkingTreeWatchTarget,
     options?: { replaceFallback?: boolean },
   ): Promise<boolean> {
+    await target.subscriptionClosePromise;
+    if (!this.hasWorkingTreeObservationDemand(target)) return false;
+    const replaceFallback = options?.replaceFallback === true;
     const ignore = this.workingTreeIgnoreList(target);
     let watcherErrored = false;
     let subscribeSettled = false;
@@ -1828,6 +1838,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
               return;
             }
             watcherErrored = true;
+            this.noteWorkingTreeCapacityFailure(target, error);
             this.watcherErrorCallbackCount += 1;
             this.logger.warn(
               { err: error, cwd: target.cwd },
@@ -1855,7 +1866,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
         },
         { ignore, signal: target.closeController.signal },
         markSubscribeSettled,
-        options?.replaceFallback ? WATCH_RECOVERY_SUBSCRIBE_TIMEOUT_MS : undefined,
+        replaceFallback ? WATCH_RECOVERY_SUBSCRIBE_TIMEOUT_MS : undefined,
       );
       if (watcherErrored) {
         await this.unsubscribeWatcherSubscription(subscription, target.watchPath);
@@ -1863,13 +1874,14 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       }
       if (
         !this.hasWorkingTreeObservationDemand(target) ||
-        (target.fallbackPolling && !options?.replaceFallback) ||
+        (target.fallbackPolling && !replaceFallback) ||
         target.subscription
       ) {
         await this.unsubscribeWatcherSubscription(subscription, target.watchPath);
         return false;
       }
       target.subscription = subscription;
+      target.capacityFailure = null;
       target.appliedIgnoreList = ignore;
       // Do not reset `attemptCount` here — `subscribe()` resolving proves
       // nothing about the watcher's health on a filesystem where it errors on
@@ -1877,7 +1889,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       // `scheduleWorkingTreeWatchRecovery` only resets the ladder once this
       // one has survived long enough to prove itself durable.
       target.recovery.establishedAt = this.deps.now().getTime();
-      if (options?.replaceFallback && target.repoRoot !== null) {
+      if (replaceFallback && target.repoRoot !== null) {
         target.fallbackPolling = false;
         if (target.fallbackPollTimer) {
           clearTimeout(target.fallbackPollTimer);
@@ -1902,7 +1914,8 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       // Retry initial failures too, but let markSubscribeSettled defer that retry
       // until the expired attempt has finished instead of overlapping scans.
       watcherErrored = true;
-      if (!options?.replaceFallback) {
+      this.noteWorkingTreeCapacityFailure(target, error);
+      if (!replaceFallback) {
         this.startWorkingTreeWatchFallback(target, "watcher_setup_failed");
       }
       if (subscribeSettled) {
@@ -1998,7 +2011,11 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     const subscription = target.subscription;
     target.subscription = null;
     if (subscription) {
-      void this.unsubscribeWatcherSubscription(subscription, target.watchPath);
+      const closing = this.unsubscribeWatcherSubscription(subscription, target.watchPath);
+      target.subscriptionClosePromise = closing;
+      void closing.finally(() => {
+        if (target.subscriptionClosePromise === closing) target.subscriptionClosePromise = null;
+      });
     }
     this.notifyWorkingTreeChanged(target, "working-tree-watch-error");
     this.startWorkingTreeWatchFallback(target, reason);
@@ -2035,8 +2052,13 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     if (
       !this.hasWorkingTreeObservationDemand(target) ||
       target.subscription ||
-      target.recovery.timer
+      target.recovery.timer ||
+      target.capacityRecoveryPromise
     ) {
+      return;
+    }
+    if (target.capacityFailure) {
+      this.scheduleWorkingTreeCapacityRecovery(target, target.capacityFailure);
       return;
     }
     const delayMs = this.advanceWatchRecoveryLadder(target.recovery);
@@ -2046,11 +2068,45 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     }, delayMs);
   }
 
+  private noteWorkingTreeCapacityFailure(target: WorkingTreeWatchTarget, error: unknown): void {
+    target.capacityFailure = error instanceof FileObservationCapacityError ? error : null;
+  }
+
+  private scheduleWorkingTreeCapacityRecovery(
+    target: WorkingTreeWatchTarget,
+    failure: FileObservationCapacityError,
+  ): void {
+    const retry = failure.retryWhenAvailable({
+      signal: target.closeController.signal,
+      recheckAfterMs: WATCH_RECOVERY_MAX_DELAY_MS,
+      run: async () => {
+        if (!this.hasWorkingTreeObservationDemand(target)) return;
+        target.capacityFailure = null;
+        await this.recoverWorkingTreeWatch(target);
+      },
+    });
+    target.capacityRecoveryPromise = retry;
+    void retry
+      .catch((error: unknown) => {
+        if (!target.closed && !this.disposed) {
+          this.logger.warn({ err: error, cwd: target.cwd }, "Capacity recovery failed");
+        }
+      })
+      .finally(() => {
+        if (target.capacityRecoveryPromise === retry) target.capacityRecoveryPromise = null;
+        this.scheduleWorkingTreeWatchRecovery(target);
+      });
+  }
+
   private async recoverWorkingTreeWatch(target: WorkingTreeWatchTarget): Promise<void> {
     if (target.closed || target.subscription) {
       return;
     }
-    await this.refreshWorkingTreeIgnoredDirectories(target);
+    const fresh = await this.refreshWorkingTreeIgnoredDirectories(target, { force: true });
+    if (!fresh) {
+      this.scheduleWorkingTreeWatchRecovery(target);
+      return;
+    }
     if (target.closed || target.subscription) {
       return;
     }
@@ -2280,28 +2336,37 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     return events.some((event) => isRelevant(event.path));
   }
 
-  private refreshWorkingTreeIgnoredDirectories(target: WorkingTreeWatchTarget): Promise<void> {
+  private refreshWorkingTreeIgnoredDirectories(
+    target: WorkingTreeWatchTarget,
+    options: { force?: boolean } = {},
+  ): Promise<boolean> {
     if (target.closed || target.repoRoot === null) {
-      return Promise.resolve();
+      return Promise.resolve(false);
     }
     target.ignoredDirectoriesRefreshRequested = true;
     if (target.ignoredDirectoriesRefreshPromise) {
+      if (options.force) {
+        return target.ignoredDirectoriesRefreshPromise.then(() =>
+          this.refreshWorkingTreeIgnoredDirectories(target, options),
+        );
+      }
       return target.ignoredDirectoriesRefreshPromise;
     }
-    if (this.workingTreeIgnoreRefreshDelay(target) > 0) {
+    if (!options.force && this.workingTreeIgnoreRefreshDelay(target) > 0) {
       this.scheduleWorkingTreeIgnoreRefresh(target);
-      return Promise.resolve();
+      return Promise.resolve(false);
     }
 
     const refreshPromise = (async () => {
       target.ignoredDirectoriesRefreshRequested = false;
       try {
-        await this.replaceWorkingTreeIgnoredDirectories(target);
+        return await this.replaceWorkingTreeIgnoredDirectories(target);
       } catch (error) {
         this.logger.warn(
           { err: error, cwd: target.cwd },
           "Failed to refresh working tree watcher ignore paths",
         );
+        return false;
       }
     })().finally(() => {
       // Completion, rather than submission, also bounds retries after a long
@@ -2331,13 +2396,13 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
 
   private async replaceWorkingTreeIgnoredDirectories(
     target: WorkingTreeWatchTarget,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const { ignored: ignoredDirectories, failed } = await this.loadIgnoredDirs(
       target.watchPath,
       target.ignoredDirectories,
     );
     if (target.closed) {
-      return;
+      return false;
     }
     if (failed) {
       // A failed `git ls-files` must not leave directories discovered since
@@ -2354,11 +2419,11 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       this.pruneKnownDirectories(target);
     }
     if (target.fallbackPolling) {
-      return;
+      return !failed;
     }
     const subscription = target.subscription;
     if (!subscription) {
-      return;
+      return !failed;
     }
     // Compare against the resolved list the live subscription actually
     // accepted (`appliedIgnoreList`), not what git last reported
@@ -2367,7 +2432,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     // otherwise latch forever.
     const next = this.workingTreeIgnoreList(target);
     if (this.haveSamePaths(new Set(target.appliedIgnoreList), new Set(next))) {
-      return;
+      return !failed;
     }
     try {
       await subscription.updateIgnore(next);
@@ -2382,12 +2447,13 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
         { err: error, cwd: target.cwd },
         "Failed to update working tree watcher ignore paths",
       );
-      return;
+      return false;
     }
     if (target.closed || target.fallbackPolling) {
-      return;
+      return false;
     }
     this.notifyWorkingTreeChanged(target, "working-tree-watch-reconfigured");
+    return !failed;
   }
 
   private haveSamePaths(first: Set<string>, second: Set<string>): boolean {
