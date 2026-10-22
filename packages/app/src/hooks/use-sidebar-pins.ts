@@ -7,10 +7,12 @@ import type {
 } from "@/hooks/use-sidebar-workspaces-list";
 import { applyStoredOrdering } from "@/hooks/sidebar-workspaces-view-model";
 import { useSessionStore } from "@/stores/session-store";
+import { flattenWorkspaceTree } from "@/components/sidebar/workspace-tree/model";
 import {
-  compareWorkspaceSiblings,
-  flattenWorkspaceTree,
-} from "@/components/sidebar/workspace-tree/model";
+  resolvePinnedWorkspaceTree,
+  type PinnedWorkspaceTree,
+  type PinnedWorkspaceSection,
+} from "@/components/sidebar/workspace-tree/pinned-layout";
 
 export interface PinnedSidebarKeys {
   pinnedWorkspaceKeys: string[];
@@ -20,7 +22,7 @@ export interface PinnedSidebarKeys {
 }
 
 export interface PinnedSidebarGroups {
-  // A pinned workspace carries its descendants into the same section.
+  // Membership is explicit; a layout edge never pins or superpins another workspace.
   pinnedChats: SidebarWorkspacePlacement[];
   superpinnedChats: SidebarWorkspacePlacement[];
   // Everything else, with pinned chats removed. Feeds the draggable project list.
@@ -132,20 +134,20 @@ export function splitPinnedSidebarGroups(input: {
   keys: PinnedSidebarKeys;
   pinnedWorkspaceOrder: string[];
   superpinnedWorkspaceOrder?: string[];
+  pinnedWorkspaceTree?: PinnedWorkspaceTree;
 }): PinnedSidebarGroups {
   const { projects, keys, pinnedWorkspaceOrder } = input;
   if (keys.pinnedWorkspaceKeys.length === 0)
     return { pinnedChats: [], superpinnedChats: [], unpinnedProjects: projects };
   const workspaces = projects.flatMap((project) => project.workspaces);
-  const superpinned = collectPinnedSubtrees(
-    workspaces,
-    new Set(Object.keys(keys.superpinnedAtByKey)),
+  const superpinnedKeys = new Set(Object.keys(keys.superpinnedAtByKey));
+  const pinnedKeys = new Set(keys.pinnedWorkspaceKeys);
+  const superpinned = workspaces.filter((workspace) => superpinnedKeys.has(workspace.workspaceKey));
+  const pinned = workspaces.filter(
+    (workspace) =>
+      pinnedKeys.has(workspace.workspaceKey) && !superpinnedKeys.has(workspace.workspaceKey),
   );
-  const pinned = collectPinnedSubtrees(
-    workspaces.filter((workspace) => !superpinned.covered.has(workspace.workspaceKey)),
-    new Set(keys.pinnedWorkspaceKeys),
-  );
-  superpinned.roots.sort((a, b) => {
+  superpinned.sort((a, b) => {
     const byTime =
       Date.parse(keys.superpinnedAtByKey[b.workspaceKey]!) -
       Date.parse(keys.superpinnedAtByKey[a.workspaceKey]!);
@@ -153,72 +155,56 @@ export function splitPinnedSidebarGroups(input: {
       byTime || a.serverId.localeCompare(b.serverId) || a.workspaceId.localeCompare(b.workspaceId)
     );
   });
-  pinned.roots.sort((a, b) =>
+  pinned.sort((a, b) =>
     (keys.pinnedAtByKey[b.workspaceKey] ?? "").localeCompare(
       keys.pinnedAtByKey[a.workspaceKey] ?? "",
     ),
   );
   const superRoots = applyStoredOrdering({
-    items: superpinned.roots,
+    items: superpinned,
     storedOrder: input.superpinnedWorkspaceOrder ?? [],
     getKey: (workspace) => workspace.workspaceKey,
   });
   const orderedRoots = applyStoredOrdering({
-    items: pinned.roots,
+    items: pinned,
     storedOrder: pinnedWorkspaceOrder,
     getKey: (workspace) => workspace.workspaceKey,
   });
-  const covered = new Set([...superpinned.covered, ...pinned.covered]);
+  const covered = new Set([...superpinned, ...pinned].map((workspace) => workspace.workspaceKey));
   return {
-    superpinnedChats: superRoots.flatMap(
-      (workspace) => superpinned.subtrees.get(workspace.workspaceKey)!,
-    ),
-    pinnedChats: rankPinnedSiblingRoots(orderedRoots).flatMap(
-      (workspace) => pinned.subtrees.get(workspace.workspaceKey)!,
-    ),
+    superpinnedChats: projectPinnedTree({
+      workspaces: superRoots,
+      section: "superpinned",
+      tree: input.pinnedWorkspaceTree,
+    }),
+    pinnedChats: projectPinnedTree({
+      workspaces: orderedRoots,
+      section: "pinned",
+      tree: input.pinnedWorkspaceTree,
+    }),
     unpinnedProjects: projects.map((project) => projectWithoutPinnedWorkspaces(project, covered)),
   };
 }
-function collectPinnedSubtrees(workspaces: SidebarWorkspacePlacement[], keys: ReadonlySet<string>) {
-  const roots: SidebarWorkspacePlacement[] = [];
-  const subtrees = new Map<string, SidebarWorkspacePlacement[]>();
-  const covered = new Set<string>();
-  let current: SidebarWorkspacePlacement | null = null;
-  let depth = -1;
-  for (const row of flattenWorkspaceTree(workspaces, new Set())) {
-    if (row.depth <= depth) current = null;
-    if (!current && keys.has(row.workspace.workspaceKey)) {
-      current = row.workspace;
-      depth = row.depth;
-      roots.push(current);
-      subtrees.set(current.workspaceKey, []);
-    }
-    if (!current) continue;
-    subtrees.get(current.workspaceKey)!.push(row.workspace);
-    covered.add(row.workspace.workspaceKey);
-  }
-  return { roots, subtrees, covered };
+interface PinnedTreeProjectionInput {
+  workspaces: SidebarWorkspacePlacement[];
+  section: PinnedWorkspaceSection;
+  tree?: PinnedWorkspaceTree;
 }
-function rankPinnedSiblingRoots(roots: SidebarWorkspacePlacement[]): SidebarWorkspacePlacement[] {
-  const groupKey = (workspace: SidebarWorkspacePlacement) =>
-    JSON.stringify([
-      workspace.serverId,
-      workspace.projectViewKey,
-      workspace.parentWorkspaceId ?? null,
-    ]);
-  const groups = new Map<string, SidebarWorkspacePlacement[]>();
-  for (const root of roots) {
-    const key = groupKey(root);
-    const siblings = groups.get(key);
-    if (siblings) siblings.push(root);
-    else groups.set(key, [root]);
-  }
-  for (const siblings of groups.values()) siblings.sort(compareWorkspaceSiblings);
-  const offsets = new Map<string, number>();
-  return roots.map((root) => {
-    const key = groupKey(root);
-    const index = offsets.get(key) ?? 0;
-    offsets.set(key, index + 1);
-    return groups.get(key)![index]!;
+function projectPinnedTree({
+  workspaces,
+  section,
+  tree = {},
+}: PinnedTreeProjectionInput): SidebarWorkspacePlacement[] {
+  const members = workspaces.map((workspace) =>
+    Object.assign({}, workspace, { sidebarSection: section }),
+  );
+  const layout = resolvePinnedWorkspaceTree(members, tree);
+  const projected = members.map((workspace) => {
+    const placement = layout.get(workspace.workspaceKey)!;
+    return Object.assign({}, workspace, {
+      sidebarParentWorkspaceKey: placement.parentWorkspaceKey,
+      siblingOrder: placement.siblingOrder,
+    });
   });
+  return flattenWorkspaceTree(projected, new Set()).map((row) => row.workspace);
 }

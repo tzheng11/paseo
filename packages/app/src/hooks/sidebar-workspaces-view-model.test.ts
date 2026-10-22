@@ -6,6 +6,7 @@ import {
   flattenWorkspaceTree,
   getWorkspaceAncestorKeys,
   getWorkspaceDescendantKeys,
+  effectiveWorkspaceParentKey,
 } from "@/components/sidebar/workspace-tree/model";
 import {
   appendMissingOrderKeys,
@@ -111,6 +112,7 @@ describe("workspace hierarchy", () => {
       name: id,
       parentWorkspaceId,
       siblingOrder,
+      sidebarSection: "pinned" as const,
     };
   }
 
@@ -164,7 +166,7 @@ describe("workspace hierarchy", () => {
     ];
     const rows = flattenWorkspaceTree(workspaces, new Set());
     expect(rows.map((row) => row.workspace.workspaceId)).toEqual(["a", "b", "orphan", "self"]);
-    expect(rows.map((row) => row.depth)).toEqual([0, 1, 0, 0]);
+    expect(rows.map((row) => row.depth)).toEqual([0, 0, 0, 0]);
   });
 
   it("scopes parent identity to the host and project", () => {
@@ -177,6 +179,74 @@ describe("workspace hierarchy", () => {
     const foreignProject = { ...node("other-project", "parent"), projectViewKey: "other-project" };
     const rows = flattenWorkspaceTree([parent, foreignHost, foreignProject], new Set());
     expect(rows.map((row) => row.depth)).toEqual([0, 0, 0]);
+  });
+
+  it("nests explicit pin parents across hosts and projects using the full workspace key", () => {
+    const parent = node("parent", null);
+    const sameIdElsewhere = {
+      ...node("parent", null),
+      serverId: "other",
+      workspaceKey: "other:parent",
+    };
+    const child = {
+      ...node("child", null),
+      serverId: "other",
+      workspaceKey: "other:child",
+      projectViewKey: "different-project",
+      sidebarParentWorkspaceKey: parent.workspaceKey,
+    };
+    const rows = flattenWorkspaceTree([sameIdElsewhere, parent, child], new Set());
+    expect(rows.map((row) => [row.workspace.workspaceKey, row.depth])).toEqual([
+      ["other:parent", 0],
+      ["srv:parent", 0],
+      ["other:child", 1],
+    ]);
+    expect(getWorkspaceAncestorKeys([sameIdElsewhere, parent, child], child.workspaceKey)).toEqual([
+      parent.workspaceKey,
+    ]);
+    expect(effectiveWorkspaceParentKey([sameIdElsewhere, parent, child], child)).toBe(
+      parent.workspaceKey,
+    );
+  });
+
+  it("keeps ordinary rows flat and reachable despite backend parents and collapsed pin keys", () => {
+    const parent = { ...node("z-parent", null), sidebarSection: undefined };
+    const child = { ...node("a-child", "z-parent"), sidebarSection: undefined };
+    const workspaces = [parent, child];
+    const rows = flattenWorkspaceTree(workspaces, new Set([parent.workspaceKey]));
+    expect(rows.map((row) => [row.workspace.workspaceId, row.depth, row.hasChildren])).toEqual([
+      ["z-parent", 0, false],
+      ["a-child", 0, false],
+    ]);
+    expect(effectiveWorkspaceParentKey(workspaces, child)).toBeNull();
+    expect(getWorkspaceAncestorKeys(workspaces, child.workspaceKey)).toEqual([]);
+    expect(getWorkspaceDescendantKeys(workspaces, parent.workspaceKey)).toEqual(new Set());
+  });
+
+  it("promotes missing or other-section pin parents and honors explicit root overrides", () => {
+    const parent = node("parent", null);
+    const children = [
+      {
+        ...node("other-section", null),
+        sidebarSection: "superpinned" as const,
+        sidebarParentWorkspaceKey: parent.workspaceKey,
+      },
+      { ...node("missing", null), sidebarParentWorkspaceKey: "offline:parent" },
+      { ...node("explicit-root", "parent"), sidebarParentWorkspaceKey: null },
+    ];
+    const workspaces = [parent, ...children];
+    const rows = flattenWorkspaceTree(workspaces, new Set([parent.workspaceKey]));
+    expect(rows.map((row) => [row.workspace.workspaceId, row.depth])).toEqual([
+      ["parent", 0],
+      ["other-section", 0],
+      ["missing", 0],
+      ["explicit-root", 0],
+    ]);
+    expect(children.map((child) => effectiveWorkspaceParentKey(workspaces, child))).toEqual([
+      null,
+      null,
+      null,
+    ]);
   });
 });
 

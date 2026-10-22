@@ -128,7 +128,7 @@ describe("buildSidebarProjection", () => {
         ...projectionInput({ groupMode }),
         projects: [makeProject([parent.placement, child.placement])],
         pinnedKeys: {
-          pinnedWorkspaceKeys: [parent.placement.workspaceKey],
+          pinnedWorkspaceKeys: [parent.placement.workspaceKey, child.placement.workspaceKey],
           superpinnedAtByKey: {},
           pinnedAtByKey: {},
         },
@@ -144,6 +144,95 @@ describe("buildSidebarProjection", () => {
         { serverId: "srv", workspaceId: "parent" },
       ]);
       expect(projection.workspaceGroups).toEqual([]);
+    });
+  }
+
+  for (const groupMode of ["project", "status"] as const) {
+    it(`keeps ordinary ${groupMode} rows and shortcuts flat despite legacy parents and collapsed pin keys`, () => {
+      const parent = makeWorkspace("parent");
+      const child = makeWorkspace("child");
+      child.placement.parentWorkspaceId = parent.placement.workspaceId;
+      child.entry.parentWorkspaceId = parent.placement.workspaceId;
+      const projection = buildSidebarProjection({
+        ...projectionInput({ groupMode }),
+        projects: [makeProject([child.placement, parent.placement])],
+        pinnedKeys: { pinnedWorkspaceKeys: [], pinnedAtByKey: {}, superpinnedAtByKey: {} },
+        workspaceEntriesByKey: new Map(
+          [child.entry, parent.entry].map((entry) => [entry.workspaceKey, entry]),
+        ),
+        collapsedWorkspaceKeys: new Set([parent.placement.workspaceKey]),
+        pinnedWorkspaceTree: {
+          [child.placement.workspaceKey]: {
+            parentWorkspaceKey: parent.placement.workspaceKey,
+            siblingOrder: 0,
+          },
+        },
+      });
+      expect(workspaceIds(projection.pinnedGroups.unpinnedProjects[0]!.workspaces)).toEqual([
+        "child",
+        "parent",
+      ]);
+      expect(projection.shortcutModel.shortcutTargets).toEqual([
+        { serverId: "srv", workspaceId: "child" },
+        { serverId: "srv", workspaceId: "parent" },
+      ]);
+      expect(projection.pinnedGroups.pinnedChats).toEqual([]);
+    });
+  }
+
+  for (const mode of ["alphabetical", "activity"] as const) {
+    it(`keeps pin subtrees intact while ${mode} sorts roots and children independently`, () => {
+      const parent = makeWorkspace("parent");
+      const zChild = makeWorkspace("z-child", "done", [], "other");
+      const aChild = makeWorkspace("a-child", "done", [], "other");
+      const root = makeWorkspace("root");
+      parent.entry.name = "Zulu parent";
+      root.entry.name = "Middle root";
+      zChild.entry.name = "Zulu child";
+      aChild.entry.name = "Alpha child";
+      parent.entry.statusEnteredAt = new Date("2026-01-01T00:00:00Z");
+      root.entry.statusEnteredAt = new Date("2026-01-02T00:00:00Z");
+      zChild.entry.statusEnteredAt = new Date("2026-01-03T00:00:00Z");
+      aChild.entry.statusEnteredAt = new Date("2026-01-04T00:00:00Z");
+      const workspaces = [parent, zChild, aChild, root];
+      const projection = buildSidebarProjection({
+        ...projectionInput(),
+        projects: [
+          makeProject([parent.placement, root.placement]),
+          makeProject([zChild.placement, aChild.placement], "other"),
+        ],
+        workspaceEntriesByKey: new Map(workspaces.map(({ entry }) => [entry.workspaceKey, entry])),
+        pinnedKeys: {
+          pinnedWorkspaceKeys: workspaces.map(({ placement }) => placement.workspaceKey),
+          pinnedAtByKey: {},
+          superpinnedAtByKey: {},
+        },
+        pinnedWorkspaceSortMode: mode,
+        pinnedWorkspaceTree: {
+          [parent.placement.workspaceKey]: { parentWorkspaceKey: null, siblingOrder: 0 },
+          [root.placement.workspaceKey]: { parentWorkspaceKey: null, siblingOrder: 30 },
+          [zChild.placement.workspaceKey]: {
+            parentWorkspaceKey: parent.placement.workspaceKey,
+            siblingOrder: 10,
+          },
+          [aChild.placement.workspaceKey]: {
+            parentWorkspaceKey: parent.placement.workspaceKey,
+            siblingOrder: 20,
+          },
+        },
+      });
+      expect(workspaceIds(projection.pinnedGroups.pinnedChats)).toEqual([
+        "root",
+        "parent",
+        "a-child",
+        "z-child",
+      ]);
+      expect(projection.shortcutModel.shortcutTargets.map((target) => target.workspaceId)).toEqual([
+        "root",
+        "parent",
+        "a-child",
+        "z-child",
+      ]);
     });
   }
 

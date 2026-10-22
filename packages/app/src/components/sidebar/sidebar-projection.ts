@@ -24,6 +24,7 @@ import {
 } from "@/utils/sidebar-shortcuts";
 import { statusWorkspaceGroups, type SidebarWorkspaceGroup } from "./sidebar-labels";
 import { flattenWorkspaceTree } from "./workspace-tree/model";
+import type { PinnedWorkspaceTree } from "./workspace-tree/pinned-layout";
 
 export interface SidebarProjection {
   pinnedGroups: PinnedSidebarGroups;
@@ -45,6 +46,7 @@ export interface SidebarProjectionInput {
   pinnedKeys: PinnedSidebarKeys;
   pinnedWorkspaceOrder: string[];
   superpinnedWorkspaceOrder?: string[];
+  pinnedWorkspaceTree?: PinnedWorkspaceTree;
   pinnedWorkspaceSortMode?: PinnedWorkspaceSortMode;
   workspaceTitleSource?: WorkspaceTitleSource;
   workspaceSortModeByProject?: Readonly<Record<string, SidebarWorkspaceSortMode>>;
@@ -64,13 +66,17 @@ export function buildSidebarProjection(input: SidebarProjectionInput): SidebarPr
     keys: input.pinnedKeys,
     pinnedWorkspaceOrder: input.pinnedWorkspaceOrder,
     superpinnedWorkspaceOrder: input.superpinnedWorkspaceOrder,
+    pinnedWorkspaceTree: input.pinnedWorkspaceTree,
   });
-  pinnedGroups.pinnedChats = sortSidebarWorkspaces({
+  const sortedPinned = sortSidebarWorkspaces({
     workspaces: pinnedGroups.pinnedChats,
     mode: input.pinnedWorkspaceSortMode ?? "manual",
     workspaceTitleSource: input.workspaceTitleSource ?? "title",
     workspaceEntriesByKey: input.workspaceEntriesByKey,
   });
+  pinnedGroups.pinnedChats = flattenWorkspaceTree(sortedPinned, new Set(), false).map(
+    (row) => row.workspace,
+  );
   pinnedGroups.unpinnedProjects = pinnedGroups.unpinnedProjects.map((project) => {
     const mode = input.workspaceSortModeByProject?.[project.viewKey] ?? "manual";
     if (mode === "manual") return project;
@@ -116,11 +122,7 @@ export function buildSidebarProjection(input: SidebarProjectionInput): SidebarPr
   if (input.groupMode === "project") {
     sections.push(
       ...pinnedGroups.unpinnedProjects.map((project) => ({
-        workspaces: flattenWorkspaceTree(
-          project.workspaces,
-          collapsedWorkspaces,
-          (input.workspaceSortModeByProject?.[project.viewKey] ?? "manual") === "manual",
-        ).map((row) => row.workspace),
+        workspaces: project.workspaces,
         collapsed: input.collapsedProjectKeys.has(project.viewKey),
       })),
     );

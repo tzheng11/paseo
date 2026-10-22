@@ -60,7 +60,7 @@ export function SidebarModelProvider({
   const {
     settings: { workspaceTitleSource },
   } = useAppSettings();
-  const list = useSidebarWorkspacesList({ enabled: active });
+  const list = useSidebarWorkspacesList({ enabled: active, includeAllHosts: true });
   const showBackground = useSidebarViewStore((state) => state.showBackground);
   const groupMode = useSidebarViewStore((state) => state.groupMode);
   const labelFilter = useSidebarViewStore((state) => state.labelFilter);
@@ -81,6 +81,7 @@ export function SidebarModelProvider({
     (state) => state.superpinnedWorkspaceOrder,
   );
   const pinnedWorkspaceOrder = useSidebarOrderStore((state) => state.pinnedWorkspaceOrder);
+  const pinnedWorkspaceTree = useSidebarOrderStore((state) => state.pinnedWorkspaceTree);
   const pinnedWorkspaceSortMode = useSidebarOrderStore((state) => state.pinnedWorkspaceSortMode);
   const workspaceSortModeByProject = useSidebarOrderStore(
     (state) => state.workspaceSortModeByProject,
@@ -171,6 +172,7 @@ export function SidebarModelProvider({
       pinnedKeys,
       pinnedWorkspaceOrder,
       superpinnedWorkspaceOrder,
+      pinnedWorkspaceTree,
       pinnedWorkspaceSortMode,
       workspaceSortModeByProject,
       workspaceTitleSource,
@@ -194,6 +196,7 @@ export function SidebarModelProvider({
       pinnedKeys,
       pinnedWorkspaceOrder,
       superpinnedWorkspaceOrder,
+      pinnedWorkspaceTree,
       pinnedWorkspaceSortMode,
       workspaceSortModeByProject,
       workspaceTitleSource,
@@ -206,7 +209,7 @@ export function SidebarModelProvider({
     () => ({
       ...list,
       projects: filteredProjects,
-      allProjects: list.projects,
+      allProjects: list.allProjects,
       resolvedProjectFilters,
       hasProjectsBeforeFilter: list.projects.length > 0,
       workspaceEntriesByKey: filteredWorkspaceEntriesByKey,

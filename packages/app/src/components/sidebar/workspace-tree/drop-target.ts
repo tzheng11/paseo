@@ -1,4 +1,5 @@
 import type { SidebarWorkspacePlacement } from "@/hooks/use-sidebar-workspaces-list";
+import { resolvePinnedWorkspaceTree, type PinnedWorkspaceSection } from "./pinned-layout";
 
 export type WorkspaceDropPosition = "before" | "inside" | "after";
 export interface WorkspaceTreeDrop {
@@ -7,6 +8,10 @@ export interface WorkspaceTreeDrop {
   position: WorkspaceDropPosition;
   parentWorkspaceId: string | null;
   beforeWorkspaceId: string | null;
+  // Pinned layout uses complete identities and never sends these relationships to a host.
+  parentWorkspaceKey?: string | null;
+  beforeWorkspaceKey?: string | null;
+  pinSection?: PinnedWorkspaceSection;
   pinnedOrderOnly?: boolean;
 }
 export interface WorkspaceTreeDropRejection {
@@ -15,10 +20,10 @@ export interface WorkspaceTreeDropRejection {
 }
 interface WorkspaceTreeDropInput {
   workspaces: readonly SidebarWorkspacePlacement[];
+  allWorkspaces?: readonly SidebarWorkspacePlacement[];
   workspaceKey: string;
   targetWorkspaceKey: string;
   position: WorkspaceDropPosition;
-  pinnedRootKeys?: ReadonlySet<string>;
 }
 export function resolveWorkspaceTreeDrop(input: WorkspaceTreeDropInput): WorkspaceTreeDrop | null {
   return resolveWorkspaceTreeDropResult(input).drop;
@@ -31,105 +36,99 @@ export function resolveWorkspaceTreeDropResult(input: WorkspaceTreeDropInput): {
   const target = input.workspaces.find((item) => item.workspaceKey === input.targetWorkspaceKey);
   if (!source || !target || source.workspaceKey === target.workspaceKey)
     return { drop: null, rejection: null };
-  if (source.serverId !== target.serverId || source.projectViewKey !== target.projectViewKey) {
-    const drop = resolvePinnedRootDrop(input, source, target);
-    if (drop) return { drop, rejection: null };
-    const scope = source.serverId !== target.serverId ? "host" : "project";
-    return {
-      drop: null,
-      rejection: {
-        targetWorkspaceKey: target.workspaceKey,
-        message:
-          input.position === "inside"
-            ? `Use a workspace ${scope === "host" ? "on" : "in"} the same ${scope} to nest`
-            : `Reorder workspaces within the same ${scope}`,
-      },
-    };
-  }
-  const parentWorkspaceId =
-    input.position === "inside" ? target.workspaceId : effectiveParentId(input.workspaces, target);
-  const byId = new Map(
-    input.workspaces
-      .filter((item) => item.serverId === source.serverId)
-      .map((item) => [item.workspaceId, item]),
+  const reject = (message: string) => ({
+    drop: null,
+    rejection: { targetWorkspaceKey: target.workspaceKey, message },
+  });
+  const fullTree = resolvePinnedWorkspaceTree(input.allWorkspaces ?? input.workspaces);
+  const changingSection = source.sidebarSection !== target.sidebarSection;
+  if (
+    changingSection &&
+    Array.from(fullTree.values()).some((item) => item.parentWorkspaceKey === source.workspaceKey)
+  )
+    return reject("Move children out first before moving this workspace to another pin section");
+  if (target.sidebarSection)
+    return resolvePinnedDrop(input, source, target, fullTree, target.sidebarSection);
+  if (input.position === "inside")
+    return reject("Pin workspaces to nest them in Pinned or SuperPinned");
+  if (source.serverId !== target.serverId || source.projectViewKey !== target.projectViewKey)
+    return reject(
+      "Reorder within a project, or pin workspaces to arrange them across projects and hosts",
+    );
+  const siblings = input.workspaces.filter(
+    (item) =>
+      !item.sidebarSection &&
+      item.serverId === target.serverId &&
+      item.projectViewKey === target.projectViewKey &&
+      item.workspaceKey !== source.workspaceKey,
   );
-  const seen = new Set<string>();
-  let parent = parentWorkspaceId;
-  while (parent) {
-    if (parent === source.workspaceId || seen.has(parent))
-      return {
-        drop: null,
-        rejection: {
-          targetWorkspaceKey: target.workspaceKey,
-          message: "A workspace cannot be moved into one of its children",
-        },
-      };
-    seen.add(parent);
-    parent = byId.get(parent)?.parentWorkspaceId ?? null;
-  }
-  let beforeWorkspaceId: string | null = null;
-  if (input.position === "before") beforeWorkspaceId = target.workspaceId;
-  if (input.position === "after") {
-    const siblings = input.workspaces
-      .filter(
-        (item) =>
-          item.serverId === target.serverId &&
-          item.projectViewKey === target.projectViewKey &&
-          effectiveParentId(input.workspaces, item) === parentWorkspaceId &&
-          item.workspaceKey !== source.workspaceKey,
-      )
-      .sort(
-        (left, right) =>
-          (left.siblingOrder ?? 0) - (right.siblingOrder ?? 0) ||
-          left.workspaceId.localeCompare(right.workspaceId),
-      );
-    const targetIndex = siblings.findIndex((item) => item.workspaceKey === target.workspaceKey);
-    beforeWorkspaceId = siblings[targetIndex + 1]?.workspaceId ?? null;
-  }
+  const targetIndex = siblings.findIndex((item) => item.workspaceKey === target.workspaceKey);
   return {
     drop: {
       workspaceKey: source.workspaceKey,
       targetWorkspaceKey: target.workspaceKey,
       position: input.position,
-      parentWorkspaceId,
-      beforeWorkspaceId,
+      parentWorkspaceId: null,
+      beforeWorkspaceId:
+        input.position === "before"
+          ? target.workspaceId
+          : (siblings[targetIndex + 1]?.workspaceId ?? null),
     },
     rejection: null,
   };
 }
-
-function resolvePinnedRootDrop(
-  input: { position: WorkspaceDropPosition; pinnedRootKeys?: ReadonlySet<string> },
+function resolvePinnedDrop(
+  input: WorkspaceTreeDropInput,
   source: SidebarWorkspacePlacement,
   target: SidebarWorkspacePlacement,
-): WorkspaceTreeDrop | null {
-  if (
-    input.position === "inside" ||
-    !input.pinnedRootKeys?.has(source.workspaceKey) ||
-    !input.pinnedRootKeys.has(target.workspaceKey)
-  )
-    return null;
+  fullTree: ReturnType<typeof resolvePinnedWorkspaceTree>,
+  section: PinnedWorkspaceSection,
+): { drop: WorkspaceTreeDrop | null; rejection: WorkspaceTreeDropRejection | null } {
+  const reject = (message: string) => ({
+    drop: null,
+    rejection: { targetWorkspaceKey: target.workspaceKey, message },
+  });
+  // Filtering a parent out of view must not silently delete the saved edge
+  // when placing a workspace alongside one of that parent's children.
+  const parents = fullTree;
+  const parentWorkspaceKey =
+    input.position === "inside"
+      ? target.workspaceKey
+      : (parents.get(target.workspaceKey)?.parentWorkspaceKey ?? null);
+  let ancestor: string | null = target.workspaceKey;
+  const seen = new Set<string>();
+  while (ancestor !== null && !seen.has(ancestor)) {
+    if (ancestor === source.workspaceKey)
+      return reject("A workspace cannot be moved into one of its children");
+    seen.add(ancestor);
+    ancestor = fullTree.get(ancestor)?.parentWorkspaceKey ?? null;
+  }
+  const siblings = input.workspaces.filter(
+    (item) =>
+      item.sidebarSection === target.sidebarSection &&
+      item.workspaceKey !== source.workspaceKey &&
+      (parents.get(item.workspaceKey)?.parentWorkspaceKey ?? null) === parentWorkspaceKey,
+  );
+  // Keep the order actually shown (including A–Z/activity), rather than old manual ranks.
+  const targetIndex = siblings.findIndex((item) => item.workspaceKey === target.workspaceKey);
+  let beforeWorkspaceKey: string | null = null;
+  if (input.position === "before") beforeWorkspaceKey = target.workspaceKey;
+  if (input.position === "after")
+    beforeWorkspaceKey = siblings[targetIndex + 1]?.workspaceKey ?? null;
   return {
-    workspaceKey: source.workspaceKey,
-    targetWorkspaceKey: target.workspaceKey,
-    position: input.position,
-    parentWorkspaceId: source.parentWorkspaceId ?? null,
-    beforeWorkspaceId: null,
-    pinnedOrderOnly: true,
+    drop: {
+      workspaceKey: source.workspaceKey,
+      targetWorkspaceKey: target.workspaceKey,
+      position: input.position,
+      parentWorkspaceId: null,
+      beforeWorkspaceId: null,
+      parentWorkspaceKey,
+      beforeWorkspaceKey,
+      pinSection: section,
+      pinnedOrderOnly: true,
+    },
+    rejection: null,
   };
-}
-export function effectiveParentId(
-  workspaces: readonly SidebarWorkspacePlacement[],
-  workspace: SidebarWorkspacePlacement,
-): string | null {
-  return workspaces.some(
-    (parent) =>
-      parent.serverId === workspace.serverId &&
-      parent.projectViewKey === workspace.projectViewKey &&
-      parent.workspaceId === workspace.parentWorkspaceId,
-  )
-    ? (workspace.parentWorkspaceId ?? null)
-    : null;
 }
 
 export function workspaceDropPosition(relativeY: number, height: number): WorkspaceDropPosition {

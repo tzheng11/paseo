@@ -52,7 +52,7 @@ const ThemedGrip = withUnistyles(GripVertical);
 const treeAccessibility = {
   screenReaderInstructions: {
     draggable:
-      "Press Space to pick up. Use Up and Down to reorder. For workspaces, use Right to nest and Left to lift out. Press Space to drop or Escape to cancel.",
+      "Press Space to pick up. Use Up and Down to reorder. In Pinned and SuperPinned, use Right to nest and Left to lift out. Press Space to drop or Escape to cancel.",
   },
 };
 const treeCollisionDetection: CollisionDetection = (args) => {
@@ -69,19 +69,11 @@ const treeCollisionDetection: CollisionDetection = (args) => {
 export function WorkspaceTreeProvider(props: WorkspaceTreeProviderProps) {
   return (
     <WorkspaceTreeController {...props}>
-      <WebTreeDragSurface pinnedRootKeys={props.pinnedRootKeys}>
-        {props.children}
-      </WebTreeDragSurface>
+      <WebTreeDragSurface>{props.children}</WebTreeDragSurface>
     </WorkspaceTreeController>
   );
 }
-function WebTreeDragSurface({
-  children,
-  pinnedRootKeys,
-}: {
-  children: React.ReactNode;
-  pinnedRootKeys?: ReadonlySet<string>;
-}) {
+function WebTreeDragSurface({ children }: { children: React.ReactNode }) {
   const drag = useWorkspaceTreeDrag();
   const origin = useRef<{ x: number; y: number } | null>(null);
   const pointer = useRef<{ x: number; y: number } | null>(null);
@@ -115,10 +107,10 @@ function WebTreeDragSurface({
       const next = resolveWorkspaceKeyboardDrop({
         code: event.code,
         workspaces: drag.workspaces,
+        allWorkspaces: drag.allWorkspaces,
         workspaceKey: String(args.active),
         targetKeys: targets.map((target) => target.key),
         currentDrop: keyboardDrop.current,
-        pinnedRootKeys,
       });
       if (!next) return;
       const target = targets.find((item) => item.key === next.targetWorkspaceKey);
@@ -127,7 +119,7 @@ function WebTreeDragSurface({
       drag.hover(next.targetWorkspaceKey, next.position);
       return { x: target.rect.left, y: target.rect.top };
     },
-    [drag, pinnedRootKeys],
+    [drag],
   );
   const sensors = useSensors(
     useSensor(MouseSensor, { activationConstraint: { distance: 6 } }),

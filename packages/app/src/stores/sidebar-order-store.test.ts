@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   computeSidebarOrderUpdates,
   type SidebarProjectEntry,
@@ -22,6 +23,7 @@ describe("migrateSidebarOrderState", () => {
       projectOrder: ["project-a"],
       pinnedWorkspaceOrder: [],
       superpinnedWorkspaceOrder: [],
+      pinnedWorkspaceTree: {},
       pinnedWorkspaceSortMode: "manual",
       workspaceSortModeByProject: {},
       workspaceOrderByProject: {
@@ -37,7 +39,9 @@ describe("migrateSidebarOrderState", () => {
     if (!storageName) throw new Error("Missing sidebar storage name");
     useSidebarOrderStore.getState().setSuperpinnedWorkspaceOrder(["host:b", "host:a", "host:b"]);
     const saved = await options.storage.getItem(storageName);
-    expect(saved?.state).toMatchObject({ superpinnedWorkspaceOrder: ["host:b", "host:a"] });
+    expect(saved?.state).toMatchObject({
+      superpinnedWorkspaceOrder: ["host:b", "host:a"],
+    });
     expect(migrateSidebarOrderState(saved?.state).superpinnedWorkspaceOrder).toEqual([
       "host:b",
       "host:a",
@@ -51,6 +55,7 @@ describe("migrateSidebarOrderState", () => {
       projectOrder: [],
       pinnedWorkspaceOrder: [],
       superpinnedWorkspaceOrder: [],
+      pinnedWorkspaceTree: {},
       pinnedWorkspaceSortMode: "manual",
       workspaceOrderByProject: {},
       workspaceSortModeByProject: {},
@@ -63,6 +68,175 @@ describe("migrateSidebarOrderState", () => {
     });
 
     expect(migrated.pinnedWorkspaceOrder).toEqual(["host-a:one", "host-b:two"]);
+  });
+
+  it.each([0, 1])("retains legacy trimming and per-server merges for version %i", (version) => {
+    const migrated = migrateSidebarOrderState(
+      {
+        projectOrder: [" project ", "project"],
+        projectOrderByServerId: { "host-a": [" other ", "project"] },
+        pinnedWorkspaceOrder: [" host-a:one ", "host-a:one"],
+        superpinnedWorkspaceOrder: [" host-a:two ", "host-a:two"],
+        workspaceOrderByProject: {
+          " project ": [" host-a:one ", "host-a:one"],
+        },
+        workspaceOrderByServerAndProject: {
+          " host-a :: project ": [" one ", " two ", "host-a:two"],
+        },
+      },
+      version,
+    );
+
+    expect(migrated).toMatchObject({
+      projectOrder: ["project", "other"],
+      pinnedWorkspaceOrder: ["host-a:one"],
+      superpinnedWorkspaceOrder: ["host-a:two"],
+      workspaceOrderByProject: { project: ["host-a:one", "host-a:two"] },
+      pinnedWorkspaceTree: {},
+    });
+  });
+
+  it("round-trips host-qualified parents, fractional ranks and dormant entries through actual validated persistence", async () => {
+    const tree = {
+      "one:shared": { parentWorkspaceKey: "two:shared", siblingOrder: 0.125 },
+      "offline:child": {
+        parentWorkspaceKey: "offline:parent",
+        siblingOrder: -2.5,
+      },
+    };
+    await useSidebarOrderStore.getState().setPinnedWorkspaceTree(tree);
+    const options = useSidebarOrderStore.persist.getOptions();
+    const name = options.name;
+    if (!name) throw new Error("Missing sidebar storage name");
+    const saved = await options.storage!.getItem(name);
+    expect(saved?.version).toBe(3);
+    expect(saved?.state).toMatchObject({ pinnedWorkspaceTree: tree });
+    await useSidebarOrderStore.setState({ pinnedWorkspaceTree: {} });
+    await options.storage!.setItem(name, saved!);
+    await useSidebarOrderStore.persist.rehydrate();
+    expect(useSidebarOrderStore.getState().pinnedWorkspaceTree).toEqual(tree);
+  });
+
+  it("hydrates a real v2 envelope without dropping its existing orders", async () => {
+    const options = useSidebarOrderStore.persist.getOptions();
+    const name = options.name;
+    if (!name) throw new Error("Missing sidebar storage name");
+    await AsyncStorage.setItem(
+      name,
+      JSON.stringify({
+        version: 2,
+        state: {
+          pinnedWorkspaceOrder: ["one:a", "two:b"],
+          superpinnedWorkspaceOrder: ["three:c"],
+          workspaceOrderByProject: { project: ["one:a"] },
+        },
+      }),
+    );
+    await useSidebarOrderStore.persist.rehydrate();
+    expect(useSidebarOrderStore.getState()).toMatchObject({
+      pinnedWorkspaceTree: {},
+      pinnedWorkspaceOrder: ["one:a", "two:b"],
+      superpinnedWorkspaceOrder: ["three:c"],
+      workspaceOrderByProject: { project: ["one:a"] },
+    });
+    expect(JSON.parse((await AsyncStorage.getItem(name))!).version).toBe(3);
+  });
+
+  it("awaits the durable tree write and rejects a storage failure", async () => {
+    let release!: () => void;
+    const spy = vi.spyOn(AsyncStorage, "setItem").mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    try {
+      let complete = false;
+      const pending = useSidebarOrderStore
+        .getState()
+        .setPinnedWorkspaceTree(
+          {
+            "one:a": { parentWorkspaceKey: null, siblingOrder: 0 },
+          },
+          { section: "pinned", keys: ["one:a"] },
+        )
+        .then(() => {
+          complete = true;
+          return undefined;
+        });
+      await Promise.resolve();
+      expect(complete).toBe(false);
+      release();
+      await pending;
+      expect(complete).toBe(true);
+      spy.mockRejectedValueOnce(new Error("Storage unavailable"));
+      await expect(
+        useSidebarOrderStore
+          .getState()
+          .setPinnedWorkspaceTree({}, { section: "superpinned", keys: ["two:b"] }),
+      ).rejects.toThrow("Storage unavailable");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("writes tree, deduplicated root order and manual sort atomically through validated storage", async () => {
+    await useSidebarOrderStore.setState({
+      pinnedWorkspaceSortMode: "alphabetical",
+      superpinnedWorkspaceOrder: ["priority:a"],
+    });
+    const options = useSidebarOrderStore.persist.getOptions();
+    const name = options.name;
+    if (!name) throw new Error("Missing sidebar storage name");
+    const spy = vi.spyOn(AsyncStorage, "setItem");
+    try {
+      const tree = {
+        "one:a": { parentWorkspaceKey: "two:b", siblingOrder: 0.125 },
+      };
+      await useSidebarOrderStore.getState().setPinnedWorkspaceTree(tree, {
+        section: "pinned",
+        keys: ["two:b", "two:b", "one:a"],
+      });
+      expect(spy).toHaveBeenCalledTimes(1);
+      const saved = JSON.parse((await AsyncStorage.getItem(name))!);
+      expect(saved.state).toMatchObject({
+        pinnedWorkspaceTree: tree,
+        pinnedWorkspaceOrder: ["two:b", "one:a"],
+        pinnedWorkspaceSortMode: "manual",
+        superpinnedWorkspaceOrder: ["priority:a"],
+      });
+      expect(JSON.parse(spy.mock.calls[0]![1])).toEqual(saved);
+      useSidebarOrderStore.getState().setPinnedWorkspaceSortMode("activity");
+      spy.mockClear();
+      await useSidebarOrderStore.getState().setPinnedWorkspaceTree(tree, {
+        section: "superpinned",
+        keys: ["priority:b", "priority:b"],
+      });
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(useSidebarOrderStore.getState()).toMatchObject({
+        superpinnedWorkspaceOrder: ["priority:b"],
+        pinnedWorkspaceSortMode: "activity",
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("rejects invalid ranks without losing unrelated legacy orders", () => {
+    expect(
+      migrateSidebarOrderState({
+        pinnedWorkspaceOrder: ["one:a"],
+        pinnedWorkspaceTree: {
+          "one:a": {
+            parentWorkspaceKey: null,
+            siblingOrder: Number.POSITIVE_INFINITY,
+          },
+        },
+      }),
+    ).toMatchObject({
+      pinnedWorkspaceOrder: ["one:a"],
+      pinnedWorkspaceTree: {},
+    });
   });
 
   it("preserves alphabetical sorting and manual order during migration", () => {
@@ -108,7 +282,10 @@ describe("migrateSidebarOrderState", () => {
   });
 
   it("keeps each project's mode and manual order while selecting another mode", () => {
-    useSidebarOrderStore.setState({ workspaceOrderByProject: {}, workspaceSortModeByProject: {} });
+    useSidebarOrderStore.setState({
+      workspaceOrderByProject: {},
+      workspaceSortModeByProject: {},
+    });
     const store = useSidebarOrderStore.getState();
     store.setWorkspaceOrder("first", ["b", "a"]);
     store.setWorkspaceSortMode("first", "alphabetical");
@@ -199,5 +376,45 @@ describe("sidebar order keys that end in whitespace", () => {
     });
 
     expect(migrated.projectOrder).toEqual(["host-a:one"]);
+  });
+
+  it("preserves exact v2 scope and order keys through validated hydration and v3 persistence", async () => {
+    const options = useSidebarOrderStore.persist.getOptions();
+    const name = options.name;
+    if (!name) throw new Error("Missing sidebar storage name");
+    const siblingProjectKey = PROJECT_KEY.trimEnd();
+    const state = {
+      projectOrder: [PROJECT_KEY, siblingProjectKey],
+      pinnedWorkspaceOrder: ["srv-1:feature ", "srv-1:feature"],
+      superpinnedWorkspaceOrder: ["srv-2:priority ", "srv-2:priority"],
+      pinnedWorkspaceSortMode: "activity",
+      workspaceOrderByProject: {
+        [PROJECT_KEY]: ["srv-1:spaced ", "srv-1:spaced"],
+        [siblingProjectKey]: ["srv-1:plain"],
+      },
+      workspaceSortModeByProject: {
+        [PROJECT_KEY]: "activity",
+        [siblingProjectKey]: "alphabetical",
+      },
+    };
+    await AsyncStorage.setItem(name, JSON.stringify({ version: 2, state }));
+
+    await useSidebarOrderStore.persist.rehydrate();
+
+    const expectedState = { ...state, pinnedWorkspaceTree: {} };
+    expect(useSidebarOrderStore.getState()).toMatchObject(expectedState);
+    expect(useSidebarOrderStore.getState().getWorkspaceOrder(PROJECT_KEY)).toEqual(
+      state.workspaceOrderByProject[PROJECT_KEY],
+    );
+    expect(useSidebarOrderStore.getState().getWorkspaceOrder(siblingProjectKey)).toEqual([
+      "srv-1:plain",
+    ]);
+    expect(JSON.parse((await AsyncStorage.getItem(name))!)).toEqual({
+      version: 3,
+      state: expectedState,
+    });
+
+    await useSidebarOrderStore.persist.rehydrate();
+    expect(useSidebarOrderStore.getState()).toMatchObject(expectedState);
   });
 });

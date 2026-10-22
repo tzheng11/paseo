@@ -29,6 +29,9 @@ export interface SidebarWorkspacePlacement {
   workspaceKind: WorkspaceDescriptor["workspaceKind"];
   parentWorkspaceId?: string | null;
   siblingOrder?: number;
+  // Navigation layout belongs to this client, independently of host/project ownership.
+  sidebarParentWorkspaceKey?: string | null;
+  sidebarSection?: "pinned" | "superpinned";
   background?: boolean;
   name: string;
 }

@@ -4,6 +4,10 @@ import { persist } from "zustand/middleware";
 import { z } from "zod";
 import { createValidatedPersistStorage } from "@/storage/validated-persist-storage";
 import type { SidebarWorkspaceSortMode } from "@/components/sidebar/workspace-sort";
+import type {
+  PinnedWorkspaceSection,
+  PinnedWorkspaceTreePlacement,
+} from "@/components/sidebar/workspace-tree/pinned-layout";
 
 export type PinnedWorkspaceSortMode = SidebarWorkspaceSortMode;
 
@@ -11,6 +15,11 @@ interface SidebarOrderStoreState {
   projectOrder: string[];
   pinnedWorkspaceOrder: string[];
   superpinnedWorkspaceOrder: string[];
+  pinnedWorkspaceTree: Record<string, PinnedWorkspaceTreePlacement>;
+  setPinnedWorkspaceTree: (
+    tree: Record<string, PinnedWorkspaceTreePlacement>,
+    rootOrder?: { section: PinnedWorkspaceSection; keys: string[] },
+  ) => Promise<void>;
   setSuperpinnedWorkspaceOrder: (keys: string[]) => void;
   pinnedWorkspaceSortMode: PinnedWorkspaceSortMode;
   setPinnedWorkspaceSortMode: (mode: PinnedWorkspaceSortMode) => void;
@@ -29,6 +38,7 @@ interface SidebarOrderPersistedState {
   projectOrder?: string[];
   pinnedWorkspaceOrder?: string[];
   superpinnedWorkspaceOrder?: string[];
+  pinnedWorkspaceTree?: Record<string, PinnedWorkspaceTreePlacement>;
   pinnedWorkspaceSortMode?: PinnedWorkspaceSortMode;
   workspaceOrderByProject?: Record<string, string[]>;
   workspaceSortModeByProject?: Record<string, SidebarWorkspaceSortMode>;
@@ -38,10 +48,18 @@ interface SidebarOrderPersistedState {
 
 const WorkspaceSortModeSchema = z.enum(["manual", "alphabetical", "activity"]);
 const StringArrayRecordSchema = z.record(z.string(), z.array(z.string()));
+const PinnedWorkspaceTreeSchema = z.record(
+  z.string(),
+  z.strictObject({
+    parentWorkspaceKey: z.string().nullable(),
+    siblingOrder: z.number().finite(),
+  }),
+);
 const SidebarOrderPersistedStateSchema = z.strictObject({
   projectOrder: z.array(z.string()).optional(),
   pinnedWorkspaceOrder: z.array(z.string()).optional(),
   superpinnedWorkspaceOrder: z.array(z.string()).optional(),
+  pinnedWorkspaceTree: PinnedWorkspaceTreeSchema.catch({}).optional(),
   pinnedWorkspaceSortMode: WorkspaceSortModeSchema.optional(),
   workspaceSortModeByProject: z.record(z.string(), WorkspaceSortModeSchema).optional(),
   workspaceOrderByProject: StringArrayRecordSchema.optional(),
@@ -54,8 +72,8 @@ interface SidebarWorkspaceOrderScope {
   projectViewKey: string;
 }
 
-// Trims each key. Only for persisted state read at migration time, where a
-// stray space is an artifact of an older format rather than part of the key.
+// Trims keys from pre-v2 persisted formats, where stray spaces were artifacts
+// rather than part of an exact project or workspace key.
 function normalizeKeys(keys: string[]): string[] {
   const seen = new Set<string>();
   const normalized: string[] = [];
@@ -122,10 +140,26 @@ function normalizeLegacyWorkspaceKey(serverId: string, rawWorkspaceKey: string):
   return workspaceKey.startsWith(serverPrefix) ? workspaceKey : `${serverPrefix}${workspaceKey}`;
 }
 
-export function migrateSidebarOrderState(persistedState: unknown): {
+function migrateModernSidebarOrderState(state: SidebarOrderPersistedState) {
+  return {
+    projectOrder: state.projectOrder ?? [],
+    pinnedWorkspaceOrder: state.pinnedWorkspaceOrder ?? [],
+    superpinnedWorkspaceOrder: state.superpinnedWorkspaceOrder ?? [],
+    pinnedWorkspaceTree: state.pinnedWorkspaceTree ?? {},
+    pinnedWorkspaceSortMode: state.pinnedWorkspaceSortMode ?? "manual",
+    workspaceOrderByProject: state.workspaceOrderByProject ?? {},
+    workspaceSortModeByProject: state.workspaceSortModeByProject ?? {},
+  };
+}
+
+export function migrateSidebarOrderState(
+  persistedState: unknown,
+  version = 0,
+): {
   projectOrder: string[];
   pinnedWorkspaceOrder: string[];
   superpinnedWorkspaceOrder: string[];
+  pinnedWorkspaceTree: Record<string, PinnedWorkspaceTreePlacement>;
   pinnedWorkspaceSortMode: PinnedWorkspaceSortMode;
   workspaceOrderByProject: Record<string, string[]>;
   workspaceSortModeByProject: Record<string, SidebarWorkspaceSortMode>;
@@ -136,12 +170,19 @@ export function migrateSidebarOrderState(persistedState: unknown): {
       projectOrder: [],
       pinnedWorkspaceOrder: [],
       superpinnedWorkspaceOrder: [],
+      pinnedWorkspaceTree: {},
       pinnedWorkspaceSortMode: "manual",
       workspaceOrderByProject: {},
       workspaceSortModeByProject: {},
     };
   }
   const state: SidebarOrderPersistedState = result.data;
+
+  // v2 already stores exact view keys, including directory names ending in a
+  // space. Adding the pin tree must not rerun legacy trimming or merge scopes.
+  if (version >= 2) {
+    return migrateModernSidebarOrderState(state);
+  }
 
   const projectOrder = normalizeKeys(state.projectOrder ?? []);
   const seenProjects = new Set(projectOrder);
@@ -170,12 +211,11 @@ export function migrateSidebarOrderState(persistedState: unknown): {
   }
 
   return {
+    ...migrateModernSidebarOrderState(state),
     projectOrder,
     pinnedWorkspaceOrder: normalizeKeys(state.pinnedWorkspaceOrder ?? []),
     superpinnedWorkspaceOrder: normalizeKeys(state.superpinnedWorkspaceOrder ?? []),
-    pinnedWorkspaceSortMode: state.pinnedWorkspaceSortMode ?? "manual",
     workspaceOrderByProject,
-    workspaceSortModeByProject: state.workspaceSortModeByProject ?? {},
   };
 }
 
@@ -185,6 +225,21 @@ export const useSidebarOrderStore = create<SidebarOrderStoreState>()(
       projectOrder: [],
       pinnedWorkspaceOrder: [],
       superpinnedWorkspaceOrder: [],
+      pinnedWorkspaceTree: {},
+      setPinnedWorkspaceTree: async (tree, rootOrder) => {
+        const update: Partial<SidebarOrderStoreState> = {
+          pinnedWorkspaceTree: PinnedWorkspaceTreeSchema.parse(tree),
+        };
+        if (rootOrder?.section === "pinned") {
+          update.pinnedWorkspaceOrder = dedupeKeys(rootOrder.keys);
+          update.pinnedWorkspaceSortMode = "manual";
+        } else if (rootOrder?.section === "superpinned") {
+          update.superpinnedWorkspaceOrder = dedupeKeys(rootOrder.keys);
+        }
+        // persist's wrapped set returns the storage promise at runtime. Await it
+        // so a failed durable write cannot be reported as a successful drop.
+        await Promise.resolve(set(update));
+      },
       setSuperpinnedWorkspaceOrder: (keys) => set({ superpinnedWorkspaceOrder: dedupeKeys(keys) }),
       pinnedWorkspaceSortMode: "manual",
       setPinnedWorkspaceSortMode: (mode) => set({ pinnedWorkspaceSortMode: mode }),
@@ -205,7 +260,10 @@ export const useSidebarOrderStore = create<SidebarOrderStoreState>()(
       },
       getPinnedWorkspaceOrder: () => get().pinnedWorkspaceOrder,
       setPinnedWorkspaceOrder: (keys) => {
-        set({ pinnedWorkspaceOrder: dedupeKeys(keys), pinnedWorkspaceSortMode: "manual" });
+        set({
+          pinnedWorkspaceOrder: dedupeKeys(keys),
+          pinnedWorkspaceSortMode: "manual",
+        });
       },
       getWorkspaceOrder: (projectViewKey) => {
         if (!projectViewKey.trim()) return [];
@@ -228,11 +286,12 @@ export const useSidebarOrderStore = create<SidebarOrderStoreState>()(
         projectOrder: state.projectOrder,
         pinnedWorkspaceOrder: state.pinnedWorkspaceOrder,
         superpinnedWorkspaceOrder: state.superpinnedWorkspaceOrder,
+        pinnedWorkspaceTree: state.pinnedWorkspaceTree,
         pinnedWorkspaceSortMode: state.pinnedWorkspaceSortMode,
         workspaceOrderByProject: state.workspaceOrderByProject,
         workspaceSortModeByProject: state.workspaceSortModeByProject,
       }),
-      version: 2,
+      version: 3,
       migrate: migrateSidebarOrderState,
     },
   ),

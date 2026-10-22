@@ -496,11 +496,22 @@ Workspace hierarchy is organizational and host-local. A parent must belong to th
 changing it keeps the workspace's directory, agents, and worktree ownership. Hierarchy moves
 validate ancestry and update ordering inside one registry mutation, so concurrent moves cannot
 form a cycle. Ordinary record refreshes preserve these fields. Archiving a workspace keeps its
-children active; the sidebar presents children of an unavailable parent at the top level.
+children active. This registry relationship remains available to host-local API clients; it does not
+control nesting in ordinary sidebar project or status lists.
 
 Sibling ranks are finite floating-point numbers shared by clients. A move inserts between ranks;
 the registry renumbers that sibling group atomically when the gap no longer has a representable
 midpoint. Expanded and collapsed workspace preferences stay on the client.
+
+The sidebar renders independent navigation trees only in Pinned and SuperPinned. Their layout
+is persisted with this app/browser's existing sidebar ordering preferences, using full
+`serverId:workspaceId` parent keys and finite fractional sibling ranks. A pin tree can span
+projects and hosts without changing workspace ownership, directory paths, or registry parent
+fields. Explicit pin priority determines section membership. Missing, filtered, or unpinned
+parents leave their children visible as roots, while stored edges remain available if the parent
+returns. Legacy registry parents are used only when both workspaces are explicitly in the same
+pin section and the client has no saved layout override. Pin membership changes still use the
+workspace's own host; rearranging an existing pin tree is a client-local operation.
 
 Client directory replicas persist parent IDs and ranks alongside their sync checkpoint. The
 checkpoint format changes when older cached projections cannot represent hierarchy; retaining

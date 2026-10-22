@@ -30,7 +30,10 @@ import {
   createSidebarWorkspaceEntry,
   type SidebarProjectEntry,
 } from "@/hooks/use-sidebar-workspaces-list";
-import { useSidebarWorkspacesList } from "@/hooks/use-sidebar-workspaces-list";
+import {
+  useSidebarWorkspacesList,
+  type SidebarWorkspacesListResult,
+} from "@/hooks/use-sidebar-workspaces-list";
 import {
   getHostRuntimeStore,
   type HostRuntimeController,
@@ -351,6 +354,116 @@ describe("sidebar workspace render isolation", () => {
         workspaceOrderByProject: {},
       });
     });
+  });
+
+  it("keeps hidden-host pin metadata separate from visible rows and opts into only directory demand", async () => {
+    const hiddenId = "sidebar-hidden-host";
+    act(() => {
+      setHostProfiles([makeHost(), { ...makeHost(), serverId: hiddenId, label: "Hidden Host" }]);
+      useSessionStore.getState().initializeSession(hiddenId, null as unknown as DaemonClient);
+      seedRuntimeWorkspaces(
+        hiddenId,
+        new Map([
+          [
+            "hidden-child",
+            workspace({
+              id: "hidden-child",
+              projectId: "hidden-project",
+              projectDisplayName: "Hidden Project",
+              name: "hidden",
+            }),
+          ],
+        ]),
+      );
+      useSessionStore.getState().setHasHydratedWorkspaces(hiddenId, true);
+    });
+    const release = vi.fn();
+    const acquire = vi
+      .spyOn(getHostRuntimeStore(), "acquireDirectoryDemand")
+      .mockReturnValue(release);
+    let current: SidebarWorkspacesListResult | undefined;
+    function CatalogProbe({
+      includeAllHosts = false,
+      enabled = true,
+    }: {
+      includeAllHosts?: boolean;
+      enabled?: boolean;
+    }) {
+      current = useSidebarWorkspacesList({ hostFilters: [SERVER_ID], includeAllHosts, enabled });
+      return null;
+    }
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    try {
+      await act(async () => {
+        root?.render(<CatalogProbe />);
+      });
+      expect(acquire.mock.calls.map(([serverId]) => serverId)).toEqual([SERVER_ID]);
+      expect(current?.workspacePlacements.every((item) => item.serverId === SERVER_ID)).toBe(true);
+      expect(
+        current?.projects
+          .flatMap((project) => project.workspaces)
+          .some((item) => item.serverId === hiddenId),
+      ).toBe(false);
+      expect(
+        current?.allProjects
+          .flatMap((project) => project.workspaces)
+          .some((item) => item.serverId === hiddenId),
+      ).toBe(true);
+      acquire.mockClear();
+      await act(async () => {
+        root?.render(<CatalogProbe includeAllHosts />);
+      });
+      expect(acquire.mock.calls.map(([serverId]) => serverId)).toEqual([SERVER_ID, hiddenId]);
+      expect(current?.isLoading).toBe(false);
+      expect(current?.workspacePlacements.every((item) => item.serverId === SERVER_ID)).toBe(true);
+      acquire.mockClear();
+      release.mockClear();
+      await act(async () => {
+        root?.render(<CatalogProbe includeAllHosts enabled={false} />);
+      });
+      expect(acquire).not.toHaveBeenCalled();
+      expect(release).toHaveBeenCalledTimes(2);
+    } finally {
+      acquire.mockRestore();
+      act(() => {
+        root?.unmount();
+      });
+      root = null;
+      act(() => {
+        useSessionStore.getState().clearSession(hiddenId);
+      });
+    }
+  });
+
+  it("does not make visible-host loading wait for an unhydrated hidden directory", async () => {
+    const hiddenId = "sidebar-not-hydrated";
+    act(() => {
+      setHostProfiles([makeHost(), { ...makeHost(), serverId: hiddenId }]);
+    });
+    const acquire = vi
+      .spyOn(getHostRuntimeStore(), "acquireDirectoryDemand")
+      .mockReturnValue(vi.fn());
+    let current: SidebarWorkspacesListResult | undefined;
+    function CatalogProbe() {
+      current = useSidebarWorkspacesList({ hostFilters: [SERVER_ID], includeAllHosts: true });
+      return null;
+    }
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    try {
+      await act(async () => {
+        root?.render(<CatalogProbe />);
+      });
+      expect(acquire.mock.calls.map(([serverId]) => serverId)).toEqual([SERVER_ID, hiddenId]);
+      expect(current?.isLoading).toBe(false);
+      expect(current?.isInitialLoad).toBe(false);
+      expect(current?.projects.length).toBeGreaterThan(0);
+    } finally {
+      acquire.mockRestore();
+    }
   });
 
   it("re-renders only the changed workspace row for a status update", async () => {
