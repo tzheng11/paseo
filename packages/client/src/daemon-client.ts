@@ -3400,6 +3400,26 @@ export class DaemonClient {
     return { value: payload.value };
   }
 
+  async setWorkspacePinPlacement(input: {
+    workspaceId: string;
+    placement: { parentWorkspaceKey: string | null; siblingOrder: number };
+    expectedRevision: number;
+    requestId?: string;
+  }) {
+    // COMPAT(universalPins): added in v0.13.0-beta.1; remove gate after 2027-04-22.
+    if (this.lastServerInfoMessage?.features?.workspacePinPlacement !== true)
+      throw new Error("Update this host to sync pin nesting across clients.");
+    const { requestId, ...message } = input;
+    const payload = await this.sendCorrelatedSessionRequest({
+      requestId,
+      message: { type: "workspace.pin.placement.set.request", ...message },
+      responseType: "workspace.pin.placement.set.response",
+    });
+    if (!payload.accepted || !payload.placement)
+      throw new Error(payload.error ?? "Unable to save pin layout.");
+    return payload.placement;
+  }
+
   async moveWorkspace(
     workspaceId: string,
     input: WorkspaceMoveOptions,

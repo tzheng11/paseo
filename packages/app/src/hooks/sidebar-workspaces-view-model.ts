@@ -29,7 +29,8 @@ export interface SidebarWorkspacePlacement {
   workspaceKind: WorkspaceDescriptor["workspaceKind"];
   parentWorkspaceId?: string | null;
   siblingOrder?: number;
-  // Navigation layout belongs to this client, independently of host/project ownership.
+  pinPlacement?: WorkspaceDescriptor["pinPlacement"];
+  // Pin navigation is shared independently of host/project ownership.
   sidebarParentWorkspaceKey?: string | null;
   sidebarSection?: "pinned" | "superpinned";
   background?: boolean;
@@ -172,6 +173,7 @@ export function createSidebarWorkspaceEntry(input: {
     projectKind: input.workspace.projectKind,
     workspaceKind: input.workspace.workspaceKind,
     parentWorkspaceId: input.workspace.parentWorkspaceId,
+    pinPlacement: input.workspace.pinPlacement,
     siblingOrder: input.workspace.siblingOrder,
     background: input.workspace.background,
     name: input.workspace.name,

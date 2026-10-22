@@ -1020,6 +1020,20 @@ export const WorkspaceFieldValueSetRequestSchema = z.object({
   requestId: z.string(),
 });
 
+export const WorkspacePinPlacementSchema = z.object({
+  parentWorkspaceKey: z.string().min(1).max(512).nullable(),
+  siblingOrder: z.number().finite(),
+  revision: z.number().int().nonnegative(),
+});
+
+export const WorkspacePinPlacementSetRequestSchema = z.object({
+  type: z.literal("workspace.pin.placement.set.request"),
+  workspaceId: z.string(),
+  placement: WorkspacePinPlacementSchema.omit({ revision: true }),
+  expectedRevision: z.number().int().nonnegative(),
+  requestId: z.string(),
+});
+
 export const WorkspaceMoveRequestSchema = z.object({
   type: z.literal("workspace.move.request"),
   workspaceId: z.string(),
@@ -2225,6 +2239,17 @@ export const WorkspaceFieldValueSetResponseSchema = z.object({
   }),
 });
 
+export const WorkspacePinPlacementSetResponseSchema = z.object({
+  type: z.literal("workspace.pin.placement.set.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    accepted: z.boolean(),
+    placement: WorkspacePinPlacementSchema.nullable(),
+    error: z.string().nullable(),
+  }),
+});
+
 export const WorkspaceMoveResponseSchema = z.object({
   type: z.literal("workspace.move.response"),
   payload: z.object({
@@ -3400,6 +3425,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceTitleSetRequestSchema,
   WorkspaceFieldValueSetRequestSchema,
   WorkspaceMoveRequestSchema,
+  WorkspacePinPlacementSetRequestSchema,
   WorkspacePinSetRequestSchema,
   WorkspaceSuperpinSetRequestSchema,
   WorkspaceLabelListRequestSchema,
@@ -3784,6 +3810,8 @@ export const ServerInfoStatusPayloadSchema = z
         // COMPAT(workspaceFields): added in v0.11.3; remove gate after 2027-04-14.
         workspaceFields: z.boolean().optional(),
         workspaceHierarchy: z.boolean().optional(),
+        // COMPAT(universalPins): added in v0.13.0-beta.1; remove gate after 2027-04-22.
+        workspacePinPlacement: z.boolean().optional(),
         providersSnapshot: z.boolean().optional(),
         connectedHosts: z.boolean().optional(),
         hostMultiplexing: z.boolean().optional(),
@@ -4279,6 +4307,8 @@ export const WorkspaceGitHubRuntimePayloadSchema = z
 export const WorkspaceDescriptorPayloadSchema = z
   .object({
     id: z.string(),
+    // COMPAT(universalPins): added in v0.13.0-beta.1; remove optional after 2027-04-22.
+    pinPlacement: WorkspacePinPlacementSchema.optional(),
     parentWorkspaceId: z.string().nullable().optional(),
     siblingOrder: z.number().finite().optional(),
     projectId: z.string(),
@@ -7339,6 +7369,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceTitleSetResponseSchema,
   WorkspaceFieldValueSetResponseSchema,
   WorkspaceMoveResponseSchema,
+  WorkspacePinPlacementSetResponseSchema,
   WorkspacePinSetResponseSchema,
   WorkspaceSuperpinSetResponseSchema,
   WorkspaceRecoveryInspectResponseSchema,
