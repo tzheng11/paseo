@@ -129,13 +129,13 @@ describe("syncObservers", () => {
     h.service.dispose();
   });
 
-  test("resumes a focused checkout and suspends it after the idle grace", async () => {
+  test("resumes a focused checkout and suspends it after one idle hour", async () => {
     vi.useFakeTimers();
     const h = buildHarness();
     h.service.syncObservers([makeDescriptor({ id: "ws1", workspaceDirectory: WS1 })]);
     h.service.setFocusedDirectories([WS1]);
     h.service.setFocusedDirectories([]);
-    await vi.advanceTimersByTimeAsync(59_999);
+    await vi.advanceTimersByTimeAsync(3_599_999);
     expect(h.observationCalls).toEqual([
       { cwd: WS1, observeWorkingTree: false },
       { cwd: WS1, observeWorkingTree: true },

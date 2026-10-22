@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import type { AgentManager, ManagedAgent } from "./agent/agent-manager.js";
 import type { WorkspaceGitService } from "./workspace-git-service.js";
+import { WORKING_TREE_OBSERVATION_IDLE_GRACE_MS } from "./workspace-git-observation-policy.js";
 
 /** Agent execution owns working-tree coverage even when every client disconnects. */
 export function observeActiveWorkspaceGit(deps: {
@@ -16,7 +17,7 @@ export function observeActiveWorkspaceGit(deps: {
     target.idleTimer = setTimeout(() => {
       targets.delete(cwd);
       target.unsubscribe();
-    }, 60_000);
+    }, WORKING_TREE_OBSERVATION_IDLE_GRACE_MS);
     target.idleTimer.unref?.();
   }
 

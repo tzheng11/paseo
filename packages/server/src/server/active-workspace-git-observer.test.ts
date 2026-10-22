@@ -5,7 +5,7 @@ import { observeActiveWorkspaceGit } from "./active-workspace-git-observer.js";
 
 afterEach(() => vi.useRealTimers());
 
-test("running agents retain shared coverage without clients and release it after the final turn", async () => {
+test("running agents retain shared coverage without clients until one hour after the final turn", async () => {
   vi.useFakeTimers();
   const cwd = resolve("/tmp/repo");
   let emit: AgentSubscriber = () => {};
@@ -33,16 +33,18 @@ test("running agents retain shared coverage without clients and release it after
   emit(state("second", "running"));
   expect(registered).toEqual([cwd]);
   emit(state("first", "idle"));
-  await vi.advanceTimersByTimeAsync(60_000);
+  await vi.advanceTimersByTimeAsync(3_600_000);
   expect(released).toEqual([]);
   emit(state("second", "closed"));
-  await vi.advanceTimersByTimeAsync(59_999);
+  await vi.advanceTimersByTimeAsync(3_599_999);
   expect(released).toEqual([]);
   emit(state("second", "running"));
   await vi.advanceTimersByTimeAsync(1);
   expect(released).toEqual([]);
   emit(state("second", "idle"));
-  await vi.advanceTimersByTimeAsync(60_000);
+  await vi.advanceTimersByTimeAsync(3_599_999);
+  expect(released).toEqual([]);
+  await vi.advanceTimersByTimeAsync(1);
   expect(released).toEqual([cwd]);
   emit(state("second", "running"));
   expect(registered).toEqual([cwd, cwd]);

@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import type pino from "pino";
 import type { WorkspaceDescriptorPayload } from "../../messages.js";
+import { WORKING_TREE_OBSERVATION_IDLE_GRACE_MS } from "../../workspace-git-observation-policy.js";
 import type {
   WorkspaceGitRuntimeSnapshot,
   WorkspaceGitService,
@@ -16,8 +17,6 @@ interface WorkspaceGitWatchState {
   lastBranchName: string | null;
   status?: WorkspaceDescriptorPayload["status"];
 }
-
-const IDLE_WORKING_TREE_GRACE_MS = 60_000;
 
 export interface WorkspaceGitObserverMetrics {
   watchedDirectoryCount: number;
@@ -190,7 +189,7 @@ export function createWorkspaceGitObserverService(deps: {
       target.idleTimer ??= setTimeout(() => {
         target.idleTimer = null;
         syncSubscription(normalizedCwd, true);
-      }, IDLE_WORKING_TREE_GRACE_MS);
+      }, WORKING_TREE_OBSERVATION_IDLE_GRACE_MS);
       target.idleTimer.unref?.();
       return;
     }
