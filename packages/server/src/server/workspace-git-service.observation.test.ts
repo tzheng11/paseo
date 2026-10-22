@@ -1566,6 +1566,70 @@ describe("WorkspaceGitService checkout observation", () => {
     service.dispose();
   });
 
+  test.each(["standalone", "comparison switch"])(
+    "%s uncommitted diff retains metadata coverage with only a dormant sidebar",
+    async (scenario) => {
+      const watcher = createWatcherHarness();
+      let isDirty = true;
+      let diffFiles = [{ path: "new-working-change.txt", additions: 1, deletions: 0 }];
+      const service = createService(watcher, {
+        getCheckoutStatus: vi.fn(async (cwd: string) => createCheckoutStatus(cwd, { isDirty })),
+        getCheckoutShortstat: vi.fn(async () => ({ additions: isDirty ? 1 : 0, deletions: 0 })),
+        getCheckoutDiff: vi.fn(async () => ({ diff: "", structured: diffFiles })),
+      });
+      const diffManager = new CheckoutDiffManager({
+        logger: createLogger(),
+        paseoHome: "/tmp/paseo-home",
+        workspaceGitService: service,
+      });
+      const sidebar = service.registerWorkspace(
+        { cwd: REPO_CWD, observeWorkingTree: false },
+        vi.fn(),
+      );
+      const diffListener = vi.fn();
+      try {
+        const previous =
+          scenario === "comparison switch"
+            ? await diffManager.subscribe(
+                { cwd: REPO_CWD, compare: { mode: "base", baseRef: "main" } },
+                vi.fn(),
+              )
+            : null;
+        const diff = await diffManager.subscribe(
+          { cwd: REPO_CWD, compare: { mode: "uncommitted" } },
+          diffListener,
+        );
+        expect(diff.initial.files).toEqual(diffFiles);
+        previous?.unsubscribe();
+        await vi.waitFor(() => {
+          expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
+          expect(service.getMetrics().workspaceRefreshInFlightCount).toBe(0);
+        });
+        expect(getWatcherSubscribeCallCount(watcher, REPO_CWD)).toBe(1);
+        expect(getWatcherSubscribeCallCount(watcher, GIT_DIR)).toBe(1);
+
+        // Committing changes only .git: the working-tree watcher correctly ignores it.
+        isDirty = false;
+        diffFiles = [];
+        watcher.records
+          .find((record) => record.directory === GIT_DIR)
+          ?.callback(null, [{ path: path.join(GIT_DIR, "index"), type: "update" }]);
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(diffListener).toHaveBeenLastCalledWith({ cwd: REPO_CWD, files: [], error: null });
+        diff.unsubscribe();
+        await vi.waitFor(() => {
+          expect(service.getMetrics().workingTreeWatchTargetCount).toBe(0);
+        });
+        // Metadata-only sidebar coverage remains after explicit diff demand closes.
+        expect(getWatcherSubscribeCallCount(watcher, GIT_DIR)).toBe(1);
+      } finally {
+        diffManager.dispose();
+        sidebar.unsubscribe();
+        await service.dispose();
+      }
+    },
+  );
+
   test("metadata-only changes refresh worktree summary and active uncommitted diff", async () => {
     const watcher = createWatcherHarness();
     let isDirty = true;

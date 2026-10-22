@@ -373,17 +373,20 @@ export class CheckoutDiffManager {
         return;
       }
       this.rememberWorkspaceSnapshot(target, snapshot);
-      const workspaceSubscription = this.workspaceGitService.registerWorkspace(
-        { cwd: target.cwd },
-        (nextSnapshot) => this.rememberWorkspaceSnapshot(target, nextSnapshot),
-      );
-      if (this.targets.get(target.key) !== target || target.listeners.size === 0) {
-        workspaceSubscription.unsubscribe();
-        return;
-      }
-      target.workspaceGitUnsubscribe = workspaceSubscription.unsubscribe;
-      if (target.compare.mode === "base") return;
     }
+    // Every comparison depends on Git metadata: commits can clear an uncommitted
+    // diff without changing a working-tree file. Own the shared metadata-to-
+    // working-tree link even when sidebar observers only request metadata.
+    const workspaceSubscription = this.workspaceGitService.registerWorkspace(
+      { cwd: target.cwd },
+      (nextSnapshot) => this.rememberWorkspaceSnapshot(target, nextSnapshot),
+    );
+    if (this.targets.get(target.key) !== target || target.listeners.size === 0) {
+      workspaceSubscription.unsubscribe();
+      return;
+    }
+    target.workspaceGitUnsubscribe = workspaceSubscription.unsubscribe;
+    if (target.compare.mode === "base") return;
 
     const { repoRoot, unsubscribe } = await this.workspaceGitService.requestWorkingTreeWatch(
       target.cwd,
