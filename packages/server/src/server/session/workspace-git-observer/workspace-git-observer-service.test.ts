@@ -1,6 +1,6 @@
 import { resolve } from "node:path";
 import type pino from "pino";
-import { describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import type { WorkspaceDescriptorPayload } from "../../messages.js";
 import type {
   WorkspaceGitListener,
@@ -27,6 +27,7 @@ function makeDescriptor(overrides: {
   name?: string | null;
   currentBranch?: string | null;
   diffStat?: { additions: number; deletions: number } | null;
+  status?: WorkspaceDescriptorPayload["status"];
 }): WorkspaceDescriptorPayload {
   return {
     id: overrides.id,
@@ -38,6 +39,7 @@ function makeDescriptor(overrides: {
       ? { gitRuntime: { currentBranch: overrides.currentBranch } }
       : {}),
     diffStat: overrides.diffStat ?? null,
+    status: overrides.status ?? "done",
   } as unknown as WorkspaceDescriptorPayload;
 }
 
@@ -52,6 +54,7 @@ function flushMicrotasks(): Promise<void> {
 function buildHarness(opts: { emitCwdRejects?: boolean } = {}) {
   const listeners = new Map<string, WorkspaceGitListener>();
   const registerCalls: string[] = [];
+  const observationCalls: Array<{ cwd: string; observeWorkingTree: boolean }> = [];
   const unsubscribeCalls: string[] = [];
   const emitCwdCalls: string[] = [];
   const statusCalls: Array<{ cwd: string; branch: string | null }> = [];
@@ -59,13 +62,14 @@ function buildHarness(opts: { emitCwdRejects?: boolean } = {}) {
   const warnCalls: unknown[][] = [];
 
   const workspaceGitService: Pick<WorkspaceGitService, "registerWorkspace"> = {
-    registerWorkspace({ cwd }, listener) {
+    registerWorkspace({ cwd, observeWorkingTree }, listener) {
       registerCalls.push(cwd);
+      observationCalls.push({ cwd, observeWorkingTree: observeWorkingTree !== false });
       listeners.set(cwd, listener);
       return {
         unsubscribe() {
           unsubscribeCalls.push(cwd);
-          listeners.delete(cwd);
+          if (listeners.get(cwd) === listener) listeners.delete(cwd);
         },
       };
     },
@@ -100,6 +104,7 @@ function buildHarness(opts: { emitCwdRejects?: boolean } = {}) {
     service,
     emitSnapshot,
     registerCalls,
+    observationCalls,
     unsubscribeCalls,
     emitCwdCalls,
     statusCalls,
@@ -109,6 +114,38 @@ function buildHarness(opts: { emitCwdRejects?: boolean } = {}) {
 }
 
 describe("syncObservers", () => {
+  afterEach(() => vi.useRealTimers());
+
+  test("keeps dormant sidebar workspaces on metadata observation only", () => {
+    const h = buildHarness();
+    h.service.syncObservers([
+      makeDescriptor({ id: "ws1", workspaceDirectory: WS1 }),
+      makeDescriptor({ id: "ws2", workspaceDirectory: WS2, status: "running" }),
+    ]);
+    expect(h.observationCalls).toEqual([
+      { cwd: WS1, observeWorkingTree: false },
+      { cwd: WS2, observeWorkingTree: true },
+    ]);
+    h.service.dispose();
+  });
+
+  test("resumes a focused checkout and suspends it after the idle grace", async () => {
+    vi.useFakeTimers();
+    const h = buildHarness();
+    h.service.syncObservers([makeDescriptor({ id: "ws1", workspaceDirectory: WS1 })]);
+    h.service.setFocusedDirectories([WS1]);
+    h.service.setFocusedDirectories([]);
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(h.observationCalls).toEqual([
+      { cwd: WS1, observeWorkingTree: false },
+      { cwd: WS1, observeWorkingTree: true },
+    ]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(h.observationCalls.at(-1)).toEqual({ cwd: WS1, observeWorkingTree: false });
+    h.emitSnapshot(WS1, "still-observes-metadata");
+    expect(h.branchChanges).toEqual([["ws1", null, "still-observes-metadata"]]);
+    h.service.dispose();
+  });
   test("registers a WorkspaceGitService subscription for a git workspace", () => {
     const h = buildHarness();
     h.service.syncObservers([makeDescriptor({ id: "ws1", workspaceDirectory: WS1 })]);

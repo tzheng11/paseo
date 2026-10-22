@@ -163,6 +163,7 @@ import { resolvePaseoToolPolicy } from "./agent/paseo-tool-policy.js";
 import { BrowserToolsBroker } from "./browser-tools/broker.js";
 import { DaemonConfigBrowserToolsPolicy } from "./browser-tools/policy.js";
 import { WorkspaceGitServiceImpl } from "./workspace-git-service.js";
+import { observeActiveWorkspaceGit } from "./active-workspace-git-observer.js";
 import { resolveWorkspaceIdForPath } from "./resolve-workspace-id-for-path.js";
 import {
   archiveByScope,
@@ -992,6 +993,10 @@ export async function createPaseoDaemon(
     resolvePaseoToolPolicy: (provider) =>
       resolvePaseoToolPolicy(provider, daemonConfigStore.get().providers),
     logger,
+  });
+  const stopActiveWorkspaceGitObservation = observeActiveWorkspaceGit({
+    agentManager,
+    workspaceGitService,
   });
   daemonConfigStore.onFieldChange("idleUnloadAfterMinutes", (value) => {
     agentManager.setIdleUnloadAfterMinutes(typeof value === "number" ? value : 120);
@@ -1845,6 +1850,7 @@ export async function createPaseoDaemon(
       speechService.start();
       scriptHealthMonitor.start();
     } catch (error) {
+      stopActiveWorkspaceGitObservation();
       timelineStore.close();
       localCredential = null;
       await deleteLocalCredential(config.paseoHome);
@@ -1875,6 +1881,7 @@ export async function createPaseoDaemon(
     wsServer?.prepareForShutdown();
     await wsServer?.agentMessages.close();
     agentManager.prepareForShutdown();
+    stopActiveWorkspaceGitObservation();
     await closeAllAgents(logger, agentManager);
     await withTimeout({
       promise: pluginRuntime.drainEvents(),

@@ -814,6 +814,7 @@ export class Session {
   private readonly unsubscribeSetupObservation: () => void;
   private readonly workspaceSetupRuntime: WorkspaceSetupRuntime;
   private readonly workspaceGitObserver: WorkspaceGitObserverService;
+  private focusedGitObservationGeneration = 0;
   private readonly workspaceDirectory: WorkspaceDirectory;
   private readonly voiceSessions: VoiceSessions;
   private readonly checkoutSession: CheckoutSession;
@@ -1338,6 +1339,7 @@ export class Session {
       .catch((err) => this.sessionLogger.error({ err }, "Failed to release source subscriptions"));
     this.clientSources.delete(source);
     this.refreshObservationProducers();
+    this.refreshFocusedGitObservation();
   }
 
   private subscribeAgentTimelines(agentIds: string[]): OwnedSubscription {
@@ -5237,12 +5239,47 @@ export class Session {
       appVisible: msg.appVisible,
       appVisibilityChangedAt,
     };
+    this.refreshFocusedGitObservation();
     if (msg.appVisible && focusedTerminalId) {
       void this.clearFocusedTerminalAttention(focusedTerminalId);
     }
     if (metadata.pushToken) {
       this.pushNotifications.renew(metadata.pushToken);
     }
+  }
+
+  private refreshFocusedGitObservation(): void {
+    const generation = ++this.focusedGitObservationGeneration;
+    const activities = [...this.clientSources.values()]
+      .map((source) => source.activity)
+      .filter((activity) => activity?.appVisible);
+    void Promise.all(
+      activities.map(async (activity) => {
+        const terminal = activity?.focusedTerminalId
+          ? this.terminalManager?.getTerminal(activity.focusedTerminalId)
+          : null;
+        if (terminal) {
+          const workspace = await this.workspaceRegistry.get(terminal.workspaceId);
+          return workspace?.cwd ?? terminal.cwd;
+        }
+        if (!activity?.focusedAgentId) return null;
+        const agent =
+          this.agentManager.getAgent(activity.focusedAgentId) ??
+          (await this.agentStorage.get(activity.focusedAgentId));
+        return agent && !("archivedAt" in agent && agent.archivedAt) ? agent.cwd : null;
+      }),
+    )
+      .then((cwds) => {
+        if (!this.isCleanedUp && generation === this.focusedGitObservationGeneration) {
+          this.workspaceGitObserver.setFocusedDirectories(
+            cwds.filter((cwd): cwd is string => cwd !== null),
+          );
+        }
+        return null;
+      })
+      .catch((error) => {
+        this.sessionLogger.warn({ err: error }, "Failed to resolve foreground Git observation");
+      });
   }
 
   private async clearFocusedTerminalAttention(terminalId: string): Promise<void> {
