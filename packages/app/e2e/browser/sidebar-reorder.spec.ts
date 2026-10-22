@@ -857,6 +857,9 @@ test("cross-section leaves wait for ACKs and whole cross-host subtrees move hidd
     expect(moves).toHaveLength(1);
     expect(JSON.parse(moves[0]).message).toEqual({
       type: "workspace.move.request",
+      requestId: expect.stringMatching(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+      ),
       workspaceId: remote.workspaceId,
       parentWorkspaceId: null,
       beforeWorkspaceId: ordinaryAnchor,
