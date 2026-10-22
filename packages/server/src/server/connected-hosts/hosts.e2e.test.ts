@@ -1629,19 +1629,7 @@ test(
     // An idle recipient must not report old idle as completion of its queued task.
     expect((await destination.client.waitForFinish(child.id, 50)).status).toBe("timeout");
     await childStarted.promise;
-    const report = await childMcp.callTool({
-      name: "send_agent_prompt",
-      arguments: {
-        serverId: aId,
-        agentId: parent.id,
-        prompt: "REMOTE_REPORT <ready>",
-        notifyOnFinish: false,
-      },
-    });
-    expect(report.isError).not.toBe(true);
-    expect(report.structuredContent).toMatchObject({ deliveryStatus: "queued", serverId: aId });
-    expect(parentPrompts).toEqual([]);
-
+    // CLI startup can exceed the quiet window; admit its report before the fast MCP send.
     const cli = await promisify(execFile)(
       process.execPath,
       [
@@ -1664,6 +1652,19 @@ test(
     );
     expect(JSON.parse(cli.stdout)).toMatchObject({ status: "queued" });
     expect(parentPrompts).toEqual([]);
+    const report = await childMcp.callTool({
+      name: "send_agent_prompt",
+      arguments: {
+        serverId: aId,
+        agentId: parent.id,
+        prompt: "REMOTE_REPORT <ready>",
+        notifyOnFinish: false,
+      },
+    });
+    expect(report.isError).not.toBe(true);
+    expect(report.structuredContent).toMatchObject({ deliveryStatus: "queued", serverId: aId });
+    expect(parentPrompts).toEqual([]);
+
     const receiptStates = async () => {
       const directory = join(a.paseoHome, "agent-requests");
       const receipts = await Promise.all(
@@ -1693,11 +1694,12 @@ test(
     expect(
       messages.map((message) => [message.event, message.sender.id, message.sender.serverId]),
     ).toEqual([
-      ["message", child.id, bId],
       ["message", parent.id, undefined],
+      ["message", child.id, bId],
       ["finished", child.id, bId],
     ]);
-    expect(messages[0]!.text).toBe("REMOTE_REPORT <ready>");
+    expect(messages[0]!.text).toBe("LOCAL_CLI_REPORT");
+    expect(messages[1]!.text).toBe("REMOTE_REPORT <ready>");
     expect(timeline.entries.filter((row) => row.item.type === "user_message")).toEqual([]);
 
     const human = await aWorkspace.agents.create({
