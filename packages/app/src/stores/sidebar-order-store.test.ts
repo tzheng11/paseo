@@ -169,12 +169,19 @@ describe("migrateSidebarOrderState", () => {
       release();
       await pending;
       expect(complete).toBe(true);
+      const beforeFailure = useSidebarOrderStore.getState();
       spy.mockRejectedValueOnce(new Error("Storage unavailable"));
       await expect(
         useSidebarOrderStore
           .getState()
           .setPinnedWorkspaceTree({}, { section: "superpinned", keys: ["two:b"] }),
       ).rejects.toThrow("Storage unavailable");
+      expect(useSidebarOrderStore.getState().pinnedWorkspaceTree).toBe(
+        beforeFailure.pinnedWorkspaceTree,
+      );
+      expect(useSidebarOrderStore.getState().superpinnedWorkspaceOrder).toBe(
+        beforeFailure.superpinnedWorkspaceOrder,
+      );
     } finally {
       spy.mockRestore();
     }
