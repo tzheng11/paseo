@@ -1,15 +1,81 @@
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 
 import {
   areEquivalentPaths,
   createPathEquivalenceMatcher,
   createLexicalWatchPathFilter,
+  createRealpathAwarePathBatch,
   getRealpathAwareRelativePath,
   isPathInsideRoot,
 } from "./path.js";
+
+describe("batch-scoped realpath resolution", () => {
+  test("shares existing and deleted path resolutions across matching and containment", () => {
+    const directory = mkdtempSync(join(tmpdir(), "paseo-path-batch-"));
+    const existing = join(directory, "existing");
+    const deleted = join(directory, "deleted");
+    mkdirSync(existing);
+    const native = vi.spyOn(realpathSync, "native");
+    try {
+      const batch = createRealpathAwarePathBatch();
+      const matches = batch.createMatcher(existing);
+      for (let index = 0; index < 5; index += 1) {
+        expect(matches(existing)).toBe(true);
+        expect(batch.relativePath(directory, existing)).toBe("existing");
+        expect(batch.relativePath(directory, deleted)).toBe("deleted");
+        expect(batch.relativePath(existing, deleted)).toBeNull();
+      }
+      expect(native).toHaveBeenCalledTimes(3);
+    } finally {
+      native.mockRestore();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "a new batch observes retargeted symlinks and paths created after a miss",
+    () => {
+      const directory = mkdtempSync(join(tmpdir(), "paseo-path-batch-"));
+      try {
+        const first = join(directory, "first");
+        const second = join(directory, "second");
+        const alias = join(directory, "alias");
+        mkdirSync(first);
+        mkdirSync(second);
+        mkdirSync(join(first, "nested"));
+        mkdirSync(join(second, "nested"));
+        symlinkSync(first, alias, "dir");
+        const before = createRealpathAwarePathBatch();
+        expect(before.relativePath(alias, join(first, "nested"))).toBe("nested");
+        expect(before.relativePath(second, join(alias, "created"))).toBeNull();
+
+        rmSync(alias);
+        symlinkSync(second, alias, "dir");
+        writeFileSync(join(alias, "created"), "created after the first batch");
+        const after = createRealpathAwarePathBatch();
+        expect(after.relativePath(alias, join(second, "nested"))).toBe("nested");
+        expect(after.relativePath(alias, join(first, "nested"))).toBeNull();
+        expect(after.relativePath(second, join(alias, "created"))).toBe("created");
+        expect(after.createMatcher(second)(alias)).toBe(true);
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("preserves Windows suffix casing and containment boundaries within a batch", () => {
+    const batch = createRealpathAwarePathBatch();
+    expect(batch.relativePath("C:\\Repo\\.git", "c:/repo/.git/refs/heads/FeatureCase")).toBe(
+      "refs\\heads\\FeatureCase",
+    );
+    expect(batch.relativePath("C:\\Repo", "c:/repo-other/index")).toBeNull();
+    expect(batch.relativePath("C:\\Repo", "c:/repo/../outside/index")).toBeNull();
+    expect(batch.createMatcher(String.raw`\\?\C:\Repo`)("c:/REPO")).toBe(true);
+  });
+});
 
 describe("lexical watcher filtering", () => {
   test("filters a dependency burst against many ignored roots and retains a tracked edit", () => {

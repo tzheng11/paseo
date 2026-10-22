@@ -1,4 +1,6 @@
 import path from "node:path";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import type pino from "pino";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -1045,6 +1047,145 @@ describe("WorkspaceGitService checkout observation", () => {
 
     subscription.unsubscribe();
     service.dispose();
+  });
+
+  test("resolves metadata batch paths once across 135 worktrees and 256 deleted events", async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "paseo-metadata-batch-"));
+    const commonGitDir = path.join(directory, "repository.git");
+    const worktrees = Array.from({ length: 135 }, (_, index) =>
+      path.join(directory, `worktree-${index}`),
+    );
+    for (const cwd of worktrees) {
+      const privateGitDir = path.join(commonGitDir, "worktrees", path.basename(cwd));
+      mkdirSync(privateGitDir, { recursive: true });
+      writeFileSync(path.join(privateGitDir, "commondir"), "../..\n");
+      mkdirSync(cwd);
+    }
+    const watcher = createWatcherHarness();
+    const getCheckoutStatus = vi.fn(async (cwd: string) => createCheckoutStatus(cwd));
+    const service = createService(watcher, {
+      getCheckoutStatus,
+      getCheckoutSnapshotFacts: vi.fn(
+        async (cwd: string): Promise<CheckoutSnapshotFacts> => ({
+          ...createCheckoutFacts(cwd),
+          absoluteGitDir: path.join(commonGitDir, "worktrees", path.basename(cwd)),
+          gitCommonDir: commonGitDir,
+        }),
+      ),
+      resolveAbsoluteGitDir: vi.fn(async (cwd: string) =>
+        path.join(commonGitDir, "worktrees", path.basename(cwd)),
+      ),
+      runGitCommand: vi.fn(async (args: string[], options: { cwd: string }) => ({
+        stdout: args[0] === "rev-parse" ? `${options.cwd}\n` : "",
+        stderr: "",
+        truncated: false,
+        exitCode: 0,
+        signal: null,
+      })),
+    });
+    const subscriptions = worktrees.map((cwd) => service.registerWorkspace({ cwd }, vi.fn()));
+    try {
+      await vi.waitFor(() => {
+        expect(service.getMetrics()).toMatchObject({
+          repositoryTargetCount: 1,
+          repositoryWorkspaceLinkCount: 135,
+          workspaceObservationSetupInFlightCount: 0,
+          workspaceRefreshInFlightCount: 0,
+        });
+      });
+      const repoWatcher = getWatcherRecordsForDirectory(watcher, commonGitDir)[0]!;
+      const events: WatchEvent[] = Array.from({ length: 256 }, (_, index) => ({
+        path: path.join(
+          commonGitDir,
+          "worktrees",
+          path.basename(worktrees[index % worktrees.length]!),
+          index < worktrees.length ? "index" : "config.worktree",
+        ),
+        type: "delete",
+      }));
+      getCheckoutStatus.mockClear();
+      const nativeRealpath = vi.spyOn(realpathSync, "native");
+      let resolutionCalls: number;
+      let callbackMs: number;
+      try {
+        const startedAt = vi.getRealSystemTime();
+        repoWatcher.callback(null, events);
+        callbackMs = vi.getRealSystemTime() - startedAt;
+        resolutionCalls = nativeRealpath.mock.calls.length;
+      } finally {
+        nativeRealpath.mockRestore();
+      }
+      process.stdout.write(
+        `metadata batch resolution ${JSON.stringify({
+          worktrees: worktrees.length,
+          events: events.length,
+          resolutionCalls,
+          callbackMs,
+        })}\n`,
+      );
+      // Filesystem work must scale with distinct roots and event paths, even
+      // though routing still compares each event with the relevant worktrees.
+      expect(resolutionCalls).toBeLessThanOrEqual(2 * (worktrees.length + events.length + 1));
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.waitFor(() => {
+        expect(new Set(getCalledCwds(getCheckoutStatus))).toEqual(new Set(worktrees));
+      });
+    } finally {
+      for (const subscription of subscriptions) subscription.unsubscribe();
+      await service.dispose();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("private config metadata refreshes only its owner's ignore rules", async () => {
+    const watcher = createWatcherHarness();
+    const runGitCommand = vi.fn(async (args: string[], options: { cwd: string }) => ({
+      stdout: args[0] === "rev-parse" ? `${options.cwd}\n` : "",
+      stderr: "",
+      truncated: false,
+      exitCode: 0,
+      signal: null,
+    }));
+    const service = createService(watcher, {
+      getCheckoutSnapshotFacts: vi.fn(async (cwd: string) => createLinkedCheckoutFacts(cwd)),
+      runGitCommand,
+    });
+    const subscriptions = [WORKTREE_A, WORKTREE_B].map((cwd) =>
+      service.registerWorkspace({ cwd }, vi.fn()),
+    );
+    try {
+      await vi.waitFor(() => {
+        expect(service.getMetrics()).toMatchObject({
+          repositoryWorkspaceLinkCount: 2,
+          workspaceObservationSetupInFlightCount: 0,
+          workspaceRefreshInFlightCount: 0,
+        });
+      });
+      const repoWatcher = getWatcherRecordsForDirectory(watcher, GIT_DIR)[0]!;
+      const ignoreRefreshes = () =>
+        new Set(
+          runGitCommand.mock.calls
+            .filter(([args]) => args[0] === "ls-files")
+            .map(([, options]) => options.cwd),
+        );
+      runGitCommand.mockClear();
+      repoWatcher.callback(null, [
+        {
+          path: path.join(createLinkedCheckoutFacts(WORKTREE_A).absoluteGitDir, "config.worktree"),
+          type: "delete",
+        },
+      ]);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.waitFor(() => expect(ignoreRefreshes()).toEqual(new Set([WORKTREE_A])));
+
+      runGitCommand.mockClear();
+      repoWatcher.callback(null, [{ path: path.join(GIT_DIR, "config"), type: "update" }]);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.waitFor(() => expect(ignoreRefreshes()).toEqual(new Set([WORKTREE_A, WORKTREE_B])));
+    } finally {
+      for (const subscription of subscriptions) subscription.unsubscribe();
+      await service.dispose();
+    }
   });
 
   test("routes private worktree metadata to its owner and shared base refs to dependents", async () => {
