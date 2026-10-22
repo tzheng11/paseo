@@ -18,6 +18,7 @@ function nativeHistoryFixture(
     rollout_ordinal INTEGER, updated_at_ordinal INTEGER, item_type TEXT, item_json TEXT);
     CREATE INDEX history_order ON thread_items(thread_id, rollout_ordinal);`);
   const insert = db.prepare("INSERT INTO thread_items VALUES ('thread', ?, ?, ?, ?, ?, ?)");
+  db.exec("BEGIN");
   for (const [index, item] of items.entries())
     insert.run(
       item.turnId,
@@ -27,6 +28,7 @@ function nativeHistoryFixture(
       item.type ?? "agentMessage",
       JSON.stringify(item),
     );
+  db.exec("COMMIT");
   db.close();
   const pages: string[][] = [];
   const request = vi.fn(async (method: string, raw: unknown) => {

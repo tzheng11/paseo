@@ -2,8 +2,24 @@ import { mkdtempSync, rmSync } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import { readCodexHistoryIndex } from "./history-index.js";
+
+const controlled = vi.hoisted(() => ({ workers: [] as import("node:events").EventEmitter[] }));
+vi.mock("node:worker_threads", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:worker_threads")>();
+  const { EventEmitter } = await import("node:events");
+  return {
+    ...actual,
+    Worker: vi.fn(function (file: URL, options: import("node:worker_threads").WorkerOptions) {
+      const data = options.workerData as { databasePath?: string } | undefined;
+      if (!data?.databasePath?.startsWith("controlled:")) return new actual.Worker(file, options);
+      const worker = new EventEmitter();
+      controlled.workers.push(worker);
+      return worker;
+    }),
+  };
+});
 
 const directories: string[] = [];
 afterEach(() => {
@@ -180,3 +196,114 @@ test.each([false, true])(
     expect(JSON.stringify(result)).not.toContain("invalid JSON");
   },
 );
+
+test("holds metadata admission through successful replies and asynchronous errors until worker exit", async () => {
+  controlled.workers.length = 0;
+  const reads = Array.from({ length: 3 }, (_, index) =>
+    readCodexHistoryIndex({
+      databasePath: `controlled:${index}`,
+      threadId: "thread",
+      operation: "messages",
+    }),
+  );
+  for (const read of reads) void read.catch(() => undefined);
+  const settled = [false, false, false];
+  reads.forEach(
+    (read, index) =>
+      void read.then(
+        () => {
+          settled[index] = true;
+          return undefined;
+        },
+        () => {
+          settled[index] = true;
+          return undefined;
+        },
+      ),
+  );
+  const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
+  const result = {
+    totalEvents: 0,
+    totalBytes: 0,
+    version: "empty",
+    payloadsDecoded: 0,
+    userMessages: [],
+    asyncQuestionIds: [],
+    messages: [],
+  };
+  try {
+    await turn();
+    expect(controlled.workers).toHaveLength(2);
+    controlled.workers[0].emit("message", { ok: true, result });
+    controlled.workers[1].emit("error", new Error("worker cleanup failed"));
+    await turn();
+    expect(settled).toEqual([false, false, false]);
+    expect(controlled.workers).toHaveLength(2);
+    controlled.workers[0].emit("exit", 0);
+    expect(await reads[0]).toEqual(result);
+    await turn();
+    expect(controlled.workers).toHaveLength(3);
+    expect(settled[1]).toBe(false);
+    controlled.workers[1].emit("exit", 1);
+    await expect(reads[1]).rejects.toThrow("worker cleanup failed");
+    controlled.workers[2].emit("message", { ok: true, result });
+    controlled.workers[2].emit("exit", 0);
+    await expect(reads[2]).resolves.toEqual(result);
+  } finally {
+    // Release every controlled worker, including requests still waiting for admission after a failed assertion.
+    for (let index = 0; index < 3; index++) {
+      for (const worker of controlled.workers) worker.emit("exit", 0);
+      await turn();
+    }
+    await Promise.allSettled(reads);
+  }
+});
+
+test.each([true, false])(
+  "rejects nonzero metadata worker exit even after a reply (reply: %s)",
+  async (reply) => {
+    controlled.workers.length = 0;
+    const read = readCodexHistoryIndex({
+      databasePath: "controlled:nonzero",
+      threadId: "thread",
+      operation: "messages",
+    });
+    void read.catch(() => undefined);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    if (reply) controlled.workers[0].emit("message", { ok: true, result: { totalEvents: 0 } });
+    controlled.workers[0].emit("exit", 1);
+    await expect(read).rejects.toThrow(/worker.*\(1\)/);
+  },
+);
+
+test("rejects a clean metadata worker exit without a reply", async () => {
+  controlled.workers.length = 0;
+  const read = readCodexHistoryIndex({
+    databasePath: "controlled:no-reply",
+    threadId: "thread",
+    operation: "messages",
+  });
+  void read.catch(() => undefined);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  controlled.workers[0].emit("exit", 0);
+  await expect(read).rejects.toThrow(/before replying/);
+});
+
+test("holds a failed metadata reply until worker exit", async () => {
+  controlled.workers.length = 0;
+  let settled = false;
+  const read = readCodexHistoryIndex({
+    databasePath: "controlled:failed-reply",
+    threadId: "thread",
+    operation: "messages",
+  });
+  void read.catch(() => {
+    settled = true;
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  controlled.workers[0].emit("message", { ok: false, errorName: "RangeError" });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  expect(settled).toBe(false);
+  controlled.workers[0].emit("exit", 0);
+  await expect(read).rejects.toThrow("Native history index read failed (RangeError)");
+});
