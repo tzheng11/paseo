@@ -1,4 +1,4 @@
-import { expect, type Locator, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 import { daemonWsRoutePattern } from "./daemon-port";
 
 type WebSocketMessage = string | Buffer;
@@ -13,6 +13,26 @@ interface SurfaceRect {
 interface LayoutObservation {
   active: boolean;
   layoutShift: number;
+  startedAtMs: number;
+  stoppedAtMs: number | null;
+  layoutShiftEntryCount: number;
+  layoutShiftEntries: Array<{
+    startedAtMs: number;
+    value: number;
+    hadRecentInput: boolean;
+    sources: Array<{
+      nodeName: string | null;
+      inCommandCenter: boolean;
+      ancestry: Array<{
+        tag: string;
+        testId: string | null;
+        role: string | null;
+        label: string | null;
+      }>;
+      previousRect: SurfaceRect;
+      currentRect: SurfaceRect;
+    }>;
+  }>;
   samples: Record<string, SurfaceRect[]>;
 }
 
@@ -93,7 +113,15 @@ export async function failDirectorySuggestionRequests(page: Page): Promise<void>
 export async function startCommandCenterLayoutObservation(page: Page): Promise<void> {
   await page.evaluate((selectors) => {
     const oracleWindow = window as LayoutOracleWindow;
-    const observation: LayoutObservation = { active: true, layoutShift: 0, samples: {} };
+    const observation: LayoutObservation = {
+      active: true,
+      layoutShift: 0,
+      startedAtMs: performance.now(),
+      stoppedAtMs: null,
+      layoutShiftEntryCount: 0,
+      layoutShiftEntries: [],
+      samples: {},
+    };
     oracleWindow.__commandCenterLayoutObservation = observation;
 
     const observedElements = new WeakSet<Element>();
@@ -143,7 +171,57 @@ export async function startCommandCenterLayoutObservation(page: Page): Promise<v
       try {
         const performanceObserver = new PerformanceObserver((list) => {
           for (const entry of list.getEntries()) {
-            observation.layoutShift += (entry as PerformanceEntry & { value?: number }).value ?? 0;
+            const shift = entry as PerformanceEntry & {
+              value?: number;
+              hadRecentInput?: boolean;
+              sources?: Array<{
+                node?: Node;
+                previousRect: DOMRectReadOnly;
+                currentRect: DOMRectReadOnly;
+              }>;
+            };
+            const value = shift.value ?? 0;
+            observation.layoutShift += value;
+            observation.layoutShiftEntryCount++;
+            // Retain attribution without changing the existing page-wide score or threshold.
+            if (observation.layoutShiftEntries.length >= 20) continue;
+            observation.layoutShiftEntries.push({
+              startedAtMs: entry.startTime,
+              value,
+              hadRecentInput: shift.hadRecentInput === true,
+              sources: (shift.sources ?? []).slice(0, 5).map((source) => {
+                const element =
+                  source.node instanceof Element ? source.node : source.node?.parentElement;
+                const ancestry = [];
+                for (
+                  let current = element;
+                  current && ancestry.length < 6;
+                  current = current.parentElement
+                ) {
+                  ancestry.push({
+                    tag: current.tagName.toLowerCase(),
+                    testId: current.getAttribute("data-testid"),
+                    role: current.getAttribute("role"),
+                    label: current.getAttribute("aria-label")?.slice(0, 120) ?? null,
+                  });
+                }
+                const rect = ({ x, y, width, height }: DOMRectReadOnly): SurfaceRect => ({
+                  x,
+                  y,
+                  width,
+                  height,
+                });
+                return {
+                  nodeName: source.node?.nodeName ?? null,
+                  inCommandCenter: Boolean(
+                    element?.closest('[data-testid="command-center-panel"]'),
+                  ),
+                  ancestry,
+                  previousRect: rect(source.previousRect),
+                  currentRect: rect(source.currentRect),
+                };
+              }),
+            });
           }
         });
         performanceObserver.observe({ type: "layout-shift", buffered: false });
@@ -160,7 +238,13 @@ export async function expectStableCommandCenterLayout(page: Page): Promise<void>
     const state = (window as LayoutOracleWindow).__commandCenterLayoutObservation;
     if (!state) throw new Error("Command center layout observer was not installed");
     state.active = false;
+    state.stoppedAtMs = performance.now();
     return state;
+  });
+
+  await test.info().attach("command-center-layout", {
+    body: JSON.stringify(observation, null, 2),
+    contentType: "application/json",
   });
 
   for (const surface of Object.keys(SURFACE_SELECTORS)) {
