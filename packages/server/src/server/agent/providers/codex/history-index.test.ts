@@ -134,3 +134,49 @@ test.each(["UTF-8", "UTF-16le"] as const)(
     expect(page.nextCursor).toBe(7);
   },
 );
+
+test.each([false, true])(
+  "selects message metadata in one ordered pass with global positions and tool anchors (user-only: %s)",
+  async (userOnly) => {
+    const source = fixture();
+    const db = new DatabaseSync(source.databasePath);
+    db.exec("DELETE FROM thread_items WHERE thread_id = 'thread'");
+    const insert = db.prepare("INSERT INTO thread_items VALUES (?, ?, ?, ?, ?, ?, ?)");
+    const types = [
+      "mcpToolCall",
+      "userMessage",
+      "agentMessage",
+      "mcpToolCall",
+      "mcpToolCall",
+      "userMessage",
+      "agentMessage",
+    ];
+    const turns = ["first", "first", "first", "second", "first", "first", "second"];
+    for (const [index, type] of types.entries())
+      insert.run(
+        "thread",
+        turns[index],
+        String(index),
+        index * 3 + 1,
+        index * 3 + 1,
+        type,
+        index === 4 ? "invalid JSON".repeat(10000) : "🧪\0",
+      );
+    db.close();
+    const result = await readCodexHistoryIndex({ ...source, operation: "messages", userOnly });
+    const expected = userOnly ? [1, 5] : [1, 2, 5, 6];
+    expect(result.messages?.map((ref) => ref.index)).toEqual(expected);
+    expect(result.messages?.map((ref) => ref.previousItemId)).toEqual(
+      userOnly ? ["0", "4"] : ["0", "1", "4", "3"],
+    );
+    expect(result.messages?.map((ref) => ref.ordinal)).toEqual(
+      expected.map((index) => index * 3 + 1),
+    );
+    expect(result.messages?.map((ref) => ref.messageType)).toEqual(
+      expected.map((index) => types[index]),
+    );
+    expect(result.totalEvents).toBe(7);
+    expect(result.payloadsDecoded).toBe(0);
+    expect(JSON.stringify(result)).not.toContain("invalid JSON");
+  },
+);

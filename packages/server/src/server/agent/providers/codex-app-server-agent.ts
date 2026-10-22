@@ -27,6 +27,7 @@ import {
   type SteerResult,
   type AgentSlashCommand,
   type AgentStreamEvent,
+  type AgentHistoryStreamOptions,
   type AgentTimelineItem,
   type ToolCallTimelineItem,
   type AgentUsage,
@@ -4926,9 +4927,9 @@ export class CodexAppServerAgentSession implements AgentSession {
     }
   }
 
-  async *streamHistoryEntries(options?: {
-    messagesOnly?: boolean;
-  }): AsyncGenerator<HistoryWindowEntry<AgentStreamEvent>> {
+  async *streamHistoryEntries(
+    options?: AgentHistoryStreamOptions,
+  ): AsyncGenerator<HistoryWindowEntry<AgentStreamEvent>> {
     await this.ensureDeferredHistory();
     if (this.nativeHistorySource) {
       const owned = await this.createHistoryReader();

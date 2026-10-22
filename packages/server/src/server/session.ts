@@ -8319,7 +8319,7 @@ export class Session {
         logger: this.sessionLogger,
       });
       const rows = msg.includeProviderHistory
-        ? this.agentManager.streamFullHistoryMessages(msg.agentId)
+        ? this.agentManager.streamFullHistoryMessages(msg.agentId, { userOnly: true })
         : this.agentManager.streamTimelineRows(msg.agentId);
       const epoch = this.agentManager.getTimelineEpoch(msg.agentId);
       const index = await streamTimelinePromptIndex(epoch, rows);

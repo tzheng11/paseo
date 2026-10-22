@@ -673,6 +673,12 @@ export interface AgentUsageSession {
   sessionKey: string;
 }
 
+/** Internal read selection; provider positions still count every history item. */
+export interface AgentHistoryStreamOptions {
+  messagesOnly?: boolean;
+  userMessagesOnly?: boolean;
+}
+
 export interface AgentSession {
   usageSession?(): AgentUsageSession | null;
   readonly provider: AgentProvider;
@@ -701,9 +707,9 @@ export interface AgentSession {
   }): Promise<HistoryPage<AgentStreamEvent>>;
   streamAllHistory?(): AsyncGenerator<AgentStreamEvent>;
   /** Provider positions, separate from live stream sequences. Explicit full consumer. */
-  streamHistoryEntries?(options?: {
-    messagesOnly?: boolean;
-  }): AsyncGenerator<HistoryWindowEntry<AgentStreamEvent>>;
+  streamHistoryEntries?(
+    options?: AgentHistoryStreamOptions,
+  ): AsyncGenerator<HistoryWindowEntry<AgentStreamEvent>>;
   getRuntimeInfo(): Promise<AgentRuntimeInfo>;
   getAvailableModes(): Promise<AgentMode[]>;
   getCurrentMode(): Promise<string | null>;

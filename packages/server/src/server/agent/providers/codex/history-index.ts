@@ -10,6 +10,9 @@ export interface CodexHistoryItemReference {
   index: number;
   bytes: number;
 }
+export interface CodexHistoryMessageReference extends CodexHistoryItemReference {
+  messageType: "userMessage" | "agentMessage";
+}
 export interface CodexHistoryIndexResult {
   totalEvents: number;
   totalBytes: number;
@@ -21,6 +24,7 @@ export interface CodexHistoryIndexResult {
   tail?: CodexHistoryItemReference[];
   gap?: { startIndex: number; endIndex: number; count: number; bytes: number } | null;
   entries?: CodexHistoryItemReference[];
+  messages?: CodexHistoryMessageReference[];
   oversized?: Array<{ index: number; bytes: number }>;
   nextCursor?: number | null;
 }
@@ -29,6 +33,7 @@ export type CodexHistoryIndexRequest = {
   threadId: string;
   retainedItemIds?: string[];
 } & (
+  | { operation: "messages"; userOnly?: boolean }
   | { operation: "windows"; head: HistoryReadLimit; tail: HistoryReadLimit }
   | { operation: "page"; cursor: number; direction: "before" | "after"; limit: HistoryReadLimit }
 );

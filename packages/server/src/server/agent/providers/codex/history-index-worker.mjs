@@ -121,6 +121,35 @@ try {
     }
     const next = backwards ? cursor - visited : cursor + visited;
     selection = { entries: refs, oversized, nextCursor: next <= 0 || next >= count ? null : next };
+  } else if (workerData.operation === "messages") {
+    // One metadata pass preserves global positions and exact per-turn anchors.
+    // Do not load item_json, collect tool references, or repeat OFFSET scans.
+    const messages = [];
+    const previousByTurn = new Map();
+    let index = 0;
+    for (const row of db
+      .prepare(`SELECT item_id AS itemId, turn_id AS turnId,
+      rollout_ordinal AS ordinal, octet_length(item_json) AS bytes, item_type AS messageType
+      FROM thread_items WHERE thread_id = ? ORDER BY rollout_ordinal`)
+      .iterate(thread)) {
+      if (
+        row.messageType === "userMessage" ||
+        (!workerData.userOnly && row.messageType === "agentMessage")
+      ) {
+        messages.push({
+          itemId: String(row.itemId),
+          turnId: String(row.turnId),
+          ordinal: Number(row.ordinal),
+          bytes: Number(row.bytes),
+          index,
+          previousItemId: previousByTurn.get(row.turnId) ?? null,
+          messageType: row.messageType,
+        });
+      }
+      previousByTurn.set(row.turnId, String(row.itemId));
+      index++;
+    }
+    selection = { messages };
   } else throw new RangeError("Unknown history operation");
   const userMessages = db
     .prepare(`SELECT item_id AS messageId, turn_id AS turnId

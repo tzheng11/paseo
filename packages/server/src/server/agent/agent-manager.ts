@@ -75,6 +75,7 @@ import {
   type AgentSessionConfig,
   type SteerResult,
   type AgentStreamEvent,
+  type AgentHistoryStreamOptions,
   type AgentTimelineItem,
   type AgentUsage,
   type AgentRuntimeInfo,
@@ -859,6 +860,16 @@ export interface RetiredInternalAgent {
   lastMessage: string | null;
 }
 
+function matchesHistorySelection(
+  item: AgentTimelineItem,
+  options?: AgentHistoryStreamOptions,
+): boolean {
+  if (options?.userMessagesOnly) return item.type === "user_message";
+  return (
+    !options?.messagesOnly || item.type === "user_message" || item.type === "assistant_message"
+  );
+}
+
 export class AgentManager {
   private readonly reloadOperations?: ReloadOperationStore;
   private readonly recoveryMessages?: Pick<MessageReceipts, "send">;
@@ -1552,13 +1563,19 @@ export class AgentManager {
   }
 
   /** Search and prompt indexing explicitly traverse the unloaded provider middle. */
-  async *streamFullHistoryMessages(id: string): AsyncGenerator<AgentTimelineRow> {
-    yield* this.streamFullHistoryRows(id, { messagesOnly: true });
+  async *streamFullHistoryMessages(
+    id: string,
+    options?: { userOnly?: boolean },
+  ): AsyncGenerator<AgentTimelineRow> {
+    yield* this.streamFullHistoryRows(id, {
+      messagesOnly: true,
+      ...(options?.userOnly ? { userMessagesOnly: true } : {}),
+    });
   }
 
   async *streamFullHistoryRows(
     id: string,
-    options?: { messagesOnly?: boolean },
+    options?: AgentHistoryStreamOptions,
   ): AsyncGenerator<AgentTimelineRow> {
     const agent = this.requireSessionAgent(id);
     if (!agent.session.streamHistoryEntries)
@@ -1569,19 +1586,9 @@ export class AgentManager {
         throw new Error("History changed during streamed read");
       const event = entry.value;
       if (event.type !== "timeline") continue;
-      if (
-        options?.messagesOnly &&
-        event.item.type !== "user_message" &&
-        event.item.type !== "assistant_message"
-      )
-        continue;
+      if (!matchesHistorySelection(event.item, options)) continue;
       for (const projected of projectAgentMessages(event.item)) {
-        if (
-          options?.messagesOnly &&
-          projected.type !== "user_message" &&
-          projected.type !== "assistant_message"
-        )
-          continue;
+        if (!matchesHistorySelection(projected, options)) continue;
         const item = limitAgentTimelineItemContent(projected);
         yield {
           seq: entry.index + 1,
