@@ -84,13 +84,38 @@ export function createLexicalWatchPathFilter({
 }
 
 export function createRealpathAwarePathMatcher(target: string): (candidate: string) => boolean {
-  const targetMatchers = collectPathVariants(target).map((variant) =>
-    createPathEquivalenceMatcher(variant),
-  );
+  return createPathVariantMatcher(collectPathVariants(target), collectPathVariants);
+}
+
+function createPathVariantMatcher(
+  targetVariants: string[],
+  resolveVariants: (value: string) => string[],
+): (candidate: string) => boolean {
+  const targetMatchers = targetVariants.map((variant) => createPathEquivalenceMatcher(variant));
 
   return (candidate) => {
-    const candidateVariants = collectPathVariants(candidate);
+    const candidateVariants = resolveVariants(candidate);
     return candidateVariants.some((variant) => targetMatchers.some((matches) => matches(variant)));
+  };
+}
+
+/** Resolve each exact path once during a synchronous observer batch, including
+ * failures. Discard the batch afterwards so changed/deleted symlinks are freshly
+ * resolved next time. Variant order and lexical fallbacks remain unchanged. */
+export function createRealpathAwarePathBatch() {
+  const cache = new Map<string, string[]>();
+  const variants = (value: string): string[] => {
+    let resolved = cache.get(value);
+    if (!resolved) {
+      resolved = collectPathVariants(value);
+      cache.set(value, resolved);
+    }
+    return resolved;
+  };
+  return {
+    createMatcher: (target: string) => createPathVariantMatcher(variants(target), variants),
+    relativePath: (root: string, candidate: string) =>
+      getRelativePathFromVariants(variants(root), variants(candidate)),
   };
 }
 
@@ -126,9 +151,13 @@ export function normalizePathForIdentity(value: string): string {
  * must keep those two operations coupled.
  */
 export function getRealpathAwareRelativePath(root: string, candidate: string): string | null {
-  const rootVariants = collectPathVariants(root);
-  const candidateVariants = collectPathVariants(candidate);
+  return getRelativePathFromVariants(collectPathVariants(root), collectPathVariants(candidate));
+}
 
+function getRelativePathFromVariants(
+  rootVariants: string[],
+  candidateVariants: string[],
+): string | null {
   for (const rootVariant of rootVariants) {
     for (const candidateVariant of candidateVariants) {
       const relativePath = getRelativePathInsideRoot(rootVariant, candidateVariant);
