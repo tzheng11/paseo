@@ -1,4 +1,4 @@
-import { describe, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import pino from "pino";
 
 import type { SessionInboundMessage, SessionOutboundMessage } from "../server/messages.js";
@@ -82,7 +82,12 @@ function createLogger(): pino.Logger {
 }
 
 describe("terminal-session-controller restore", () => {
-  test("delivers output produced while restore is in flight after the restore frame", async () => {
+  afterEach(() => vi.useRealTimers());
+
+  test.each([0, 5])("replays restore output exactly once (delay %ims)", async (delayMs) => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const restoreTime = 1000;
+    vi.setSystemTime(restoreTime);
     let terminalListener: ((message: ServerMessage) => void) | null = null;
     const snapshot = deferred<TerminalStateSnapshot | null>();
     const binaryFrames: TerminalStreamFrame[] = [];
@@ -139,6 +144,11 @@ describe("terminal-session-controller restore", () => {
         const frame = decodeTerminalStreamFrame(bytes);
         if (frame) {
           binaryFrames.push(frame);
+          if (frame.opcode === TerminalStreamOpcode.Restore) {
+            // markFlushed runs before the async replay continuation. Advance
+            // that gap deterministically to cover both output frame boundaries.
+            queueMicrotask(() => vi.setSystemTime(restoreTime + delayMs));
+          }
         }
       },
       hasBinaryChannel: () => true,
@@ -161,7 +171,7 @@ describe("terminal-session-controller restore", () => {
     terminalListener?.({ type: "output", data: "restore-after\n", revision: 2 });
     snapshot.resolve({ state: terminalState("restore-before"), revision: 1 });
     await snapshot.promise;
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await vi.runAllTimersAsync();
 
     expect(outboundMessages).toContainEqual({
       type: "subscribe_terminal_response",
@@ -172,14 +182,21 @@ describe("terminal-session-controller restore", () => {
         requestId: "req-1",
       },
     });
-    expect(binaryFrames.map((frame) => frame.opcode)).toEqual([
-      TerminalStreamOpcode.Restore,
-      TerminalStreamOpcode.Output,
-    ]);
+    expect(binaryFrames[0]?.opcode).toBe(TerminalStreamOpcode.Restore);
     expect(new TextDecoder().decode(binaryFrames[0]?.payload)).toContain("restore-before");
-    expect(new TextDecoder().decode(binaryFrames[1]?.payload)).toBe(
-      "\x1b[?1h\x1b[?2004hrestore-after\n",
+    const outputFrames = binaryFrames.slice(1);
+    expect(outputFrames.map((frame) => frame.opcode)).toEqual(
+      delayMs === 0
+        ? [TerminalStreamOpcode.Output]
+        : [TerminalStreamOpcode.Output, TerminalStreamOpcode.Output],
     );
+    const outputChunks = outputFrames.map((frame) => new TextDecoder().decode(frame.payload));
+    expect(outputChunks).toEqual(
+      delayMs === 0
+        ? ["\x1b[?1h\x1b[?2004hrestore-after\n"]
+        : ["\x1b[?1h\x1b[?2004h", "restore-after\n"],
+    );
+    expect(outputChunks.join("")).toBe("\x1b[?1h\x1b[?2004hrestore-after\n");
   });
 });
 
