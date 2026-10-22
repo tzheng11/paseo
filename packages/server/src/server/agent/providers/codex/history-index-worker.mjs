@@ -7,9 +7,10 @@ const db = new DatabaseSync(workerData.databasePath, { readOnly: true });
 try {
   db.exec("PRAGMA query_only=ON; PRAGMA cache_size=-4096; BEGIN");
   const thread = workerData.threadId;
+  // octet_length(column) reads byte lengths without loading JSON payload pages.
   const stats = db
     .prepare(`SELECT COUNT(*) AS count,
-    COALESCE(SUM(length(CAST(item_json AS BLOB))), 0) AS bytes,
+    COALESCE(SUM(octet_length(item_json)), 0) AS bytes,
     COALESCE(MAX(rollout_ordinal), 0) AS lastOrdinal,
     COALESCE(MAX(updated_at_ordinal), 0) AS lastUpdate
     FROM thread_items WHERE thread_id = ?`)
@@ -17,7 +18,7 @@ try {
   const count = Number(stats.count);
   const totalBytes = Number(stats.bytes);
   const metadata = `SELECT item_id AS itemId, turn_id AS turnId,
-    rollout_ordinal AS ordinal, length(CAST(item_json AS BLOB)) AS bytes
+    rollout_ordinal AS ordinal, octet_length(item_json) AS bytes
     FROM thread_items WHERE thread_id = ?`;
   const previous = db.prepare(`SELECT item_id AS id FROM thread_items
     WHERE thread_id = ? AND turn_id = ? AND rollout_ordinal < ?
