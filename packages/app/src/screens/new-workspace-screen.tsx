@@ -18,11 +18,12 @@ import { Composer } from "@/composer";
 import { ComposerDock } from "@/composer/dock";
 import { useComposerEditingSession, useComposerFullscreen } from "@/composer/editing-session";
 import { FileDropZone } from "@/components/file-drop/file-drop-zone";
+import { ScrollView } from "@/components/ui/scroll-view";
+import { HostsOverview } from "@/hosts-overview/hosts-overview";
 import {
   resolveComposerAttachmentSubmitFormat,
   splitComposerAttachmentsForSubmit,
 } from "@/composer/attachments/submit";
-import { TitlebarDragRegion } from "@/components/desktop/titlebar-drag-region";
 import { MenuHeader } from "@/components/headers/menu-header";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { useToast } from "@/contexts/toast-context";
@@ -119,6 +120,8 @@ import {
 } from "./workspace/terminals/state";
 import { captureWorkspaceDraftCleanup } from "./new-workspace/background-handoff";
 import { useNewWorkspaceScreenPresence } from "./new-workspace/screen-presence";
+
+const WINDOW_CONTENT_DATASET = { "window-content": "" };
 
 function useIsNewWorkspaceDraftHandoffActive(input: {
   draftId: string | undefined;
@@ -1656,9 +1659,21 @@ function NewWorkspaceLayout({
   const importSessionButton = <ImportSessionButton compact={isCompact} onPress={onImportSession} />;
   // Compact has no title: the fields name themselves. The free space above pushes them down onto
   // the composer, where the thumb is.
+  const hostsOverview = fullscreen ? null : (
+    <View style={styles.hostsOverview}>
+      <HostsOverview />
+    </View>
+  );
   const setupFields = isCompact ? (
     <>
-      <View style={styles.compactSetupSpace} pointerEvents="none" />
+      <ScrollView
+        style={styles.compactSetupSpace}
+        contentContainerStyle={styles.compactOverviewContent}
+        keyboardShouldPersistTaps="handled"
+        testID="new-workspace-hosts-scroll"
+      >
+        {hostsOverview}
+      </ScrollView>
       {formStack}
     </>
   ) : (
@@ -1666,6 +1681,7 @@ function NewWorkspaceLayout({
       <View style={styles.composerTitleContainer} pointerEvents="none">
         <Text style={styles.composerTitle}>{title}</Text>
       </View>
+      {hostsOverview}
       {formStack}
     </>
   );
@@ -1674,8 +1690,7 @@ function NewWorkspaceLayout({
       {fullscreen ? null : (
         <MenuHeader borderless rightContent={isCompact ? importSessionButton : undefined} />
       )}
-      <View style={styles.content}>
-        <TitlebarDragRegion />
+      <View style={styles.content} dataSet={WINDOW_CONTENT_DATASET}>
         <ComposerDock centered={!isCompact} fullscreen={fullscreen}>
           {setupFields}
           <>
@@ -1701,8 +1716,16 @@ const styles = StyleSheet.create((theme) => ({
   compactSetupSpace: {
     flex: 1,
   },
+  compactOverviewContent: {
+    flexGrow: 1,
+    justifyContent: "flex-end",
+  },
+  hostsOverview: {
+    alignItems: "center",
+    paddingHorizontal: theme.spacing[6],
+    marginBottom: theme.spacing[6],
+  },
   composerTitleContainer: {
-    marginBottom: theme.spacing[8],
     paddingLeft: theme.spacing[6],
     paddingRight: theme.spacing[4],
   },
