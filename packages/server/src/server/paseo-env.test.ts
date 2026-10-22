@@ -64,6 +64,21 @@ describe("paseo env contract", () => {
     expect(env.PATH).toBe("/custom/bin");
   });
 
+  test("keeps the native inventory override inside daemon processes", () => {
+    const base = { PASEO_NATIVE_MAX_TRACKED_ENTRIES: "2000000", PATH: "/usr/bin" };
+    expect(createPaseoInternalEnv(base).PASEO_NATIVE_MAX_TRACKED_ENTRIES).toBe("2000000");
+    for (const inherited of [base, {}]) {
+      const overlay = { PASEO_NATIVE_MAX_TRACKED_ENTRIES: "2000000" };
+      expect(
+        createExternalProcessEnv(inherited, overlay).PASEO_NATIVE_MAX_TRACKED_ENTRIES,
+      ).toBeUndefined();
+      expect(
+        createExternalCommandProcessEnv("node", inherited, overlay)
+          .PASEO_NATIVE_MAX_TRACKED_ENTRIES,
+      ).toBeUndefined();
+    }
+  });
+
   test("applies non-control overlays to external process env", () => {
     const env = createExternalProcessEnv(baseEnv, { PATH: "/custom/bin" }, { CUSTOM: "value" });
 
