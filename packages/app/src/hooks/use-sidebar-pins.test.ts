@@ -7,6 +7,7 @@ import {
   buildPinnedSidebarKeys,
   arePinnedSidebarKeysEqual,
   splitPinnedSidebarGroups,
+  type PinnedSidebarKeys,
 } from "@/hooks/use-sidebar-pins";
 
 function placement(workspaceKey: string): SidebarWorkspacePlacement {
@@ -33,8 +34,17 @@ function project(projectKey: string, workspaces: SidebarWorkspacePlacement[]): S
   };
 }
 
+function pinKeys(workspaces: SidebarWorkspacePlacement[]): PinnedSidebarKeys {
+  const keys = workspaces.map((workspace) => workspace.workspaceKey);
+  return {
+    pinnedWorkspaceKeys: keys,
+    pinnedAtByKey: Object.fromEntries(keys.map((key) => [key, "2026-01-01T00:00:00Z"])),
+    superpinnedAtByKey: {},
+  };
+}
+
 describe("splitPinnedSidebarGroups", () => {
-  it("hoists a pinned parent's whole subtree without duplicating pinned descendants", () => {
+  it("keeps pin membership independent while nesting explicitly pinned legacy children", () => {
     const parent = { ...placement("s1:parent"), workspaceId: "parent", siblingOrder: 1 };
     const child = {
       ...placement("s1:child"),
@@ -64,11 +74,10 @@ describe("splitPinnedSidebarGroups", () => {
     expect(result.pinnedChats.map((workspace) => workspace.workspaceId)).toEqual([
       "parent",
       "child",
-      "grandchild",
     ]);
     expect(
       result.unpinnedProjects[0]?.workspaces.map((workspace) => workspace.workspaceId),
-    ).toEqual(["other"]);
+    ).toEqual(["grandchild", "other"]);
   });
 
   it("keeps the project shell reachable when every chat is pinned", () => {
@@ -155,6 +164,127 @@ describe("splitPinnedSidebarGroups", () => {
       "newer",
     ]);
   });
+
+  it("uses full-key cross-host parents and layout ranks before deterministic new-pin fallbacks", () => {
+    const parent = { ...placement("s1:parent"), workspaceId: "parent" };
+    const otherParent = {
+      ...placement("remote:parent"),
+      workspaceId: "parent",
+      serverId: "remote",
+      projectViewKey: "p2",
+    };
+    const child = {
+      ...placement("remote:child"),
+      workspaceId: "child",
+      serverId: "remote",
+      projectViewKey: "p2",
+    };
+    const newPin = { ...placement("s1:new"), workspaceId: "new" };
+    const workspaces = [parent, otherParent, child, newPin];
+    const result = splitPinnedSidebarGroups({
+      projects: [project("p1", [parent, newPin]), project("p2", [otherParent, child])],
+      keys: pinKeys(workspaces),
+      pinnedWorkspaceOrder: [parent.workspaceKey, child.workspaceKey, otherParent.workspaceKey],
+      pinnedWorkspaceTree: {
+        [parent.workspaceKey]: { parentWorkspaceKey: null, siblingOrder: 20 },
+        [otherParent.workspaceKey]: { parentWorkspaceKey: null, siblingOrder: 10 },
+        [child.workspaceKey]: { parentWorkspaceKey: parent.workspaceKey, siblingOrder: 0.125 },
+      },
+    });
+    expect(result.pinnedChats.map((workspace) => workspace.workspaceKey)).toEqual([
+      otherParent.workspaceKey,
+      parent.workspaceKey,
+      child.workspaceKey,
+      newPin.workspaceKey,
+    ]);
+    expect(
+      result.pinnedChats.find((workspace) => workspace.workspaceKey === child.workspaceKey),
+    ).toMatchObject({
+      sidebarParentWorkspaceKey: parent.workspaceKey,
+      sidebarSection: "pinned",
+      siblingOrder: 0.125,
+    });
+    expect(result.unpinnedProjects.map((entry) => entry.workspaces)).toEqual([[], []]);
+    expect(child.sidebarParentWorkspaceKey).toBeUndefined();
+  });
+
+  it("promotes children when a parent leaves their section without deleting dormant layout edges", () => {
+    const parent = { ...placement("s1:parent"), workspaceId: "parent" };
+    const child = {
+      ...placement("remote:child"),
+      workspaceId: "child",
+      serverId: "remote",
+      projectViewKey: "p2",
+    };
+    const tree = {
+      [child.workspaceKey]: { parentWorkspaceKey: parent.workspaceKey, siblingOrder: 5 },
+    };
+    const input = {
+      projects: [project("p1", [parent]), project("p2", [child])],
+      keys: pinKeys([child]),
+      pinnedWorkspaceOrder: [],
+      pinnedWorkspaceTree: tree,
+    };
+    const unpinnedParent = splitPinnedSidebarGroups(input);
+    expect(
+      unpinnedParent.pinnedChats.map((workspace) => [
+        workspace.workspaceKey,
+        workspace.sidebarParentWorkspaceKey,
+      ]),
+    ).toEqual([[child.workspaceKey, null]]);
+    expect(unpinnedParent.unpinnedProjects[0]?.workspaces).toEqual([parent]);
+    const promotedParent = splitPinnedSidebarGroups({
+      ...input,
+      keys: {
+        ...pinKeys([parent, child]),
+        superpinnedAtByKey: { [parent.workspaceKey]: "2026-01-02T00:00:00Z" },
+      },
+    });
+    expect(promotedParent.superpinnedChats.map((workspace) => workspace.workspaceKey)).toEqual([
+      parent.workspaceKey,
+    ]);
+    expect(
+      promotedParent.pinnedChats.map((workspace) => [
+        workspace.workspaceKey,
+        workspace.sidebarParentWorkspaceKey,
+      ]),
+    ).toEqual([[child.workspaceKey, null]]);
+    const filteredParent = splitPinnedSidebarGroups({
+      ...input,
+      projects: [project("p2", [child])],
+    });
+    expect(filteredParent.pinnedChats.map((workspace) => workspace.workspaceKey)).toEqual([
+      child.workspaceKey,
+    ]);
+    const restored = splitPinnedSidebarGroups({ ...input, keys: pinKeys([parent, child]) });
+    expect(
+      restored.pinnedChats.map((workspace) => [
+        workspace.workspaceKey,
+        workspace.sidebarParentWorkspaceKey,
+      ]),
+    ).toEqual([
+      [parent.workspaceKey, null],
+      [child.workspaceKey, parent.workspaceKey],
+    ]);
+    expect(tree).toEqual({
+      [child.workspaceKey]: { parentWorkspaceKey: parent.workspaceKey, siblingOrder: 5 },
+    });
+  });
+
+  it("keeps a persisted explicit root even when the daemon still has a legacy parent", () => {
+    const parent = { ...placement("s1:parent"), workspaceId: "parent" };
+    const child = { ...placement("s1:child"), workspaceId: "child", parentWorkspaceId: "parent" };
+    const result = splitPinnedSidebarGroups({
+      projects: [project("p1", [parent, child])],
+      keys: pinKeys([parent, child]),
+      pinnedWorkspaceOrder: [],
+      pinnedWorkspaceTree: { [child.workspaceKey]: { parentWorkspaceKey: null, siblingOrder: 1 } },
+    });
+    expect(
+      result.pinnedChats.find((workspace) => workspace.workspaceKey === child.workspaceKey),
+    ).toMatchObject({ parentWorkspaceId: "parent", sidebarParentWorkspaceKey: null });
+    expect(child.parentWorkspaceId).toBe("parent");
+  });
 });
 
 const UNIQUE_KEY = "3fdb71dd-7bc7-81c1-8df8-e1a11aa86938@0b7e04dd45da#unique-section";
@@ -236,10 +366,11 @@ it("keeps superpin daemon order until a separate subtree reorder is saved", () =
   const input = {
     projects: [project("p1", [parent, child, newer])],
     keys: {
-      pinnedWorkspaceKeys: [parent.workspaceKey, newer.workspaceKey],
+      pinnedWorkspaceKeys: [parent.workspaceKey, child.workspaceKey, newer.workspaceKey],
       pinnedAtByKey: {},
       superpinnedAtByKey: {
         [parent.workspaceKey]: "2026-10-18T01:00:00Z",
+        [child.workspaceKey]: "2026-10-18T01:30:00Z",
         [newer.workspaceKey]: "2026-10-18T02:00:00Z",
       },
     },

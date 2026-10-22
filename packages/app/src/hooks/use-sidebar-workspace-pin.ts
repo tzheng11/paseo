@@ -77,6 +77,48 @@ export async function reconcileWorkspacePin(serverId: string): Promise<void> {
   throw new DirectoryRefreshSupersededError("Workspace state confirmation was superseded");
 }
 
+export function markWorkspacePinOutcomeUnknown(workspaceKey: string): void {
+  unknownWorkspaceKeys.add(workspaceKey);
+  pendingWorkspaceKeys.add(workspaceKey);
+  notifyPending();
+}
+
+export async function confirmWorkspacePinChange(
+  workspace: Pick<PinnableWorkspace, "workspaceKey" | "serverId">,
+): Promise<void> {
+  if (reconcilingWorkspaceKeys.has(workspace.workspaceKey))
+    throw new Error("This workspace's pin state is already being checked");
+  reconcilingWorkspaceKeys.add(workspace.workspaceKey);
+  try {
+    await reconcileWorkspacePin(workspace.serverId);
+    unknownWorkspaceKeys.delete(workspace.workspaceKey);
+  } finally {
+    reconcilingWorkspaceKeys.delete(workspace.workspaceKey);
+  }
+}
+
+// Tree dragging shares the same admission guard as menus and keyboard shortcuts.
+// A retry after a lost ACK must finish a read before another mutation is allowed.
+export async function runWorkspacePinChange<T>(
+  workspace: Pick<PinnableWorkspace, "workspaceKey" | "serverId">,
+  action: () => Promise<T>,
+): Promise<T> {
+  const key = workspace.workspaceKey;
+  if (pendingWorkspaceKeys.has(key) && !unknownWorkspaceKeys.has(key))
+    throw new Error("This workspace's pin change is still pending");
+  if (reconcilingWorkspaceKeys.has(key))
+    throw new Error("This workspace's pin state is already being checked");
+  pendingWorkspaceKeys.add(key);
+  notifyPending();
+  try {
+    if (unknownWorkspaceKeys.has(key)) await confirmWorkspacePinChange(workspace);
+    return await action();
+  } finally {
+    if (!unknownWorkspaceKeys.has(key)) pendingWorkspaceKeys.delete(key);
+    notifyPending();
+  }
+}
+
 function useWorkspacePinController(kind: "pin" | "superpin"): ToggleSidebarWorkspacePin {
   const { t } = useTranslation();
   const toast = useToast();

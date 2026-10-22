@@ -3,11 +3,15 @@ import { createElement, isValidElement, type PropsWithChildren } from "react";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, expect, it, vi } from "vitest";
+import { applyWorkspaceTreeMove } from "@/components/sidebar/workspace-tree/pin-placement";
 import type { ToastApi } from "@/components/toast-host";
 import {
   useSidebarWorkspacePinController,
   useSidebarWorkspaceSuperpinController,
   useWorkspacePinPending,
+  runWorkspacePinChange,
+  markWorkspacePinOutcomeUnknown,
+  confirmWorkspacePinChange,
 } from "./use-sidebar-workspace-pin";
 import { DaemonClient, DaemonConnectionError } from "@getpaseo/client/internal/daemon-client";
 import type { useKeyboardActionHandler } from "./use-keyboard-action-handler";
@@ -159,4 +163,98 @@ it("3fdb71dd-7bc7-8140-810e-e7cd4f4539b5@999c2120aca7#timeout keeps the shared m
   expect(mocks.refresh).toHaveBeenCalledTimes(2);
   expect(mocks.superpin).toHaveBeenCalledTimes(1);
   expect(useSessionStore.getState().sessions["pin-unit"]).toBeUndefined();
+});
+
+it("tree retries only read after an unknown pin ACK and failed confirmation", async () => {
+  const workspace = {
+    serverId: "pin-unit",
+    workspaceId: "tree-unknown",
+    workspaceKey: "pin-unit:tree-unknown",
+  };
+  mocks.pin.mockReset().mockRejectedValueOnce(new DaemonConnectionError("lost ACK"));
+  mocks.refresh
+    .mockReset()
+    .mockRejectedValueOnce(new Error("read failed"))
+    .mockRejectedValueOnce(new Error("read failed again"));
+  let confirmedPinned = false;
+  const attempt = () =>
+    runWorkspacePinChange(workspace, async () =>
+      applyWorkspaceTreeMove({
+        client: {
+          moveWorkspace: vi.fn(),
+          setWorkspacePinned: vi.fn().mockImplementation(mocks.pin),
+          setWorkspaceSuperpinned: vi.fn(),
+        },
+        workspaceId: workspace.workspaceId,
+        drop: {
+          workspaceKey: workspace.workspaceKey,
+          targetWorkspaceKey: "other:parent",
+          position: "inside",
+          parentWorkspaceId: null,
+          beforeWorkspaceId: null,
+          pinnedOrderOnly: true,
+          pinSection: "pinned",
+        },
+        pinned: confirmedPinned,
+        superpinned: false,
+        shouldPin: true,
+        shouldSuperpin: false,
+        confirmPinState: async () => {
+          markWorkspacePinOutcomeUnknown(workspace.workspaceKey);
+          await confirmWorkspacePinChange(workspace);
+          return { pinned: confirmedPinned, superpinned: false };
+        },
+      }),
+    );
+  await expect(attempt()).rejects.toThrow("read failed");
+  await expect(attempt()).rejects.toThrow("read failed again");
+  expect(mocks.pin).toHaveBeenCalledTimes(1);
+  mocks.refresh.mockImplementationOnce(async () => {
+    confirmedPinned = true;
+  });
+  await attempt();
+  expect(mocks.refresh).toHaveBeenCalledTimes(3);
+  expect(mocks.pin).toHaveBeenCalledTimes(1);
+});
+
+it("tree admission blocks menu and shortcut pin mutations until it settles", async () => {
+  const queryClient = new QueryClient();
+  function wrapper({ children }: PropsWithChildren) {
+    return createElement(QueryClientProvider, { client: queryClient }, children);
+  }
+  const workspace = {
+    serverId: "pin-unit",
+    workspaceId: "tree-pending",
+    workspaceKey: "pin-unit:tree-pending",
+    pinnedAt: "now",
+    superpinnedAt: null,
+  };
+  const hook = renderHook(
+    () => ({
+      pin: useSidebarWorkspacePinController(),
+      superpin: useSidebarWorkspaceSuperpinController(),
+      pending: useWorkspacePinPending(workspace.workspaceKey),
+    }),
+    { wrapper },
+  );
+  let finish!: () => void;
+  const held = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  let running!: Promise<void>;
+  act(() => {
+    running = runWorkspacePinChange(workspace, () => held);
+  });
+  await waitFor(() => expect(hook.result.current.pending).toBe(true));
+  act(() => {
+    hook.result.current.pin(workspace);
+    hook.result.current.superpin(workspace);
+  });
+  expect(mocks.pin).not.toHaveBeenCalled();
+  expect(mocks.superpin).not.toHaveBeenCalled();
+  await act(async () => {
+    finish();
+    await running;
+  });
+  await waitFor(() => expect(hook.result.current.pending).toBe(false));
 });

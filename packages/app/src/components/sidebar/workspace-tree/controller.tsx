@@ -26,13 +26,14 @@ import {
 
 export interface WorkspaceTreeProviderProps {
   workspaces: readonly SidebarWorkspacePlacement[];
+  allWorkspaces?: readonly SidebarWorkspacePlacement[];
   supportedServerIds: ReadonlyMap<string, boolean>;
-  pinnedRootKeys?: ReadonlySet<string>;
   onMove: (drop: WorkspaceTreeDrop) => Promise<void>;
   children: ReactNode;
 }
 interface TreeDragController {
   workspaces: readonly SidebarWorkspacePlacement[];
+  allWorkspaces: readonly SidebarWorkspacePlacement[];
   activeWorkspaceKey: string | null;
   activeSubtreeKeys: ReadonlySet<string>;
   drop: WorkspaceTreeDrop | null;
@@ -50,8 +51,8 @@ const ControllerContext = createContext<TreeDragController | null>(null);
 
 export function WorkspaceTreeController({
   workspaces,
+  allWorkspaces = workspaces,
   supportedServerIds,
-  pinnedRootKeys,
   onMove,
   children,
 }: WorkspaceTreeProviderProps) {
@@ -72,7 +73,16 @@ export function WorkspaceTreeController({
       setPending(true);
       setFailure(null);
       try {
-        await onMove(next);
+        const current = resolveWorkspaceTreeDropResult({
+          workspaces,
+          allWorkspaces,
+          workspaceKey: next.workspaceKey,
+          targetWorkspaceKey: next.targetWorkspaceKey,
+          position: next.position,
+        });
+        if (!current.drop)
+          throw new Error(current.rejection?.message ?? "Workspace is no longer available");
+        await onMove(current.drop);
         if (next.position === "inside") {
           useSidebarCollapsedSectionsStore
             .getState()
@@ -98,7 +108,7 @@ export function WorkspaceTreeController({
         setPending(false);
       }
     },
-    [onMove, toast, workspaces],
+    [onMove, toast, workspaces, allWorkspaces],
   );
   const cancel = useCallback(() => {
     activeRef.current = null;
@@ -120,10 +130,10 @@ export function WorkspaceTreeController({
       const result = source
         ? resolveWorkspaceTreeDropResult({
             workspaces,
+            allWorkspaces,
             workspaceKey: source,
             targetWorkspaceKey,
             position,
-            pinnedRootKeys,
           })
         : { drop: null, rejection: null };
       const next = result.drop;
@@ -142,7 +152,7 @@ export function WorkspaceTreeController({
           : result.rejection,
       );
     },
-    [pinnedRootKeys, workspaces],
+    [allWorkspaces, workspaces],
   );
   const finish = useCallback(() => {
     const next = dropRef.current;
@@ -167,7 +177,9 @@ export function WorkspaceTreeController({
   }, [drop?.position, drop?.targetWorkspaceKey]);
   const enabled = useCallback(
     (workspace: SidebarWorkspacePlacement) =>
-      supportedServerIds.get(workspace.serverId) === true && !pending,
+      (workspace.sidebarSection !== undefined ||
+        supportedServerIds.get(workspace.serverId) === true) &&
+      !pending,
     [pending, supportedServerIds],
   );
   const activeSubtreeKeys = useMemo(
@@ -175,14 +187,15 @@ export function WorkspaceTreeController({
       activeWorkspaceKey
         ? new Set([
             activeWorkspaceKey,
-            ...getWorkspaceDescendantKeys(workspaces, activeWorkspaceKey),
+            ...getWorkspaceDescendantKeys(allWorkspaces, activeWorkspaceKey),
           ])
         : new Set<string>(),
-    [activeWorkspaceKey, workspaces],
+    [activeWorkspaceKey, allWorkspaces],
   );
   const value = useMemo(
     () => ({
       workspaces,
+      allWorkspaces,
       activeWorkspaceKey,
       activeSubtreeKeys,
       drop,
@@ -196,6 +209,7 @@ export function WorkspaceTreeController({
     }),
     [
       workspaces,
+      allWorkspaces,
       activeWorkspaceKey,
       activeSubtreeKeys,
       drop,

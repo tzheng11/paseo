@@ -87,6 +87,8 @@ const EMPTY_PROJECT_NAMES = new Map<string, string>();
 export interface SidebarWorkspacesListResult {
   workspacePlacements: SidebarWorkspacePlacement[];
   projects: SidebarProjectEntry[];
+  /** Known directory metadata across every registered host, before host filters. */
+  allProjects: SidebarProjectEntry[];
   projectNamesByViewKey: Map<string, string>;
   isLoading: boolean;
   isInitialLoad: boolean;
@@ -97,6 +99,8 @@ export interface SidebarWorkspacesListResult {
 export function useSidebarWorkspacesList(options?: {
   hostFilters?: readonly string[];
   enabled?: boolean;
+  /** Keep hidden-host directory metadata current for cross-host pin-tree checks. */
+  includeAllHosts?: boolean;
 }): SidebarWorkspacesListResult {
   const runtime = getHostRuntimeStore();
   const allHosts = useHosts();
@@ -121,11 +125,14 @@ export function useSidebarWorkspacesList(options?: {
     }
     return matched;
   }, [allServerIds, hostFilters, hostRegistryLoaded]);
+  const directoryDemandServerIds = options?.includeAllHosts ? allServerIds : serverIds;
   useEffect(() => {
     if (!isActive) return;
-    const releases = serverIds.map((serverId) => runtime.acquireDirectoryDemand(serverId));
+    const releases = directoryDemandServerIds.map((serverId) =>
+      runtime.acquireDirectoryDemand(serverId),
+    );
     return () => releases.forEach((release) => release());
-  }, [isActive, runtime, serverIds]);
+  }, [directoryDemandServerIds, isActive, runtime]);
 
   useEffect(() => {
     if (!hostRegistryLoaded) {
@@ -139,6 +146,12 @@ export function useSidebarWorkspacesList(options?: {
   const directoryServerIds = useWorkspaceDirectoryServerIds(serverIds);
 
   const hostProjects = useHostProjects(directoryServerIds);
+  const allDirectoryServerIds = useWorkspaceDirectoryServerIds(allServerIds);
+  const allHostProjects = useHostProjects(allDirectoryServerIds);
+  const allSidebarModel = useMemo(
+    () => buildSidebarWorkspacePlacementModel({ projects: allHostProjects }),
+    [allHostProjects],
+  );
 
   const sidebarModel = useMemo(
     () =>
@@ -195,6 +208,7 @@ export function useSidebarWorkspacesList(options?: {
   return {
     workspacePlacements,
     projects,
+    allProjects: allSidebarModel.projects.length > 0 ? allSidebarModel.projects : EMPTY_PROJECTS,
     projectNamesByViewKey,
     ...loadingState,
     refreshAll,

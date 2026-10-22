@@ -12,6 +12,8 @@ function workspace(id: string, parentWorkspaceId: string | null = null): Sidebar
     projectKind: "git",
     workspaceKind: "worktree",
     parentWorkspaceId,
+    sidebarSection: "pinned",
+    sidebarParentWorkspaceKey: parentWorkspaceId ? `host:${parentWorkspaceId}` : null,
     siblingOrder: id.charCodeAt(0),
     name: id,
   };
@@ -31,18 +33,18 @@ describe("workspace keyboard drops", () => {
     expect(after).toMatchObject({
       targetWorkspaceKey: "host:b",
       position: "after",
-      parentWorkspaceId: null,
-      beforeWorkspaceId: "c",
+      parentWorkspaceKey: null,
+      beforeWorkspaceKey: "host:c",
     });
     expect(
       resolveWorkspaceKeyboardDrop({ ...base, code: "ArrowUp", currentDrop: after }),
-    ).toMatchObject({ targetWorkspaceKey: "host:b", position: "before", parentWorkspaceId: null });
+    ).toMatchObject({ targetWorkspaceKey: "host:b", position: "before", parentWorkspaceKey: null });
     expect(
       resolveWorkspaceKeyboardDrop({ ...base, code: "ArrowDown", currentDrop: after }),
-    ).toMatchObject({ targetWorkspaceKey: "host:c", position: "after", parentWorkspaceId: null });
+    ).toMatchObject({ targetWorkspaceKey: "host:c", position: "after", parentWorkspaceKey: null });
     expect(
       resolveWorkspaceKeyboardDrop({ ...base, workspaceKey: "host:c", code: "ArrowUp" }),
-    ).toMatchObject({ targetWorkspaceKey: "host:b", position: "before", parentWorkspaceId: null });
+    ).toMatchObject({ targetWorkspaceKey: "host:b", position: "before", parentWorkspaceKey: null });
   });
 
   it("nests only on Right and lifts out on Left", () => {
@@ -55,34 +57,42 @@ describe("workspace keyboard drops", () => {
     expect(inside).toMatchObject({
       targetWorkspaceKey: "host:b",
       position: "inside",
-      parentWorkspaceId: "b",
+      parentWorkspaceKey: "host:b",
     });
     expect(
       resolveWorkspaceKeyboardDrop({ ...base, code: "ArrowLeft", currentDrop: inside }),
-    ).toMatchObject({ targetWorkspaceKey: "host:b", position: "after", parentWorkspaceId: null });
+    ).toMatchObject({ targetWorkspaceKey: "host:b", position: "after", parentWorkspaceKey: null });
     expect(
       resolveWorkspaceKeyboardDrop({ ...base, workspaceKey: "host:d", code: "ArrowLeft" }),
-    ).toMatchObject({ targetWorkspaceKey: "host:b", position: "after", parentWorkspaceId: null });
+    ).toMatchObject({ targetWorkspaceKey: "host:b", position: "after", parentWorkspaceKey: null });
   });
 
   it("indents under the preceding sibling rather than its expanded descendant", () => {
     expect(
       resolveWorkspaceKeyboardDrop({ ...base, workspaceKey: "host:c", code: "ArrowRight" }),
-    ).toMatchObject({ targetWorkspaceKey: "host:b", position: "inside", parentWorkspaceId: "b" });
+    ).toMatchObject({
+      targetWorkspaceKey: "host:b",
+      position: "inside",
+      parentWorkspaceKey: "host:b",
+    });
   });
 
-  it("uses rendered targets and skips invalid descendants and other projects", () => {
+  it("uses rendered targets and skips invalid descendants and other pin sections", () => {
     expect(
       resolveWorkspaceKeyboardDrop({
         ...base,
         targetKeys: ["host:a", "host:c"],
         code: "ArrowDown",
       }),
-    ).toMatchObject({ targetWorkspaceKey: "host:c", position: "after", parentWorkspaceId: null });
+    ).toMatchObject({ targetWorkspaceKey: "host:c", position: "after", parentWorkspaceKey: null });
     expect(
       resolveWorkspaceKeyboardDrop({ ...base, workspaceKey: "host:b", code: "ArrowDown" }),
-    ).toMatchObject({ targetWorkspaceKey: "host:c", position: "after", parentWorkspaceId: null });
-    const other = { ...workspace("x"), projectViewKey: "other" };
+    ).toMatchObject({ targetWorkspaceKey: "host:c", position: "after", parentWorkspaceKey: null });
+    const other = {
+      ...workspace("x"),
+      projectViewKey: "other",
+      sidebarSection: "superpinned" as const,
+    };
     expect(
       resolveWorkspaceKeyboardDrop({
         ...base,
@@ -93,23 +103,24 @@ describe("workspace keyboard drops", () => {
     ).toMatchObject({ targetWorkspaceKey: "host:c" });
   });
 
-  it("keeps pinned roots reorderable across projects without nesting them", () => {
-    const other = { ...workspace("x"), projectViewKey: "other" };
+  it("nests across projects and lifts using a cross-host full parent key", () => {
+    const remote = {
+      ...workspace("a"),
+      serverId: "remote",
+      workspaceKey: "remote:a",
+      projectViewKey: "other",
+    };
     const input = {
       ...base,
-      workspaces: [...workspaces, other],
-      targetKeys: ["host:a", "host:x"],
-      pinnedRootKeys: new Set(["host:a", "host:x"]),
+      workspaces: [...workspaces, remote],
+      workspaceKey: "remote:a",
+      targetKeys: ["host:b", "host:d", "remote:a"],
     };
-    const after = resolveWorkspaceKeyboardDrop({ ...input, code: "ArrowDown" });
-    expect(after).toMatchObject({
-      targetWorkspaceKey: "host:x",
-      position: "after",
-      pinnedOrderOnly: true,
-    });
+    const nested = resolveWorkspaceKeyboardDrop({ ...input, code: "ArrowRight" });
+    expect(nested).toMatchObject({ parentWorkspaceKey: "host:b", pinnedOrderOnly: true });
     expect(
-      resolveWorkspaceKeyboardDrop({ ...input, code: "ArrowRight", currentDrop: after }),
-    ).toBeNull();
+      resolveWorkspaceKeyboardDrop({ ...input, code: "ArrowLeft", currentDrop: nested }),
+    ).toMatchObject({ targetWorkspaceKey: "host:b", position: "after", parentWorkspaceKey: null });
   });
 
   it("reorders and indents an orphan promoted to the root after its parent is archived", () => {
@@ -123,17 +134,17 @@ describe("workspace keyboard drops", () => {
     expect(resolveWorkspaceKeyboardDrop({ ...input, code: "ArrowDown" })).toMatchObject({
       targetWorkspaceKey: "host:b",
       position: "after",
-      parentWorkspaceId: null,
+      parentWorkspaceKey: null,
     });
     expect(resolveWorkspaceKeyboardDrop({ ...input, code: "ArrowUp" })).toMatchObject({
       targetWorkspaceKey: "host:a",
       position: "before",
-      parentWorkspaceId: null,
+      parentWorkspaceKey: null,
     });
     expect(resolveWorkspaceKeyboardDrop({ ...input, code: "ArrowRight" })).toMatchObject({
       targetWorkspaceKey: "host:a",
       position: "inside",
-      parentWorkspaceId: "a",
+      parentWorkspaceKey: "host:a",
     });
     expect(resolveWorkspaceKeyboardDrop({ ...input, code: "ArrowLeft" })).toBeNull();
   });

@@ -1,15 +1,10 @@
 import type { SidebarWorkspacePlacement } from "@/hooks/sidebar-workspaces-view-model";
+import { resolvePinnedWorkspaceTree } from "./pinned-layout";
 
 export interface WorkspaceTreeRow {
   workspace: SidebarWorkspacePlacement;
   depth: number;
   hasChildren: boolean;
-}
-
-function parentKey(workspace: SidebarWorkspacePlacement): string | null {
-  return workspace.parentWorkspaceId
-    ? `${workspace.serverId}:${workspace.parentWorkspaceId}`
-    : null;
 }
 
 export function compareWorkspaceSiblings(
@@ -18,33 +13,27 @@ export function compareWorkspaceSiblings(
 ): number {
   if (left.siblingOrder === undefined || right.siblingOrder === undefined) return 0;
   return (
-    left.siblingOrder - right.siblingOrder || left.workspaceId.localeCompare(right.workspaceId)
+    left.siblingOrder - right.siblingOrder || left.workspaceKey.localeCompare(right.workspaceKey)
   );
 }
 
-function workspaceParents(workspaces: readonly SidebarWorkspacePlacement[]): Map<string, string> {
-  const byKey = new Map(workspaces.map((workspace) => [workspace.workspaceKey, workspace]));
+function workspaceParents(
+  layout: ReturnType<typeof resolvePinnedWorkspaceTree>,
+): Map<string, string> {
   const parents = new Map<string, string>();
-  for (const workspace of workspaces) {
-    const candidateKey = parentKey(workspace);
-    const parent = candidateKey === null ? undefined : byKey.get(candidateKey);
-    const sameProject = parent?.projectViewKey === workspace.projectViewKey;
-    if (parent && sameProject && parent.workspaceKey !== workspace.workspaceKey) {
-      parents.set(workspace.workspaceKey, parent.workspaceKey);
-    }
-  }
-  // Directory snapshots can arrive incrementally. A corrupt or partially loaded
-  // ancestor chain must never hide a workspace from navigation.
-  for (const workspace of workspaces) {
-    const seen = new Set<string>();
-    let key: string | undefined = workspace.workspaceKey;
-    while (key !== undefined && !seen.has(key)) {
-      seen.add(key);
-      key = parents.get(key);
-    }
-    if (key !== undefined) parents.delete(key);
+  for (const [key, placement] of layout) {
+    if (placement.parentWorkspaceKey !== null) parents.set(key, placement.parentWorkspaceKey);
   }
   return parents;
+}
+
+export function effectiveWorkspaceParentKey(
+  workspaces: readonly SidebarWorkspacePlacement[],
+  workspace: SidebarWorkspacePlacement,
+): string | null {
+  return (
+    resolvePinnedWorkspaceTree(workspaces).get(workspace.workspaceKey)?.parentWorkspaceKey ?? null
+  );
 }
 
 export function flattenWorkspaceTree(
@@ -52,7 +41,8 @@ export function flattenWorkspaceTree(
   collapsedKeys: ReadonlySet<string>,
   sortSiblings = true,
 ): WorkspaceTreeRow[] {
-  const parents = workspaceParents(workspaces);
+  const layout = resolvePinnedWorkspaceTree(workspaces);
+  const parents = workspaceParents(layout);
   const children = new Map<string, SidebarWorkspacePlacement[]>();
   const roots: SidebarWorkspacePlacement[] = [];
   for (const workspace of workspaces) {
@@ -66,7 +56,15 @@ export function flattenWorkspaceTree(
     else children.set(parent, [workspace]);
   }
   if (sortSiblings) {
-    for (const siblings of children.values()) siblings.sort(compareWorkspaceSiblings);
+    const compare = (left: SidebarWorkspacePlacement, right: SidebarWorkspacePlacement) => {
+      const leftRank = layout.get(left.workspaceKey)?.siblingOrder ?? 0;
+      const rightRank = layout.get(right.workspaceKey)?.siblingOrder ?? 0;
+      return leftRank - rightRank || left.workspaceKey.localeCompare(right.workspaceKey);
+    };
+    const rootSection = roots[0]?.sidebarSection;
+    if (rootSection && roots.every((workspace) => workspace.sidebarSection === rootSection))
+      roots.sort(compare);
+    for (const siblings of children.values()) siblings.sort(compare);
   }
 
   const rows: WorkspaceTreeRow[] = [];
@@ -88,7 +86,7 @@ export function getWorkspaceAncestorKeys(
   workspaces: readonly SidebarWorkspacePlacement[],
   workspaceKey: string,
 ): string[] {
-  const parents = workspaceParents(workspaces);
+  const parents = workspaceParents(resolvePinnedWorkspaceTree(workspaces));
   const ancestors: string[] = [];
   let parent = parents.get(workspaceKey);
   while (parent !== undefined) {
