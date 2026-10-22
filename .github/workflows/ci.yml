@@ -42,6 +42,12 @@ jobs:
       - name: Install agent CLIs for provider discovery
         run: node scripts/npm-retry.mjs install -g @anthropic-ai/claude-code @openai/codex@0.105.0 opencode-ai
 
+      - name: Typecheck the app with installed dependencies
+        run: npm run typecheck --workspace=@getpaseo/app
+
+      - name: Run only the new layout callback regressions
+        run: npm run test --workspace=@getpaseo/app -- --project unit src/command-center/layout-observation.test.ts --bail=1
+
       - name: Run only the failing layout case with attribution
         run: >-
           npm run test:e2e --workspace=@getpaseo/app --
