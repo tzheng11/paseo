@@ -2567,6 +2567,10 @@ describe("WorkspaceGitService checkout observation", () => {
     await vi.waitFor(() => {
       expect(getWatcherRecordsForDirectory(watcher, REPO_CWD)).toHaveLength(2);
     });
+    expect(runGitCommand).not.toHaveBeenCalledWith(
+      ["ls-files", "-o", "-i", "--directory", "--exclude-standard"],
+      expect.anything(),
+    );
     await vi.advanceTimersByTimeAsync(1_000);
     await vi.waitFor(() => {
       expect(service.getMetrics().workspaceRefreshInFlightCount).toBe(0);

@@ -2102,7 +2102,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     if (target.closed || target.subscription) {
       return;
     }
-    const fresh = await this.refreshWorkingTreeIgnoredDirectories(target, { force: true });
+    const fresh =
+      target.repoRoot === null ||
+      (await this.refreshWorkingTreeIgnoredDirectories(target, { force: true }));
     if (!fresh) {
       this.scheduleWorkingTreeWatchRecovery(target);
       return;
