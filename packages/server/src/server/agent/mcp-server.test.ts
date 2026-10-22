@@ -2832,6 +2832,110 @@ describe("create_agent MCP tool", () => {
     expect(rows.get("second")?.pinPlacement?.parentWorkspaceKey).toBe("local:manager");
   });
 
+  it("creates a local caller child with an unrelated offline peer while refusing unresolved parents and incomplete subtree moves", async () => {
+    const { agentManager, agentStorage, spies } = createTestDeps();
+    spies.agentManager.getAgent.mockReturnValue({
+      id: "caller",
+      workspaceId: "manager",
+      cwd: process.cwd(),
+      config: {},
+      provider: "codex",
+      currentModeId: "full-access",
+    } as ManagedAgent);
+    const timestamp = "2026-07-17T00:00:00.000Z";
+    const manager = createPersistedWorkspaceRecord({
+      workspaceId: "manager",
+      projectId: "project",
+      cwd: process.cwd(),
+      kind: "directory",
+      displayName: "Manager",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      pinnedAt: timestamp,
+    });
+    const sibling = createPersistedWorkspaceRecord({
+      ...manager,
+      workspaceId: "legacy-child",
+      parentWorkspaceId: manager.workspaceId,
+      siblingOrder: 8192,
+    });
+    const createCalls: unknown[] = [];
+    const peerReads = vi.fn(async () => {
+      throw new Error("Offline peer must not be read");
+    });
+    const writes = vi.fn(async () => {
+      throw new Error("No move should begin");
+    });
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      callerAgentId: "caller",
+      serverId: "local",
+      providerSnapshotManager: createOpenCodeManager().manager,
+      workspaceRegistry: {
+        get: async () => manager,
+        list: async () => [manager, sibling],
+        upsert: async () => {},
+        move: unexpectedWorkspaceMove,
+      },
+      createDirectoryWorkspace: async (_cwd, _title, _projectId, context) => {
+        createCalls.push(context?.sidebarPlacement);
+        return sibling;
+      },
+      setWorkspacePinPlacement: writes,
+      hosts: () => ({
+        directory: async () => ({
+          self: { serverId: "local", label: "Local" },
+          hosts: [
+            {
+              serverId: "offline",
+              registrationId: "offline",
+              label: "Offline",
+              source: { id: "user", key: "offline" },
+              metadata: {},
+              enabled: true,
+              status: "offline",
+              targetDescription: "test",
+              lastOnlineAt: null,
+              nextRetryAt: null,
+              error: null,
+            },
+          ],
+        }),
+        use: peerReads,
+      }),
+      logger,
+    });
+    const created = await invokeToolWithParsedInput(registeredTool(server, "create_workspace"), {
+      isolation: "local",
+      path: process.cwd(),
+    });
+    expect(created.isError).not.toBe(true);
+    expect(createCalls).toEqual([
+      { parentWorkspaceKey: "local:manager", section: "pinned", siblingOrder: 9216 },
+    ]);
+    expect(peerReads).not.toHaveBeenCalled();
+    const unavailable = await invokeToolWithParsedInput(
+      registeredTool(server, "create_workspace"),
+      { isolation: "local", path: process.cwd(), parentWorkspaceKey: "offline:manager" },
+    );
+    expect(unavailable).toMatchObject({
+      isError: true,
+      structuredContent: { error: expect.stringContaining("Parent host is unavailable") },
+    });
+    expect(createCalls).toHaveLength(1);
+    const moved = await invokeToolWithParsedInput(registeredTool(server, "move_workspace"), {
+      workspaceId: "manager",
+      parentWorkspaceKey: null,
+      section: "superpinned",
+    });
+    expect(moved).toMatchObject({
+      isError: true,
+      structuredContent: { error: expect.stringContaining("Reconnect all registered hosts") },
+    });
+    expect(writes).not.toHaveBeenCalled();
+  });
+
   it("resolves caller placement before routed creation and pages cross-host siblings", async () => {
     const { agentManager, agentStorage, spies } = createTestDeps();
     spies.agentManager.getAgent.mockReturnValue({

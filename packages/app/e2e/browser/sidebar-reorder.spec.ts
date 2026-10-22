@@ -34,6 +34,12 @@ async function visibleBoundingBox(row: Locator) {
   return box;
 }
 
+interface DirectoryHydration {
+  epoch: number;
+  projects: boolean;
+  workspaces: boolean;
+}
+
 async function pressProjectRow(rows: Locator) {
   await rows.page().mouse.down();
 }
@@ -686,6 +692,8 @@ test("cross-section leaves wait for ACKs and whole cross-host subtrees move hidd
     let rejectFirst = true;
     let rejectGroupChild = false;
     let heldAcceptedResponse = false;
+    const directoryConnections = new Map<string, DirectoryHydration>();
+    let directoryEpoch = 0;
     const request = z
       .object({
         message: z.object({ type: z.string(), workspaceId: z.string().optional() }).passthrough(),
@@ -695,7 +703,10 @@ test("cross-section leaves wait for ACKs and whole cross-host subtrees move hidd
       new RegExp(`:(?:${getE2EDaemonPort()}|${secondary.port})\\b`),
       (browser) => {
         if (tearingDown) return;
-        const sourceHost = new URL(browser.url()).port === String(secondary.port);
+        const port = new URL(browser.url()).port;
+        const sourceHost = port === String(secondary.port);
+        const directory = { epoch: ++directoryEpoch, projects: false, workspaces: false };
+        directoryConnections.set(port, directory);
         const server = browser.connectToServer();
         const buffered: Array<string | Buffer> = [];
         let gate = false;
@@ -744,6 +755,8 @@ test("cross-section leaves wait for ACKs and whole cross-host subtrees move hidd
         });
         server.onMessage((message) => {
           const envelope = JSON.parse(message.toString());
+          if (envelope.message?.type === "project.list.response") directory.projects = true;
+          if (envelope.message?.type === "fetch_workspaces_response") directory.workspaces = true;
           if (
             sourceHost &&
             !heldAcceptedResponse &&
@@ -763,6 +776,25 @@ test("cross-section leaves wait for ACKs and whole cross-host subtrees move hidd
         });
       },
     );
+    async function reloadWithDirectoryHydration() {
+      const beforeReload = directoryEpoch;
+      await reloadPreservingHostRegistry(page);
+      // Cached rows can paint before either live directory settles. A drag
+      // needs the new connection's authoritative catalog on both owners.
+      await expect
+        .poll(() =>
+          [getE2EDaemonPort(), secondary.port].every((hostPort) => {
+            const directory = directoryConnections.get(String(hostPort));
+            return (
+              directory !== undefined &&
+              directory.epoch > beforeReload &&
+              directory.projects &&
+              directory.workspaces
+            );
+          }),
+        )
+        .toBe(true);
+    }
     await page.setViewportSize({ width: 1440, height: 1100 });
     await gotoAppShell(page);
     await addConnectedHostAndReload(page, {
@@ -843,7 +875,7 @@ test("cross-section leaves wait for ACKs and whole cross-host subtrees move hidd
     await expect.poll(() => treeIndent(page, childKey, movingKey, "superpinned")).toBe(16);
     await expect.poll(() => treeIndent(page, siblingKey, movingKey, "superpinned")).toBe(16);
     await expect.poll(() => treeIndent(page, grandchildKey, movingKey, "superpinned")).toBe(32);
-    await reloadPreservingHostRegistry(page);
+    await reloadWithDirectoryHydration();
     await expectTreeOrder(
       page,
       [remoteSuperpinnedKey, movingKey, childKey, grandchildKey, siblingKey],
@@ -918,7 +950,7 @@ test("cross-section leaves wait for ACKs and whole cross-host subtrees move hidd
       parentWorkspaceId: null,
       beforeWorkspaceId: ordinaryAnchor,
     });
-    await reloadPreservingHostRegistry(page);
+    await reloadWithDirectoryHydration();
     await expect(ordinaryRow(movingKey)).toBeVisible();
     await dragWorkspace(page, movingKey, landingKey, "inside");
     await expectGroupPins(false);
@@ -926,7 +958,7 @@ test("cross-section leaves wait for ACKs and whole cross-host subtrees move hidd
     await expect.poll(() => treeIndent(page, childKey, landingKey)).toBe(32);
     await expect.poll(() => treeIndent(page, siblingKey, landingKey)).toBe(32);
     await expect.poll(() => treeIndent(page, grandchildKey, landingKey)).toBe(48);
-    await reloadPreservingHostRegistry(page);
+    await reloadWithDirectoryHydration();
     await expectTreeOrder(page, [landingKey, movingKey, childKey, grandchildKey, siblingKey]);
     await expect.poll(() => treeIndent(page, grandchildKey, landingKey)).toBe(48);
     // Menu changes can move one parent: its children become roots while their
@@ -944,7 +976,7 @@ test("cross-section leaves wait for ACKs and whole cross-host subtrees move hidd
     await rowMenuAction(page, movingKey, "pin");
     await expect.poll(() => treeIndent(page, movingKey, landingKey)).toBe(16);
     await expect.poll(() => treeIndent(page, childKey, landingKey)).toBe(32);
-    await reloadPreservingHostRegistry(page);
+    await reloadWithDirectoryHydration();
     await expect.poll(() => treeIndent(page, childKey, landingKey)).toBe(32);
     expect(pinRequests.slice(menuRequestsStart).every((host) => host === "source")).toBe(true);
     expect(await Promise.all([backendHierarchy(target), backendHierarchy(remote)])).toEqual(

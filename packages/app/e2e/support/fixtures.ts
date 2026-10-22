@@ -11,6 +11,7 @@ import {
 } from "./helpers/project-picker-fixture";
 import { connectSeedClient, type SeedDaemonClient } from "./helpers/seed-client";
 import { createWithWorkspace, type WithWorkspace } from "./helpers/with-workspace";
+import { seedProjectSidebarGrouping } from "./helpers/sidebar";
 
 const EXTRA_HOSTS_KEY = "@paseo:e2e-extra-hosts";
 
@@ -132,6 +133,7 @@ const test = daemonTest.extend<{
       });
 
       await hideDeveloperToasts(page);
+      await seedProjectSidebarGrouping(page);
 
       const entries: string[] = [];
 
@@ -172,15 +174,6 @@ const test = daemonTest.extend<{
 
           localStorage.setItem("@paseo:e2e", "1");
           localStorage.setItem("@paseo:e2e-seed-nonce", nonce);
-
-          // Most journeys exercise project controls. Give them an explicit preference;
-          // fresh production clients default to the ungrouped workspace tree.
-          if (!localStorage.getItem("sidebar-view")) {
-            localStorage.setItem(
-              "sidebar-view",
-              JSON.stringify({ state: { groupMode: "project" }, version: 7 }),
-            );
-          }
 
           const rawExtraHosts = localStorage.getItem(extraHostsKey);
           const extraHosts = rawExtraHosts ? JSON.parse(rawExtraHosts) : [];

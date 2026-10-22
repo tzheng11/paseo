@@ -802,7 +802,7 @@ function createToolCatalog(
     );
     if (requireComplete && destinations.some((host) => host.status !== "online"))
       throw new PaseoToolInputError(
-        "Reconnect all registered hosts before changing the shared workspace hierarchy, or supply a saved parent section and siblingOrder for child creation.",
+        "Reconnect all registered hosts before moving the shared workspace hierarchy.",
       );
     const remote = await Promise.all(
       destinations
@@ -848,7 +848,9 @@ function createToolCatalog(
             section: workspaceSidebarSection(row),
             pinPlacement: row.pinPlacement,
           }))
-      : await loadSidebarCatalog();
+      : // Creation adds a fresh leaf, so unrelated offline owners cannot hide a descendant being moved.
+        // Resolve its parent from reachable owners and append after their known siblings.
+        await loadSidebarCatalog(false);
     const sidebarPlacement = resolveSidebarAutomationPlacement({
       workspaces: rows,
       parentWorkspaceKey: parent ?? null,
