@@ -154,12 +154,13 @@ test("dormant checkouts retain metadata coverage while active checkout edits rem
   const fileObserver: FileObserver = {
     async subscribe(directory, callback, options) {
       const subscription = await observer.subscribe(directory, callback, options);
-      liveRoots.add(directory);
+      const canonicalDirectory = realpathSync(directory);
+      liveRoots.add(canonicalDirectory);
       return {
         updateIgnore: (paths) => subscription.updateIgnore(paths),
         async unsubscribe() {
           await subscription.unsubscribe();
-          liveRoots.delete(directory);
+          liveRoots.delete(canonicalDirectory);
         },
       };
     },

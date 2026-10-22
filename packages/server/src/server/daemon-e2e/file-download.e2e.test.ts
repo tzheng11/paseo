@@ -97,6 +97,7 @@ describe("daemon E2E", () => {
             await expectDownloadClosed(filePath);
           }
         } finally {
+          await ctx.cleanup();
           rmSync(directory, { recursive: true, force: true });
         }
       },
@@ -168,6 +169,7 @@ describe("daemon E2E", () => {
           const body = await response.text();
           expect(body).toBe(fileContents);
         } finally {
+          await ctx.cleanup();
           rmSync(cwd, { recursive: true, force: true });
         }
       },
@@ -211,6 +213,7 @@ describe("daemon E2E", () => {
 
       expect(response.status).toBe(403);
 
+      await ctx.cleanup();
       rmSync(cwd, { recursive: true, force: true });
     }, 60000);
 
@@ -229,6 +232,7 @@ describe("daemon E2E", () => {
       expect(tokenResponse.token).toBeNull();
       expect(tokenResponse.error).toBeTruthy();
 
+      await ctx.cleanup();
       rmSync(cwd, { recursive: true, force: true });
     }, 60000);
   });

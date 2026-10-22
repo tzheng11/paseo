@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import type pino from "pino";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import type { CheckoutSnapshotFacts, CheckoutStatusGit } from "../utils/checkout-git.js";
+import type {
+  CheckoutContext,
+  CheckoutSnapshotFacts,
+  CheckoutStatusGit,
+} from "../utils/checkout-git.js";
 import { CheckoutDiffManager } from "./checkout-diff-manager.js";
 import type { FileObserver } from "./file-observer/index.js";
 import { WorkspaceGitServiceImpl } from "./workspace-git-service.js";
@@ -489,6 +493,39 @@ describe("WorkspaceGitService checkout observation", () => {
 
     closeFinished.resolve();
     await disposal;
+  });
+
+  test("dispose drains its pending Git probe and prevents its follow-up commands", async () => {
+    const watcher = createWatcherHarness();
+    const commandFinished = createDeferred<void>();
+    const run = vi.fn(async () => {
+      await commandFinished.promise;
+      return { stdout: "", stderr: "", truncated: false, exitCode: 0, signal: null };
+    });
+    const service = createService(watcher, {
+      createRunGitCommand: () => run,
+      getCheckoutSnapshotFacts: async (cwd: string, context: CheckoutContext) => {
+        await context!.runGitCommand!(["first-probe"], { cwd });
+        await context!.runGitCommand!(["follow-up-probe"], { cwd });
+        return { isGit: false };
+      },
+    });
+    service.registerWorkspace({ cwd: REPO_CWD }, () => {});
+    await vi.waitFor(() => expect(run).toHaveBeenCalledOnce());
+
+    let finished = false;
+    const disposal = service.dispose().then(() => {
+      finished = true;
+      return undefined;
+    });
+    await flushPromises();
+    expect(finished).toBe(false);
+    commandFinished.resolve();
+    await disposal;
+    await flushPromises();
+    expect(finished).toBe(true);
+    expect(run).toHaveBeenCalledOnce();
+    expect(watcher.subscribe).not.toHaveBeenCalled();
   });
 
   test("shares one recursive checkout observer between cwd-equivalent consumers", async () => {

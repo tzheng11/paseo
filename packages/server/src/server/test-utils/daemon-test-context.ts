@@ -44,13 +44,15 @@ export async function createDaemonTestContext(
   });
   await client.connect();
   await client.fetchAgents({ subscribe: {} });
+  let cleanupPromise: Promise<void> | null = null;
 
   return {
     daemon,
     client,
-    cleanup: async () => {
-      await client.close();
-      await daemon.close();
-    },
+    cleanup: () =>
+      (cleanupPromise ??= (async () => {
+        await client.close();
+        await daemon.close();
+      })()),
   };
 }

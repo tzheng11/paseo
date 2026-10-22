@@ -397,6 +397,7 @@ interface WorkspaceGitServiceDependencies {
     runGitCommand: RunGitCommand,
   ) => Promise<WorkspaceGitFetchResult>;
   runGitCommand: typeof runGitCommand;
+  createRunGitCommand: typeof createRunGitCommand;
   getWorkspaceGitSelfHealPhaseMs: typeof getWorkspaceGitObservationReensurePhaseMs;
   getWorkingTreeIgnoreRefreshIntervalMs: () => number;
   createWatcherLivenessCanary: typeof createWatcherLivenessCanary;
@@ -590,6 +591,7 @@ function buildDefaultWorkspaceGitServiceDeps(
     hasOriginRemote,
     runGitFetch: fetchWorkspaceGitRemote,
     runGitCommand: createRunGitCommand("workspace-watch"),
+    createRunGitCommand,
     getWorkspaceGitSelfHealPhaseMs: getWorkspaceGitObservationReensurePhaseMs,
     createWatcherLivenessCanary,
     now: () => new Date(),
@@ -656,6 +658,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   private readonly disposeController = new AbortController();
   private disposed = false;
   private disposePromise: Promise<void> | null = null;
+  private readonly inFlightGitCommands = new Set<Promise<unknown>>();
   private readonly snapshotUpdatedListeners = new Set<WorkspaceGitSnapshotUpdatedListener>();
   private readonly workspaceTargets = new Map<string, WorkspaceGitTarget>();
   private readonly repoTargets = new Map<string, RepoGitTarget>();
@@ -698,6 +701,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       this.fileObserver.subscribe.bind(this.fileObserver),
       options.deps,
     );
+    this.deps.runGitCommand = this.trackGitCommandRunner(this.deps.runGitCommand);
     this.forgeResolver = createForgeResolver({
       createService: (forge) => this.deps.forgeOverrides?.[forge] ?? createForgeService(forge),
     });
@@ -862,7 +866,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       paseoHome: this.paseoHome,
       worktreesRoot: this.worktreesRoot,
       logger: this.logger,
-      runGitCommand: createRunGitCommand("workspace-checkout-metadata"),
+      runGitCommand: this.createGitCommandRunner("workspace-checkout-metadata"),
     });
     const cached = this.peekSnapshot(normalizedCwd);
     if (cached && cached.git.isGit !== facts.isGit) {
@@ -1191,8 +1195,26 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     this.workingTreeWatchResolutions.clear();
     this.workingTreeWatchAliases.clear();
     this.snapshotUpdatedListeners.clear();
-    this.disposePromise = this.fileObserver.close();
+    this.disposePromise = Promise.all([
+      this.fileObserver.close(),
+      Promise.allSettled(this.inFlightGitCommands),
+    ]).then(() => undefined);
     return this.disposePromise;
+  }
+
+  private createGitCommandRunner(provenance: string): RunGitCommand {
+    return this.trackGitCommandRunner(this.deps.createRunGitCommand(provenance));
+  }
+
+  private trackGitCommandRunner(run: RunGitCommand): RunGitCommand {
+    return (args, options) => {
+      // A multi-step checkout probe may still be unwinding after disposal.
+      // Drain commands already submitted, but never let it start another one.
+      this.assertNotDisposed();
+      const command = run(args, options).finally(() => this.inFlightGitCommands.delete(command));
+      this.inFlightGitCommands.add(command);
+      return command;
+    };
   }
 
   private assertNotDisposed(): void {
@@ -1547,7 +1569,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     return this.loadCheckoutFacts(target, {
       paseoHome: this.paseoHome,
       logger: this.logger,
-      runGitCommand: createRunGitCommand("workspace-observation"),
+      runGitCommand: this.createGitCommandRunner("workspace-observation"),
     });
   }
 
@@ -3538,7 +3560,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
         });
       }
       try {
-        const runRefreshGitCommand = createRunGitCommand(`workspace-refresh:${request.reason}`);
+        const runRefreshGitCommand = this.createGitCommandRunner(
+          `workspace-refresh:${request.reason}`,
+        );
         const refresh = () =>
           this.workspaceRefreshLimit(() => {
             if (target.closed || this.workspaceTargets.get(target.cwd) !== target) {
@@ -4004,7 +4028,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
               }
             },
           },
-          createRunGitCommand("background-fetch"),
+          this.createGitCommandRunner("background-fetch"),
         );
       } catch (error) {
         this.logger.warn(
