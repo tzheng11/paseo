@@ -1760,13 +1760,17 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     return [join(target.watchPath, ".git"), ...target.ignoredDirectories];
   }
 
+  private hasWorkingTreeObservationDemand(target: WorkingTreeWatchTarget): boolean {
+    return !target.closed && (target.repoRoot !== null || target.listeners.size > 0);
+  }
+
   private startWorkingTreeSubscription(
     target: WorkingTreeWatchTarget,
     options?: { replaceFallback?: boolean },
   ): Promise<boolean> {
     // Automatic Git demand only needs bounded discovery outside a repository.
     // Explicit directory consumers still own recursive coverage there.
-    if (target.closed || (target.repoRoot === null && target.listeners.size === 0)) {
+    if (!this.hasWorkingTreeObservationDemand(target)) {
       return Promise.resolve(false);
     }
     if (target.subscription) return Promise.resolve(true);
@@ -1836,7 +1840,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
         return false;
       }
       if (
-        target.closed ||
+        !this.hasWorkingTreeObservationDemand(target) ||
         (target.fallbackPolling && !options?.replaceFallback) ||
         target.subscription
       ) {
@@ -2006,7 +2010,11 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   }
 
   private scheduleWorkingTreeWatchRecovery(target: WorkingTreeWatchTarget): void {
-    if (target.closed || target.subscription || target.recovery.timer) {
+    if (
+      !this.hasWorkingTreeObservationDemand(target) ||
+      target.subscription ||
+      target.recovery.timer
+    ) {
       return;
     }
     const delayMs = this.advanceWatchRecoveryLadder(target.recovery);

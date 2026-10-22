@@ -2552,6 +2552,41 @@ describe("WorkspaceGitService checkout observation", () => {
     service.dispose();
   });
 
+  test("a pending non-Git recovery cannot retain recursive coverage after its last explicit consumer leaves", async () => {
+    const watcher = createWatcherHarness();
+    const service = createService(watcher, {
+      getCheckoutSnapshotFacts: vi.fn(
+        async (): Promise<CheckoutSnapshotFacts> => ({ isGit: false }),
+      ),
+      getCheckoutStatus: vi.fn(async () => ({ isGit: false }) as const),
+      getWorkspaceGitSelfHealPhaseMs: () => 1_000_000,
+      runGitCommand: vi.fn(async () => {
+        throw new Error("not a git repository");
+      }),
+    });
+    const automatic = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    await service.getSnapshot(REPO_CWD);
+    await vi.waitFor(() =>
+      expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0),
+    );
+    const explicit = await service.requestWorkingTreeWatch(REPO_CWD, vi.fn());
+    const replacement = createDeferred<Awaited<ReturnType<typeof watcher.subscribe>>>();
+    const lateUnsubscribe = vi.fn(async () => {});
+    watcher.subscribe.mockImplementationOnce(() => replacement.promise);
+    watcher.records[0]!.callback(new Error("watcher stopped"), []);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(watcher.subscribe).toHaveBeenCalledTimes(2);
+
+    explicit.unsubscribe();
+    expect(service.getMetrics().workingTreeWatchTargetCount).toBe(1);
+    replacement.resolve({ updateIgnore: vi.fn(async () => {}), unsubscribe: lateUnsubscribe });
+    await vi.waitFor(() => expect(lateUnsubscribe).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(watcher.subscribe).toHaveBeenCalledTimes(2);
+    automatic.unsubscribe();
+    await service.dispose();
+  });
+
   test("adding ignored directories updates filtering without replacing the watcher", async () => {
     const watcher = createWatcherHarness();
     let ignoredDirectories = "node_modules/\n";
