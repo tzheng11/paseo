@@ -72,8 +72,8 @@ interface SidebarWorkspaceOrderScope {
   projectViewKey: string;
 }
 
-// Trims each key. Only for persisted state read at migration time, where a
-// stray space is an artifact of an older format rather than part of the key.
+// Trims keys from pre-v2 persisted formats, where stray spaces were artifacts
+// rather than part of an exact project or workspace key.
 function normalizeKeys(keys: string[]): string[] {
   const seen = new Set<string>();
   const normalized: string[] = [];
@@ -140,7 +140,22 @@ function normalizeLegacyWorkspaceKey(serverId: string, rawWorkspaceKey: string):
   return workspaceKey.startsWith(serverPrefix) ? workspaceKey : `${serverPrefix}${workspaceKey}`;
 }
 
-export function migrateSidebarOrderState(persistedState: unknown): {
+function migrateModernSidebarOrderState(state: SidebarOrderPersistedState) {
+  return {
+    projectOrder: state.projectOrder ?? [],
+    pinnedWorkspaceOrder: state.pinnedWorkspaceOrder ?? [],
+    superpinnedWorkspaceOrder: state.superpinnedWorkspaceOrder ?? [],
+    pinnedWorkspaceTree: state.pinnedWorkspaceTree ?? {},
+    pinnedWorkspaceSortMode: state.pinnedWorkspaceSortMode ?? "manual",
+    workspaceOrderByProject: state.workspaceOrderByProject ?? {},
+    workspaceSortModeByProject: state.workspaceSortModeByProject ?? {},
+  };
+}
+
+export function migrateSidebarOrderState(
+  persistedState: unknown,
+  version = 0,
+): {
   projectOrder: string[];
   pinnedWorkspaceOrder: string[];
   superpinnedWorkspaceOrder: string[];
@@ -162,6 +177,12 @@ export function migrateSidebarOrderState(persistedState: unknown): {
     };
   }
   const state: SidebarOrderPersistedState = result.data;
+
+  // v2 already stores exact view keys, including directory names ending in a
+  // space. Adding the pin tree must not rerun legacy trimming or merge scopes.
+  if (version >= 2) {
+    return migrateModernSidebarOrderState(state);
+  }
 
   const projectOrder = normalizeKeys(state.projectOrder ?? []);
   const seenProjects = new Set(projectOrder);
@@ -190,13 +211,11 @@ export function migrateSidebarOrderState(persistedState: unknown): {
   }
 
   return {
+    ...migrateModernSidebarOrderState(state),
     projectOrder,
     pinnedWorkspaceOrder: normalizeKeys(state.pinnedWorkspaceOrder ?? []),
     superpinnedWorkspaceOrder: normalizeKeys(state.superpinnedWorkspaceOrder ?? []),
-    pinnedWorkspaceTree: state.pinnedWorkspaceTree ?? {},
-    pinnedWorkspaceSortMode: state.pinnedWorkspaceSortMode ?? "manual",
     workspaceOrderByProject,
-    workspaceSortModeByProject: state.workspaceSortModeByProject ?? {},
   };
 }
 
