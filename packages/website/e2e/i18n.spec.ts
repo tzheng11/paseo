@@ -177,9 +177,14 @@ test("shows a translated plugin overview, or the English one under a notice", as
   await expect(page.getByRole("heading", { name: "Behavior" })).toBeVisible();
 });
 
-test("shows the changelog in Chinese", async ({ page }) => {
+test("shows translated changelog entries and labels untranslated releases", async ({ page }) => {
   await page.goto("/zh-CN/changelog");
 
-  await expect(page.getByRole("heading", { name: "新增" }).first()).toBeVisible();
-  await expect(page.getByRole("note")).toHaveCount(0);
+  const translated = page.locator('.changelog-release-notes[lang="zh-CN"]');
+  await expect(translated.first()).toBeVisible();
+  await expect(translated.getByRole("heading", { name: "新增" }).first()).toBeVisible();
+  await expect(translated.getByRole("note")).toHaveCount(0);
+
+  const untranslated = page.locator('.changelog-release-notes[lang="en"]');
+  await expect(untranslated.getByRole("note")).toHaveCount(await untranslated.count());
 });

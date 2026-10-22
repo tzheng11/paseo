@@ -1,9 +1,8 @@
 import { z } from "zod";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
-import * as agentMessageDelivery from "../agent/agent-messages/delivery.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { afterEach, expect, test, vi } from "vitest";
+import { afterEach, expect, test } from "vitest";
 import { createPaseoApi } from "@getpaseo/client";
 import { createHostClient, createHostChannelTransport } from "@getpaseo/client/node";
 import { createTestPaseoDaemon, type TestPaseoDaemon } from "../test-utils/paseo-daemon.js";
@@ -1559,51 +1558,26 @@ test(
     const parentPrompts: string[] = [];
     const childStarted = Promise.withResolvers<void>();
     const finishChild = Promise.withResolvers<void>();
-    cleanup.push(async () => {
-      finishChild.resolve();
-    });
-    const recipientBatches = new Set<() => void>();
-    let holdRecipientBatches = false;
-    let recipientAdmissions = 0;
-    const createDelivery = agentMessageDelivery.createAgentMessageDelivery;
-    const factory = vi
-      .spyOn(agentMessageDelivery, "createAgentMessageDelivery")
-      .mockImplementation((options) =>
-        createDelivery({
-          ...options,
-          schedule: (delay, callback) => {
-            if (!holdRecipientBatches) {
-              const timer = setTimeout(callback, delay);
-              return () => clearTimeout(timer);
-            }
-            expect(delay).toBe(2000);
-            recipientAdmissions += 1;
-            recipientBatches.add(callback);
-            return () => {
-              recipientBatches.delete(callback);
-            };
-          },
-        }),
-      );
-    cleanup.push(async () => {
-      factory.mockRestore();
-      recipientBatches.clear();
-    });
+    const finishParent = Promise.withResolvers<void>();
     const a = await daemon({
       agentClients: createTestAgentClients({
         onStartTurn: (prompt, config) => {
           if (config.title === "Batch parent")
             parentPrompts.push(typeof prompt === "string" ? prompt : JSON.stringify(prompt));
         },
+        // Receipts acknowledge dispatch, so keep the turn active until both writes settle.
+        beforeTurnComplete: () => finishParent.promise,
       }),
     });
-    // Only the origin's existing delivery schedule is controlled by this test.
-    factory.mockRestore();
     const b = await daemon({
       agentClients: createTestAgentClients({
         onStartTurn: () => childStarted.resolve(),
         beforeTurnComplete: () => finishChild.promise,
       }),
+    });
+    cleanup.push(async () => {
+      finishChild.resolve();
+      finishParent.resolve();
     });
     const origin = await api(a);
     const destination = await api(b);
@@ -1659,34 +1633,14 @@ test(
     // An idle recipient must not report old idle as completion of its queued task.
     expect((await destination.client.waitForFinish(child.id, 50)).status).toBe("timeout");
     await childStarted.promise;
-    // Transport, the child daemon, and CLI startup keep using real timers.
-    holdRecipientBatches = true;
-    const report = await childMcp.callTool({
-      name: "send_agent_prompt",
-      arguments: {
-        serverId: aId,
-        agentId: parent.id,
-        prompt: "REMOTE_REPORT <ready>",
-        notifyOnFinish: false,
-      },
-    });
-    expect(report.isError).not.toBe(true);
-    expect(report.structuredContent).toMatchObject({ deliveryStatus: "queued", serverId: aId });
-    expect(parentPrompts).toEqual([]);
-
-    // A cold CLI may take longer than the recipient's two-second batch window.
-    const slowCli = join(a.staticDir, "slow-batch-cli.mjs");
-    await writeFile(
-      slowCli,
-      `await new Promise(resolve => setTimeout(resolve, 2100));\nawait import(${JSON.stringify(new URL("../../../../cli/src/index.ts", import.meta.url).href)});\n`,
-    );
+    // CLI startup can exceed the quiet window; admit its report before the fast MCP send.
     const cli = await promisify(execFile)(
       process.execPath,
       [
         "--conditions=source",
         "--import",
         "tsx",
-        slowCli,
+        fileURLToPath(new URL("../../../../cli/src/index.ts", import.meta.url)),
         "--host",
         `127.0.0.1:${a.port}`,
         "send",
@@ -1702,6 +1656,19 @@ test(
     );
     expect(JSON.parse(cli.stdout)).toMatchObject({ status: "queued" });
     expect(parentPrompts).toEqual([]);
+    const report = await childMcp.callTool({
+      name: "send_agent_prompt",
+      arguments: {
+        serverId: aId,
+        agentId: parent.id,
+        prompt: "REMOTE_REPORT <ready>",
+        notifyOnFinish: false,
+      },
+    });
+    expect(report.isError).not.toBe(true);
+    expect(report.structuredContent).toMatchObject({ deliveryStatus: "queued", serverId: aId });
+    expect(parentPrompts).toEqual([]);
+
     const receiptStates = async () => {
       const directory = join(a.paseoHome, "agent-requests");
       const receipts = await Promise.all(
@@ -1718,17 +1685,14 @@ test(
     };
     expect(await receiptStates()).toEqual(["pending", "pending"]);
     finishChild.resolve();
-    await expect.poll(() => recipientAdmissions, { timeout: 10000 }).toBe(3);
-    expect(recipientBatches.size).toBe(1);
-    const flush = [...recipientBatches][0]!;
-    recipientBatches.clear();
-    flush();
     await expect.poll(() => parentPrompts, { timeout: 10000 }).toHaveLength(1);
     expect(parentPrompts[0]).toContain("REMOTE_REPORT &lt;ready&gt;");
     expect(parentPrompts[0]).toContain("LOCAL_CLI_REPORT");
     expect(parentPrompts[0]).toContain('event="finished"');
     expect(parentPrompts[0]).toContain(`source-agent-id="${child.id}"`);
     await expect.poll(receiptStates, { timeout: 10000 }).toEqual(["completed", "completed"]);
+    expect((await origin.client.fetchAgent(parent.id))?.agent.status).toBe("running");
+    finishParent.resolve();
     const timeline = await origin.client.fetchAgentTimeline(parent.id);
     const messages = timeline.entries.flatMap((row) =>
       row.item.type === "tool_call" && row.item.agentMessage ? [row.item.agentMessage] : [],
@@ -1736,11 +1700,12 @@ test(
     expect(
       messages.map((message) => [message.event, message.sender.id, message.sender.serverId]),
     ).toEqual([
-      ["message", child.id, bId],
       ["message", parent.id, undefined],
+      ["message", child.id, bId],
       ["finished", child.id, bId],
     ]);
-    expect(messages[0]!.text).toBe("REMOTE_REPORT <ready>");
+    expect(messages[0]!.text).toBe("LOCAL_CLI_REPORT");
+    expect(messages[1]!.text).toBe("REMOTE_REPORT <ready>");
     expect(timeline.entries.filter((row) => row.item.type === "user_message")).toEqual([]);
 
     const human = await aWorkspace.agents.create({
