@@ -709,6 +709,7 @@ test("cross-section leaves wait for ACKs and whole cross-host subtrees move hidd
         });
       },
     );
+    await page.setViewportSize({ width: 1440, height: 1100 });
     await gotoAppShell(page);
     await addConnectedHostAndReload(page, {
       serverId: secondary.serverId,
@@ -830,6 +831,8 @@ test("cross-section leaves wait for ACKs and whole cross-host subtrees move hidd
     // descendants unpin into their own original project lists without host moves.
     expect(await Promise.all([backendHierarchy(target), backendHierarchy(remote)])).toEqual(before);
     expect(moves).toEqual([]);
+    await expect(treeNode(page, movingKey)).toBeInViewport();
+    await expect(page.getByTestId(`workspace-tree-node-${ordinaryAnchorKey}`)).toBeInViewport();
     await dragWorkspace(page, movingKey, ordinaryAnchorKey, "before");
     await expectGroupPins(false, false);
     const ordinaryRow = (key: string) =>
