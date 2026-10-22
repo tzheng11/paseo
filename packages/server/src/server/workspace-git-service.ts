@@ -491,6 +491,7 @@ interface WorkingTreeWatchTarget {
   watchPath: string;
   repoRoot: string | null;
   subscription: FileObserverSubscription | null;
+  subscriptionSetupPromise: Promise<boolean> | null;
   ignoredDirectories: Set<string>;
   // What the live subscription actually accepted, as of the last successful
   // `updateIgnore`/subscribe — the full resolved ignore list (the watch root's
@@ -1108,6 +1109,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
         claim.target = pending;
         pending.listeners.add(onChange);
       });
+      if (target.repoRoot === null && !target.subscription) {
+        await this.startWorkingTreeSubscription(target, { replaceFallback: true });
+      }
       this.assertNotDisposed();
       return {
         repoRoot: target.repoRoot,
@@ -1593,6 +1597,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       watchPath,
       repoRoot,
       subscription: null,
+      subscriptionSetupPromise: null,
       ignoredDirectories: new Set(),
       appliedIgnoreList: [],
       ignoredDirectoriesRefreshPromise: null,
@@ -1755,7 +1760,27 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     return [join(target.watchPath, ".git"), ...target.ignoredDirectories];
   }
 
-  private async startWorkingTreeSubscription(
+  private startWorkingTreeSubscription(
+    target: WorkingTreeWatchTarget,
+    options?: { replaceFallback?: boolean },
+  ): Promise<boolean> {
+    // Automatic Git demand only needs bounded discovery outside a repository.
+    // Explicit directory consumers still own recursive coverage there.
+    if (target.closed || (target.repoRoot === null && target.listeners.size === 0)) {
+      return Promise.resolve(false);
+    }
+    if (target.subscription) return Promise.resolve(true);
+    if (target.subscriptionSetupPromise) return target.subscriptionSetupPromise;
+    const setup = this.subscribeWorkingTree(target, options);
+    target.subscriptionSetupPromise = setup;
+    const clear = () => {
+      if (target.subscriptionSetupPromise === setup) target.subscriptionSetupPromise = null;
+    };
+    void setup.then(clear, clear);
+    return setup;
+  }
+
+  private async subscribeWorkingTree(
     target: WorkingTreeWatchTarget,
     options?: { replaceFallback?: boolean },
   ): Promise<boolean> {
@@ -2015,6 +2040,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       return;
     }
     target.repoRoot = repoRoot;
+    await target.subscriptionSetupPromise;
     if (target.subscription && target.fallbackPolling) {
       target.fallbackPolling = false;
       if (target.fallbackPollTimer) {
@@ -2023,6 +2049,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       }
     }
     await this.refreshWorkingTreeIgnoredDirectories(target);
+    if (!target.subscription) {
+      await this.startWorkingTreeSubscription(target, { replaceFallback: true });
+    }
   }
 
   /**
@@ -4097,6 +4126,15 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     }
 
     target.listeners.delete(listener);
+    if (target.repoRoot === null && target.listeners.size === 0) {
+      const subscription = target.subscription;
+      target.subscription = null;
+      if (subscription) void this.unsubscribeWatcherSubscription(subscription, target.watchPath);
+      if (target.recovery.timer) {
+        clearTimeout(target.recovery.timer);
+        target.recovery.timer = null;
+      }
+    }
     if (target.listeners.size > 0 || target.workspaceKeys.size > 0) {
       return;
     }

@@ -1997,6 +1997,7 @@ describe("WorkspaceGitService checkout observation", () => {
       });
     });
     expect(watcher.records.filter((record) => record.directory === GIT_DIR)).toHaveLength(0);
+    expect(watcher.records).toHaveLength(0);
 
     isGit = true;
     await vi.advanceTimersByTimeAsync(5_000);
@@ -2516,6 +2517,12 @@ describe("WorkspaceGitService checkout observation", () => {
     await vi.waitFor(() => {
       expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
     });
+    expect(watcher.records).toHaveLength(0);
+    const [explicit, another] = await Promise.all([
+      service.requestWorkingTreeWatch(REPO_CWD, vi.fn()),
+      service.requestWorkingTreeWatch(REPO_CWD, vi.fn()),
+    ]);
+    expect(getWatcherRecordsForDirectory(watcher, REPO_CWD)).toHaveLength(1);
     const checkoutWatcher = getWatcherRecordsForDirectory(watcher, REPO_CWD)[0];
     checkoutWatcher?.callback(new Error("watcher stopped"), []);
 
@@ -2533,6 +2540,14 @@ describe("WorkspaceGitService checkout observation", () => {
       expect(getCheckoutStatus.mock.calls.length).toBeGreaterThan(statusCallsAfterRecovery);
     });
 
+    explicit.unsubscribe();
+    expect(
+      getWatcherRecordsForDirectory(watcher, REPO_CWD).at(-1)?.unsubscribe,
+    ).not.toHaveBeenCalled();
+    another.unsubscribe();
+    expect(
+      getWatcherRecordsForDirectory(watcher, REPO_CWD).at(-1)?.unsubscribe,
+    ).toHaveBeenCalledTimes(1);
     subscription.unsubscribe();
     service.dispose();
   });

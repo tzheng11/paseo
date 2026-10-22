@@ -8,6 +8,8 @@ import type { CheckoutSnapshotFacts, CheckoutStatusGit } from "../utils/checkout
 import { CheckoutDiffManager } from "./checkout-diff-manager.js";
 import { createFileObserver } from "./file-observer/index.js";
 import { WorkspaceGitServiceImpl } from "./workspace-git-service.js";
+import { observeActiveWorkspaceGit } from "./active-workspace-git-observer.js";
+import type { AgentSubscriber, ManagedAgent } from "./agent/agent-manager.js";
 import type { FileChange, FileObserver, SubscribeToFileChanges } from "./file-observer/index.js";
 
 function createLogger(): pino.Logger {
@@ -62,6 +64,76 @@ afterEach(async () => {
     await cleanup.pop()?.();
   }
 });
+
+test("initializing non-Git agents use no recursive inventory while explicit file demand and later Git initialization stay live", async () => {
+  const root = realpathSync(mkdtempSync(path.join(tmpdir(), "paseo-non-git-observation-")));
+  writeFileSync(path.join(root, "file.txt"), "before\n");
+  const observer = createFileObserver();
+  const service = new WorkspaceGitServiceImpl({
+    logger: pino({ enabled: false }),
+    paseoHome: path.join(root, "home"),
+    fileObserver: observer,
+  });
+  let emit: AgentSubscriber = () => {};
+  const stop = observeActiveWorkspaceGit({
+    agentManager: {
+      subscribe(callback) {
+        emit = callback;
+        return () => {};
+      },
+    },
+    workspaceGitService: service,
+  });
+  let explicit: Awaited<ReturnType<typeof service.requestWorkingTreeWatch>> | null = null;
+  cleanup.push(async () => {
+    explicit?.unsubscribe();
+    stop();
+    await service.dispose();
+    rmSync(root, { recursive: true, force: true });
+  });
+  emit({
+    type: "agent_state",
+    agent: { id: "non-git", cwd: root, lifecycle: "initializing" } as ManagedAgent,
+  });
+  expect((await service.getSnapshot(root, { includeForge: false })).git.isGit).toBe(false);
+  await vi.waitFor(() =>
+    expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0),
+  );
+  expect(observer.getDiagnostics()).toMatchObject({
+    activeObservationCount: 0,
+    nativeTrackedFileCount: 0,
+  });
+
+  const changed = vi.fn();
+  explicit = await service.requestWorkingTreeWatch(root, changed);
+  expect(observer.getDiagnostics().activeObservationCount).toBe(1);
+  writeFileSync(path.join(root, "file.txt"), "explicit edit\n");
+  await vi.waitFor(() => expect(changed).toHaveBeenCalled(), { timeout: 10_000 });
+  explicit.unsubscribe();
+  explicit = null;
+  await vi.waitFor(() => expect(observer.getDiagnostics().activeObservationCount).toBe(0));
+
+  execFileSync("git", ["init", "-b", "main"], { cwd: root, stdio: "pipe" });
+  writeFileSync(path.join(root, ".gitignore"), "home/\n");
+  execFileSync("git", ["add", "file.txt", ".gitignore"], { cwd: root, stdio: "pipe" });
+  execFileSync(
+    "git",
+    ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "initial"],
+    { cwd: root, stdio: "pipe" },
+  );
+  expect((await service.getCheckout(root)).isGit).toBe(true);
+  await vi.waitFor(() => expect(observer.getDiagnostics().activeObservationCount).toBe(2), {
+    timeout: 10_000,
+  });
+  await vi.waitFor(() =>
+    expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0),
+  );
+  expect(service.peekSnapshot(root)?.git.isDirty).toBe(false);
+  writeFileSync(path.join(root, "file.txt"), "Git edit\n");
+  await vi.waitFor(() => expect(service.peekSnapshot(root)?.git.isDirty).toBe(true), {
+    timeout: 10_000,
+  });
+}, 30_000);
 
 test("dormant checkouts retain metadata coverage while active checkout edits remain live", async () => {
   const root = realpathSync(mkdtempSync(path.join(tmpdir(), "paseo-dormant-observation-")));
