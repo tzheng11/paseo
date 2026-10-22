@@ -5000,18 +5000,25 @@ describe("Codex app-server provider", () => {
           return { data: [{ id: "turn", items: [] }], nextCursor: null };
         if (method !== "thread/items/list") throw new Error("Full history endpoint was requested");
         const params = z
-          .object({ limit: z.literal(1), cursor: z.object({ itemId: z.string() }).optional() })
+          .object({
+            limit: z.number().int().min(1).max(8),
+            cursor: z.object({ itemId: z.string() }).optional(),
+          })
           .parse(raw);
         const index = params.cursor ? Number(params.cursor.itemId) + 1 : 0;
-        decoded.push(index);
+        const indices: number[] = [];
+        const data = [];
+        for (let itemIndex = index; itemIndex < Math.min(index + params.limit, 1000); itemIndex++) {
+          indices.push(itemIndex);
+          data.push({
+            turnId: "turn",
+            item: { type: "agentMessage", id: String(itemIndex), text: String(itemIndex) },
+          });
+        }
+        decoded.push(...indices);
         return {
-          data: [
-            {
-              turnId: "turn",
-              item: { type: "agentMessage", id: String(index), text: String(index) },
-            },
-          ],
-          nextCursor: null,
+          data,
+          nextCursor: index + indices.length < 1000 ? String(index + indices.length - 1) : null,
         };
       });
       session.client = { request };
@@ -5020,8 +5027,13 @@ describe("Codex app-server provider", () => {
         const events: AgentStreamEvent[] = [];
         for await (const event of session.streamHistory()) events.push(event);
         expect(events).toHaveLength(321);
-        expect(decoded).toHaveLength(320);
-        expect(decoded.every((index) => index < 64 || index >= 744)).toBe(true);
+        expect(decoded.toSorted((left, right) => left - right)).toEqual([
+          ...Array.from({ length: 64 }, (_, index) => index),
+          ...Array.from({ length: 256 }, (_, index) => 744 + index),
+        ]);
+        expect(
+          request.mock.calls.filter(([method]) => method === "thread/items/list"),
+        ).toHaveLength(40);
         const primaryRequest = vi.fn(async () => {
           throw new Error("History must not use the writer's RPC channel");
         });
