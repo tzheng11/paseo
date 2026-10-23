@@ -14,6 +14,7 @@ import { PRIVATE_FILE_MODE } from "../src/server/private-files.js";
 import { loadPersistedConfig } from "../src/server/persisted-config.js";
 import { runSupervisor } from "./supervisor.js";
 import { resolveSupervisorLogFile } from "./supervisor-log-config.js";
+import { resolveWorkerExecArgv } from "./supervisor-worker-config.js";
 
 process.title = "Paseo Supervisor";
 
@@ -67,24 +68,6 @@ function resolveDevWorkerEntry(): string {
   return candidate;
 }
 
-function resolveWorkerExecArgv(workerEntry: string, devMode: boolean): string[] {
-  const execArgv = workerEntry.endsWith(".ts") ? ["--import", "tsx"] : [];
-  if (!devMode) {
-    return execArgv;
-  }
-  const devArgs = [
-    "--heapsnapshot-near-heap-limit=3",
-    "--max-old-space-size=3072",
-    "--report-on-fatalerror",
-    "--report-directory=/tmp/paseo-reports",
-  ];
-  const inspectArg = process.env.PASEO_NODE_INSPECT ?? "--inspect";
-  if (inspectArg !== "0" && inspectArg !== "false" && inspectArg !== "off") {
-    devArgs.push(inspectArg);
-  }
-  return [...devArgs, ...execArgv];
-}
-
 function resolvePackagedNodeEntrypointRunnerPath(currentScriptPath: string): string | null {
   const packageMarker = `${path.sep}node_modules${path.sep}@getpaseo${path.sep}server${path.sep}`;
   const markerIndex = currentScriptPath.lastIndexOf(packageMarker);
@@ -100,12 +83,17 @@ function resolvePackagedNodeEntrypointRunnerPath(currentScriptPath: string): str
 async function main(): Promise<void> {
   const config = parseConfig(process.argv.slice(2));
   const workerEntry = config.devMode ? resolveDevWorkerEntry() : resolveWorkerEntry();
-  const workerExecArgv = resolveWorkerExecArgv(workerEntry, config.devMode);
   const workerEnv: NodeJS.ProcessEnv = { ...process.env };
   const packagedNodeEntrypointRunner =
     process.env.ELECTRON_RUN_AS_NODE === "1"
       ? resolvePackagedNodeEntrypointRunnerPath(fileURLToPath(import.meta.url))
       : null;
+  const workerExecArgv = resolveWorkerExecArgv({
+    workerEntry,
+    devMode: config.devMode,
+    env: process.env,
+    enableProductionHeap: packagedNodeEntrypointRunner === null,
+  });
 
   const paseoHome = resolvePaseoHome(workerEnv);
   const persistedConfig = loadPersistedConfig(paseoHome);

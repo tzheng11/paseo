@@ -1,11 +1,13 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
+import { getHeapStatistics } from "node:v8";
 import { createPaseoDaemon, formatListenTarget } from "./bootstrap.js";
 import { loadConfig } from "./config.js";
 import { resolvePaseoHome } from "./paseo-home.js";
 import { createRootLogger } from "./logger.js";
 import type { DaemonLifecycleIntent } from "./bootstrap.js";
 import { getProcessDiagnostics } from "./process-diagnostics.js";
+import { workerHeapDiagnostics } from "./worker-heap-diagnostics.js";
 
 process.title = "Paseo Daemon";
 
@@ -130,6 +132,13 @@ function applyCliFlagOverrides(config: ReturnType<typeof loadConfig>): void {
 
 async function main() {
   const { paseoHome, logger, config } = bootstrapFromEnvironment();
+  logger.info(
+    workerHeapDiagnostics({
+      execArgv: process.execArgv,
+      heapSizeLimitBytes: getHeapStatistics().heap_size_limit,
+    }),
+    "Daemon worker heap configuration",
+  );
   let daemon: Awaited<ReturnType<typeof createPaseoDaemon>> | null = null;
   let shutdownPromise: Promise<number> | null = null;
   let exitHookInstalled = false;
