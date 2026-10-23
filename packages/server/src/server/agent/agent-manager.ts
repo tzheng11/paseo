@@ -1839,7 +1839,10 @@ export class AgentManager {
     // agent whose working directory may be gone.
     const record = this.registry ? await this.registry.get(resolvedAgentId) : null;
     const currentResumeOptions = record
-      ? { purpose: record.archivedAt ? ("history" as const) : ("interactive" as const) }
+      ? {
+          ...resumeOptions,
+          purpose: record.archivedAt ? ("history" as const) : ("interactive" as const),
+        }
       : resumeOptions;
     const purpose = currentResumeOptions?.purpose ?? "interactive";
 
@@ -1849,6 +1852,12 @@ export class AgentManager {
       { purpose },
     );
     const client = this.requireClient(handle.provider);
+    if (
+      currentResumeOptions?.historyReadMode === "bounded" &&
+      !client.capabilities.supportsBoundedHistory
+    ) {
+      throw new Error(`Provider '${handle.provider}' does not support bounded history loading`);
+    }
     const available = await client.isAvailable();
     if (!available) {
       throw new Error(
