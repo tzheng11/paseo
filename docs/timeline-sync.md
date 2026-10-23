@@ -51,9 +51,13 @@ archived reads and imports; it does not build a complete normalized replay befor
 reports its source count and bytes. Its `unit` distinguishes native provider items from normalized
 replay events; these counts are not projected UI-row counts. A page skips an oversized source
 record, reports its size and advances. Selected items remain bounded by serialized bytes and event
-count after normalization. History-page clients use a separate read-only provider connection,
-so an export or page failure cannot close an agent's writer channel. `streamAllHistory` is the
-explicit full provider replay path.
+count after normalization. Cold bounded reads use a separate read-only provider connection;
+resuming a writer can load its entire transcript or start an autonomous goal even when its
+response excludes turns. The read requires a paginated native index and fails explicitly when
+that contract is unavailable. Ordinary compatible history access and `streamAllHistory` retain
+their existing replay paths. An unarchived agent starts its writer only for a later interactive
+action, preserving its selected model and speed tier; archived reads stay read-only. Page and
+export failures cannot close an existing writer channel.
 
 Provider positions are separate from live-stream cursors. The client gates middle paging on
 `server_info.features.boundedTimelineHistory` and the agent's `supportsBoundedHistory` capability,

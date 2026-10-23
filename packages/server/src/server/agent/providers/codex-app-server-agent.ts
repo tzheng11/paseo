@@ -3606,6 +3606,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   private persistedHistory: AgentHistoryReplay<PersistedTimelineEntry> | null = null;
   private nativeHistorySource: CodexHistorySource | null = null;
   private nativeHistoryWindows: HistoryWindows<AgentStreamEvent> | null = null;
+  private nativeHistoryIdentity: { threadId: string; path: string } | null = null;
   private persistedAsyncQuestionIds = new Set<string>();
   private loadingPersistedHistory = false;
   private persistedProviderSubagentEvents: AgentStreamEvent[] = [];
@@ -3698,6 +3699,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     private readonly initialResumePurpose: NonNullable<
       AgentResumeSessionOptions["purpose"]
     > = "interactive",
+    private readonly initialHistoryReadMode?: AgentResumeSessionOptions["historyReadMode"],
   ) {
     this.logger = logger.child({
       module: "agent",
@@ -3744,20 +3746,21 @@ export class CodexAppServerAgentSession implements AgentSession {
     });
   }
 
-  async connect(): Promise<void> {
+  async connect(interactive = false): Promise<void> {
     if (this.closed) {
       throw this.createClosedError();
     }
-    if (this.connectionState !== "disconnected") return;
-    if (this.connectionPromise) {
+    while (this.connectionPromise) {
       await this.connectionPromise;
       if (this.closed) {
         throw this.createClosedError();
       }
-      return;
     }
+    const promotingHistory = interactive && this.connectionState === "history-ready";
+    if (this.connectionState !== "disconnected" && !promotingHistory) return;
+    if (promotingHistory) this.connectionState = "disconnected";
 
-    const connectionPromise = this.establishConnection();
+    const connectionPromise = this.establishConnection(interactive, promotingHistory);
     this.connectionPromise = connectionPromise;
     try {
       if (this.initialResumePurpose === "maintenance") {
@@ -3775,6 +3778,13 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (this.closed) {
       throw this.createClosedError();
     }
+  }
+
+  private async ensureInteractiveConnection(): Promise<void> {
+    if (this.initialResumePurpose === "history") {
+      throw new Error("Archived Codex history is read-only");
+    }
+    await this.connect(true);
   }
 
   private async connectMaintenance(connection: Promise<void>): Promise<void> {
@@ -3825,8 +3835,18 @@ export class CodexAppServerAgentSession implements AgentSession {
     return disposal;
   }
 
-  private async establishConnection(): Promise<void> {
-    if (this.initialResumePurpose === "history") {
+  private shouldReadHistoryOnly(interactive: boolean): boolean {
+    return (
+      this.initialResumePurpose === "history" ||
+      (this.initialHistoryReadMode === "bounded" && !interactive)
+    );
+  }
+
+  private async establishConnection(
+    interactive: boolean,
+    promotingHistory: boolean,
+  ): Promise<void> {
+    if (this.shouldReadHistoryOnly(interactive)) {
       await this.readArchivedHistory();
       this.connectionState = "history-ready";
       return;
@@ -3876,7 +3896,8 @@ export class CodexAppServerAgentSession implements AgentSession {
 
       if (this.currentThreadId) {
         await this.ensureThreadLoaded();
-        if (!this.deferredHistory) await this.loadPersistedHistory(this.client);
+        if (!this.deferredHistory && !promotingHistory)
+          await this.loadPersistedHistory(this.client);
         await this.applyDefaultModelAndThinking();
       }
 
@@ -4210,7 +4231,12 @@ export class CodexAppServerAgentSession implements AgentSession {
         typeof initialized?.userAgent === "string" &&
         codexVersionAtLeast(initialized.userAgent, CODEX_PAGED_HISTORY_MIN_VERSION);
       client.notify("initialized", {});
-      await this.loadPersistedHistory(client);
+      await this.loadPersistedHistory(client, this.initialHistoryReadMode);
+      if (this.initialHistoryReadMode === "bounded" && this.initialResumePurpose !== "history") {
+        this.speedModels =
+          CodexModelListResponseSchema.parse(await client.request("model/list", {})).data ?? [];
+        this.reconcileServiceTier();
+      }
     } finally {
       await client.dispose();
     }
@@ -4234,7 +4260,10 @@ export class CodexAppServerAgentSession implements AgentSession {
     );
   }
 
-  private async loadPersistedHistory(client: CodexAppServerClientLike | null): Promise<void> {
+  private async loadPersistedHistory(
+    client: CodexAppServerClientLike | null,
+    readMode?: "bounded",
+  ): Promise<void> {
     if (!client || !this.currentThreadId) return;
     const threadId = this.currentThreadId;
 
@@ -4261,11 +4290,15 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.persistedAsyncQuestionIds = new Set(windows.asyncQuestionIds);
       this.nativeHistorySource = source;
       this.nativeHistoryWindows = windows;
+      this.nativeHistoryIdentity = metadata?.path ? { threadId, path: metadata.path } : null;
       this.resetCodexUserMessageTurns();
       for (const message of windows.userMessages)
         this.rememberCodexUserMessageTurn(message.messageId, message.turnId);
       this.historyPending = true;
       return;
+    }
+    if (readMode === "bounded") {
+      throw new Error("Codex cannot read bounded native history for this thread");
     }
     const history = await loadCodexThreadHistoryTimeline({
       threadId,
@@ -4464,8 +4497,8 @@ export class CodexAppServerAgentSession implements AgentSession {
       return expandCodexCustomPrompt(parsed.body, args);
     }
 
-    if (this.connectionState === "disconnected") {
-      await this.connect();
+    if (this.connectionState !== "connected") {
+      await this.ensureInteractiveConnection();
     } else {
       await this.loadSkills();
     }
@@ -4676,7 +4709,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.dismissPendingPlanApprovals("Dismissed by a new prompt");
 
     try {
-      await this.connect();
+      await this.ensureInteractiveConnection();
       if (!this.client) {
         throw new Error("Codex client not initialized");
       }
@@ -4862,11 +4895,19 @@ export class CodexAppServerAgentSession implements AgentSession {
   }
 
   async hasPersistedSession(): Promise<boolean> {
-    if (!this.client || !this.currentThreadId) return false;
-    const metadata = await readCodexThreadHistoryMetadata(this.client, this.currentThreadId);
-    if (!metadata.path || !path.isAbsolute(metadata.path)) return false;
+    if (this.closed || !this.currentThreadId) return false;
+    let sourcePath: string | null = null;
+    if (this.client) {
+      sourcePath = (await readCodexThreadHistoryMetadata(this.client, this.currentThreadId)).path;
+    } else if (
+      this.connectionState === "history-ready" &&
+      this.nativeHistoryIdentity?.threadId === this.currentThreadId
+    ) {
+      sourcePath = this.nativeHistoryIdentity.path;
+    }
+    if (!sourcePath || !path.isAbsolute(sourcePath)) return false;
     try {
-      const stat = await fs.stat(metadata.path);
+      const stat = await fs.stat(sourcePath);
       return stat.isFile() && stat.size > 0;
     } catch {
       return false;
@@ -4964,7 +5005,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     head: HistoryReadLimit;
     tail: HistoryReadLimit;
   }): Promise<HistoryWindows<AgentStreamEvent>> {
-    await this.ensureDeferredHistory();
+    await this.ensureDeferredHistory("bounded");
     if (
       this.nativeHistoryWindows &&
       limits.head.events === DEFAULT_HISTORY_WINDOWS.head.events &&
@@ -4985,7 +5026,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     direction: "before" | "after";
     limit: HistoryReadLimit;
   }): Promise<HistoryPage<AgentStreamEvent>> {
-    await this.ensureDeferredHistory();
+    await this.ensureDeferredHistory("bounded");
     if (this.nativeHistorySource)
       return this.withHistoryReader((client) => this.nativeHistorySource!.page(client, options));
     if (!this.persistedHistory) return { entries: [], oversized: [], nextCursor: null };
@@ -5004,10 +5045,10 @@ export class CodexAppServerAgentSession implements AgentSession {
     }
   }
 
-  private async ensureDeferredHistory(): Promise<void> {
+  private async ensureDeferredHistory(readMode?: "bounded"): Promise<void> {
     if (!this.deferredHistory) return;
     if (this.closed || !this.client) throw this.createClosedError();
-    this.deferredHistoryPromise ??= this.loadPersistedHistory(this.client)
+    this.deferredHistoryPromise ??= this.loadPersistedHistory(this.client, readMode)
       .then(() => {
         this.deferredHistory = false;
         return undefined;
@@ -5397,7 +5438,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   }
 
   async revertConversation(input: { messageId: string }): Promise<void> {
-    await this.connect();
+    await this.ensureInteractiveConnection();
     await this.ensureDeferredHistory();
     if (!this.client) {
       throw new Error("Codex client is not initialized");
@@ -5608,7 +5649,7 @@ export class CodexAppServerAgentSession implements AgentSession {
 
   private async executeCompactCommand(): Promise<string | null> {
     try {
-      await this.connect();
+      await this.ensureInteractiveConnection();
       if (this.currentThreadId) {
         await this.ensureThreadLoaded();
       } else {
@@ -5638,7 +5679,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       return "Usage: /goal <objective>|pause|resume|clear";
     }
     try {
-      await this.connect();
+      await this.ensureInteractiveConnection();
       if (this.currentThreadId) {
         await this.ensureThreadLoaded();
       } else {
@@ -7844,6 +7885,7 @@ export class CodexAppServerAgentClient implements AgentClient {
       autoReviewEnabled,
       launchContext?.agentId,
       options?.purpose ?? "interactive",
+      options?.historyReadMode,
     );
     await session.connect();
     return session;
