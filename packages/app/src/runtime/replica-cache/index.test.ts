@@ -382,6 +382,11 @@ describe("ReplicaCache", () => {
     const writer = createCache(storage);
     const baseline = directory({ workspaces: { generation: "g", afterSeq: 12 } });
     const workspace = baseline.workspaces.get("workspace-1")!;
+    workspace.pinPlacement = {
+      parentWorkspaceKey: "remote:parent",
+      siblingOrder: 100,
+      revision: 3,
+    };
     workspace.fieldValues = {
       notionProjectUrl: "https://notion.so/project\n東京",
       notionIssueUrl: "",
@@ -396,51 +401,59 @@ describe("ReplicaCache", () => {
     );
     const restored = await reader.readDirectory(SERVER_ID);
     expect(restored.workspaces.get(workspace.id)?.fieldValues).toEqual(workspace.fieldValues);
+    expect(restored.workspaces.get(workspace.id)?.pinPlacement).toEqual(workspace.pinPlacement);
     expect(restored.checkpoint).toEqual(baseline.checkpoint);
   });
 
-  it("refreshes legacy workspace cursors while keeping other cached entities", async () => {
-    const storage = new MemoryStorage();
-    const writer = createCache(storage);
-    const baseline = directory({
-      workspaces: { generation: "g", afterSeq: 12 },
-      agents: { generation: "g", afterSeq: 9 },
-      projects: { generation: "g", afterSeq: 4 },
-    });
-    commitDirectory(writer, SERVER_ID, baseline);
-    writer.commitTimeline(SERVER_ID, "agent-1", timeline());
-    await writer.flush();
-    for (const row of storage.rows.values()) {
-      if (row.kind === "workspace") {
-        const payload = JSON.parse(row.payload);
-        delete payload.fieldValues;
-        row.payload = JSON.stringify(payload);
+  it.each([1, 2])(
+    "refreshes v%s workspace cursors while keeping other cached entities",
+    async (version) => {
+      const storage = new MemoryStorage();
+      const writer = createCache(storage);
+      const baseline = directory({
+        workspaces: { generation: "g", afterSeq: 12 },
+        agents: { generation: "g", afterSeq: 9 },
+        projects: { generation: "g", afterSeq: 4 },
+      });
+      commitDirectory(writer, SERVER_ID, baseline);
+      writer.commitTimeline(SERVER_ID, "agent-1", timeline());
+      await writer.flush();
+      for (const row of storage.rows.values()) {
+        if (row.kind === "workspace") {
+          const payload = JSON.parse(row.payload);
+          delete payload.fieldValues;
+          row.payload = JSON.stringify(payload);
+        }
+        if (row.kind === "checkpoint") {
+          row.payload = JSON.stringify({
+            version,
+            workspaceFieldsVersion: 2,
+            cursors: baseline.checkpoint,
+          });
+        }
       }
-      if (row.kind === "checkpoint") {
-        row.payload = JSON.stringify({ version: 1, cursors: baseline.checkpoint });
-      }
-    }
 
-    const reader = createCache(storage);
-    const restored = await reader.readDirectory(SERVER_ID);
-    expect(restored.checkpoint).toEqual({
-      agents: baseline.checkpoint.agents,
-      projects: baseline.checkpoint.projects,
-    });
-    expect([...restored.workspaces.keys()]).toEqual([...baseline.workspaces.keys()]);
-    expect([...restored.projects.keys()]).toEqual([...baseline.projects.keys()]);
-    expect([...restored.agents.keys()]).toEqual([...baseline.agents.keys()]);
-    expect(await reader.readTimeline(SERVER_ID, "agent-1")).toEqual(timeline());
+      const reader = createCache(storage);
+      const restored = await reader.readDirectory(SERVER_ID);
+      expect(restored.checkpoint).toEqual({
+        agents: baseline.checkpoint.agents,
+        projects: baseline.checkpoint.projects,
+      });
+      expect([...restored.workspaces.keys()]).toEqual([...baseline.workspaces.keys()]);
+      expect([...restored.projects.keys()]).toEqual([...baseline.projects.keys()]);
+      expect([...restored.agents.keys()]).toEqual([...baseline.agents.keys()]);
+      expect(await reader.readTimeline(SERVER_ID, "agent-1")).toEqual(timeline());
 
-    baseline.workspaces.get("workspace-1")!.fieldValues = { notionIssueUrl: "canonical" };
-    reader.replaceDirectoryBaseline(SERVER_ID, baseline);
-    await reader.flush();
-    const reopened = await createCache(storage).readDirectory(SERVER_ID);
-    expect(reopened.checkpoint).toEqual(baseline.checkpoint);
-    expect(reopened.workspaces.get("workspace-1")?.fieldValues).toEqual({
-      notionIssueUrl: "canonical",
-    });
-  });
+      baseline.workspaces.get("workspace-1")!.fieldValues = { notionIssueUrl: "canonical" };
+      reader.replaceDirectoryBaseline(SERVER_ID, baseline);
+      await reader.flush();
+      const reopened = await createCache(storage).readDirectory(SERVER_ID);
+      expect(reopened.checkpoint).toEqual(baseline.checkpoint);
+      expect(reopened.workspaces.get("workspace-1")?.fieldValues).toEqual({
+        notionIssueUrl: "canonical",
+      });
+    },
+  );
 
   it.each([null, "2026-10-18T22:00:00.000Z"])(
     "3fdb71dd7bc781c9964de0b6101b4e61@e93b9847d6fd#replica-cache retains %s across close/reopen",

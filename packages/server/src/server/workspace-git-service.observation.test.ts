@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import type pino from "pino";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import type { CheckoutSnapshotFacts, CheckoutStatusGit } from "../utils/checkout-git.js";
+import type {
+  CheckoutContext,
+  CheckoutSnapshotFacts,
+  CheckoutStatusGit,
+} from "../utils/checkout-git.js";
 import { CheckoutDiffManager } from "./checkout-diff-manager.js";
 import type { FileObserver } from "./file-observer/index.js";
 import { WorkspaceGitServiceImpl } from "./workspace-git-service.js";
@@ -267,6 +271,169 @@ describe("WorkspaceGitService checkout observation", () => {
     vi.useRealTimers();
   });
 
+  test("sidebar metadata subscriptions do not inventory a dormant checkout", async () => {
+    const watcher = createWatcherHarness();
+    const service = createService(watcher);
+    const summary = service.registerWorkspace(
+      { cwd: REPO_CWD, observeWorkingTree: false },
+      () => {},
+    );
+    try {
+      await service.getSnapshot(REPO_CWD);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(getWatcherSubscribeCallCount(watcher, REPO_CWD)).toBe(0);
+      expect(getWatcherSubscribeCallCount(watcher, GIT_DIR)).toBe(1);
+    } finally {
+      summary.unsubscribe();
+      await service.dispose();
+    }
+  });
+
+  test("suspending the final working-tree consumer cancels its pending native inventory", async () => {
+    const watcher = createWatcherHarness();
+    let inventorySignal: AbortSignal | undefined;
+    const service = createService(watcher, {
+      subscribe: async (
+        directory: string,
+        callback: WatchRecord["callback"],
+        options?: { signal?: AbortSignal },
+      ) => {
+        if (directory !== REPO_CWD) return watcher.subscribe(directory, callback);
+        inventorySignal = options?.signal;
+        return new Promise<never>((_resolve, reject) => {
+          inventorySignal!.addEventListener("abort", () => reject(inventorySignal!.reason), {
+            once: true,
+          });
+        });
+      },
+    });
+    const summary = service.registerWorkspace(
+      { cwd: REPO_CWD, observeWorkingTree: false },
+      () => {},
+    );
+    await service.getSnapshot(REPO_CWD);
+    await vi.advanceTimersByTimeAsync(0);
+    const active = service.registerWorkspace({ cwd: REPO_CWD }, () => {});
+    await vi.waitFor(() => expect(inventorySignal?.aborted).toBe(false));
+    active.unsubscribe();
+    expect(inventorySignal?.aborted).toBe(true);
+    await vi.waitFor(() => {
+      expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
+      expect(service.getMetrics().workingTreeWatchTargetCount).toBe(0);
+    });
+    expect(getWatcherSubscribeCallCount(watcher, GIT_DIR)).toBe(1);
+    summary.unsubscribe();
+    await service.dispose();
+  });
+
+  test("concurrent working-tree claims await the same initial inventory barrier", async () => {
+    const watcher = createWatcherHarness();
+    const inventoryFinished = createDeferred<void>();
+    let inventoryStarted = false;
+    const service = createService(watcher, {
+      subscribe: async (...args: Parameters<typeof watcher.subscribe>) => {
+        if (args[0] === REPO_CWD) {
+          inventoryStarted = true;
+          await inventoryFinished.promise;
+        }
+        return watcher.subscribe(...args);
+      },
+    });
+    let firstReady = false;
+    let secondReady = false;
+    const first = service
+      .requestWorkingTreeWatch(REPO_CWD, () => {})
+      .then((watch) => {
+        firstReady = true;
+        return watch;
+      });
+    await vi.waitFor(() => expect(inventoryStarted).toBe(true));
+    const second = service
+      .requestWorkingTreeWatch(REPO_CWD, () => {})
+      .then((watch) => {
+        secondReady = true;
+        return watch;
+      });
+    await flushPromises();
+    expect(firstReady).toBe(false);
+    expect(secondReady).toBe(false);
+    inventoryFinished.resolve();
+    const watches = await Promise.all([first, second]);
+    expect(getWatcherSubscribeCallCount(watcher, REPO_CWD)).toBe(1);
+    for (const watch of watches) watch.unsubscribe();
+    await service.dispose();
+  });
+
+  test("a slow explicit watch does not retain unrelated dormant checkout inventories", async () => {
+    const watcher = createWatcherHarness();
+    const slowCwd = path.join(REPO_CWD, "other-checkout");
+    const inventoryFinished = createDeferred<void>();
+    let inventoryStarted = false;
+    const service = createService(watcher, {
+      runGitCommand: async (_args: string[], options: { cwd: string }) => ({
+        stdout: `${options.cwd}\n`,
+        stderr: "",
+        truncated: false,
+        exitCode: 0,
+        signal: null,
+      }),
+      subscribe: async (...args: Parameters<typeof watcher.subscribe>) => {
+        if (args[0] === slowCwd) {
+          inventoryStarted = true;
+          await inventoryFinished.promise;
+        }
+        return watcher.subscribe(...args);
+      },
+    });
+    const summary = service.registerWorkspace(
+      { cwd: REPO_CWD, observeWorkingTree: false },
+      () => {},
+    );
+    const active = service.registerWorkspace({ cwd: REPO_CWD }, () => {});
+    await vi.waitFor(() => expect(getWatcherSubscribeCallCount(watcher, REPO_CWD)).toBe(1));
+    const other = service.requestWorkingTreeWatch(slowCwd, () => {});
+    await vi.waitFor(() => expect(inventoryStarted).toBe(true));
+    active.unsubscribe();
+    expect(getWatcherRecordsForDirectory(watcher, REPO_CWD)[0]!.unsubscribe).toHaveBeenCalledOnce();
+    inventoryFinished.resolve();
+    (await other).unsubscribe();
+    summary.unsubscribe();
+    await service.dispose();
+  });
+
+  test("a new subdirectory consumer replaces a cancelled predecessor's pending inventory", async () => {
+    const watcher = createWatcherHarness();
+    const cancelledInventory = createDeferred<void>();
+    let rootStarts = 0;
+    const service = createService(watcher, {
+      subscribe: async (...args: Parameters<typeof watcher.subscribe>) => {
+        if (args[0] === REPO_CWD && ++rootStarts === 1) await cancelledInventory.promise;
+        return watcher.subscribe(...args);
+      },
+    });
+    const summary = service.registerWorkspace(
+      { cwd: REPO_CWD, observeWorkingTree: false },
+      () => {},
+    );
+    await service.getSnapshot(REPO_CWD);
+    await vi.advanceTimersByTimeAsync(0);
+    const active = service.registerWorkspace({ cwd: REPO_CWD }, () => {});
+    await vi.waitFor(() => expect(rootStarts).toBe(1));
+    active.unsubscribe();
+    const replacement = await service.requestWorkingTreeWatch(path.join(REPO_CWD, "src"), () => {});
+    expect(service.getMetrics().workingTreeWatchTargetCount).toBe(1);
+    cancelledInventory.resolve();
+    await vi.waitFor(() => {
+      expect(getWatcherRecordsForDirectory(watcher, REPO_CWD)).toHaveLength(2);
+      expect(
+        getWatcherRecordsForDirectory(watcher, REPO_CWD)[1]!.unsubscribe,
+      ).toHaveBeenCalledOnce();
+    });
+    replacement.unsubscribe();
+    summary.unsubscribe();
+    await service.dispose();
+  });
+
   test("waits for the initial watcher inventory before building a cold diff", async () => {
     const watcher = createWatcherHarness();
     const inventoryFinished = createDeferred<void>();
@@ -326,6 +493,39 @@ describe("WorkspaceGitService checkout observation", () => {
 
     closeFinished.resolve();
     await disposal;
+  });
+
+  test("dispose drains its pending Git probe and prevents its follow-up commands", async () => {
+    const watcher = createWatcherHarness();
+    const commandFinished = createDeferred<void>();
+    const run = vi.fn(async () => {
+      await commandFinished.promise;
+      return { stdout: "", stderr: "", truncated: false, exitCode: 0, signal: null };
+    });
+    const service = createService(watcher, {
+      createRunGitCommand: () => run,
+      getCheckoutSnapshotFacts: async (cwd: string, context: CheckoutContext) => {
+        await context!.runGitCommand!(["first-probe"], { cwd });
+        await context!.runGitCommand!(["follow-up-probe"], { cwd });
+        return { isGit: false };
+      },
+    });
+    service.registerWorkspace({ cwd: REPO_CWD }, () => {});
+    await vi.waitFor(() => expect(run).toHaveBeenCalledOnce());
+
+    let finished = false;
+    const disposal = service.dispose().then(() => {
+      finished = true;
+      return undefined;
+    });
+    await flushPromises();
+    expect(finished).toBe(false);
+    commandFinished.resolve();
+    await disposal;
+    await flushPromises();
+    expect(finished).toBe(true);
+    expect(run).toHaveBeenCalledOnce();
+    expect(watcher.subscribe).not.toHaveBeenCalled();
   });
 
   test("shares one recursive checkout observer between cwd-equivalent consumers", async () => {
@@ -1324,7 +1524,7 @@ describe("WorkspaceGitService checkout observation", () => {
       ]);
     await vi.advanceTimersByTimeAsync(1_000);
     await vi.waitFor(() => {
-      expect(getCalledCwds(getCheckoutStatus)).toEqual([WORKTREE_A, WORKTREE_B]);
+      expect(getCalledCwds(getCheckoutStatus).sort()).toEqual([WORKTREE_A, WORKTREE_B]);
     });
 
     first.unsubscribe();
@@ -1834,6 +2034,7 @@ describe("WorkspaceGitService checkout observation", () => {
       });
     });
     expect(watcher.records.filter((record) => record.directory === GIT_DIR)).toHaveLength(0);
+    expect(watcher.records).toHaveLength(0);
 
     isGit = true;
     await vi.advanceTimersByTimeAsync(5_000);
@@ -2353,6 +2554,12 @@ describe("WorkspaceGitService checkout observation", () => {
     await vi.waitFor(() => {
       expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
     });
+    expect(watcher.records).toHaveLength(0);
+    const [explicit, another] = await Promise.all([
+      service.requestWorkingTreeWatch(REPO_CWD, vi.fn()),
+      service.requestWorkingTreeWatch(REPO_CWD, vi.fn()),
+    ]);
+    expect(getWatcherRecordsForDirectory(watcher, REPO_CWD)).toHaveLength(1);
     const checkoutWatcher = getWatcherRecordsForDirectory(watcher, REPO_CWD)[0];
     checkoutWatcher?.callback(new Error("watcher stopped"), []);
 
@@ -2370,8 +2577,51 @@ describe("WorkspaceGitService checkout observation", () => {
       expect(getCheckoutStatus.mock.calls.length).toBeGreaterThan(statusCallsAfterRecovery);
     });
 
+    explicit.unsubscribe();
+    expect(
+      getWatcherRecordsForDirectory(watcher, REPO_CWD).at(-1)?.unsubscribe,
+    ).not.toHaveBeenCalled();
+    another.unsubscribe();
+    expect(
+      getWatcherRecordsForDirectory(watcher, REPO_CWD).at(-1)?.unsubscribe,
+    ).toHaveBeenCalledTimes(1);
     subscription.unsubscribe();
     service.dispose();
+  });
+
+  test("a pending non-Git recovery cannot retain recursive coverage after its last explicit consumer leaves", async () => {
+    const watcher = createWatcherHarness();
+    const service = createService(watcher, {
+      getCheckoutSnapshotFacts: vi.fn(
+        async (): Promise<CheckoutSnapshotFacts> => ({ isGit: false }),
+      ),
+      getCheckoutStatus: vi.fn(async () => ({ isGit: false }) as const),
+      getWorkspaceGitSelfHealPhaseMs: () => 1_000_000,
+      runGitCommand: vi.fn(async () => {
+        throw new Error("not a git repository");
+      }),
+    });
+    const automatic = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    await service.getSnapshot(REPO_CWD);
+    await vi.waitFor(() =>
+      expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0),
+    );
+    const explicit = await service.requestWorkingTreeWatch(REPO_CWD, vi.fn());
+    const replacement = createDeferred<Awaited<ReturnType<typeof watcher.subscribe>>>();
+    const lateUnsubscribe = vi.fn(async () => {});
+    watcher.subscribe.mockImplementationOnce(() => replacement.promise);
+    watcher.records[0]!.callback(new Error("watcher stopped"), []);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(watcher.subscribe).toHaveBeenCalledTimes(2);
+
+    explicit.unsubscribe();
+    expect(service.getMetrics().workingTreeWatchTargetCount).toBe(1);
+    replacement.resolve({ updateIgnore: vi.fn(async () => {}), unsubscribe: lateUnsubscribe });
+    await vi.waitFor(() => expect(lateUnsubscribe).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(watcher.subscribe).toHaveBeenCalledTimes(2);
+    automatic.unsubscribe();
+    await service.dispose();
   });
 
   test("adding ignored directories updates filtering without replacing the watcher", async () => {

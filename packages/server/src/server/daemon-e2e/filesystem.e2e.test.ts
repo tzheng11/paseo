@@ -101,9 +101,10 @@ describe("checkout discard", () => {
         }
       } finally {
         // afterEach shuts down the daemon and its repository observers first.
-        onTestFinished(() =>
-          rm(cwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }),
-        );
+        onTestFinished(async () => {
+          await ctx.cleanup();
+          await rm(cwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+        });
       }
     },
   );
@@ -148,6 +149,7 @@ describe("file explorer", () => {
           expect(response.entries).toEqual([entry]);
         }
       } finally {
+        await ctx.cleanup();
         rmSync(cwd, { recursive: true, force: true });
       }
     },
@@ -189,6 +191,7 @@ describe("file explorer", () => {
       expect(control.error).toBeNull();
       expect(control.entries).toEqual([{ path: "visible.txt", kind: "file" }]);
     } finally {
+      await ctx.cleanup();
       rmSync(directory, { recursive: true, force: true });
     }
   });
@@ -254,6 +257,7 @@ describe("file explorer", () => {
       expect(new TextDecoder().decode(final.bytes)).toBe("second payload\n");
       expect(readdirSync(cwd)).toEqual([fileName]);
     } finally {
+      await ctx.cleanup();
       rmSync(cwd, { recursive: true, force: true });
     }
   });
@@ -296,6 +300,7 @@ describe("file explorer", () => {
           ),
         );
       } finally {
+        await ctx.cleanup();
         rmSync(cwd, { recursive: true, force: true });
       }
     },
@@ -398,6 +403,7 @@ describe("file explorer", () => {
         [".notes.txt", "notes.txt", copiedDirectoryName].sort(),
       );
     } finally {
+      await ctx.cleanup();
       rmSync(cwd, { recursive: true, force: true });
     }
   });
@@ -435,6 +441,7 @@ describe("file explorer", () => {
       }
       expect(readdirSync(outside)).toEqual(["secret.txt"]);
     } finally {
+      await ctx.cleanup();
       rmSync(directory, { recursive: true, force: true });
     }
   });
@@ -470,6 +477,7 @@ describe("file explorer", () => {
       });
       expect(readdirSync(outside)).toEqual(["secret.txt"]);
     } finally {
+      await ctx.cleanup();
       rmSync(directory, { recursive: true, force: true });
     }
   });
@@ -523,6 +531,7 @@ describe("file explorer", () => {
           "edited through copied alias\n",
         );
       } finally {
+        await ctx.cleanup();
         rmSync(cwd, { recursive: true, force: true });
       }
     },
@@ -547,6 +556,7 @@ describe("file explorer", () => {
         const copy = await ctx.client.readFile(cwd, "alias copy.txt");
         expect(new TextDecoder().decode(copy.bytes)).toBe("absolute target payload\n");
       } finally {
+        await ctx.cleanup();
         rmSync(cwd, { recursive: true, force: true });
       }
     },
@@ -597,6 +607,7 @@ describe("file explorer", () => {
 
     // Cleanup
     await ctx.client.deleteAgent(agent.id);
+    await ctx.cleanup();
     rmSync(cwd, { recursive: true, force: true });
   }, 60000); // 1 minute timeout
 
@@ -629,6 +640,7 @@ describe("file explorer", () => {
 
     // Cleanup
     await ctx.client.deleteAgent(agent.id);
+    await ctx.cleanup();
     rmSync(cwd, { recursive: true, force: true });
   }, 60000); // 1 minute timeout
 
@@ -651,6 +663,7 @@ describe("file explorer", () => {
 
     // Cleanup
     await ctx.client.deleteAgent(agent.id);
+    await ctx.cleanup();
     rmSync(cwd, { recursive: true, force: true });
   }, 60000); // 1 minute timeout
 });
@@ -658,9 +671,10 @@ describe("file explorer", () => {
 describe("commit file diffs", () => {
   test.each([".", "apps/web"])("opens committed files from %s workspaces", async (relativePath) => {
     const cwd = tmpCwd();
-    onTestFinished(() =>
-      rmSync(cwd, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }),
-    );
+    onTestFinished(async () => {
+      await ctx.cleanup();
+      rmSync(cwd, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    });
     const workspace = path.join(cwd, relativePath);
     const filePath = "apps/web/notes.txt";
     function git(args: string[]): string {

@@ -8,7 +8,10 @@ const state = vi.hoisted(() => ({
   connected: true,
   superpinnedAt: null as string | null,
   toggle: vi.fn(),
+  push: vi.fn(),
 }));
+vi.mock("expo-router", () => ({ router: { push: state.push } }));
+vi.mock("@/stores/draft-keys", () => ({ generateDraftId: () => "draft_child" }));
 vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 vi.mock("@/runtime/host-features", () => ({ useHostFeatureAvailability: () => state.capable }));
 vi.mock("@/runtime/host-runtime", () => ({ useHostRuntimeIsConnected: () => state.connected }));
@@ -17,7 +20,21 @@ vi.mock("@/hooks/use-sidebar-workspace-pin", () => ({
   useSidebarWorkspaceSuperpinController: () => state.toggle,
 }));
 vi.mock("@/stores/session-store-hooks", () => ({
-  useWorkspaceFields: () => ({ id: "w1", pinnedAt: null, superpinnedAt: state.superpinnedAt }),
+  useWorkspaceFields: (
+    _serverId: string,
+    _workspaceId: string,
+    select: (value: object) => unknown,
+  ) =>
+    select({
+      id: "w1",
+      pinnedAt: null,
+      superpinnedAt: state.superpinnedAt,
+      projectId: "project",
+      projectRootPath: "/work/project",
+      projectDisplayName: "Project",
+      background: false,
+      archivingAt: null,
+    }),
 }));
 vi.mock("@/components/ui/dropdown-menu", () => ({
   DropdownMenuItem: MenuItem,
@@ -51,6 +68,21 @@ afterEach(() => {
 });
 
 for (const surface of ["context", "dropdown"] as const) {
+  it(`opens child creation with explicit parent and project defaults from the ${surface} menu`, () => {
+    const view = render(
+      createElement(WorkspaceMenuItems, {
+        surface,
+        serverId: "host",
+        workspaceId: "w1",
+        workspaceKey: "host:w1",
+      }),
+    );
+    fireEvent.click(view.getByRole("button", { name: "sidebar.workspace.actions.addChild" }));
+    const route = state.push.mock.calls[0]?.[0];
+    expect(route).toBe(
+      "/new?serverId=host&dir=%2Fwork%2Fproject&name=Project&projectId=project&draftId=draft_child&parentWorkspaceKey=host%3Aw1",
+    );
+  });
   describe(`3fdb71dd-7bc7-81fe-9280-c37f47c8e4b9@c0b2fb81314b#old-daemon ${surface} row/header menu`, () => {
     for (const superpinnedAt of [null, "2026-10-18T22:00:00Z"]) {
       it.each([null, false, true])(

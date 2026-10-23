@@ -10,11 +10,12 @@ afterEach(() => {
   for (const directory of directories.splice(0))
     rmSync(directory, { recursive: true, force: true });
 });
-function fixture() {
+function fixture(encoding: "UTF-8" | "UTF-16le" = "UTF-8") {
   const directory = mkdtempSync(path.join(tmpdir(), "codex-history-index-test-"));
   directories.push(directory);
   const databasePath = path.join(directory, "history.sqlite");
   const db = new DatabaseSync(databasePath);
+  db.exec(`PRAGMA encoding = '${encoding}'`);
   db.exec(`CREATE TABLE thread_items (
     thread_id TEXT, turn_id TEXT, item_id TEXT, rollout_ordinal INTEGER,
     updated_at_ordinal INTEGER, item_type TEXT, item_json TEXT
@@ -90,3 +91,46 @@ test("pages around an oversized record without decoding it or losing cursor prog
     }),
   ).rejects.toThrow("RangeError");
 });
+
+test.each(["UTF-8", "UTF-16le"] as const)(
+  "preserves exact byte budgets for Unicode and embedded NULs in %s history",
+  async (encoding) => {
+    const source = fixture(encoding);
+    const payload = "é🧪\0".repeat(20000);
+    const payloadBytes = Buffer.byteLength(payload, encoding === "UTF-8" ? "utf8" : "utf16le");
+    const db = new DatabaseSync(source.databasePath);
+    db.prepare("UPDATE thread_items SET item_json = ? WHERE thread_id = ? AND item_id = ?").run(
+      payload,
+      source.threadId,
+      "5",
+    );
+    db.close();
+
+    const result = await readCodexHistoryIndex({
+      ...source,
+      operation: "windows",
+      head: { events: 2, bytes: 1000 },
+      tail: { events: 2, bytes: 1000 },
+    });
+    expect(result.totalEvents).toBe(10);
+    expect(result.totalBytes).toBe(payloadBytes + 360);
+    expect(result.gap).toEqual({
+      startIndex: 2,
+      endIndex: 7,
+      count: 6,
+      bytes: payloadBytes + 200,
+    });
+    expect(result.payloadsDecoded).toBe(0);
+
+    const page = await readCodexHistoryIndex({
+      ...source,
+      operation: "page",
+      cursor: 5,
+      direction: "after",
+      limit: { events: 2, bytes: 1000 },
+    });
+    expect(page.oversized).toEqual([{ index: 5, bytes: payloadBytes }]);
+    expect(page.entries?.map((row) => row.index)).toEqual([6]);
+    expect(page.nextCursor).toBe(7);
+  },
+);

@@ -1,5 +1,6 @@
 import { WorkspaceFieldError } from "@getpaseo/protocol/workspace-fields";
 import { setWorkspaceFieldValue } from "./workspace-fields.js";
+import { setWorkspacePinPlacement } from "./workspace-pin-placement.js";
 import type { AgentMessageDelivery } from "./agent/agent-messages/index.js";
 import { AgentDirectory } from "./agent/directory.js";
 import { ConnectedHostSession } from "./connected-hosts/index.js";
@@ -814,6 +815,7 @@ export class Session {
   private readonly unsubscribeSetupObservation: () => void;
   private readonly workspaceSetupRuntime: WorkspaceSetupRuntime;
   private readonly workspaceGitObserver: WorkspaceGitObserverService;
+  private focusedGitObservationGeneration = 0;
   private readonly workspaceDirectory: WorkspaceDirectory;
   private readonly voiceSessions: VoiceSessions;
   private readonly checkoutSession: CheckoutSession;
@@ -826,6 +828,7 @@ export class Session {
   private readonly daemonSession: DaemonSession;
   private readonly fleetSession: FleetSession;
   private readonly hubExecutionController: HubExecutionController | null;
+  private readonly pinServerId: string | undefined;
   private readonly workspaceScripts: WorkspaceScriptsService;
   private readonly messageReceipts: Pick<MessageReceipts, "send">;
   private readonly agentMessages: AgentMessageDelivery;
@@ -889,6 +892,7 @@ export class Session {
       daemonRuntimeConfig,
       getWebSocketRuntimeMetrics,
     } = options;
+    this.pinServerId = serverId;
     this.browserToolsBroker = options.browserToolsBroker;
     this.clientId = clientId;
     this.authorization = new SessionAuthorization(permissions);
@@ -1338,6 +1342,7 @@ export class Session {
       .catch((err) => this.sessionLogger.error({ err }, "Failed to release source subscriptions"));
     this.clientSources.delete(source);
     this.refreshObservationProducers();
+    this.refreshFocusedGitObservation();
   }
 
   private subscribeAgentTimelines(agentIds: string[]): OwnedSubscription {
@@ -3082,6 +3087,15 @@ export class Session {
         return this.handleWorkspaceFieldValueSetRequest(msg);
       case "workspace.move.request":
         return this.handleWorkspaceMoveRequest(msg);
+      default:
+        return this.dispatchWorkspacePinMessage(msg);
+    }
+  }
+
+  private dispatchWorkspacePinMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+    switch (msg.type) {
+      case "workspace.pin.placement.set.request":
+        return this.handleWorkspacePinPlacementSetRequest(msg);
       case "workspace.title.set.request":
         return this.handleWorkspaceTitleSetRequest(msg.workspaceId, msg.title, msg.requestId);
       case "workspace.superpin.set.request":
@@ -3853,6 +3867,35 @@ export class Session {
           accepted: false,
           removedWorkspaceIds: [],
           error: getErrorMessageOr(error, "Failed to remove project"),
+        },
+      });
+    }
+  }
+
+  private async handleWorkspacePinPlacementSetRequest(
+    request: Extract<SessionInboundMessage, { type: "workspace.pin.placement.set.request" }>,
+  ): Promise<void> {
+    const { requestId, workspaceId } = request;
+    try {
+      const placement = await setWorkspacePinPlacement(
+        this.workspaceRegistry,
+        request,
+        this.pinServerId,
+      );
+      this.emit({
+        type: "workspace.pin.placement.set.response",
+        payload: { requestId, workspaceId, accepted: true, placement, error: null },
+      });
+      await this.emitWorkspaceUpdatesForWorkspaceIds([workspaceId]);
+    } catch (error) {
+      this.emit({
+        type: "workspace.pin.placement.set.response",
+        payload: {
+          requestId,
+          workspaceId,
+          accepted: false,
+          placement: null,
+          error: getErrorMessageOr(error, "Unable to save pin layout"),
         },
       });
     }
@@ -5237,12 +5280,47 @@ export class Session {
       appVisible: msg.appVisible,
       appVisibilityChangedAt,
     };
+    this.refreshFocusedGitObservation();
     if (msg.appVisible && focusedTerminalId) {
       void this.clearFocusedTerminalAttention(focusedTerminalId);
     }
     if (metadata.pushToken) {
       this.pushNotifications.renew(metadata.pushToken);
     }
+  }
+
+  private refreshFocusedGitObservation(): void {
+    const generation = ++this.focusedGitObservationGeneration;
+    const activities = [...this.clientSources.values()]
+      .map((source) => source.activity)
+      .filter((activity) => activity?.appVisible);
+    void Promise.all(
+      activities.map(async (activity) => {
+        const terminal = activity?.focusedTerminalId
+          ? this.terminalManager?.getTerminal(activity.focusedTerminalId)
+          : null;
+        if (terminal) {
+          const workspace = await this.workspaceRegistry.get(terminal.workspaceId);
+          return workspace?.cwd ?? terminal.cwd;
+        }
+        if (!activity?.focusedAgentId) return null;
+        const agent =
+          this.agentManager.getAgent(activity.focusedAgentId) ??
+          (await this.agentStorage.get(activity.focusedAgentId));
+        return agent && !("archivedAt" in agent && agent.archivedAt) ? agent.cwd : null;
+      }),
+    )
+      .then((cwds) => {
+        if (!this.isCleanedUp && generation === this.focusedGitObservationGeneration) {
+          this.workspaceGitObserver.setFocusedDirectories(
+            cwds.filter((cwd): cwd is string => cwd !== null),
+          );
+        }
+        return null;
+      })
+      .catch((error) => {
+        this.sessionLogger.warn({ err: error }, "Failed to resolve foreground Git observation");
+      });
   }
 
   private async clearFocusedTerminalAttention(terminalId: string): Promise<void> {
@@ -5870,6 +5948,7 @@ export class Session {
     return {
       id: workspace.workspaceId,
       parentWorkspaceId: workspace.parentWorkspaceId,
+      pinPlacement: workspace.pinPlacement,
       siblingOrder: workspace.siblingOrder,
       projectId: workspace.projectId,
       projectDisplayName: resolvedProjectRecord
@@ -5965,6 +6044,7 @@ export class Session {
     return {
       id: result.workspace.workspaceId,
       parentWorkspaceId: result.workspace.parentWorkspaceId,
+      pinPlacement: result.workspace.pinPlacement,
       siblingOrder: result.workspace.siblingOrder,
       projectId: result.workspace.projectId,
       projectDisplayName: projectRecord
@@ -7053,6 +7133,7 @@ export class Session {
         background: request.background,
         parentWorkspaceId: request.parentWorkspaceId,
         siblingOrder: request.siblingOrder,
+        sidebarPlacement: request.sidebarPlacement,
         callerWorkspaceId: await this.getCallerWorkspaceId(request.callerAgentId),
       },
     );
@@ -7119,6 +7200,7 @@ export class Session {
         background: request.background,
         parentWorkspaceId: request.parentWorkspaceId,
         siblingOrder: request.siblingOrder,
+        sidebarPlacement: request.sidebarPlacement,
         callerWorkspaceId: await this.getCallerWorkspaceId(request.callerAgentId),
       },
       source.baseBranch

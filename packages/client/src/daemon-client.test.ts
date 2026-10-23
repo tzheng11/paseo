@@ -8245,6 +8245,36 @@ test("workspace hierarchy sends correlated moves and reports daemon rejection", 
   await expect(rejected).rejects.toThrow("own ancestor");
 });
 
+test("shared workspace placement requires its capability and preserves atomic section input", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "sidebar-placement",
+    logger: createMockLogger(),
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+  const connected = client.connect();
+  mock.triggerOpen({ features: { workspacePinPlacement: true } });
+  await connected;
+  await expect(
+    client.createWorkspace({
+      source: { kind: "directory", path: "/repo" },
+      sidebarPlacement: { parentWorkspaceKey: "remote:manager", section: "pinned" },
+    }),
+  ).rejects.toThrow("Update this host");
+  await expect(
+    client.setWorkspacePinPlacement({
+      workspaceId: "child",
+      placement: { parentWorkspaceKey: "remote:manager", siblingOrder: 1024 },
+      section: "pinned",
+      expectedRevision: 0,
+    }),
+  ).rejects.toThrow("Update this host");
+  expect(mock.sent).toHaveLength(0);
+});
+
 test("workspace hierarchy requires a capable host before creating or moving", async () => {
   const mock = createMockTransport();
   const client = new DaemonClient({

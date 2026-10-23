@@ -10,6 +10,7 @@ import {
   useSidebarWorkspaceSuperpinController,
   useWorkspacePinPending,
   runWorkspacePinChange,
+  runWorkspacePinChanges,
   markWorkspacePinOutcomeUnknown,
   confirmWorkspacePinChange,
 } from "./use-sidebar-workspace-pin";
@@ -257,4 +258,149 @@ it("tree admission blocks menu and shortcut pin mutations until it settles", asy
     await running;
   });
   await waitFor(() => expect(hook.result.current.pending).toBe(false));
+});
+
+it("batch admission rejects an overlap without reserving earlier unrelated members", async () => {
+  const parent = { serverId: "batch-host", workspaceKey: "batch-host:parent-overlap" };
+  const child = { serverId: "batch-host", workspaceKey: "batch-host:child-overlap" };
+  let finish!: () => void;
+  const held = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  const running = runWorkspacePinChange(child, () => held);
+  const rejectedAction = vi.fn(async () => undefined);
+  await expect(runWorkspacePinChanges([parent, child], rejectedAction)).rejects.toThrow(
+    "still pending",
+  );
+  expect(rejectedAction).not.toHaveBeenCalled();
+  const unrelatedAction = vi.fn(async () => "accepted");
+  await expect(runWorkspacePinChange(parent, unrelatedAction)).resolves.toBe("accepted");
+  expect(unrelatedAction).toHaveBeenCalledTimes(1);
+  finish();
+  await running;
+});
+
+it("batch admission blocks pin menus for every descendant until the whole group settles", async () => {
+  mocks.pin.mockReset();
+  mocks.superpin.mockReset();
+  const queryClient = new QueryClient();
+  function wrapper({ children }: PropsWithChildren) {
+    return createElement(QueryClientProvider, { client: queryClient }, children);
+  }
+  const parent = {
+    serverId: "batch-one",
+    workspaceId: "parent",
+    workspaceKey: "batch-one:parent",
+    pinnedAt: "now",
+    superpinnedAt: null,
+  };
+  const child = {
+    ...parent,
+    serverId: "batch-two",
+    workspaceId: "child",
+    workspaceKey: "batch-two:child",
+  };
+  const hook = renderHook(
+    () => ({
+      pin: useSidebarWorkspacePinController(),
+      superpin: useSidebarWorkspaceSuperpinController(),
+      parentPending: useWorkspacePinPending(parent.workspaceKey),
+      childPending: useWorkspacePinPending(child.workspaceKey),
+    }),
+    { wrapper },
+  );
+  let finish!: () => void;
+  const held = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  let running!: Promise<void>;
+  act(() => {
+    running = runWorkspacePinChanges([parent, child], () => held);
+  });
+  expect(hook.result.current.parentPending).toBe(true);
+  expect(hook.result.current.childPending).toBe(true);
+  act(() => {
+    hook.result.current.pin(parent);
+    hook.result.current.pin(child);
+    hook.result.current.superpin(child);
+  });
+  expect(mocks.pin).not.toHaveBeenCalled();
+  expect(mocks.superpin).not.toHaveBeenCalled();
+  await expect(runWorkspacePinChange(child, async () => undefined)).rejects.toThrow(
+    "still pending",
+  );
+  await act(async () => {
+    finish();
+    await running;
+  });
+  expect(hook.result.current.parentPending).toBe(false);
+  expect(hook.result.current.childPending).toBe(false);
+});
+
+it("reserves every unknown group member before the first read and deduplicates identities", async () => {
+  const first = { serverId: "unknown-one", workspaceKey: "unknown-one:reserved" };
+  const second = { serverId: "unknown-two", workspaceKey: "unknown-two:reserved" };
+  markWorkspacePinOutcomeUnknown(first.workspaceKey);
+  markWorkspacePinOutcomeUnknown(second.workspaceKey);
+  let finishRead!: () => void;
+  const read = new Promise<void>((resolve) => {
+    finishRead = resolve;
+  });
+  mocks.refresh.mockReset().mockReturnValueOnce(read).mockResolvedValueOnce(undefined);
+  const action = vi.fn(async () => "confirmed");
+  const running = runWorkspacePinChanges([first, first, second], action);
+  expect(mocks.refresh).toHaveBeenCalledTimes(1);
+  await expect(runWorkspacePinChange(second, async () => undefined)).rejects.toThrow(
+    "still pending",
+  );
+  expect(action).not.toHaveBeenCalled();
+  finishRead();
+  await expect(running).resolves.toBe("confirmed");
+  expect(mocks.refresh).toHaveBeenCalledTimes(2);
+  expect(action).toHaveBeenCalledTimes(1);
+  await expect(runWorkspacePinChanges([first, second], async () => "released")).resolves.toBe(
+    "released",
+  );
+});
+
+it("failed group confirmation releases known members and keeps only unknown outcomes guarded", async () => {
+  const known = { serverId: "known-host", workspaceKey: "known-host:read-failure" };
+  const unknown = { serverId: "unknown-host", workspaceKey: "unknown-host:read-failure" };
+  const hook = renderHook(() => ({
+    knownPending: useWorkspacePinPending(known.workspaceKey),
+    unknownPending: useWorkspacePinPending(unknown.workspaceKey),
+  }));
+  act(() => markWorkspacePinOutcomeUnknown(unknown.workspaceKey));
+  mocks.refresh.mockReset().mockRejectedValueOnce(new Error("group confirmation failed"));
+  const action = vi.fn(async () => undefined);
+  await act(async () => {
+    await expect(runWorkspacePinChanges([known, unknown], action)).rejects.toThrow(
+      "group confirmation failed",
+    );
+  });
+  expect(action).not.toHaveBeenCalled();
+  expect(hook.result.current.knownPending).toBe(false);
+  expect(hook.result.current.unknownPending).toBe(true);
+  await expect(runWorkspacePinChange(known, async () => "available")).resolves.toBe("available");
+  mocks.refresh.mockResolvedValueOnce(undefined);
+  await act(async () => {
+    await runWorkspacePinChange(unknown, async () => undefined);
+  });
+  expect(hook.result.current.unknownPending).toBe(false);
+  expect(mocks.refresh).toHaveBeenCalledTimes(2);
+});
+
+it("releases every group reservation when the mutation action rejects", async () => {
+  const workspaces = [
+    { serverId: "release-one", workspaceKey: "release-one:action-failure" },
+    { serverId: "release-two", workspaceKey: "release-two:action-failure" },
+  ];
+  await expect(
+    runWorkspacePinChanges(workspaces, async () => {
+      throw new Error("membership rejected");
+    }),
+  ).rejects.toThrow("membership rejected");
+  const action = vi.fn(async () => undefined);
+  await runWorkspacePinChanges(workspaces, action);
+  expect(action).toHaveBeenCalledTimes(1);
 });

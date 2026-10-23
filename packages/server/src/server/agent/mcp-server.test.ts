@@ -1,3 +1,5 @@
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import { setWorkspacePinPlacement } from "../workspace-pin-placement.js";
 import type { AgentMessageDelivery } from "./agent-messages/index.js";
 import { createTestAgentMessages } from "../test-utils/agent-messages.js";
 import { setupFinishNotification, type PromptDispatchDisposition } from "./agent-prompt.js";
@@ -2732,6 +2734,323 @@ describe("create_agent MCP tool", () => {
     ]);
   });
 
+  it("places IC workspaces below their caller and moves a shared subtree without changing legacy ownership", async () => {
+    const { agentManager, agentStorage, spies } = createTestDeps();
+    const timestamp = "2026-07-17T00:00:00.000Z";
+    const make = (workspaceId: string, parentWorkspaceKey: string | null, siblingOrder: number) =>
+      createPersistedWorkspaceRecord({
+        workspaceId,
+        projectId: workspaceId,
+        cwd: process.cwd(),
+        kind: "directory",
+        displayName: workspaceId,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        pinnedAt: timestamp,
+        pinPlacement: { parentWorkspaceKey, siblingOrder, revision: 1 },
+      });
+    const rows = new Map(
+      [
+        make("manager", null, 1024),
+        make("first", "local:manager", 1024),
+        make("second", "local:manager", 2048),
+        make("grandchild", "local:first", 1024),
+      ].map((row) => [row.workspaceId, row]),
+    );
+    spies.agentManager.getAgent.mockReturnValue({
+      id: "caller",
+      workspaceId: "manager",
+      cwd: process.cwd(),
+      config: {},
+      provider: "codex",
+      currentModeId: "full-access",
+    } as ManagedAgent);
+    const registry: WorkspaceRegistry = {
+      initialize: async () => {},
+      existsOnDisk: async () => true,
+      get: async (id) => rows.get(id) ?? null,
+      list: async () => [...rows.values()],
+      upsert: async (row) => {
+        rows.set(row.workspaceId, row);
+      },
+      move: unexpectedWorkspaceMove,
+      update: async (id, updater) => {
+        const row = rows.get(id);
+        if (!row) return null;
+        const next = updater(row);
+        rows.set(id, next);
+        return next;
+      },
+      archive: async () => {},
+      remove: async () => {},
+    };
+    const createCalls: unknown[] = [];
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      callerAgentId: "caller",
+      serverId: "local",
+      providerSnapshotManager: createOpenCodeManager().manager,
+      workspaceRegistry: registry,
+      createDirectoryWorkspace: async (_cwd, _title, _projectId, context) => {
+        createCalls.push(context?.sidebarPlacement);
+        return rows.get("first")!;
+      },
+      setWorkspacePinPlacement: (input) => setWorkspacePinPlacement(registry, input, "local"),
+      logger,
+    });
+    await invokeToolWithParsedInput(registeredTool(server, "create_workspace"), {
+      isolation: "local",
+      path: process.cwd(),
+    });
+    expect(createCalls[0]).toEqual({
+      parentWorkspaceKey: "local:manager",
+      section: "pinned",
+      siblingOrder: 3072,
+    });
+    await invokeToolWithParsedInput(registeredTool(server, "create_workspace"), {
+      isolation: "local",
+      path: process.cwd(),
+      parentWorkspaceKey: null,
+    });
+    expect(createCalls[1]).toMatchObject({ parentWorkspaceKey: null, section: "unpinned" });
+    const moved = await invokeToolWithParsedInput(registeredTool(server, "move_workspace"), {
+      workspaceId: "first",
+      parentWorkspaceKey: null,
+      section: "superpinned",
+    });
+    expect(moved.isError).not.toBe(true);
+    expect(rows.get("first")?.superpinnedAt).toBeTypeOf("string");
+    expect(rows.get("grandchild")?.superpinnedAt).toBeTypeOf("string");
+    expect(rows.get("first")?.projectId).toBe("first");
+    expect(rows.get("first")?.parentWorkspaceId).toBeNull();
+    const reorder = await invokeToolWithParsedInput(registeredTool(server, "move_workspace"), {
+      workspaceId: "second",
+      beforeWorkspaceKey: "local:first",
+    });
+    expect(reorder.isError).toBe(true);
+    expect(rows.get("second")?.pinPlacement?.parentWorkspaceKey).toBe("local:manager");
+  });
+
+  it("creates a local caller child with an unrelated offline peer while refusing unresolved parents and incomplete subtree moves", async () => {
+    const { agentManager, agentStorage, spies } = createTestDeps();
+    spies.agentManager.getAgent.mockReturnValue({
+      id: "caller",
+      workspaceId: "manager",
+      cwd: process.cwd(),
+      config: {},
+      provider: "codex",
+      currentModeId: "full-access",
+    } as ManagedAgent);
+    const timestamp = "2026-07-17T00:00:00.000Z";
+    const manager = createPersistedWorkspaceRecord({
+      workspaceId: "manager",
+      projectId: "project",
+      cwd: process.cwd(),
+      kind: "directory",
+      displayName: "Manager",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      pinnedAt: timestamp,
+    });
+    const sibling = createPersistedWorkspaceRecord({
+      ...manager,
+      workspaceId: "legacy-child",
+      parentWorkspaceId: manager.workspaceId,
+      siblingOrder: 8192,
+    });
+    const createCalls: unknown[] = [];
+    const peerReads = vi.fn(async () => {
+      throw new Error("Offline peer must not be read");
+    });
+    const writes = vi.fn(async () => {
+      throw new Error("No move should begin");
+    });
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      callerAgentId: "caller",
+      serverId: "local",
+      providerSnapshotManager: createOpenCodeManager().manager,
+      workspaceRegistry: {
+        get: async () => manager,
+        list: async () => [manager, sibling],
+        upsert: async () => {},
+        move: unexpectedWorkspaceMove,
+      },
+      createDirectoryWorkspace: async (_cwd, _title, _projectId, context) => {
+        createCalls.push(context?.sidebarPlacement);
+        return sibling;
+      },
+      setWorkspacePinPlacement: writes,
+      hosts: () => ({
+        directory: async () => ({
+          self: { serverId: "local", label: "Local" },
+          hosts: [
+            {
+              serverId: "offline",
+              registrationId: "offline",
+              label: "Offline",
+              source: { id: "user", key: "offline" },
+              metadata: {},
+              enabled: true,
+              status: "offline",
+              targetDescription: "test",
+              lastOnlineAt: null,
+              nextRetryAt: null,
+              error: null,
+            },
+          ],
+        }),
+        use: peerReads,
+      }),
+      logger,
+    });
+    const created = await invokeToolWithParsedInput(registeredTool(server, "create_workspace"), {
+      isolation: "local",
+      path: process.cwd(),
+    });
+    expect(created.isError).not.toBe(true);
+    expect(createCalls).toEqual([
+      { parentWorkspaceKey: "local:manager", section: "pinned", siblingOrder: 9216 },
+    ]);
+    expect(peerReads).not.toHaveBeenCalled();
+    const unavailable = await invokeToolWithParsedInput(
+      registeredTool(server, "create_workspace"),
+      { isolation: "local", path: process.cwd(), parentWorkspaceKey: "offline:manager" },
+    );
+    expect(unavailable).toMatchObject({
+      isError: true,
+      structuredContent: { error: expect.stringContaining("Parent host is unavailable") },
+    });
+    expect(createCalls).toHaveLength(1);
+    const moved = await invokeToolWithParsedInput(registeredTool(server, "move_workspace"), {
+      workspaceId: "manager",
+      parentWorkspaceKey: null,
+      section: "superpinned",
+    });
+    expect(moved).toMatchObject({
+      isError: true,
+      structuredContent: { error: expect.stringContaining("Reconnect all registered hosts") },
+    });
+    expect(writes).not.toHaveBeenCalled();
+  });
+
+  it("resolves caller placement before routed creation and pages cross-host siblings", async () => {
+    const { agentManager, agentStorage, spies } = createTestDeps();
+    spies.agentManager.getAgent.mockReturnValue({
+      id: "caller",
+      workspaceId: "manager",
+      cwd: process.cwd(),
+      config: {},
+      provider: "codex",
+      currentModeId: "full-access",
+    } as ManagedAgent);
+    const timestamp = "2026-07-17T00:00:00.000Z";
+    const manager = createPersistedWorkspaceRecord({
+      workspaceId: "manager",
+      projectId: "project",
+      cwd: process.cwd(),
+      kind: "directory",
+      displayName: "Manager",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      pinnedAt: timestamp,
+    });
+    const calls: unknown[] = [];
+    const fetches: unknown[] = [];
+    const remoteClient = {
+      getLastServerInfoMessage: () => ({
+        serverId: "remote",
+        features: { workspaceSidebarPlacement: true },
+      }),
+      fetchWorkspaces: async (query: { page?: { cursor?: string } }) => {
+        fetches.push(query);
+        const last = query.page?.cursor === "next";
+        return {
+          entries: [
+            {
+              id: last ? "last" : "first",
+              projectId: "project",
+              workspaceDirectory: "/remote/project",
+              workspaceKind: "directory",
+              pinnedAt: timestamp,
+              superpinnedAt: null,
+              pinPlacement: {
+                parentWorkspaceKey: "local:manager",
+                siblingOrder: last ? 6000 : 1024,
+                revision: 1,
+              },
+            },
+          ],
+          pageInfo: { hasMore: !last, nextCursor: last ? null : "next", prevCursor: null },
+        };
+      },
+      createWorkspace: async (input: { sidebarPlacement?: unknown }) => {
+        calls.push(input.sidebarPlacement);
+        return {
+          error: null,
+          workspace: {
+            id: "created",
+            projectId: "project",
+            workspaceDirectory: "/remote/project",
+            workspaceKind: "directory",
+            title: "IC",
+            background: false,
+            pinnedAt: timestamp,
+            pinPlacement: input.sidebarPlacement,
+          },
+        };
+      },
+    } as unknown as DaemonClient;
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      callerAgentId: "caller",
+      serverId: "local",
+      providerSnapshotManager: createOpenCodeManager().manager,
+      workspaceRegistry: {
+        get: async () => manager,
+        list: async () => [manager],
+        upsert: async () => {},
+        move: unexpectedWorkspaceMove,
+      },
+      hosts: () => ({
+        directory: async () => ({
+          self: { serverId: "local", label: "Local" },
+          hosts: [
+            {
+              serverId: "remote",
+              registrationId: "remote",
+              label: "Remote",
+              source: { id: "user", key: "remote" },
+              metadata: {},
+              enabled: true,
+              status: "online",
+              targetDescription: "test",
+              lastOnlineAt: null,
+              nextRetryAt: null,
+              error: null,
+            },
+          ],
+        }),
+        use: async (_serverId, action) => action(remoteClient),
+      }),
+      logger,
+    });
+    const response = await invokeToolWithParsedInput(registeredTool(server, "create_workspace"), {
+      serverId: "remote",
+      isolation: "local",
+      path: "/remote/project",
+    });
+    expect(response.isError).not.toBe(true);
+    expect(calls).toEqual([
+      { parentWorkspaceKey: "local:manager", section: "pinned", siblingOrder: 7024 },
+    ]);
+    expect(fetches).toHaveLength(2);
+    expect(fetches[1]).toMatchObject({ page: { limit: 200, cursor: "next" } });
+  });
+
   it("creates an background local workspace and leaves it out of list_workspaces", async () => {
     const { agentManager, agentStorage } = createTestDeps();
     interface WorkspaceCreateCall {
@@ -2833,7 +3152,7 @@ describe("create_agent MCP tool", () => {
     });
   });
 
-  it("requires an explicit hierarchy parent and preserves workspace move errors", async () => {
+  it("allows retaining a shared parent and preserves legacy workspace move errors", async () => {
     const { agentManager, agentStorage } = createTestDeps();
     const server = await createAgentMcpServer({
       agentManager,
@@ -2851,7 +3170,7 @@ describe("create_agent MCP tool", () => {
     });
     const tool = registeredTool(server, "move_workspace");
     const parsed = await tool.inputSchema.safeParseAsync({ workspaceId: "ws-missing" });
-    expect(parsed.success).toBe(false);
+    expect(parsed.success).toBe(true);
     await expect(
       invokeToolWithParsedInput(tool, { workspaceId: "ws-missing", parentWorkspaceId: null }),
     ).rejects.toThrow("Workspace ws-missing not found");

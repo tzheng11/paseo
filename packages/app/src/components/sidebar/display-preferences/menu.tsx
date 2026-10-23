@@ -21,6 +21,7 @@ import {
   GitBranch,
   GitPullRequest,
   Globe,
+  ListTree,
   Server,
   Settings2,
   Tag,
@@ -87,6 +88,7 @@ type OptionIcon = ComponentType<{
 // Options carry icons; the root rows deliberately do not. The root is four labels with their
 // current values, and a column of icons there would be decoration competing with the values.
 const GROUPING_ICONS: Record<SidebarGroupMode, OptionIcon> = {
+  none: withUnistyles(ListTree),
   project: withUnistyles(Folder),
   status: withUnistyles(CircleDashed),
 };
@@ -120,11 +122,12 @@ const TRAILING_ICONS: Record<SidebarTrailingChoice, OptionIcon> = {
   timestamp: withUnistyles(Clock),
 };
 
-const GROUPING_MODES: readonly SidebarGroupMode[] = ["project", "status"];
+const GROUPING_MODES: readonly SidebarGroupMode[] = ["none", "project", "status"];
 const TITLE_SOURCES: readonly WorkspaceTitleSource[] = ["title", "branch"];
 const TRAILING_CHOICES: readonly SidebarTrailingChoice[] = ["diff", "timestamp"];
 
 const GROUPING_LABEL_KEYS: Record<SidebarGroupMode, string> = {
+  none: "sidebar.display.grouping.none",
   project: "sidebar.display.grouping.project",
   status: "sidebar.display.grouping.status",
 };
