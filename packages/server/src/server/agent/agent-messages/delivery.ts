@@ -1,7 +1,9 @@
 import type { PromptDispatchDisposition } from "../agent-prompt.js";
 import { randomUUID } from "node:crypto";
+import { setImmediate } from "node:timers/promises";
 import type { AgentPromptInput, AgentPromptContentBlock } from "../agent-sdk-types.js";
 import { prepareAgentMessage, type AgentPromptSource } from "./envelope.js";
+import { AgentSteerTurnChangedError } from "../steer-admission-error.js";
 
 interface Message {
   recipientId: string;
@@ -96,7 +98,19 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
       .then(async () => {
         try {
           for (const message of messages) message.beforeDispatch?.();
-          const disposition = await dependencies.dispatch(request);
+          let disposition: PromptDispatchDisposition;
+          // A stale turn observation is a definitive pre-admission refusal, not a
+          // provider failure. Re-select the current turn with the same message IDs;
+          // never retry ambiguous errors or cancel a newer turn using the old claim.
+          while (true) {
+            try {
+              disposition = await dependencies.dispatch(request);
+              break;
+            } catch (error) {
+              if (!(error instanceof AgentSteerTurnChangedError)) throw error;
+              await setImmediate();
+            }
+          }
           for (const message of messages) message.resolve(disposition);
           return undefined;
         } catch (error) {

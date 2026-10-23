@@ -110,6 +110,10 @@ import {
 import { invokeRewindCapability, type RewindMode } from "./rewind/rewind.js";
 import { parseAgentMessage, projectAgentMessages } from "./agent-messages/index.js";
 import { isStaleProviderSessionError } from "./stale-provider-session-error.js";
+import {
+  AgentSteerOutcomeUnknownError,
+  AgentSteerTurnChangedError,
+} from "./steer-admission-error.js";
 import { stripInternalPaseoMcpServer, withRuntimePaseoMcpServer } from "./runtime-mcp-config.js";
 import { resolveCreateAgentTitles } from "./create-agent-title.js";
 import type { PaseoToolCatalogFactory } from "./tools/types.js";
@@ -125,6 +129,8 @@ import { extractAttention } from "../persistence-hooks.js";
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
 const IMPORTABLE_SESSION_LIST_TIMEOUT_MS = 90_000;
+// Larger than Codex's 90s request budget; custom providers also need a finite admission.
+const STEER_ADMISSION_TIMEOUT_MS = 120_000;
 const STORED_AGENT_CAPABILITIES: AgentCapabilityFlags = {
   supportsStreaming: false,
   supportsSessionPersistence: true,
@@ -353,6 +359,7 @@ export interface ProviderAvailability {
 interface AgentManagerRescueTimeouts {
   reloadSessionCloseMs?: number;
   interruptSessionMs?: number;
+  steerAdmissionMs?: number;
 }
 
 interface ProviderEnabledFlag {
@@ -859,6 +866,14 @@ export interface RetiredInternalAgent {
   lastMessage: string | null;
 }
 
+function resolveRescueTimeouts(options: AgentManagerOptions["rescueTimeouts"]) {
+  return {
+    reloadSessionCloseMs: options?.reloadSessionCloseMs ?? RELOAD_SESSION_CLOSE_TIMEOUT_MS,
+    interruptSessionMs: options?.interruptSessionMs ?? INTERRUPT_SESSION_TIMEOUT_MS,
+    steerAdmissionMs: options?.steerAdmissionMs ?? STEER_ADMISSION_TIMEOUT_MS,
+  };
+}
+
 export class AgentManager {
   private readonly reloadOperations?: ReloadOperationStore;
   private readonly recoveryMessages?: Pick<MessageReceipts, "send">;
@@ -936,12 +951,7 @@ export class AgentManager {
     this.resolvePaseoToolPolicy = options.resolvePaseoToolPolicy ?? (() => undefined);
     this.appendSystemPrompt = options.appendSystemPrompt ?? "";
     this.logger = options.logger.child({ module: "agent", component: "agent-manager" });
-    this.rescueTimeouts = {
-      reloadSessionCloseMs:
-        options.rescueTimeouts?.reloadSessionCloseMs ?? RELOAD_SESSION_CLOSE_TIMEOUT_MS,
-      interruptSessionMs:
-        options.rescueTimeouts?.interruptSessionMs ?? INTERRUPT_SESSION_TIMEOUT_MS,
-    };
+    this.rescueTimeouts = resolveRescueTimeouts(options.rescueTimeouts);
     this.beforeSteerUnavailableFallback = options.beforeSteerUnavailableFallback;
     this.agentStreamCoalescer = new AgentStreamCoalescer({
       windowMs: options.agentStreamCoalesceWindowMs ?? AGENT_STREAM_COALESCE_DEFAULT_WINDOW_MS,
@@ -3723,20 +3733,25 @@ export class AgentManager {
     if (!expectedTurnId || !agent.session.steerActiveTurn) {
       return { status: "unavailable" };
     }
-    const result = await this.runSteerAdmission(agent, expectedTurnId, async () => {
-      const admission = await agent.session.steerActiveTurn!(prompt, {
-        ...options,
-        expectedTurnId,
-      });
-      if (admission.status === "accepted") {
-        await this.recordAcceptedSteer(agent, prompt, options?.clientMessageId, expectedTurnId);
-      }
-      return admission;
-    });
+    const result = await this.runSteerAdmission(
+      agent,
+      expectedTurnId,
+      async () => {
+        return agent.session.steerActiveTurn!(prompt, {
+          ...options,
+          expectedTurnId,
+        });
+      },
+      () => this.recordAcceptedSteer(agent, prompt, options?.clientMessageId, expectedTurnId),
+    );
     // An unavailable answer is only safe to fall back from while this admission
     // still owns the active turn. Never let an A admission replace a later B.
-    if (result.status === "unavailable" && agent.activeTurnId !== expectedTurnId) {
-      throw new Error("Active turn changed before steering could be delivered");
+    if (
+      result.status === "unavailable" &&
+      agent.activeTurnId !== expectedTurnId &&
+      !this.isTurnInactive(agent)
+    ) {
+      throw new AgentSteerTurnChangedError();
     }
     return result;
   }
@@ -3754,20 +3769,23 @@ export class AgentManager {
     }
 
     const result = agent.session.steerActiveTurn
-      ? await this.runSteerAdmission(agent, expectedTurnId, async () => {
-          const admission = await agent.session.steerActiveTurn!(prompt, {
-            ...options,
-            expectedTurnId,
-          });
-          if (admission.status === "accepted") {
-            await this.recordAcceptedSteer(agent, prompt, options?.clientMessageId, expectedTurnId);
-          }
-          return admission;
-        })
+      ? await this.runSteerAdmission(
+          agent,
+          expectedTurnId,
+          async () => {
+            return agent.session.steerActiveTurn!(prompt, {
+              ...options,
+              expectedTurnId,
+            });
+          },
+          () => this.recordAcceptedSteer(agent, prompt, options?.clientMessageId, expectedTurnId),
+        )
       : { status: "unavailable" as const };
     if (result.status === "accepted") {
       return { status: "steered" };
     }
+
+    if (this.isTurnInactive(agent)) return { status: "inactive" };
 
     // Providers without autonomous steering keep their existing dispatch behavior. The shared
     // admission may recognize the turn, but only an accepted steer can own it without replacement.
@@ -3790,24 +3808,49 @@ export class AgentManager {
 
   private assertSteerAdmissionOwnsTurn(agent: ActiveManagedAgent, expectedTurnId: string): void {
     if (agent.activeTurnId !== expectedTurnId) {
-      throw new Error("Active turn changed before steering could be delivered");
+      throw new AgentSteerTurnChangedError();
     }
   }
 
-  private async runSteerAdmission<T>(
+  private isTurnInactive(agent: ActiveManagedAgent): boolean {
+    return (
+      !agent.activeTurnId &&
+      !agent.activeForegroundTurnId &&
+      !this.runs.hasRun(agent.id) &&
+      !agent.pendingReplacement
+    );
+  }
+
+  private async runSteerAdmission(
     agent: ActiveManagedAgent,
     expectedTurnId: string,
-    operation: () => Promise<T>,
-  ): Promise<T> {
+    operation: () => Promise<SteerResult>,
+    recordAccepted: () => Promise<void>,
+  ): Promise<SteerResult> {
     return this.runForegroundMutation(agent.id, async () => {
       await this.drainSessionEvents(agent.id);
       this.agentStreamCoalescer.flushFor(agent.id);
+      if (this.isTurnInactive(agent)) return { status: "unavailable" };
       this.assertSteerAdmissionOwnsTurn(agent, expectedTurnId);
       const barrier: SteerEventBarrier = { events: [] };
       this.steerEventBarriers.set(agent.id, barrier);
+      let timer: ReturnType<typeof setTimeout> | undefined;
       try {
-        return await operation();
+        const result = await Promise.race([
+          operation(),
+          new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(
+              () => reject(new AgentSteerOutcomeUnknownError(this.rescueTimeouts.steerAdmissionMs)),
+              this.rescueTimeouts.steerAdmissionMs,
+            );
+          }),
+        ]);
+        // Keep this outside the provider promise: a late acknowledgement after timeout
+        // cannot publish acceptance or replay an input with an unknown outcome.
+        if (result.status === "accepted") await recordAccepted();
+        return result;
       } finally {
+        clearTimeout(timer);
         if (this.steerEventBarriers.get(agent.id) === barrier) {
           this.steerEventBarriers.delete(agent.id);
         }
@@ -3849,12 +3892,21 @@ export class AgentManager {
     this.emitState(agent);
 
     try {
-      await this.cancelAgentRunBefore(agent.id, "replace");
+      await this.cancelAgentRunBefore(agent.id, "replace", expectedTurnId);
+      await this.drainSessionEvents(agent.id);
+      if (agent.activeTurnId || agent.activeForegroundTurnId || this.runs.hasRun(agent.id)) {
+        throw new AgentSteerTurnChangedError();
+      }
       return this.streamAgent(agent.id, prompt, options);
     } catch (error) {
       const latest = this.agents.get(agent.id);
       if (latest) {
         latest.pendingReplacement = false;
+        if (this.isTurnInactive(latest)) {
+          latest.lifecycle = latest.lastError ? "error" : "idle";
+          this.touchUpdatedAt(latest);
+          this.emitState(latest);
+        }
       }
       throw error;
     }
@@ -4046,6 +4098,10 @@ export class AgentManager {
       return { status: "not_running" };
     }
 
+    const capturedPermissions = {
+      requests: new Map(agent.pendingPermissions),
+      activityRevision: this.quotaActivityRevisions.get(agentId) ?? 0,
+    };
     const interruptAcknowledged = await this.interruptSession(agent.session, agentId);
     const settlement = await this.waitWithTimeout({
       operation: run.settledPromise,
@@ -4058,6 +4114,12 @@ export class AgentManager {
       return { status: settlement === "completed" ? "settled" : "refused" };
     }
 
+    // Settlement belongs to the captured run. A later turn owns its own terminal
+    // events and permissions, even if it starts while the interrupt is awaiting.
+    if (this.runs.getRun(agentId) !== run) {
+      this.resolveInterruptedPermissions(agent, capturedPermissions);
+      return { status: "settled" };
+    }
     const runTurnId = this.runs.getTurnId(agentId);
     if (settlement === "timed_out" && runTurnId) {
       this.logger.warn(
@@ -4094,19 +4156,49 @@ export class AgentManager {
       });
     }
 
-    if (agent.pendingPermissions.size > 0) {
-      this.resolvePendingPermissionsForAgent(agent, agent.provider, undefined, "Interrupted");
+    this.resolveInterruptedPermissions(agent, capturedPermissions);
+    return { status: "settled" };
+  }
+
+  private resolveInterruptedPermissions(
+    agent: ActiveManagedAgent,
+    capturedPermissions: {
+      requests: ReadonlyMap<string, AgentPermissionRequest>;
+      activityRevision: number;
+    },
+  ): void {
+    const before = agent.pendingPermissions.size;
+    // Without later activity, approvals arriving during interrupt still belong to
+    // this cancellation. After a newer input/turn (even one already completed),
+    // resolve only the exact captured entries, never that later work's approvals.
+    const laterActivity =
+      (this.quotaActivityRevisions.get(agent.id) ?? 0) !== capturedPermissions.activityRevision;
+    this.resolvePendingPermissionsForAgent(
+      agent,
+      agent.provider,
+      laterActivity ? { only: capturedPermissions.requests } : undefined,
+      "Interrupted",
+    );
+    if (agent.pendingPermissions.size !== before) {
       this.touchUpdatedAt(agent);
       this.emitState(agent);
     }
-    return { status: "settled" };
   }
 
   private async cancelAgentRunBefore(
     agentId: string,
     action: "reload" | "replace" | "rewind",
+    expectedTurnId?: string,
   ): Promise<void> {
-    const result = await this.cancelAgentRun(agentId);
+    const result = expectedTurnId
+      ? await this.runForegroundMutation(agentId, async () => {
+          const agent = this.requireSessionAgent(agentId);
+          await this.persistSnapshot(agent);
+          await this.drainSessionEvents(agentId);
+          this.assertSteerAdmissionOwnsTurn(agent, expectedTurnId);
+          return this.cancelAgentRunNow(agentId);
+        })
+      : await this.cancelAgentRun(agentId);
     if (result.status === "refused") {
       throw new AgentRunCancellationError(agentId, action);
     }
@@ -5316,9 +5408,12 @@ export class AgentManager {
     const isForegroundEvent = agent.activeForegroundTurnId === eventTurnId;
     this.traceHandleStreamEventStart(agent, event, eventTurnId, isForegroundEvent);
     if (
-      eventTurnId &&
-      isTurnTerminalEvent(event) &&
-      this.runs.hasFinalizedTurn(agent, eventTurnId)
+      this.isFinalizedStreamEvent({
+        agent,
+        event,
+        eventTurnId,
+        fromHistory: options?.fromHistory === true,
+      })
     ) {
       return false;
     }
@@ -5359,6 +5454,9 @@ export class AgentManager {
 
     if (!options?.fromHistory) {
       if (isTurnTerminalEvent(event)) {
+        if (eventTurnId && terminalDisposition === "closed_current") {
+          this.runs.rememberFinalizedTurn(agent, eventTurnId);
+        }
         this.runs.settleTerminalRun(agent.id, eventTurnId);
         if (isForegroundEvent) {
           this.finalizeForegroundTurn(agent, eventTurnId);
@@ -5373,6 +5471,20 @@ export class AgentManager {
     this.traceHandleStreamEventEnd(agent, event, eventTurnId, flags);
 
     return flags.shouldNotifyWaiters;
+  }
+
+  private isFinalizedStreamEvent(params: {
+    agent: ActiveManagedAgent;
+    event: AgentStreamEvent;
+    eventTurnId: string | undefined;
+    fromHistory: boolean;
+  }): boolean {
+    const { agent, event, eventTurnId, fromHistory } = params;
+    return Boolean(
+      eventTurnId &&
+      (isTurnTerminalEvent(event) || (!fromHistory && event.type === "turn_started")) &&
+      this.runs.hasFinalizedTurn(agent, eventTurnId),
+    );
   }
 
   private traceHandleStreamEventStart(
@@ -5789,10 +5901,13 @@ export class AgentManager {
   private resolvePendingPermissionsForAgent(
     agent: ActiveManagedAgent,
     provider: AgentProvider,
-    options: { fromHistory?: boolean } | undefined,
+    options:
+      | { fromHistory?: boolean; only?: ReadonlyMap<string, AgentPermissionRequest> }
+      | undefined,
     message: string,
   ): void {
-    for (const [requestId] of agent.pendingPermissions) {
+    for (const [requestId, request] of agent.pendingPermissions) {
+      if (options?.only && options.only.get(requestId) !== request) continue;
       agent.pendingPermissions.delete(requestId);
       if (!options?.fromHistory) {
         this.dispatchStream(agent.id, {
