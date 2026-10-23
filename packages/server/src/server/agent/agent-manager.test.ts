@@ -815,6 +815,30 @@ test("rejects a late bounded history result after epoch replacement", async () =
   }
 });
 
+test("serializes bounded history readers without serializing live completion", async () => {
+  const { manager, agent, session, cleanup } = await createHeldHistoryFixture();
+  const run = drainAsyncGenerator(manager.streamAgent(agent.id, "initial"));
+  await manager.waitForAgentRunStart(agent.id);
+  const first = manager.readTimelineHistory(agent.id, { operation: "page", cursor: 0 });
+  await session.readStarted.promise;
+  const second = manager.readTimelineHistory(agent.id, { operation: "page", cursor: 1 });
+  try {
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+    await run;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(manager.getAgent(agent.id)?.lifecycle).toBe("idle");
+    expect(session.readCount).toBe(1);
+    session.releaseRead.resolve();
+    await Promise.all([first, second]);
+    expect(session.readCount).toBe(2);
+  } finally {
+    session.releaseRead.resolve();
+    await Promise.allSettled([first, second]);
+    await run;
+    await cleanup();
+  }
+});
+
 test.each(["close", "reload"] as const)(
   "%s joins pending bounded history without holding live completion",
   async (operation) => {
