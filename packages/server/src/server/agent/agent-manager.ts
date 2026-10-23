@@ -946,7 +946,7 @@ export class AgentManager {
   private readonly idleReloads = new Set<string>();
   private readonly timelineStore: AgentRuntimeTimelineStore;
   private readonly historySourceBoundarySeq = new Map<string, number>();
-  private readonly pendingHistoryReads = new Map<string, Set<Promise<unknown>>>();
+  private readonly historyReadTails = new Map<string, Promise<void>>();
   private readonly providerSubagents = new ProviderSubagentStore();
   private readonly agentsAwaitingInitialSnapshotPersist = new Set<string>();
   private readonly sessionEventTails = new Map<string, Promise<void>>();
@@ -5283,22 +5283,25 @@ export class AgentManager {
   }
 
   private trackHistoryRead<T>(agentId: string, operation: () => Promise<T>): Promise<T> {
+    if (this.lifecycleMutationTails.has(agentId) || this.inFlightAgentCloses.has(agentId))
+      return Promise.reject(
+        new Error("Agent session is changing; read history after it completes"),
+      );
     const finish = this.beginAgentActivity(agentId);
-    const read = Promise.resolve().then(operation);
-    const reads = this.pendingHistoryReads.get(agentId) ?? new Set<Promise<unknown>>();
-    this.pendingHistoryReads.set(agentId, reads);
-    reads.add(read);
+    // Preserve one provider history reader per agent without serializing live
+    // events behind it. A timed-out client may still own a pending native read.
+    const previous = this.historyReadTails.get(agentId) ?? Promise.resolve();
+    const read = previous.then(operation);
     const settled = read
       .then(
         () => undefined,
         () => undefined,
       )
       .finally(() => {
-        reads.delete(read);
-        if (!reads.size && this.pendingHistoryReads.get(agentId) === reads)
-          this.pendingHistoryReads.delete(agentId);
+        if (this.historyReadTails.get(agentId) === settled) this.historyReadTails.delete(agentId);
         finish();
       });
+    this.historyReadTails.set(agentId, settled);
     this.trackBackgroundTask(settled);
     return read;
   }
@@ -5306,8 +5309,8 @@ export class AgentManager {
   private async drainHistoryReads(agentId: string): Promise<void> {
     // Teardown still owns these readers through disposal. Waiting here must not
     // put their IO back ahead of live turn completion in sessionEventTails.
-    while (this.pendingHistoryReads.get(agentId)?.size) {
-      await Promise.allSettled(this.pendingHistoryReads.get(agentId)!);
+    while (this.historyReadTails.has(agentId)) {
+      await this.historyReadTails.get(agentId);
     }
   }
 
