@@ -732,7 +732,7 @@ class HeldBoundedHistorySession extends ImmediateSteeringTestSession {
   }
 }
 
-async function createHeldHistoryFixture(options?: { restored?: boolean }) {
+async function createHeldHistoryFixture(options?: { restored?: boolean; stored?: boolean }) {
   const workdir = mkdtempSync(join(tmpdir(), "agent-history-terminal-progress-"));
   const session = new HeldBoundedHistorySession({ provider: "codex", cwd: workdir });
   const client = new (class extends TestAgentClient {
@@ -747,7 +747,13 @@ async function createHeldHistoryFixture(options?: { restored?: boolean }) {
     }
   })();
   const store = new InMemoryAgentTimelineStore();
-  const manager = new AgentManager({ clients: { codex: client }, timelineStore: store, logger });
+  const storage = options?.stored ? new AgentStorage(join(workdir, "agents"), logger) : undefined;
+  const manager = new AgentManager({
+    clients: { codex: client },
+    timelineStore: store,
+    registry: storage,
+    logger,
+  });
   const agent = options?.restored
     ? await manager.resumeAgentFromPersistence(session.describePersistence(), { cwd: workdir })
     : await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
@@ -758,7 +764,7 @@ async function createHeldHistoryFixture(options?: { restored?: boolean }) {
     await manager.closeAgent(agent.id);
     rmSync(workdir, { recursive: true, force: true });
   };
-  return { session, manager, agent, store, cleanup };
+  return { session, manager, agent, store, storage, cleanup };
 }
 
 test.each(["page", "windows"] as const)(
@@ -884,6 +890,33 @@ test.each(["close", "reload"] as const)(
     }
   },
 );
+
+test("bounded history remains available during an ordinary title write", async () => {
+  const { manager, agent, session, storage, cleanup } = await createHeldHistoryFixture({
+    stored: true,
+  });
+  const started = deferred<void>();
+  const released = deferred<void>();
+  const applySnapshot = storage!.applySnapshot.bind(storage);
+  vi.spyOn(storage!, "applySnapshot").mockImplementationOnce(async (...args) => {
+    started.resolve();
+    await released.promise;
+    return applySnapshot(...args);
+  });
+  const title = manager.setTitle(agent.id, "Updated title");
+  try {
+    await started.promise;
+    session.releaseRead.resolve();
+    await expect(
+      manager.readTimelineHistory(agent.id, { operation: "page", cursor: 0 }),
+    ).resolves.toMatchObject({ entries: [], unit: "provider_items" });
+    expect((await storage!.get(agent.id))?.title).not.toBe("Updated title");
+  } finally {
+    released.resolve();
+    await title;
+    await cleanup();
+  }
+});
 
 test("rejects a stale bounded history epoch before provider IO", async () => {
   const { manager, agent, session, cleanup } = await createHeldHistoryFixture();

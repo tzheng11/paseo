@@ -891,6 +891,7 @@ export class AgentManager {
   private readonly timelineStore: AgentRuntimeTimelineStore;
   private readonly historySourceBoundarySeq = new Map<string, number>();
   private readonly historyReadTails = new Map<string, Promise<void>>();
+  private readonly historyReadBarriers = new Map<string, number>();
   private readonly providerSubagents = new ProviderSubagentStore();
   private readonly agentsAwaitingInitialSnapshotPersist = new Set<string>();
   private readonly sessionEventTails = new Map<string, Promise<void>>();
@@ -1620,8 +1621,7 @@ export class AgentManager {
   ) {
     return this.trackHistoryRead(id, async () => {
       const snapshot = await this.runSessionOperation(id, async () => {
-        if (this.lifecycleMutationTails.has(id) || this.inFlightAgentCloses.has(id))
-          throw new Error("Agent session is changing; read history after it completes");
+        this.assertHistoryReadAdmission(id);
         const agent = this.requireSessionAgent(id);
         const epoch = this.timelineStore.getEpoch(id);
         if (request.epoch !== undefined && request.epoch !== epoch)
@@ -2268,9 +2268,11 @@ export class AgentManager {
     overrides?: Partial<AgentSessionConfig>,
     options?: { rehydrateFromDisk?: boolean; preserveHistory?: boolean },
   ): Promise<ManagedAgent> {
-    return this.trackAgentRegistrationOperation(
-      this.runLifecycleMutation(agentId, () =>
-        this.reloadAgentSessionInternal(agentId, overrides, options),
+    return this.withHistoryReadBarrier(agentId, () =>
+      this.trackAgentRegistrationOperation(
+        this.runLifecycleMutation(agentId, () =>
+          this.reloadAgentSessionInternal(agentId, overrides, options),
+        ),
       ),
     );
   }
@@ -2555,7 +2557,11 @@ export class AgentManager {
     return close;
   }
 
-  private async closeAgentRuntime(agentId: string): Promise<void> {
+  private closeAgentRuntime(agentId: string): Promise<void> {
+    return this.withHistoryReadBarrier(agentId, () => this.closeAgentRuntimeUnlocked(agentId));
+  }
+
+  private async closeAgentRuntimeUnlocked(agentId: string): Promise<void> {
     const agent = this.requireAgent(agentId);
     this.logger.trace(
       {
@@ -4994,11 +5000,31 @@ export class AgentManager {
     });
   }
 
+  private async withHistoryReadBarrier<T>(
+    agentId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    this.historyReadBarriers.set(agentId, (this.historyReadBarriers.get(agentId) ?? 0) + 1);
+    try {
+      return await operation();
+    } finally {
+      const remaining = this.historyReadBarriers.get(agentId)! - 1;
+      if (remaining) this.historyReadBarriers.set(agentId, remaining);
+      else this.historyReadBarriers.delete(agentId);
+    }
+  }
+
+  private assertHistoryReadAdmission(agentId: string): void {
+    if (
+      this.historyReadBarriers.has(agentId) ||
+      this.idleReloads.has(agentId) ||
+      this.inFlightAgentCloses.has(agentId)
+    )
+      throw new Error("Agent session is changing; read history after it completes");
+  }
+
   private trackHistoryRead<T>(agentId: string, operation: () => Promise<T>): Promise<T> {
-    if (this.lifecycleMutationTails.has(agentId) || this.inFlightAgentCloses.has(agentId))
-      return Promise.reject(
-        new Error("Agent session is changing; read history after it completes"),
-      );
+    this.assertHistoryReadAdmission(agentId);
     const finish = this.beginAgentActivity(agentId);
     // Preserve one provider history reader per agent without serializing live
     // events behind it. A timed-out client may still own a pending native read.
