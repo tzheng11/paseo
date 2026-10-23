@@ -6,7 +6,16 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { describe, expect, test } from "vitest";
 import { experimental_createMCPClient } from "ai";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import {
+  CallToolResultSchema,
+  InitializeResultSchema,
+  JSONRPCErrorResponseSchema,
+  JSONRPCResultResponseSchema,
+  ListToolsResultSchema,
+  SUPPORTED_PROTOCOL_VERSIONS,
+} from "@modelcontextprotocol/sdk/types.js";
 import pino from "pino";
+import { z } from "zod";
 
 import { withTimeout } from "../../utils/promise-timeout.js";
 import { hashDaemonPassword } from "../auth.js";
@@ -91,10 +100,14 @@ async function createMcpClient(url: string, authToken?: string): Promise<McpClie
 
 interface OfflineMcpDaemon {
   client: McpClient;
+  mcpUrl: string;
+  capabilityToken: string;
   stop: () => Promise<void>;
 }
 
-async function startOfflineMcpDaemon(): Promise<OfflineMcpDaemon> {
+async function startOfflineMcpDaemon(
+  options: { password?: string } = {},
+): Promise<OfflineMcpDaemon> {
   const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-"));
   const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));
   const removeDirectories = async () => {
@@ -113,6 +126,7 @@ async function startOfflineMcpDaemon(): Promise<OfflineMcpDaemon> {
       mcpDebug: false,
       agentClients: createTestAgentClients(),
       agentStoragePath: path.join(paseoHome, "agents"),
+      auth: options.password ? { password: hashDaemonPassword(options.password) } : undefined,
     },
     pino({ level: "silent" }),
   ).catch(async (error: unknown) => {
@@ -121,9 +135,13 @@ async function startOfflineMcpDaemon(): Promise<OfflineMcpDaemon> {
   });
   try {
     await daemon.start();
-    const client = await createMcpClient(`http://127.0.0.1:${port}/mcp/agents`);
+    const mcpUrl = `http://127.0.0.1:${port}/mcp/agents`;
+    const capabilityToken = z.string().parse(daemon.agentManager.getMcpAuthToken());
+    const client = await createMcpClient(mcpUrl, capabilityToken);
     return {
       client,
+      mcpUrl,
+      capabilityToken,
       stop: async () => {
         await client.close();
         await daemon.stop();
@@ -231,6 +249,118 @@ async function waitForAgentFinish(options: { client: McpClient; agentId: string 
 }
 
 describe("agent MCP end-to-end (offline)", () => {
+  test.each([
+    { requested: "2026-07-28", id: 0 },
+    { requested: "2099-01-01", id: "future-version" },
+  ])(
+    "signals legacy initialization to a $requested discovery client",
+    async ({ requested, id }) => {
+      const daemon = await startOfflineMcpDaemon({ password: "protocol-test-secret" });
+      async function post(message: Record<string, unknown>, protocolVersion: string) {
+        const response = await fetch(daemon.mcpUrl, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${daemon.capabilityToken}`,
+            "content-type": "application/json",
+            accept: "application/json, text/event-stream",
+            "mcp-protocol-version": protocolVersion,
+            "mcp-method": z.string().parse(message.method),
+          },
+          body: JSON.stringify(message),
+        });
+        const text = await response.text();
+        const payload = response.headers.get("content-type")?.includes("text/event-stream")
+          ? z
+              .string()
+              .parse(text.split("\n").find((line) => line.startsWith("data: ")))
+              .slice(6)
+          : text;
+        return { status: response.status, body: payload ? (JSON.parse(payload) as unknown) : null };
+      }
+
+      try {
+        const rejected = await post(
+          {
+            jsonrpc: "2.0",
+            id,
+            method: "server/discover",
+            params: { _meta: { "io.modelcontextprotocol/protocolVersion": requested } },
+          },
+          requested,
+        );
+        expect(rejected.status).toBe(400);
+        const rejection = JSONRPCErrorResponseSchema.parse(rejected.body);
+        expect(rejection).toEqual({
+          jsonrpc: "2.0",
+          id,
+          error: {
+            code: -32601,
+            message: "Method not found: server/discover",
+          },
+        });
+        // Modern clients classify a correlated, non-modern JSON-RPC error as a
+        // legacy server. Codex's Auto lifecycle uses 2025-06-18 for initialize.
+        const version = "2025-06-18";
+        expect(SUPPORTED_PROTOCOL_VERSIONS).toContain(version);
+        const initialized = await post(
+          {
+            jsonrpc: "2.0",
+            id: "legacy-initialize",
+            method: "initialize",
+            params: {
+              protocolVersion: version,
+              capabilities: {},
+              clientInfo: { name: "modern-to-legacy-test", version: "1.0.0" },
+            },
+          },
+          version,
+        );
+        expect(initialized.status).toBe(200);
+        expect(
+          InitializeResultSchema.parse(JSONRPCResultResponseSchema.parse(initialized.body).result)
+            .protocolVersion,
+        ).toBe(version);
+        expect(
+          await post({ jsonrpc: "2.0", method: "notifications/initialized" }, version),
+        ).toEqual({ status: 202, body: null });
+        const listed = await post(
+          { jsonrpc: "2.0", id: "tools-list", method: "tools/list" },
+          version,
+        );
+        expect(listed.status).toBe(200);
+        const tools = ListToolsResultSchema.parse(
+          JSONRPCResultResponseSchema.parse(listed.body).result,
+        );
+        expect(tools.tools.map((tool) => tool.name)).toContain("list_agents");
+        const called = await post(
+          {
+            jsonrpc: "2.0",
+            id: "tools-call",
+            method: "tools/call",
+            params: { name: "list_agents", arguments: {} },
+          },
+          version,
+        );
+        expect(called.status).toBe(200);
+        const result = CallToolResultSchema.parse(
+          JSONRPCResultResponseSchema.parse(called.body).result,
+        );
+        expect(result.isError).not.toBe(true);
+        expect(result.structuredContent?.agents).toEqual([]);
+        // Discovery is the sole compatibility exception: arbitrary future-version
+        // tool requests must still fail rather than claiming modern support.
+        const unsupportedTools = await post(
+          { jsonrpc: "2.0", id: "unsupported-tools", method: "tools/list" },
+          requested,
+        );
+        expect(unsupportedTools.status).toBe(400);
+      } finally {
+        await daemon.stop();
+      }
+    },
+    30_000,
+  );
+
   test("create_agent runs initial prompt and affects filesystem", async () => {
     const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-"));
     const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));
@@ -354,8 +484,11 @@ describe("agent MCP end-to-end (offline)", () => {
       // before any MCP processing.
       const unauthorized = await fetch(mcpUrl, {
         method: "POST",
-        headers: { "content-type": "application/json" },
-        body: "{}",
+        headers: {
+          "content-type": "application/json",
+          "mcp-protocol-version": "2026-07-28",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: "unauthorized", method: "server/discover" }),
       });
       expect(unauthorized.status).toBe(401);
 

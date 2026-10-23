@@ -548,6 +548,13 @@ Add `localhost:6768` as a host in the official desktop app to try the fork. Keep
 separate until you have verified paging, reconnects, refresh, and reopen latency with your workload.
 The daemon's compatibility contract is in [Protocol compatibility](./protocol-compatibility.md).
 
+For a production supervisor launched with Node, `IMPOWER_PASEO_WORKER_HEAP_MB` optionally sets the
+daemon worker's V8 old-space limit to an integer from 1024 to 65536 MiB. It adds a worker execution
+flag without changing `NODE_OPTIONS`; providers and terminals keep their existing environment.
+Unset behavior, development flags and the packaged Electron runner are unchanged. Invalid values
+fail startup before acquiring the PID lock. The worker logs `maxOldSpaceSizeMiB` (null without an
+explicit execution flag) and its actual V8 `heapSizeLimitMiB` at startup.
+
 To package this machine's daemon and CLI dependencies, run `node scripts/trace-daemon.mjs` after
 building, then copy the listed paths while preserving their relative layout and workspace symlinks.
 Include the root `package.json` and `LICENSE`. The resulting directory requires a compatible Node

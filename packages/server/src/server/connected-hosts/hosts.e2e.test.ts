@@ -1,4 +1,5 @@
 import { z } from "zod";
+import pino from "pino";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -1643,7 +1644,29 @@ test(
     const childStarted = Promise.withResolvers<void>();
     const finishChild = Promise.withResolvers<void>();
     const finishParent = Promise.withResolvers<void>();
+    const dispatchErrors: {
+      message: string;
+      error?: { type?: string; message?: string; code?: string };
+    }[] = [];
+    const logger = pino(
+      { level: "error" },
+      {
+        write(line: string) {
+          const record = JSON.parse(line);
+          dispatchErrors.push({
+            message: record.msg,
+            error: record.err && {
+              type: record.err.type,
+              message: record.err.message,
+              code: record.err.code,
+            },
+          });
+          if (dispatchErrors.length > 20) dispatchErrors.shift();
+        },
+      },
+    );
     const a = await daemon({
+      logger,
       agentClients: createTestAgentClients({
         onStartTurn: (prompt, config) => {
           if (config.title === "Batch parent")
@@ -1681,6 +1704,26 @@ test(
       config: { provider: "claude/claude-test", modeId: "full-access" },
       title: "Batch parent",
     });
+    const parentStates: {
+      lifecycle: string;
+      pendingReplacement: boolean;
+      activeTurnId: string | null;
+      activeForegroundTurnId: string | null;
+    }[] = [];
+    const unsubscribeParent = a.daemon.agentManager.subscribe(
+      (event) => {
+        if (event.type !== "agent_state" || event.agent.id !== parent.id) return;
+        parentStates.push({
+          lifecycle: event.agent.lifecycle,
+          pendingReplacement: event.agent.pendingReplacement,
+          activeTurnId: event.agent.activeTurnId,
+          activeForegroundTurnId: event.agent.activeForegroundTurnId,
+        });
+        if (parentStates.length > 20) parentStates.shift();
+      },
+      { agentId: parent.id },
+    );
+    cleanup.push(async () => unsubscribeParent());
     const child = await bWorkspace.agents.create({
       config: { provider: "claude/claude-test", modeId: "full-access" },
       title: "Batch child",
@@ -1774,7 +1817,26 @@ test(
     expect(parentPrompts[0]).toContain("LOCAL_CLI_REPORT");
     expect(parentPrompts[0]).toContain('event="finished"');
     expect(parentPrompts[0]).toContain(`source-agent-id="${child.id}"`);
-    await expect.poll(receiptStates, { timeout: 10000 }).toEqual(["completed", "completed"]);
+    try {
+      await expect.poll(receiptStates, { timeout: 10000 }).toEqual(["completed", "completed"]);
+    } catch (error) {
+      const state = a.daemon.agentManager.getAgent(parent.id);
+      throw new Error(
+        `Batch acknowledgement did not settle: ${JSON.stringify({
+          receiptStates: await receiptStates(),
+          parentStates,
+          current: state && {
+            lifecycle: state.lifecycle,
+            pendingReplacement: state.pendingReplacement,
+            activeTurnId: state.activeTurnId,
+            activeForegroundTurnId: state.activeForegroundTurnId,
+          },
+          hasInFlightRun: a.daemon.agentManager.hasInFlightRun(parent.id),
+          dispatchErrors,
+        })}`,
+        { cause: error },
+      );
+    }
     expect((await origin.client.fetchAgent(parent.id))?.agent.status).toBe("running");
     finishParent.resolve();
     const timeline = await origin.client.fetchAgentTimeline(parent.id);
