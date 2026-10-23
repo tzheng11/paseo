@@ -890,6 +890,7 @@ export class AgentManager {
   private readonly idleReloads = new Set<string>();
   private readonly timelineStore: AgentRuntimeTimelineStore;
   private readonly historySourceBoundarySeq = new Map<string, number>();
+  private readonly pendingHistoryReads = new Map<string, Set<Promise<unknown>>>();
   private readonly providerSubagents = new ProviderSubagentStore();
   private readonly agentsAwaitingInitialSnapshotPersist = new Set<string>();
   private readonly sessionEventTails = new Map<string, Promise<void>>();
@@ -1617,30 +1618,50 @@ export class AgentManager {
       epoch?: string;
     },
   ) {
-    const agent = this.requireSessionAgent(id);
-    return this.runSessionOperation(id, async () => {
-      const epoch = this.timelineStore.getEpoch(id);
-      if (request.epoch !== undefined && request.epoch !== epoch)
-        throw new Error("History epoch changed; reload its windows");
-      if (request.operation === "windows") {
-        if (!agent.session.readHistoryWindows)
-          throw new Error("Provider does not support bounded history");
-        const windows = await agent.session.readHistoryWindows(DEFAULT_HISTORY_WINDOWS);
+    return this.trackHistoryRead(id, async () => {
+      const snapshot = await this.runSessionOperation(id, async () => {
+        if (this.lifecycleMutationTails.has(id) || this.inFlightAgentCloses.has(id))
+          throw new Error("Agent session is changing; read history after it completes");
+        const agent = this.requireSessionAgent(id);
+        const epoch = this.timelineStore.getEpoch(id);
+        if (request.epoch !== undefined && request.epoch !== epoch)
+          throw new Error("History epoch changed; reload its windows");
         return {
+          agent,
+          session: agent.session,
           epoch,
-          ...windows,
           liveAfterSeq: this.historySourceBoundarySeq.get(id),
-          unit: agent.session.historyWindowInfo?.unit ?? ("events" as const),
         };
-      }
-      if (!agent.session.readHistoryPage || request.cursor === undefined)
-        throw new Error("Provider history requires a supported page cursor");
-      const page = await agent.session.readHistoryPage({
-        cursor: request.cursor,
-        direction: request.direction ?? "after",
-        limit: request.limit ?? { events: 128, bytes: 256 * 1024 },
       });
-      return { epoch, ...page, unit: agent.session.historyWindowInfo?.unit ?? ("events" as const) };
+      const { agent, session, epoch, liveAfterSeq } = snapshot;
+      // Provider history can wait on a separate reader process. Keep that IO out
+      // of the live-event lane so a terminal event can settle the active turn.
+      const history = await (async () => {
+        if (request.operation === "windows") {
+          if (!session.readHistoryWindows)
+            throw new Error("Provider does not support bounded history");
+          return { ...(await session.readHistoryWindows(DEFAULT_HISTORY_WINDOWS)), liveAfterSeq };
+        }
+        if (!session.readHistoryPage || request.cursor === undefined)
+          throw new Error("Provider history requires a supported page cursor");
+        return session.readHistoryPage({
+          cursor: request.cursor,
+          direction: request.direction ?? "after",
+          limit: request.limit ?? { events: 128, bytes: 256 * 1024 },
+        });
+      })();
+      return await this.runSessionOperation(id, async () => {
+        if (
+          this.agents.get(id) !== agent ||
+          agent.session !== session ||
+          !this.timelineStore.has(id) ||
+          this.timelineStore.getEpoch(id) !== epoch ||
+          this.historySourceBoundarySeq.get(id) !== liveAfterSeq
+        ) {
+          throw new Error("History changed during bounded read; reload its windows");
+        }
+        return { epoch, ...history, unit: session.historyWindowInfo?.unit ?? ("events" as const) };
+      });
     });
   }
 
@@ -2311,6 +2332,7 @@ export class AgentManager {
     try {
       // A persisted thread can have only one writer, even when its turn is idle.
       await this.closeReloadedSession(existing.session, agentId, options.preserveHistory);
+      await this.drainHistoryReads(agentId);
       await this.drainSessionEvents(agentId);
       this.cancelRunningProviderSubagents(agentId);
       closedExisting = this.prepareAgentForClosure(
@@ -2547,6 +2569,7 @@ export class AgentManager {
       },
       "agent.manager.close.start",
     );
+    await this.drainHistoryReads(agentId);
     await this.drainSessionEvents(agentId);
     // Retain ownership until shutdown succeeds. A failed close may still own a
     // native writer, so publishing a resumable closed snapshot would orphan it.
@@ -4969,6 +4992,35 @@ export class AgentManager {
     }).catch((err) => {
       this.logger.error({ err, agentId, eventType: event.type }, "Failed to process session event");
     });
+  }
+
+  private trackHistoryRead<T>(agentId: string, operation: () => Promise<T>): Promise<T> {
+    const finish = this.beginAgentActivity(agentId);
+    const read = Promise.resolve().then(operation);
+    const reads = this.pendingHistoryReads.get(agentId) ?? new Set<Promise<unknown>>();
+    this.pendingHistoryReads.set(agentId, reads);
+    reads.add(read);
+    const settled = read
+      .then(
+        () => undefined,
+        () => undefined,
+      )
+      .finally(() => {
+        reads.delete(read);
+        if (!reads.size && this.pendingHistoryReads.get(agentId) === reads)
+          this.pendingHistoryReads.delete(agentId);
+        finish();
+      });
+    this.trackBackgroundTask(settled);
+    return read;
+  }
+
+  private async drainHistoryReads(agentId: string): Promise<void> {
+    // Teardown still owns these readers through disposal. Waiting here must not
+    // put their IO back ahead of live turn completion in sessionEventTails.
+    while (this.pendingHistoryReads.get(agentId)?.size) {
+      await Promise.allSettled(this.pendingHistoryReads.get(agentId)!);
+    }
   }
 
   private runSessionOperation<T>(agentId: string, operation: () => Promise<T>): Promise<T> {
