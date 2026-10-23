@@ -12,6 +12,7 @@ import { ReloadOperationStore } from "./agent/reload-operation-store.js";
 import { getHostName } from "./host-name.js";
 import path from "node:path";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { isJSONRPCRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { Logger } from "pino";
 import { z } from "zod";
 import { createBranchChangeRouteHandler } from "./script-route-branch-handler.js";
@@ -1594,6 +1595,17 @@ export async function createPaseoDaemon(
               message: "Method not allowed",
             },
             id: null,
+          });
+          return;
+        }
+        if (isJSONRPCRequest(req.body) && req.body.method === "server/discover") {
+          // COMPAT(mcp-legacy-discovery): added in v0.13, remove after the SDK
+          // implements modern discovery. A correlated legacy RPC error lets modern
+          // clients select initialize instead of failing HTTP version validation.
+          res.status(400).json({
+            jsonrpc: "2.0",
+            id: req.body.id,
+            error: { code: -32601, message: "Method not found: server/discover" },
           });
           return;
         }
