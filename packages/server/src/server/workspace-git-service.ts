@@ -293,6 +293,8 @@ export type WorkspaceGitListener = (snapshot: WorkspaceGitRuntimeSnapshot) => vo
 export type WorkspaceGitSnapshotUpdatedListener = (snapshot: WorkspaceGitRuntimeSnapshot) => void;
 
 export interface WorkspaceGitSubscription {
+  /** Initial observation setup has settled, including metadata and polling fallback. */
+  ready?: Promise<void>;
   unsubscribe: () => void;
 }
 
@@ -749,6 +751,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     this.scheduleWorkspaceObservationSetup(target);
 
     return {
+      ready: this.waitForWorkspaceObservationSetup(target),
       unsubscribe: () => {
         this.removeWorkspaceListener(cwd, listener);
       },
@@ -926,15 +929,8 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     this.assertNotDisposed();
     const normalizedCwd = resolve(cwd);
     const normalizedOptions = this.normalizeCheckoutDiffOptions(options);
-    // Initial inventory events cover the watcher setup gap. Process them before
-    // starting a cold diff, rather than invalidating that build halfway through.
-    const target = this.workspaceTargets.get(normalizedCwd);
-    if (target && !target.observationSetupComplete) {
-      await runWithGitCommandPriority("high", () => this.getFactsForObservation(target));
-      this.scheduleWorkspaceObservationSetup(target);
-      await target.observationSetupPromise;
-    }
-    this.assertNotDisposed();
+    // Explicit diffs use Git facts directly. Observation registration runs in
+    // the background and its owner reconciles the registration gap when ready.
     return this.checkoutDiffCache.read({
       cwd: normalizedCwd,
       compare: normalizedOptions,
@@ -1506,6 +1502,18 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
           this.scheduleWorkspaceObservationSetup(target);
         }
       });
+  }
+
+  private async waitForWorkspaceObservationSetup(target: WorkspaceGitTarget): Promise<void> {
+    while (this.isActiveObservedWorkspaceTarget(target) && !target.observationSetupComplete) {
+      this.scheduleWorkspaceObservationSetup(target);
+      const setup = target.observationSetupPromise;
+      if (!setup) return;
+      await setup;
+      // Follow a reconfiguration queued by setup's finally, but do not spin on
+      // failure: that target already owns bounded fallback and recovery.
+      if (!target.observationSetupPromise) return;
+    }
   }
 
   private async setupWorkspaceObservation(target: WorkspaceGitTarget): Promise<void> {
