@@ -7,6 +7,7 @@ const RUNTIME_CONTROL_ENV_KEYS = [
   "PASEO_SUPERVISED",
   // Child tools and terminals have their own, often smaller, V8 heaps.
   "PASEO_NATIVE_MAX_TRACKED_ENTRIES",
+  "PASEO_DARWIN_WATCH_BACKEND",
   ELECTRON_RUN_AS_NODE,
   "ELECTRON_NO_ATTACH_CONSOLE",
   "ESBUILD_BINARY_PATH",
