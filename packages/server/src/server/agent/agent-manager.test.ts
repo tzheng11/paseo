@@ -23,6 +23,7 @@ import { MessageReceipts } from "../message-receipts/index.js";
 import { ReloadOperationStore, type ReloadOperation } from "./reload-operation-store.js";
 import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 import { DiskAgentTimelineStore } from "./disk-agent-timeline-store.js";
+import { streamTimelinePromptIndex } from "./timeline-prompt-index.js";
 import { AgentHistoryReplay } from "./agent-history-replay.js";
 import { toAgentPayload } from "./agent-projections.js";
 import { projectTimelineRows } from "./timeline-projection.js";
@@ -61,6 +62,7 @@ import type {
   AgentSessionConfig,
   AgentSlashCommand,
   AgentStreamEvent,
+  AgentHistoryStreamOptions,
   AgentTimelineItem,
   ImportProviderSessionInput,
   ImportProviderSessionContext,
@@ -14964,3 +14966,107 @@ test.each(["live", "history", "accepted"] as const)(
     }
   },
 );
+
+test("streamed provider message filtering preserves prompt outline positions and forwards user-only demand", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-message-selection-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const requested: Array<AgentHistoryStreamOptions | undefined> = [];
+  class MessageSession extends TestAgentSession {
+    async *streamHistoryEntries(options?: AgentHistoryStreamOptions) {
+      requested.push(options);
+      // An adapter that ignores the hint must still be filtered by the manager.
+      const values: Array<{ index: number; value: AgentStreamEvent }> = [
+        {
+          index: 2,
+          value: {
+            type: "timeline",
+            provider: "codex",
+            timestamp: "2026-10-22T00:00:00.000Z",
+            item: {
+              type: "user_message",
+              messageId: "user-first",
+              text: "  café 🧪\0\n  first prompt  ",
+            },
+          },
+        },
+        {
+          index: 3,
+          value: {
+            type: "timeline",
+            provider: "codex",
+            item: { type: "assistant_message", messageId: "assistant", text: "reply" },
+          },
+        },
+        {
+          index: 27,
+          value: {
+            type: "timeline",
+            provider: "codex",
+            timestamp: "2026-10-22T00:01:00.000Z",
+            item: { type: "user_message", messageId: "user-last", text: "z".repeat(300000) },
+          },
+        },
+      ];
+      for (const entry of values)
+        yield { ...entry, bytes: Buffer.byteLength(JSON.stringify(entry.value)) };
+    }
+  }
+  class MessageClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new MessageSession(config);
+    }
+  }
+  const manager = new AgentManager({
+    clients: { codex: new MessageClient() },
+    registry: storage,
+    logger,
+  });
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    const all = [];
+    for await (const row of manager.streamFullHistoryMessages(agent.id)) all.push(row);
+    expect(all.map((row) => [row.historyIndex, row.seq, row.providerMessageId])).toEqual([
+      [2, 3, "user-first"],
+      [3, 4, "assistant"],
+      [27, 28, "user-last"],
+    ]);
+    const selected = await streamTimelinePromptIndex(
+      "epoch",
+      manager.streamFullHistoryMessages(agent.id, { userOnly: true }),
+    );
+    expect(selected).toEqual(
+      await streamTimelinePromptIndex(
+        "epoch",
+        (async function* () {
+          yield* all;
+        })(),
+      ),
+    );
+    expect(selected.prompts).toEqual([
+      {
+        seq: 3,
+        historyIndex: 2,
+        messageId: "user-first",
+        timestamp: "2026-10-22T00:00:00.000Z",
+        preview: "café 🧪\0 first prompt",
+      },
+      {
+        seq: 28,
+        historyIndex: 27,
+        messageId: "user-last",
+        timestamp: "2026-10-22T00:01:00.000Z",
+        preview: "z".repeat(119) + "…",
+      },
+    ]);
+    expect(requested).toEqual([
+      { messagesOnly: true },
+      { messagesOnly: true, userMessagesOnly: true },
+    ]);
+  } finally {
+    await manager.flush();
+    await storage.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});

@@ -369,11 +369,25 @@ class NativeRecursiveBackend implements ObservationBackend {
       if (fullAudit) {
         const next = await this.scanTree(this.host.root, generation);
         if (!this.canCommit(generation)) return;
-        if (emitDiff) {
-          await this.queueDiff(next.files, this.files, generation);
-          await this.queueRemovedDirectories(next.directories, this.directories, generation);
+        // Count the bounded candidate completely before admission. Reserving
+        // before diff publication keeps another audit from consuming its room
+        // while these generation-aware loops yield.
+        const previousCount = this.files.size + this.directories.size;
+        const nextCount = next.files.size + next.directories.size;
+        this.inventoryReservation.setEntryCount(Math.max(previousCount, nextCount));
+        let committed = false;
+        try {
+          if (emitDiff) {
+            await this.queueDiff(next.files, this.files, generation);
+            await this.queueRemovedDirectories(next.directories, this.directories, generation);
+          }
+          if (!this.canCommit(generation)) return;
+          this.replaceInventory(next);
+          committed = true;
+        } finally {
+          // finishClose awaits this audit before releasing the reservation.
+          if (!committed) this.inventoryReservation.setEntryCount(previousCount);
         }
-        this.replaceInventory(next);
         this.lastFullAuditAt = performance.now();
         this.host.metrics.fullReconciliationCount += 1;
       } else {
@@ -405,7 +419,7 @@ class NativeRecursiveBackend implements ObservationBackend {
     const entries = new Map<string, DirectoryEntry>();
     const pending = [root];
     let discoveredEntries = 1;
-    this.assertWithinScanLimit(discoveredEntries);
+    this.assertWithinLimit(discoveredEntries);
     while (pending.length > 0 && this.host.isActive()) {
       await this.checkpoint(generation);
       // Serial readdir multiplies filesystem/loop latency by every directory
@@ -430,7 +444,7 @@ class NativeRecursiveBackend implements ObservationBackend {
             const path = join(directory, child.name);
             if (this.host.isIgnored(path)) continue;
             discoveredEntries += 1;
-            this.assertWithinScanLimit(discoveredEntries);
+            this.assertWithinLimit(discoveredEntries);
             if (child.isDirectory()) {
               entry.directories.add(path);
               pending.push(path);
@@ -970,16 +984,14 @@ class NativeRecursiveBackend implements ObservationBackend {
     }
   }
 
-  private assertWithinScanLimit(entryCount: number): void {
-    this.assertWithinLimit(entryCount);
-    this.inventoryReservation.assertCanFit(entryCount);
-  }
-
   private assertWithinLimit(entryCount: number): void {
     if (entryCount <= MAX_TRACKED_ENTRIES) return;
-    throw new Error(
-      `Recursive file observation exceeded ${MAX_TRACKED_ENTRIES} entries under ${this.host.root}`,
-    );
+    throw this.resources.capacityError({
+      root: this.host.root,
+      scope: "root",
+      requiredEntries: entryCount,
+      limit: MAX_TRACKED_ENTRIES,
+    });
   }
 
   private async checkpoint(generation: number): Promise<void> {

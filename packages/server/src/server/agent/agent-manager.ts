@@ -75,6 +75,7 @@ import {
   type AgentSessionConfig,
   type SteerResult,
   type AgentStreamEvent,
+  type AgentHistoryStreamOptions,
   type AgentTimelineItem,
   type AgentUsage,
   type AgentRuntimeInfo,
@@ -866,6 +867,16 @@ export interface RetiredInternalAgent {
   lastMessage: string | null;
 }
 
+function matchesHistorySelection(
+  item: AgentTimelineItem,
+  options?: AgentHistoryStreamOptions,
+): boolean {
+  if (options?.userMessagesOnly) return item.type === "user_message";
+  return (
+    !options?.messagesOnly || item.type === "user_message" || item.type === "assistant_message"
+  );
+}
+
 function resolveRescueTimeouts(options: AgentManagerOptions["rescueTimeouts"]) {
   return {
     reloadSessionCloseMs: options?.reloadSessionCloseMs ?? RELOAD_SESSION_CLOSE_TIMEOUT_MS,
@@ -1562,13 +1573,19 @@ export class AgentManager {
   }
 
   /** Search and prompt indexing explicitly traverse the unloaded provider middle. */
-  async *streamFullHistoryMessages(id: string): AsyncGenerator<AgentTimelineRow> {
-    yield* this.streamFullHistoryRows(id, { messagesOnly: true });
+  async *streamFullHistoryMessages(
+    id: string,
+    options?: { userOnly?: boolean },
+  ): AsyncGenerator<AgentTimelineRow> {
+    yield* this.streamFullHistoryRows(id, {
+      messagesOnly: true,
+      ...(options?.userOnly ? { userMessagesOnly: true } : {}),
+    });
   }
 
   async *streamFullHistoryRows(
     id: string,
-    options?: { messagesOnly?: boolean },
+    options?: AgentHistoryStreamOptions,
   ): AsyncGenerator<AgentTimelineRow> {
     const agent = this.requireSessionAgent(id);
     if (!agent.session.streamHistoryEntries)
@@ -1579,19 +1596,9 @@ export class AgentManager {
         throw new Error("History changed during streamed read");
       const event = entry.value;
       if (event.type !== "timeline") continue;
-      if (
-        options?.messagesOnly &&
-        event.item.type !== "user_message" &&
-        event.item.type !== "assistant_message"
-      )
-        continue;
+      if (!matchesHistorySelection(event.item, options)) continue;
       for (const projected of projectAgentMessages(event.item)) {
-        if (
-          options?.messagesOnly &&
-          projected.type !== "user_message" &&
-          projected.type !== "assistant_message"
-        )
-          continue;
+        if (!matchesHistorySelection(projected, options)) continue;
         const item = limitAgentTimelineItemContent(projected);
         yield {
           seq: entry.index + 1,
@@ -1832,7 +1839,10 @@ export class AgentManager {
     // agent whose working directory may be gone.
     const record = this.registry ? await this.registry.get(resolvedAgentId) : null;
     const currentResumeOptions = record
-      ? { purpose: record.archivedAt ? ("history" as const) : ("interactive" as const) }
+      ? {
+          ...resumeOptions,
+          purpose: record.archivedAt ? ("history" as const) : ("interactive" as const),
+        }
       : resumeOptions;
     const purpose = currentResumeOptions?.purpose ?? "interactive";
 
@@ -1842,6 +1852,12 @@ export class AgentManager {
       { purpose },
     );
     const client = this.requireClient(handle.provider);
+    if (
+      currentResumeOptions?.historyReadMode === "bounded" &&
+      !client.capabilities.supportsBoundedHistory
+    ) {
+      throw new Error(`Provider '${handle.provider}' does not support bounded history loading`);
+    }
     const available = await client.isAvailable();
     if (!available) {
       throw new Error(

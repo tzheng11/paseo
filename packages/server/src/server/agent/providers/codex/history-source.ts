@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { AgentStreamEvent } from "../../agent-sdk-types.js";
+import type { AgentHistoryStreamOptions, AgentStreamEvent } from "../../agent-sdk-types.js";
 import type {
   HistoryPage,
   HistoryReadLimit,
@@ -23,6 +23,9 @@ const itemPage = z.object({
   ),
   nextCursor: z.string().nullable(),
 });
+type CodexHistoryItemEntry = z.infer<typeof itemPage>["data"][number];
+const HISTORY_ITEM_PAGE_SIZE = 8;
+const HISTORY_ITEM_PAGE_BYTES = 256 * 1024;
 export interface CodexHistoryReadClient {
   request(method: string, params?: unknown): Promise<unknown>;
 }
@@ -30,7 +33,7 @@ export interface CodexHistorySourceOptions {
   databasePath: string;
   threadId: string;
   retainedItemIds?: string[];
-  mapItem: (entry: z.infer<typeof itemPage>["data"][number]) => AgentStreamEvent[];
+  mapItem: (entry: CodexHistoryItemEntry) => AgentStreamEvent[];
 }
 
 /** The native store supplies metadata; the provider remains the item decoder. */
@@ -56,9 +59,39 @@ export class CodexHistorySource {
   /** Explicit full reads keep one provider page, never a complete turn. */
   async *stream(
     client: CodexHistoryReadClient,
-    options?: { messagesOnly?: boolean },
+    options?: AgentHistoryStreamOptions,
   ): AsyncGenerator<HistoryWindowEntry<AgentStreamEvent>> {
     await this.ensureProjection(client);
+    if (options?.messagesOnly || options?.userMessagesOnly) {
+      const index = await readCodexHistoryIndex({
+        databasePath: this.options.databasePath,
+        threadId: this.options.threadId,
+        operation: "messages",
+        userOnly: options.userMessagesOnly,
+      });
+      const refs = index.messages ?? [];
+      for (const batch of this.batches(refs, HISTORY_ITEM_PAGE_BYTES)) {
+        const entries = await this.readBatch(client, batch);
+        for (let offset = 0; offset < entries.length; offset++) {
+          const entry = entries[offset];
+          const ref = batch[offset];
+          if (
+            typeof entry.item !== "object" ||
+            entry.item === null ||
+            !("type" in entry.item) ||
+            entry.item.type !== ref.messageType
+          )
+            throw new Error("Native history changed while reading its message selection");
+          for (const value of this.options.mapItem(entry))
+            yield {
+              index: ref.index,
+              bytes: Buffer.byteLength(JSON.stringify(value), "utf8"),
+              value,
+            };
+        }
+      }
+      return;
+    }
     let cursor: string | null = null;
     let index = 0;
     const seen = new Set<string>();
@@ -66,7 +99,7 @@ export class CodexHistorySource {
       const page = itemPage.parse(
         await client.request("thread/items/list", {
           threadId: this.options.threadId,
-          limit: 8,
+          limit: HISTORY_ITEM_PAGE_SIZE,
           sortDirection: "asc",
           ...(cursor === null ? {} : { cursor }),
         }),
@@ -75,15 +108,8 @@ export class CodexHistorySource {
         throw new Error("Native history repeated a stream cursor");
       if (page.nextCursor !== null) seen.add(page.nextCursor);
       for (const entry of page.data) {
-        const item = entry.item;
-        const isMessage =
-          typeof item === "object" &&
-          item !== null &&
-          "type" in item &&
-          (item.type === "userMessage" || item.type === "agentMessage");
-        if (!options?.messagesOnly || isMessage)
-          for (const value of this.options.mapItem(entry))
-            yield { index, bytes: Buffer.byteLength(JSON.stringify(value), "utf8"), value };
+        for (const value of this.options.mapItem(entry))
+          yield { index, bytes: Buffer.byteLength(JSON.stringify(value), "utf8"), value };
         index++;
       }
       cursor = page.nextCursor;
@@ -196,42 +222,94 @@ export class CodexHistorySource {
     let bytes = 0;
     const oversized: Array<{ index: number; bytes: number }> = [];
     let stopIndex: number | null = null;
-    for (const ref of refs) {
+    batches: for (const batch of this.batches(refs, limit.bytes)) {
+      // A batch contains only selected adjacent items. Never page across a gap
+      // or an oversized record, and keep newest-first normalization for tails.
+      const nativeEntries = await this.readBatch(client, batch);
+      for (let offset = 0; offset < batch.length; offset++) {
+        const ref = batch[offset];
+        const values = this.options.mapItem(nativeEntries[offset]);
+        const sizes = values.map((value) =>
+          Buffer.byteLength(JSON.stringify(value) + "\n", "utf8"),
+        );
+        const size = sizes.reduce((sum, value) => sum + value, 0);
+        if (skipOversized && (size > limit.bytes || values.length > limit.events)) {
+          oversized.push({ index: ref.index, bytes: size });
+          continue;
+        }
+        if (entries.length + values.length > limit.events || bytes + size > limit.bytes) {
+          stopIndex = ref.index;
+          break batches;
+        }
+        for (let index = 0; index < values.length; index++)
+          entries.push({ index: ref.index, bytes: sizes[index], value: values[index] });
+        covered.push(ref);
+        bytes += size;
+      }
+    }
+    return { entries, covered, oversized, stopIndex };
+  }
+
+  private *batches<T extends CodexHistoryItemReference>(
+    refs: T[],
+    maxBytes: number,
+  ): Generator<T[]> {
+    const step = refs.length > 1 && refs[0].index > refs[1].index ? -1 : 1;
+    for (let start = 0; start < refs.length; ) {
+      const batch = [refs[start]];
+      let bytes = refs[start].bytes + 384;
+      while (batch.length < HISTORY_ITEM_PAGE_SIZE && start + batch.length < refs.length) {
+        const next = refs[start + batch.length];
+        if (
+          next.turnId !== batch[0].turnId ||
+          next.index !== batch.at(-1)!.index + step ||
+          bytes + next.bytes + 384 > Math.min(HISTORY_ITEM_PAGE_BYTES, maxBytes)
+        )
+          break;
+        batch.push(next);
+        bytes += next.bytes + 384;
+      }
+      yield batch;
+      start += batch.length;
+    }
+  }
+
+  private async readBatch(
+    client: CodexHistoryReadClient,
+    refs: CodexHistoryItemReference[],
+  ): Promise<CodexHistoryItemEntry[]> {
+    const backwards = refs[0].index > refs.at(-1)!.index;
+    const ascending = backwards ? refs.toReversed() : refs;
+    const entries: CodexHistoryItemEntry[] = [];
+    while (entries.length < ascending.length) {
+      const first = ascending[entries.length];
+      const remaining = ascending.length - entries.length;
       const page = itemPage.parse(
         await client.request("thread/items/list", {
           threadId: this.options.threadId,
-          turnId: ref.turnId,
-          limit: 1,
+          turnId: first.turnId,
+          limit: remaining,
           sortDirection: "asc",
-          ...(ref.previousItemId ? { cursor: { type: "item", itemId: ref.previousItemId } } : {}),
+          ...(first.previousItemId
+            ? { cursor: { type: "item", itemId: first.previousItemId } }
+            : {}),
         }),
       );
-      const entry = page.data[0];
-      if (
-        !entry ||
-        typeof entry.item !== "object" ||
-        entry.item === null ||
-        !("id" in entry.item) ||
-        entry.item.id !== ref.itemId ||
-        entry.turnId !== ref.turnId
-      )
+      if (page.data.length === 0 || page.data.length > remaining)
         throw new Error("Native history changed while reading its bounded window");
-      const values = this.options.mapItem(entry);
-      const sizes = values.map((value) => Buffer.byteLength(JSON.stringify(value) + "\n", "utf8"));
-      const size = sizes.reduce((sum, value) => sum + value, 0);
-      if (skipOversized && (size > limit.bytes || values.length > limit.events)) {
-        oversized.push({ index: ref.index, bytes: size });
-        continue;
+      for (const entry of page.data) {
+        const ref = ascending[entries.length];
+        if (
+          typeof entry.item !== "object" ||
+          entry.item === null ||
+          !("id" in entry.item) ||
+          entry.item.id !== ref.itemId ||
+          entry.turnId !== ref.turnId
+        )
+          throw new Error("Native history changed while reading its bounded window");
+        entries.push(entry);
       }
-      if (entries.length + values.length > limit.events || bytes + size > limit.bytes) {
-        stopIndex = ref.index;
-        break;
-      }
-      for (let offset = 0; offset < values.length; offset++)
-        entries.push({ index: ref.index, bytes: sizes[offset], value: values[offset] });
-      covered.push(ref);
-      bytes += size;
     }
-    return { entries, covered, oversized, stopIndex };
+    return backwards ? entries.toReversed() : entries;
   }
 }

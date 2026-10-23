@@ -176,6 +176,7 @@ export interface AgentCreateConfigUnattendedInput {
 export interface AgentCapabilityFlags {
   [capability: string]: boolean | undefined;
   supportsStreaming: boolean;
+  supportsBoundedHistory?: boolean;
   supportsSessionPersistence: boolean;
   supportsSessionListing?: boolean;
   supportsDynamicModes: boolean;
@@ -654,6 +655,9 @@ export type AgentResumePurpose = "interactive" | "history" | "maintenance";
 export interface AgentResumeSessionOptions {
   /** Defaults to interactive. History loading may be read-only for archived native sessions. */
   purpose?: AgentResumePurpose;
+  /** A bounded read must reject unsupported native history before compatible full replay.
+   * Providers advertising supportsBoundedHistory must honor this cold-load policy. */
+  historyReadMode?: "bounded";
   /** See AgentCreateSessionOptions.configuredModelIds. */
   configuredModelIds?: readonly string[];
 }
@@ -671,6 +675,12 @@ export interface AgentUsageSession {
   model?: string;
   env: Record<string, string>;
   sessionKey: string;
+}
+
+/** Internal read selection; provider positions still count every history item. */
+export interface AgentHistoryStreamOptions {
+  messagesOnly?: boolean;
+  userMessagesOnly?: boolean;
 }
 
 export interface AgentSession {
@@ -701,9 +711,9 @@ export interface AgentSession {
   }): Promise<HistoryPage<AgentStreamEvent>>;
   streamAllHistory?(): AsyncGenerator<AgentStreamEvent>;
   /** Provider positions, separate from live stream sequences. Explicit full consumer. */
-  streamHistoryEntries?(options?: {
-    messagesOnly?: boolean;
-  }): AsyncGenerator<HistoryWindowEntry<AgentStreamEvent>>;
+  streamHistoryEntries?(
+    options?: AgentHistoryStreamOptions,
+  ): AsyncGenerator<HistoryWindowEntry<AgentStreamEvent>>;
   getRuntimeInfo(): Promise<AgentRuntimeInfo>;
   getAvailableModes(): Promise<AgentMode[]>;
   getCurrentMode(): Promise<string | null>;

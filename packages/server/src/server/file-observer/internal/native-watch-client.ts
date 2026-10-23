@@ -1,4 +1,5 @@
 import { fork, type ChildProcess } from "node:child_process";
+import { resolveDarwinWatchBackend } from "./darwin-watch-backend.js";
 import type { NativeWatch } from "./native-recursive.js";
 import type {
   NativeWatchInput,
@@ -41,6 +42,9 @@ export class NativeWatchHost {
   private readonly forkHost: typeof fork;
 
   constructor(options: NativeWatchHostOptions = {}) {
+    // This module is loaded with the observer during daemon startup. Reject a
+    // bad deployment setting before it can leave consumers waiting on a child.
+    resolveDarwinWatchBackend();
     this.entry =
       options.entry ??
       new URL(
