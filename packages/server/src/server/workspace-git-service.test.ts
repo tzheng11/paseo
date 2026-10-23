@@ -531,7 +531,7 @@ describe("WorkspaceGitServiceImpl", () => {
     const listener = vi.fn();
     const subscription = service.registerWorkspace({ cwd: REPO_CWD }, listener);
 
-    expect(subscription).toEqual({ unsubscribe: expect.any(Function) });
+    expect(subscription).toEqual({ ready: expect.any(Promise), unsubscribe: expect.any(Function) });
     expect("initial" in subscription).toBe(false);
     expect(listener).not.toHaveBeenCalled();
     expect(service.peekSnapshot(REPO_CWD)).toBeNull();
