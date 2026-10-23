@@ -30,6 +30,40 @@ const input = {
   position: "inside" as const,
 };
 describe("pinned workspace tree drops", () => {
+  it("nests and reorders unpinned workspaces across projects and hosts in None", () => {
+    const unpinned = [
+      { ...workspace("a"), sidebarSection: "unpinned" as const },
+      {
+        ...workspace("b"),
+        workspaceKey: "remote:b",
+        serverId: "remote",
+        projectViewKey: "other",
+        sidebarSection: "unpinned" as const,
+      },
+    ];
+    expect(
+      resolveWorkspaceTreeDrop({ ...input, workspaces: unpinned, targetWorkspaceKey: "remote:b" }),
+    ).toMatchObject({
+      parentWorkspaceId: null,
+      beforeWorkspaceId: null,
+      parentWorkspaceKey: "remote:b",
+      pinSection: "unpinned",
+      pinnedOrderOnly: true,
+    });
+    expect(
+      resolveWorkspaceTreeDrop({
+        ...input,
+        workspaces: unpinned,
+        targetWorkspaceKey: "remote:b",
+        position: "before",
+      }),
+    ).toMatchObject({
+      parentWorkspaceKey: null,
+      beforeWorkspaceKey: "remote:b",
+      pinSection: "unpinned",
+      pinnedOrderOnly: true,
+    });
+  });
   it("nests locally with full keys and no backend parent", () => {
     expect(resolveWorkspaceTreeDrop(input)).toMatchObject({
       parentWorkspaceId: null,
@@ -85,7 +119,7 @@ describe("pinned workspace tree drops", () => {
       }),
     ).toMatchObject({ parentWorkspaceKey: null, beforeWorkspaceKey: "host:o" });
   });
-  it("checks hidden descendants before crossing sections, but allows leaves", () => {
+  it("allows groups with hidden descendants to cross sections", () => {
     const target = { ...workspace("s"), sidebarSection: "superpinned" as const };
     expect(
       resolveWorkspaceTreeDropResult({
@@ -94,7 +128,10 @@ describe("pinned workspace tree drops", () => {
         allWorkspaces: [...workspaces, target],
         targetWorkspaceKey: target.workspaceKey,
       }),
-    ).toMatchObject({ drop: null, rejection: { message: expect.stringContaining("children") } });
+    ).toMatchObject({
+      drop: { pinSection: "superpinned", parentWorkspaceKey: "host:s" },
+      rejection: null,
+    });
     expect(
       resolveWorkspaceTreeDrop({
         ...input,

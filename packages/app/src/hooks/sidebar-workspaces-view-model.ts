@@ -30,9 +30,9 @@ export interface SidebarWorkspacePlacement {
   parentWorkspaceId?: string | null;
   siblingOrder?: number;
   pinPlacement?: WorkspaceDescriptor["pinPlacement"];
-  // Pin navigation is shared independently of host/project ownership.
+  // Sidebar navigation is shared independently of host/project ownership.
   sidebarParentWorkspaceKey?: string | null;
-  sidebarSection?: "pinned" | "superpinned";
+  sidebarSection?: "unpinned" | "pinned" | "superpinned";
   background?: boolean;
   name: string;
 }

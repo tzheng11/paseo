@@ -1311,6 +1311,90 @@ test("cancelling a logical scope during admission settles it and releases its ow
 });
 
 test(
+  "MCP creates and reorders universal children across hosts and moves the complete pin group",
+  { timeout: 60000 },
+  async () => {
+    const a = await daemon();
+    const b = await daemon();
+    const origin = await api(a);
+    const destination = await api(b);
+    await origin.paseo.hosts.add({ connection: `127.0.0.1:${b.port}` });
+    const directory = await online(origin.paseo);
+    const localId = directory.self.serverId;
+    const remoteId = directory.hosts[0]!.serverId!;
+    const parent = await origin.paseo.workspaces.create({
+      source: { kind: "directory", path: a.staticDir },
+      title: "Universal manager",
+    });
+    await origin.client.setWorkspacePinned(parent.id, true);
+    const parentKey = `${localId}:${parent.id}`;
+    const mcp = new Client({ name: "universal-sidebar-placement", version: "1" });
+    cleanup.push(() => mcp.close());
+    await mcp.connect(
+      new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${a.port}/mcp/agents`)),
+    );
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const result = await mcp.callTool({ name, arguments: args });
+      expect(result.isError, JSON.stringify(result)).not.toBe(true);
+      return z.record(z.string(), z.unknown()).parse(result.structuredContent);
+    };
+    const first = await call("create_workspace", {
+      serverId: remoteId,
+      isolation: "local",
+      path: b.staticDir,
+      title: "Remote IC",
+      parentWorkspaceKey: parentKey,
+    });
+    const second = await call("create_workspace", {
+      isolation: "local",
+      path: a.staticDir,
+      title: "Local IC",
+      parentWorkspaceKey: parentKey,
+    });
+    const firstId = z.string().parse(first.workspaceId);
+    const secondId = z.string().parse(second.workspaceId);
+    const remoteBefore = (await destination.client.fetchWorkspaces()).entries.find(
+      (row) => row.id === firstId,
+    )!;
+    const localBefore = (await origin.client.fetchWorkspaces()).entries.find(
+      (row) => row.id === secondId,
+    )!;
+    expect(remoteBefore.pinnedAt).toBeTruthy();
+    expect(localBefore.pinPlacement!.siblingOrder).toBeGreaterThan(
+      remoteBefore.pinPlacement!.siblingOrder,
+    );
+    await call("move_workspace", {
+      workspaceId: secondId,
+      beforeWorkspaceKey: `${remoteId}:${firstId}`,
+    });
+    const reordered = (await origin.client.fetchWorkspaces()).entries.find(
+      (row) => row.id === secondId,
+    )!;
+    expect(reordered.pinPlacement!.parentWorkspaceKey).toBe(parentKey);
+    expect(reordered.pinPlacement!.siblingOrder).toBeLessThan(
+      remoteBefore.pinPlacement!.siblingOrder,
+    );
+    await call("move_workspace", {
+      workspaceId: parent.id,
+      parentWorkspaceKey: null,
+      section: "superpinned",
+    });
+    const localRows = (await origin.client.fetchWorkspaces()).entries;
+    const remoteAfter = (await destination.client.fetchWorkspaces()).entries.find(
+      (row) => row.id === firstId,
+    )!;
+    const localAfter = localRows.find((row) => row.id === secondId)!;
+    expect(localRows.find((row) => row.id === parent.id)?.superpinnedAt).toBeTruthy();
+    expect(remoteAfter.superpinnedAt).toBeTruthy();
+    expect(localAfter.superpinnedAt).toBeTruthy();
+    expect(remoteAfter.pinPlacement!.parentWorkspaceKey).toBe(parentKey);
+    expect(localAfter.pinPlacement!.siblingOrder).toBe(reordered.pinPlacement!.siblingOrder);
+    expect(remoteAfter.workspaceDirectory).toBe(b.staticDir);
+    expect(localAfter.workspaceDirectory).toBe(a.staticDir);
+  },
+);
+
+test(
   "agent MCP preserves remote workspace hierarchy and fractional ranks",
   { timeout: 30000 },
   async () => {
@@ -1558,15 +1642,15 @@ test(
     const parentPrompts: string[] = [];
     const childStarted = Promise.withResolvers<void>();
     const finishChild = Promise.withResolvers<void>();
-    cleanup.push(async () => {
-      finishChild.resolve();
-    });
+    const finishParent = Promise.withResolvers<void>();
     const a = await daemon({
       agentClients: createTestAgentClients({
         onStartTurn: (prompt, config) => {
           if (config.title === "Batch parent")
             parentPrompts.push(typeof prompt === "string" ? prompt : JSON.stringify(prompt));
         },
+        // Receipts acknowledge dispatch, so keep the turn active until both writes settle.
+        beforeTurnComplete: () => finishParent.promise,
       }),
     });
     const b = await daemon({
@@ -1574,6 +1658,10 @@ test(
         onStartTurn: () => childStarted.resolve(),
         beforeTurnComplete: () => finishChild.promise,
       }),
+    });
+    cleanup.push(async () => {
+      finishChild.resolve();
+      finishParent.resolve();
     });
     const origin = await api(a);
     const destination = await api(b);
@@ -1629,19 +1717,7 @@ test(
     // An idle recipient must not report old idle as completion of its queued task.
     expect((await destination.client.waitForFinish(child.id, 50)).status).toBe("timeout");
     await childStarted.promise;
-    const report = await childMcp.callTool({
-      name: "send_agent_prompt",
-      arguments: {
-        serverId: aId,
-        agentId: parent.id,
-        prompt: "REMOTE_REPORT <ready>",
-        notifyOnFinish: false,
-      },
-    });
-    expect(report.isError).not.toBe(true);
-    expect(report.structuredContent).toMatchObject({ deliveryStatus: "queued", serverId: aId });
-    expect(parentPrompts).toEqual([]);
-
+    // CLI startup can exceed the quiet window; admit its report before the fast MCP send.
     const cli = await promisify(execFile)(
       process.execPath,
       [
@@ -1664,6 +1740,19 @@ test(
     );
     expect(JSON.parse(cli.stdout)).toMatchObject({ status: "queued" });
     expect(parentPrompts).toEqual([]);
+    const report = await childMcp.callTool({
+      name: "send_agent_prompt",
+      arguments: {
+        serverId: aId,
+        agentId: parent.id,
+        prompt: "REMOTE_REPORT <ready>",
+        notifyOnFinish: false,
+      },
+    });
+    expect(report.isError).not.toBe(true);
+    expect(report.structuredContent).toMatchObject({ deliveryStatus: "queued", serverId: aId });
+    expect(parentPrompts).toEqual([]);
+
     const receiptStates = async () => {
       const directory = join(a.paseoHome, "agent-requests");
       const receipts = await Promise.all(
@@ -1686,6 +1775,8 @@ test(
     expect(parentPrompts[0]).toContain('event="finished"');
     expect(parentPrompts[0]).toContain(`source-agent-id="${child.id}"`);
     await expect.poll(receiptStates, { timeout: 10000 }).toEqual(["completed", "completed"]);
+    expect((await origin.client.fetchAgent(parent.id))?.agent.status).toBe("running");
+    finishParent.resolve();
     const timeline = await origin.client.fetchAgentTimeline(parent.id);
     const messages = timeline.entries.flatMap((row) =>
       row.item.type === "tool_call" && row.item.agentMessage ? [row.item.agentMessage] : [],
@@ -1693,11 +1784,12 @@ test(
     expect(
       messages.map((message) => [message.event, message.sender.id, message.sender.serverId]),
     ).toEqual([
-      ["message", child.id, bId],
       ["message", parent.id, undefined],
+      ["message", child.id, bId],
       ["finished", child.id, bId],
     ]);
-    expect(messages[0]!.text).toBe("REMOTE_REPORT <ready>");
+    expect(messages[0]!.text).toBe("LOCAL_CLI_REPORT");
+    expect(messages[1]!.text).toBe("REMOTE_REPORT <ready>");
     expect(timeline.entries.filter((row) => row.item.type === "user_message")).toEqual([]);
 
     const human = await aWorkspace.agents.create({

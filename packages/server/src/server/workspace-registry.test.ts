@@ -1,3 +1,7 @@
+import {
+  resolveSidebarAutomationPlacement,
+  sidebarAutomationSubtree,
+} from "./workspace-sidebar-automation.js";
 import os from "node:os";
 import path from "node:path";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
@@ -122,6 +126,172 @@ describe("workspace registries", () => {
     );
     await workspaceRegistry.archive("child", new Date().toISOString());
     await expect(save(first, 2)).rejects.toThrow("archived");
+  });
+
+  test("sidebar section and layout update together, retry idempotently and restore exact flags", async () => {
+    const original = createPersistedWorkspaceRecord({
+      workspaceId: "child",
+      projectId: "project",
+      cwd: "/tmp/project",
+      kind: "directory",
+      displayName: "child",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      pinnedAt: "2026-01-02T00:00:00.000Z",
+      superpinnedAt: "2026-01-03T00:00:00.000Z",
+    });
+    await workspaceRegistry.upsert(original);
+    const input = {
+      workspaceId: "child",
+      placement: { parentWorkspaceKey: "remote:parent", siblingOrder: 1024 },
+      expectedRevision: 0,
+      section: "unpinned" as const,
+    };
+    expect((await setWorkspacePinPlacement(workspaceRegistry, input, "own")).revision).toBe(1);
+    expect(await workspaceRegistry.get("child")).toMatchObject({
+      pinnedAt: null,
+      superpinnedAt: null,
+    });
+    expect((await setWorkspacePinPlacement(workspaceRegistry, input, "own")).revision).toBe(1);
+    await expect(
+      setWorkspacePinPlacement(workspaceRegistry, { ...input, section: "pinned" }, "own"),
+    ).rejects.toThrow("another client");
+    await setWorkspacePinPlacement(
+      workspaceRegistry,
+      {
+        ...input,
+        section: "superpinned",
+        expectedRevision: 1,
+        sectionState: { pinnedAt: original.pinnedAt, superpinnedAt: original.superpinnedAt },
+      },
+      "own",
+    );
+    expect(await workspaceRegistry.get("child")).toMatchObject({
+      pinnedAt: original.pinnedAt,
+      superpinnedAt: original.superpinnedAt,
+      pinPlacement: { revision: 2 },
+    });
+  });
+
+  test("simultaneous local parent moves cannot create a sidebar cycle", async () => {
+    for (const workspaceId of ["a", "b"])
+      await workspaceRegistry.upsert(
+        createPersistedWorkspaceRecord({
+          workspaceId,
+          projectId: "project",
+          cwd: "/tmp/project",
+          kind: "directory",
+          displayName: workspaceId,
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        }),
+      );
+    const results = await Promise.allSettled([
+      setWorkspacePinPlacement(
+        workspaceRegistry,
+        {
+          workspaceId: "a",
+          placement: { parentWorkspaceKey: "own:b", siblingOrder: 1024 },
+          expectedRevision: 0,
+        },
+        "own",
+      ),
+      setWorkspacePinPlacement(
+        workspaceRegistry,
+        {
+          workspaceId: "b",
+          placement: { parentWorkspaceKey: "own:a", siblingOrder: 1024 },
+          expectedRevision: 0,
+        },
+        "own",
+      ),
+    ]);
+    expect(results.map((result) => result.status).sort()).toEqual(["fulfilled", "rejected"]);
+  });
+
+  test("sidebar automation orders cross-host siblings, finds the full subtree, and rejects cycles", () => {
+    const rows = [
+      { workspaceKey: "a:parent", workspaceId: "parent", section: "pinned" as const },
+      {
+        workspaceKey: "b:first",
+        workspaceId: "first",
+        section: "pinned" as const,
+        pinPlacement: { parentWorkspaceKey: "a:parent", siblingOrder: 1024, revision: 1 },
+      },
+      {
+        workspaceKey: "c:second",
+        workspaceId: "second",
+        section: "pinned" as const,
+        pinPlacement: { parentWorkspaceKey: "a:parent", siblingOrder: 2048, revision: 1 },
+      },
+      {
+        workspaceKey: "c:grandchild",
+        workspaceId: "grandchild",
+        section: "pinned" as const,
+        pinPlacement: { parentWorkspaceKey: "c:second", siblingOrder: 1024, revision: 1 },
+      },
+    ];
+    expect(
+      resolveSidebarAutomationPlacement({ workspaces: rows, parentWorkspaceKey: "a:parent" }),
+    ).toEqual({ parentWorkspaceKey: "a:parent", section: "pinned", siblingOrder: 3072 });
+    expect(
+      resolveSidebarAutomationPlacement({
+        workspaces: rows,
+        parentWorkspaceKey: "a:parent",
+        beforeWorkspaceKey: "c:second",
+      }).siblingOrder,
+    ).toBe(1536);
+    expect(sidebarAutomationSubtree(rows, "a:parent")).toHaveLength(4);
+    expect(() =>
+      resolveSidebarAutomationPlacement({
+        workspaces: rows,
+        parentWorkspaceKey: "c:grandchild",
+        movingWorkspaceKey: "a:parent",
+      }),
+    ).toThrow("ancestor");
+    expect(() =>
+      resolveSidebarAutomationPlacement({ workspaces: rows, parentWorkspaceKey: "offline:parent" }),
+    ).toThrow("unavailable");
+    expect(() =>
+      resolveSidebarAutomationPlacement({
+        workspaces: rows,
+        parentWorkspaceKey: "a:parent",
+        section: "unpinned",
+      }),
+    ).toThrow("parent workspace's section");
+    const legacyRows = [
+      {
+        workspaceKey: "a:manager",
+        workspaceId: "manager",
+        projectId: "project",
+        section: "unpinned" as const,
+        siblingOrder: 999999,
+      },
+      {
+        workspaceKey: "a:legacy",
+        workspaceId: "legacy",
+        projectId: "project",
+        parentWorkspaceId: "manager",
+        section: "unpinned" as const,
+        siblingOrder: 8192,
+      },
+      {
+        workspaceKey: "b:unrelated",
+        workspaceId: "unrelated",
+        projectId: "other",
+        section: "unpinned" as const,
+        siblingOrder: 999999,
+      },
+    ];
+    expect(
+      resolveSidebarAutomationPlacement({ workspaces: legacyRows, parentWorkspaceKey: "a:manager" })
+        .siblingOrder,
+    ).toBe(9216);
+    expect(
+      resolveSidebarAutomationPlacement({ workspaces: legacyRows, parentWorkspaceKey: null })
+        .siblingOrder,
+    ).toBe(1024);
+    expect(sidebarAutomationSubtree(legacyRows, "a:manager")).toHaveLength(2);
   });
 
   test("moves workspaces between parents and persists fractional sibling ordering", async () => {

@@ -41,12 +41,6 @@ export function resolveWorkspaceTreeDropResult(input: WorkspaceTreeDropInput): {
     rejection: { targetWorkspaceKey: target.workspaceKey, message },
   });
   const fullTree = resolvePinnedWorkspaceTree(input.allWorkspaces ?? input.workspaces);
-  const changingSection = source.sidebarSection !== target.sidebarSection;
-  if (
-    changingSection &&
-    Array.from(fullTree.values()).some((item) => item.parentWorkspaceKey === source.workspaceKey)
-  )
-    return reject("Move children out first before moving this workspace to another pin section");
   if (target.sidebarSection)
     return resolvePinnedDrop(input, source, target, fullTree, target.sidebarSection);
   if (input.position === "inside")
