@@ -82,6 +82,13 @@ retain their legacy event delivery. A new app makes no setup event demand on old
 requires a host update to view details. Subscription-capable older hosts honor that absence of
 demand; broadcast-era hosts require an update before wire silence is guaranteed.
 
+## Agent MCP negotiation
+
+The agent MCP endpoint uses its installed SDK's legacy initialize handshake. After authentication,
+a modern `server/discover` probe receives a correlated JSON-RPC `-32601` method-not-found response
+so a client can select legacy initialization. Ordinary requests still enforce the SDK's supported
+protocol revisions; the compatibility response does not claim modern discovery or reload an agent.
+
 ## Every shim is tagged and dated
 
 A shim that exists for old-app or old-daemon support carries a comment naming it, the version it arrived in, and when it can go:

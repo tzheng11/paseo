@@ -1,6 +1,76 @@
 import { expect, test } from "vitest";
 import { createAgentMessageDelivery, parseAgentMessages } from "./index.js";
 import type { AgentPromptInput } from "../agent-sdk-types.js";
+import {
+  AgentSteerTurnChangedError,
+  AgentSteerOutcomeUnknownError,
+} from "../steer-admission-error.js";
+
+test("reselects a changed turn without dropping the batch or duplicating its acknowledgement", async () => {
+  const requests: Array<readonly string[]> = [];
+  const errors: unknown[] = [];
+  const acknowledgements: string[] = [];
+  const delivery = createAgentMessageDelivery({
+    dispatch: async (request) => {
+      requests.push(request.messageIds);
+      if (requests.length === 1) throw new AgentSteerTurnChangedError();
+      request.onDispatch("steered");
+      return "steered";
+    },
+    onError: (error) => {
+      errors.push(error);
+    },
+  });
+  const receipt = delivery.enqueue({
+    recipientId: "parent",
+    messageId: "same-message",
+    source: { kind: "agent-message", agentId: "child" },
+    prompt: "report",
+    onDispatch: (disposition) => acknowledgements.push(disposition),
+  });
+  await delivery.close();
+  await expect(receipt.dispatched).resolves.toBe("steered");
+  expect(requests).toEqual([["same-message"], ["same-message"]]);
+  expect(errors).toEqual([]);
+  expect(acknowledgements).toEqual(["steered"]);
+});
+
+test("does not replay unknown steering and continues the next recipient batch", async () => {
+  const clock = createClock();
+  const messages: string[] = [];
+  const errors: unknown[] = [];
+  const delivery = createAgentMessageDelivery({
+    schedule: clock.schedule,
+    dispatch: async (request) => {
+      messages.push(...request.messageIds);
+      if (request.messageIds[0] === "unknown") throw new AgentSteerOutcomeUnknownError(120000);
+      return "turn_started";
+    },
+    onError: (error) => {
+      errors.push(error);
+    },
+  });
+  const source = { kind: "agent-message" as const, agentId: "child" };
+  const unknown = delivery.enqueue({
+    recipientId: "parent",
+    messageId: "unknown",
+    source,
+    prompt: "first",
+  });
+  const rejected = expect(unknown.dispatched).rejects.toThrow("delivery outcome unknown");
+  clock.advance(2000);
+  const later = delivery.enqueue({
+    recipientId: "parent",
+    messageId: "later",
+    source,
+    prompt: "second",
+  });
+  await delivery.close();
+  await rejected;
+  await expect(later.dispatched).resolves.toBe("turn_started");
+  expect(messages).toEqual(["unknown", "later"]);
+  expect(errors).toHaveLength(1);
+});
 
 function createClock() {
   let now = 0;
