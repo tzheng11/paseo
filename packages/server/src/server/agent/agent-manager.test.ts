@@ -633,6 +633,17 @@ class SteeringTestSession extends TestAgentSession {
   }
 }
 
+// These lifecycle races control terminal delivery explicitly. Do not leave a timer
+// that can publish the fake provider's start after its completion.
+class ImmediateSteeringTestSession extends SteeringTestSession {
+  override async startTurn(prompt: AgentPromptInput): Promise<{ turnId: string }> {
+    this.startPrompts.push(prompt);
+    const turnId = `active-turn-${++this.startCount}`;
+    this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+    return { turnId };
+  }
+}
+
 class UnsupportedSteeringSession extends TestAgentSession {
   interruptCount = 0;
   startCount = 0;
@@ -1473,6 +1484,171 @@ test("orders a concurrent replacement after a pending accepted steer", async () 
   }
 });
 
+test("starts a message once when its observed turn completes before steer admission", async () => {
+  const session = new ImmediateSteeringTestSession({ provider: "codex", cwd: process.cwd() });
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-completed-steer-"));
+  const client = new (class extends TestAgentClient {
+    override async createSession() {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, logger });
+  let agentId: string | null = null;
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = agent.id;
+    const consume = (async () => {
+      for await (const _ of manager.streamAgent(agent.id, "A")) {
+      }
+    })();
+    await manager.waitForAgentRunStart(agent.id);
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+    // The terminal is queued, so the send initially observes the old running snapshot.
+    await expect(
+      startAgentRun(manager, agent.id, "after A", logger, {
+        replaceRunning: true,
+        activeTurnBehavior: "steer",
+        runOptions: { clientMessageId: "after-A" },
+      }),
+    ).resolves.toEqual({ disposition: "turn_started" });
+    await consume;
+    await manager.waitForAgentRunStart(agent.id);
+    expect(session.interruptCount).toBe(0);
+    expect(session.steerCount).toBe(0);
+    expect(session.startPrompts).toEqual(["A", "after A"]);
+  } finally {
+    if (agentId) await manager.closeAgent(agentId);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("starts an unadmitted steer once after the provider completes its turn during acknowledgement", async () => {
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const session = new (class extends ImmediateSteeringTestSession {
+    override async steerActiveTurn(): Promise<import("./agent-sdk-types.js").SteerResult> {
+      this.steerCount++;
+      entered.resolve();
+      await release.promise;
+      return { status: "unavailable" };
+    }
+  })({ provider: "codex", cwd: process.cwd() });
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-terminal-steer-"));
+  const client = new (class extends TestAgentClient {
+    override async createSession() {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, logger });
+  let agentId: string | null = null;
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = agent.id;
+    const consume = (async () => {
+      for await (const _ of manager.streamAgent(agent.id, "A")) {
+      }
+    })();
+    await manager.waitForAgentRunStart(agent.id);
+    const send = startAgentRun(manager, agent.id, "after A", logger, {
+      replaceRunning: true,
+      activeTurnBehavior: "steer",
+      runOptions: { clientMessageId: "after-A" },
+    });
+    await entered.promise;
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+    release.resolve();
+    await expect(send).resolves.toEqual({ disposition: "turn_started" });
+    await consume;
+    await manager.waitForAgentRunStart(agent.id);
+    expect(session.interruptCount).toBe(0);
+    expect(session.steerCount).toBe(1);
+    expect(session.startPrompts).toEqual(["A", "after A"]);
+    expect(
+      manager
+        .getTimeline(agent.id)
+        .filter((item) => item.type === "user_message" && item.clientMessageId === "after-A"),
+    ).toHaveLength(1);
+  } finally {
+    release.resolve();
+    if (agentId) await manager.closeAgent(agentId);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("bounds an unknown steer, releases terminal state and never records a late acknowledgement", async () => {
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const session = new (class extends ImmediateSteeringTestSession {
+    override async steerActiveTurn(): Promise<import("./agent-sdk-types.js").SteerResult> {
+      this.steerCount++;
+      entered.resolve();
+      await release.promise;
+      return { status: "accepted" };
+    }
+  })({ provider: "codex", cwd: process.cwd() });
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-unknown-steer-"));
+  const client = new (class extends TestAgentClient {
+    override async createSession() {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    logger,
+    rescueTimeouts: { steerAdmissionMs: 20 },
+  });
+  let agentId: string | null = null;
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = agent.id;
+    const consume = (async () => {
+      for await (const _ of manager.streamAgent(agent.id, "A")) {
+      }
+    })();
+    await manager.waitForAgentRunStart(agent.id);
+    const onDispatch = vi.fn();
+    const send = startAgentRun(manager, agent.id, "unknown", logger, {
+      replaceRunning: true,
+      activeTurnBehavior: "steer",
+      onDispatch,
+      runOptions: { clientMessageId: "unknown-input" },
+    });
+    const failure = expect(send).rejects.toThrow("delivery outcome unknown");
+    await entered.promise;
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+    await failure;
+    await consume;
+    expect(manager.getAgent(agent.id)?.lifecycle).toBe("idle");
+    release.resolve();
+    await manager.flush();
+    expect(onDispatch).not.toHaveBeenCalled();
+    expect(session.interruptCount).toBe(0);
+    expect(session.startPrompts).toEqual(["A"]);
+    expect(
+      manager
+        .getTimeline(agent.id)
+        .some((item) => item.type === "user_message" && item.clientMessageId === "unknown-input"),
+    ).toBe(false);
+    await expect(
+      startAgentRun(manager, agent.id, "independent later input", logger, {
+        replaceRunning: true,
+        activeTurnBehavior: "steer",
+      }),
+    ).resolves.toEqual({ disposition: "turn_started" });
+    expect(session.startPrompts).toEqual(["A", "independent later input"]);
+  } finally {
+    release.resolve();
+    if (agentId) await manager.closeAgent(agentId);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("does not replace a newer foreground turn after unavailable steer fallback is admitted", async () => {
   const entered = deferred<void>();
   const release = deferred<void>();
@@ -1539,6 +1715,249 @@ test("does not replace a newer foreground turn after unavailable steer fallback 
       consumeB ?? Promise.resolve(),
       new Promise((resolve) => setTimeout(resolve, 100)),
     ]);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("ignores a late start for a finalized turn without suppressing a new turn", async () => {
+  const session = new ImmediateSteeringTestSession({ provider: "codex", cwd: process.cwd() });
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-late-start-"));
+  const client = new (class extends TestAgentClient {
+    override async createSession() {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, logger });
+  let agentId: string | null = null;
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = agent.id;
+    const consume = (async () => {
+      for await (const _ of manager.streamAgent(agent.id, "A")) {
+      }
+    })();
+    await manager.waitForAgentRunStart(agent.id);
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+    await consume;
+    session.pushEvent({ type: "turn_started", provider: "codex", turnId: "active-turn-1" });
+    await manager.flush();
+    expect(manager.getAgent(agent.id)).toMatchObject({ lifecycle: "idle", activeTurnId: null });
+    session.pushEvent({ type: "turn_started", provider: "codex", turnId: "new-autonomous-turn" });
+    await manager.flush();
+    expect(manager.getAgent(agent.id)).toMatchObject({
+      lifecycle: "running",
+      activeTurnId: "new-autonomous-turn",
+    });
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "new-autonomous-turn" });
+    await manager.flush();
+    session.pushEvent({ type: "turn_started", provider: "codex", turnId: "new-autonomous-turn" });
+    await manager.flush();
+    expect(manager.getAgent(agent.id)).toMatchObject({ lifecycle: "idle", activeTurnId: null });
+  } finally {
+    if (agentId) await manager.closeAgent(agentId);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("does not cancel a newer turn while persisting an unavailable-steer replacement", async () => {
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const session = new ImmediateSteeringTestSession({ provider: "codex", cwd: process.cwd() });
+  session.steerResult = "unavailable";
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-replacement-cas-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const applySnapshot = storage.applySnapshot.bind(storage);
+  const snapshotSpy = vi.spyOn(storage, "applySnapshot");
+  const client = new (class extends TestAgentClient {
+    override async createSession() {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    beforeSteerUnavailableFallback: async () => {
+      // The first write publishes pendingReplacement; the awaited second write
+      // is the cancellation admission where the observed turn can change.
+      snapshotSpy.mockImplementationOnce(applySnapshot).mockImplementationOnce(async (...args) => {
+        entered.resolve();
+        await release.promise;
+        return applySnapshot(...args);
+      });
+    },
+  });
+  let agentId: string | null = null;
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = agent.id;
+    const consumeA = (async () => {
+      for await (const _ of manager.streamAgent(agent.id, "A")) {
+      }
+    })();
+    await manager.waitForAgentRunStart(agent.id);
+    await manager.flush();
+    const send = startAgentRun(manager, agent.id, "unadmitted", logger, {
+      replaceRunning: true,
+      activeTurnBehavior: "steer",
+      runOptions: { clientMessageId: "stale-replacement" },
+    });
+    const rejected = expect(send).rejects.toThrow(
+      "Active turn changed before steering could be delivered",
+    );
+    await entered.promise;
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+    await consumeA;
+    const consumeB = (async () => {
+      for await (const _ of manager.streamAgent(agent.id, "B")) {
+      }
+    })();
+    await manager.waitForAgentRunStart(agent.id);
+    release.resolve();
+    await rejected;
+    expect(session.interruptCount).toBe(0);
+    expect(manager.getAgent(agent.id)).toMatchObject({
+      lifecycle: "running",
+      activeTurnId: "active-turn-2",
+    });
+    expect(session.startPrompts).toEqual(["A", "B"]);
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-2" });
+    await consumeB;
+  } finally {
+    release.resolve();
+    snapshotSpy.mockRestore();
+    if (agentId) await manager.closeAgent(agentId);
+    await storage.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("preserves a newer turn and its permissions while the old interrupt acknowledges", async () => {
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const session = new (class extends ImmediateSteeringTestSession {
+    override async interrupt(): Promise<void> {
+      this.interruptCount++;
+      entered.resolve();
+      await release.promise;
+    }
+  })({ provider: "codex", cwd: process.cwd() });
+  session.steerResult = "unavailable";
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-interrupt-cas-"));
+  const client = new (class extends TestAgentClient {
+    override async createSession() {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, logger });
+  let agentId: string | null = null;
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = agent.id;
+    const consumeA = (async () => {
+      for await (const _ of manager.streamAgent(agent.id, "A")) {
+      }
+    })();
+    await manager.waitForAgentRunStart(agent.id);
+    manager.getAgent(agent.id)!.pendingPermissions.set("A-permission", {
+      id: "A-permission",
+      provider: "codex",
+      name: "A work",
+      kind: "tool",
+    });
+    const send = startAgentRun(manager, agent.id, "unadmitted", logger, {
+      replaceRunning: true,
+      activeTurnBehavior: "steer",
+      runOptions: { clientMessageId: "old-interrupt" },
+    });
+    const rejected = expect(send).rejects.toThrow(
+      "Active turn changed before steering could be delivered",
+    );
+    await entered.promise;
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+    await consumeA;
+    const consumeB = (async () => {
+      for await (const _ of manager.streamAgent(agent.id, "B")) {
+      }
+    })();
+    await manager.waitForAgentRunStart(agent.id);
+    manager.getAgent(agent.id)!.pendingPermissions.set("B-permission", {
+      id: "B-permission",
+      provider: "codex",
+      name: "B work",
+      kind: "tool",
+    });
+    release.resolve();
+    await rejected;
+    expect(session.interruptCount).toBe(1);
+    expect(manager.getAgent(agent.id)).toMatchObject({
+      lifecycle: "running",
+      activeTurnId: "active-turn-2",
+    });
+    expect(manager.getAgent(agent.id)!.pendingPermissions.has("B-permission")).toBe(true);
+    expect(manager.getAgent(agent.id)!.pendingPermissions.has("A-permission")).toBe(false);
+    expect(session.startPrompts).toEqual(["A", "B"]);
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-2" });
+    await consumeB;
+  } finally {
+    release.resolve();
+    if (agentId) await manager.closeAgent(agentId);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("clears approvals arriving during interrupt when the same turn completes", async () => {
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const session = new (class extends ImmediateSteeringTestSession {
+    override async interrupt(): Promise<void> {
+      this.interruptCount++;
+      entered.resolve();
+      await release.promise;
+    }
+  })({ provider: "codex", cwd: process.cwd() });
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-stop-permissions-"));
+  const client = new (class extends TestAgentClient {
+    override async createSession() {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, logger });
+  let agentId: string | null = null;
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = agent.id;
+    const consume = (async () => {
+      for await (const _ of manager.streamAgent(agent.id, "A")) {
+      }
+    })();
+    await manager.waitForAgentRunStart(agent.id);
+    const stop = manager.cancelAgentRun(agent.id);
+    await entered.promise;
+    manager.getAgent(agent.id)!.pendingPermissions.set("A-approval", {
+      id: "A-approval",
+      provider: "codex",
+      name: "A approval",
+      kind: "plan",
+    });
+
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+    await consume;
+    release.resolve();
+    await expect(stop).resolves.toEqual({ status: "settled" });
+    expect(manager.getAgent(agent.id)!.pendingPermissions.size).toBe(0);
+    expect(manager.getAgent(agent.id)?.lifecycle).toBe("idle");
+  } finally {
+    release.resolve();
+    if (agentId) await manager.closeAgent(agentId);
     rmSync(workdir, { recursive: true, force: true });
   }
 });
