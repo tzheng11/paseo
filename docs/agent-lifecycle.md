@@ -237,6 +237,12 @@ Users can also detach an existing subagent from the subagents track. Detach is d
 
 Agent-originated messages and automatic notifications share a recipient-daemon delivery module. A queued receipt acknowledges admission before provider dispatch, allowing a child to report and finish in the same two-second quiet window. Human prompts dispatch directly. Conflicting explicit interruption or session-mode choices retain separate ordered dispatches.
 
+Recipient dispatch reselects the current turn when steering definitively reports that the observed
+turn changed without admitting the input. It preserves the message IDs and never cancels a newer
+turn using an older admission. Steering acknowledgement is bounded at two minutes; an unresolved
+outcome remains pending and is not replayed, while later independent messages can proceed. Terminal
+events still settle the turn, and a delayed start for a known finalized turn cannot reopen it.
+
 The pending window is in memory. Clean shutdown flushes it before closing agents; an abrupt crash can lose it. A durable send receipt remains pending until actual dispatch acknowledgment, so a lost window never becomes a completed receipt. Completion waits cover queued admission within their original timeout and cancellation scope.
 
 Permission requests are notification checkpoints, not the end of that subscription. The caller is notified again after a permission response when the child finishes, errors, or requests another permission.

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
@@ -79,4 +80,14 @@ test("every executable daemon entrypoint enters the supervisor", async () => {
   assert.doesNotMatch(nixPackage, /--set(-default)?\s+NODE_ENV\b/);
   assert.doesNotMatch(nixModule, /\bNODE_ENV\b\s*=/);
   assert.doesNotMatch(nixModule, /\bPASEO_NODE_ENV\b/);
+});
+
+// Keep the private assembler/cutover primitives in the existing launch-contract CI job.
+test("staged runtime probe and wrappers preserve restart/install contracts", () => {
+  const result = spawnSync("python3", [join(repoRoot, "scripts/staged-runtime.test.py")], {
+    encoding: "utf8",
+    timeout: 30_000,
+  });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
 });
