@@ -438,6 +438,7 @@ interface NewWorkspaceRouteOptions {
   displayName?: string;
   projectId?: string;
   draftId?: string;
+  parentWorkspaceKey?: string;
 }
 
 function buildNewWorkspaceSearch(options: NewWorkspaceRouteOptions): string {
@@ -457,6 +458,9 @@ function buildNewWorkspaceSearch(options: NewWorkspaceRouteOptions): string {
   }
   if (options.draftId) {
     params.set("draftId", options.draftId);
+  }
+  if (options.parentWorkspaceKey) {
+    params.set("parentWorkspaceKey", options.parentWorkspaceKey);
   }
   return params.toString();
 }

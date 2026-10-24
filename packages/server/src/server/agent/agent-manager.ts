@@ -75,6 +75,7 @@ import {
   type AgentSessionConfig,
   type SteerResult,
   type AgentStreamEvent,
+  type AgentHistoryStreamOptions,
   type AgentTimelineItem,
   type AgentUsage,
   type AgentRuntimeInfo,
@@ -866,6 +867,16 @@ export interface RetiredInternalAgent {
   lastMessage: string | null;
 }
 
+function matchesHistorySelection(
+  item: AgentTimelineItem,
+  options?: AgentHistoryStreamOptions,
+): boolean {
+  if (options?.userMessagesOnly) return item.type === "user_message";
+  return (
+    !options?.messagesOnly || item.type === "user_message" || item.type === "assistant_message"
+  );
+}
+
 function resolveRescueTimeouts(options: AgentManagerOptions["rescueTimeouts"]) {
   return {
     reloadSessionCloseMs: options?.reloadSessionCloseMs ?? RELOAD_SESSION_CLOSE_TIMEOUT_MS,
@@ -890,6 +901,8 @@ export class AgentManager {
   private readonly idleReloads = new Set<string>();
   private readonly timelineStore: AgentRuntimeTimelineStore;
   private readonly historySourceBoundarySeq = new Map<string, number>();
+  private readonly historyReadTails = new Map<string, Promise<void>>();
+  private readonly historyReadBarriers = new Map<string, number>();
   private readonly providerSubagents = new ProviderSubagentStore();
   private readonly agentsAwaitingInitialSnapshotPersist = new Set<string>();
   private readonly sessionEventTails = new Map<string, Promise<void>>();
@@ -1562,13 +1575,19 @@ export class AgentManager {
   }
 
   /** Search and prompt indexing explicitly traverse the unloaded provider middle. */
-  async *streamFullHistoryMessages(id: string): AsyncGenerator<AgentTimelineRow> {
-    yield* this.streamFullHistoryRows(id, { messagesOnly: true });
+  async *streamFullHistoryMessages(
+    id: string,
+    options?: { userOnly?: boolean },
+  ): AsyncGenerator<AgentTimelineRow> {
+    yield* this.streamFullHistoryRows(id, {
+      messagesOnly: true,
+      ...(options?.userOnly ? { userMessagesOnly: true } : {}),
+    });
   }
 
   async *streamFullHistoryRows(
     id: string,
-    options?: { messagesOnly?: boolean },
+    options?: AgentHistoryStreamOptions,
   ): AsyncGenerator<AgentTimelineRow> {
     const agent = this.requireSessionAgent(id);
     if (!agent.session.streamHistoryEntries)
@@ -1579,19 +1598,9 @@ export class AgentManager {
         throw new Error("History changed during streamed read");
       const event = entry.value;
       if (event.type !== "timeline") continue;
-      if (
-        options?.messagesOnly &&
-        event.item.type !== "user_message" &&
-        event.item.type !== "assistant_message"
-      )
-        continue;
+      if (!matchesHistorySelection(event.item, options)) continue;
       for (const projected of projectAgentMessages(event.item)) {
-        if (
-          options?.messagesOnly &&
-          projected.type !== "user_message" &&
-          projected.type !== "assistant_message"
-        )
-          continue;
+        if (!matchesHistorySelection(projected, options)) continue;
         const item = limitAgentTimelineItemContent(projected);
         yield {
           seq: entry.index + 1,
@@ -1617,30 +1626,49 @@ export class AgentManager {
       epoch?: string;
     },
   ) {
-    const agent = this.requireSessionAgent(id);
-    return this.runSessionOperation(id, async () => {
-      const epoch = this.timelineStore.getEpoch(id);
-      if (request.epoch !== undefined && request.epoch !== epoch)
-        throw new Error("History epoch changed; reload its windows");
-      if (request.operation === "windows") {
-        if (!agent.session.readHistoryWindows)
-          throw new Error("Provider does not support bounded history");
-        const windows = await agent.session.readHistoryWindows(DEFAULT_HISTORY_WINDOWS);
+    return this.trackHistoryRead(id, async () => {
+      const snapshot = await this.runSessionOperation(id, async () => {
+        this.assertHistoryReadAdmission(id);
+        const agent = this.requireSessionAgent(id);
+        const epoch = this.timelineStore.getEpoch(id);
+        if (request.epoch !== undefined && request.epoch !== epoch)
+          throw new Error("History epoch changed; reload its windows");
         return {
+          agent,
+          session: agent.session,
           epoch,
-          ...windows,
           liveAfterSeq: this.historySourceBoundarySeq.get(id),
-          unit: agent.session.historyWindowInfo?.unit ?? ("events" as const),
         };
-      }
-      if (!agent.session.readHistoryPage || request.cursor === undefined)
-        throw new Error("Provider history requires a supported page cursor");
-      const page = await agent.session.readHistoryPage({
-        cursor: request.cursor,
-        direction: request.direction ?? "after",
-        limit: request.limit ?? { events: 128, bytes: 256 * 1024 },
       });
-      return { epoch, ...page, unit: agent.session.historyWindowInfo?.unit ?? ("events" as const) };
+      const { agent, session, epoch, liveAfterSeq } = snapshot;
+      // Provider history can wait on a separate reader process. Keep that IO out
+      // of the live-event lane so a terminal event can settle the active turn.
+      const history = await (async () => {
+        if (request.operation === "windows") {
+          if (!session.readHistoryWindows)
+            throw new Error("Provider does not support bounded history");
+          return { ...(await session.readHistoryWindows(DEFAULT_HISTORY_WINDOWS)), liveAfterSeq };
+        }
+        if (!session.readHistoryPage || request.cursor === undefined)
+          throw new Error("Provider history requires a supported page cursor");
+        return session.readHistoryPage({
+          cursor: request.cursor,
+          direction: request.direction ?? "after",
+          limit: request.limit ?? { events: 128, bytes: 256 * 1024 },
+        });
+      })();
+      return await this.runSessionOperation(id, async () => {
+        if (
+          this.agents.get(id) !== agent ||
+          agent.session !== session ||
+          !this.timelineStore.has(id) ||
+          this.timelineStore.getEpoch(id) !== epoch ||
+          this.historySourceBoundarySeq.get(id) !== liveAfterSeq
+        ) {
+          throw new Error("History changed during bounded read; reload its windows");
+        }
+        return { epoch, ...history, unit: session.historyWindowInfo?.unit ?? ("events" as const) };
+      });
     });
   }
 
@@ -1832,7 +1860,10 @@ export class AgentManager {
     // agent whose working directory may be gone.
     const record = this.registry ? await this.registry.get(resolvedAgentId) : null;
     const currentResumeOptions = record
-      ? { purpose: record.archivedAt ? ("history" as const) : ("interactive" as const) }
+      ? {
+          ...resumeOptions,
+          purpose: record.archivedAt ? ("history" as const) : ("interactive" as const),
+        }
       : resumeOptions;
     const purpose = currentResumeOptions?.purpose ?? "interactive";
 
@@ -1842,6 +1873,12 @@ export class AgentManager {
       { purpose },
     );
     const client = this.requireClient(handle.provider);
+    if (
+      currentResumeOptions?.historyReadMode === "bounded" &&
+      !client.capabilities.supportsBoundedHistory
+    ) {
+      throw new Error(`Provider '${handle.provider}' does not support bounded history loading`);
+    }
     const available = await client.isAvailable();
     if (!available) {
       throw new Error(
@@ -2247,9 +2284,11 @@ export class AgentManager {
     overrides?: Partial<AgentSessionConfig>,
     options?: { rehydrateFromDisk?: boolean; preserveHistory?: boolean },
   ): Promise<ManagedAgent> {
-    return this.trackAgentRegistrationOperation(
-      this.runLifecycleMutation(agentId, () =>
-        this.reloadAgentSessionInternal(agentId, overrides, options),
+    return this.withHistoryReadBarrier(agentId, () =>
+      this.trackAgentRegistrationOperation(
+        this.runLifecycleMutation(agentId, () =>
+          this.reloadAgentSessionInternal(agentId, overrides, options),
+        ),
       ),
     );
   }
@@ -2311,6 +2350,7 @@ export class AgentManager {
     try {
       // A persisted thread can have only one writer, even when its turn is idle.
       await this.closeReloadedSession(existing.session, agentId, options.preserveHistory);
+      await this.drainHistoryReads(agentId);
       await this.drainSessionEvents(agentId);
       this.cancelRunningProviderSubagents(agentId);
       closedExisting = this.prepareAgentForClosure(
@@ -2533,7 +2573,11 @@ export class AgentManager {
     return close;
   }
 
-  private async closeAgentRuntime(agentId: string): Promise<void> {
+  private closeAgentRuntime(agentId: string): Promise<void> {
+    return this.withHistoryReadBarrier(agentId, () => this.closeAgentRuntimeUnlocked(agentId));
+  }
+
+  private async closeAgentRuntimeUnlocked(agentId: string): Promise<void> {
     const agent = this.requireAgent(agentId);
     this.logger.trace(
       {
@@ -2547,6 +2591,7 @@ export class AgentManager {
       },
       "agent.manager.close.start",
     );
+    await this.drainHistoryReads(agentId);
     await this.drainSessionEvents(agentId);
     // Retain ownership until shutdown succeeds. A failed close may still own a
     // native writer, so publishing a resumable closed snapshot would orphan it.
@@ -4969,6 +5014,58 @@ export class AgentManager {
     }).catch((err) => {
       this.logger.error({ err, agentId, eventType: event.type }, "Failed to process session event");
     });
+  }
+
+  private async withHistoryReadBarrier<T>(
+    agentId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    this.historyReadBarriers.set(agentId, (this.historyReadBarriers.get(agentId) ?? 0) + 1);
+    try {
+      return await operation();
+    } finally {
+      const remaining = this.historyReadBarriers.get(agentId)! - 1;
+      if (remaining) this.historyReadBarriers.set(agentId, remaining);
+      else this.historyReadBarriers.delete(agentId);
+    }
+  }
+
+  private assertHistoryReadAdmission(agentId: string): void {
+    if (
+      this.historyReadBarriers.has(agentId) ||
+      this.idleReloads.has(agentId) ||
+      this.inFlightAgentCloses.has(agentId)
+    )
+      throw new Error("Agent session is changing; read history after it completes");
+  }
+
+  private trackHistoryRead<T>(agentId: string, operation: () => Promise<T>): Promise<T> {
+    this.assertHistoryReadAdmission(agentId);
+    const finish = this.beginAgentActivity(agentId);
+    // Preserve one provider history reader per agent without serializing live
+    // events behind it. A timed-out client may still own a pending native read.
+    const previous = this.historyReadTails.get(agentId) ?? Promise.resolve();
+    const read = previous.then(operation);
+    const settled = read
+      .then(
+        () => undefined,
+        () => undefined,
+      )
+      .finally(() => {
+        if (this.historyReadTails.get(agentId) === settled) this.historyReadTails.delete(agentId);
+        finish();
+      });
+    this.historyReadTails.set(agentId, settled);
+    this.trackBackgroundTask(settled);
+    return read;
+  }
+
+  private async drainHistoryReads(agentId: string): Promise<void> {
+    // Teardown still owns these readers through disposal. Waiting here must not
+    // put their IO back ahead of live turn completion in sessionEventTails.
+    while (this.historyReadTails.has(agentId)) {
+      await this.historyReadTails.get(agentId);
+    }
   }
 
   private runSessionOperation<T>(agentId: string, operation: () => Promise<T>): Promise<T> {

@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { createFileObserver, type FileChange } from "../index.js";
 import { createManagedObservation } from "./observation.js";
 import { createNativeRecursiveBackend } from "./native-recursive.js";
@@ -65,6 +65,7 @@ function createBackend(
     isIgnored?: (path: string) => boolean;
     ignoredRoots?: string[];
     progress?: () => void;
+    queueEvent?: (type: "create" | "update" | "delete", path: string) => void;
     observe?: Parameters<typeof createNativeRecursiveBackend>[2];
   } = {},
 ) {
@@ -78,7 +79,7 @@ function createBackend(
       ignoredRoots: options.ignoredRoots,
       isPathInside: paths.isInside,
       onInventoryProgress: options.progress,
-      queueEvent: () => {},
+      queueEvent: options.queueEvent ?? (() => {}),
       fail: (error) => {
         throw error;
       },
@@ -375,6 +376,251 @@ test("a failed native close still waits for and closes every sibling handle", as
     release();
     await backend.close().catch(() => {}); // The expected rejection was asserted above.
     await replacement.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("inventory capacity errors report the failed footprint instead of a generic watcher failure", () => {
+  const resources = new NativeRecursiveResources({ maxTrackedEntries: 6, maxConcurrentAudits: 2 });
+  const existing = resources.createInventoryReservation("existing");
+  existing.setEntryCount(4);
+  const waiting = resources.createInventoryReservation("waiting");
+  expect(() => waiting.assertCanFit(3)).toThrow(
+    expect.objectContaining({
+      name: "FileObservationCapacityError",
+      scope: "shared",
+      requiredEntries: 3,
+      limit: 6,
+    }),
+  );
+  existing.release();
+});
+
+test("capacity admission waits for the entire failed root and serializes fitting waiters fairly", async () => {
+  const resources = new NativeRecursiveResources({ maxTrackedEntries: 10, maxConcurrentAudits: 2 });
+  const existing = resources.createInventoryReservation("existing");
+  existing.setEntryCount(9);
+  const order: string[] = [];
+  const controller = new AbortController();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const admission = (root: string, requiredEntries: number, run: () => Promise<void>) =>
+    resources
+      .capacityError({ root, scope: "shared", requiredEntries, limit: 10 })
+      .retryWhenAvailable({ signal: controller.signal, recheckAfterMs: 300_000, run });
+  const large = admission("large", 7, async () => {
+    order.push("large");
+  });
+  const first = admission("first", 3, async () => {
+    order.push("first");
+    await gate;
+    resources.createInventoryReservation("first").setEntryCount(3);
+  });
+  const second = admission("second", 3, async () => {
+    order.push("second");
+  });
+  expect(order).toEqual([]);
+  existing.setEntryCount(7);
+  await Promise.resolve();
+  expect(order).toEqual(["first"]);
+  existing.setEntryCount(5);
+  await Promise.resolve();
+  expect(order).toEqual(["first"]);
+  release();
+  await first;
+  await Promise.resolve();
+  expect(order).toEqual(["first"]);
+  existing.release();
+  await second;
+  expect(order).toEqual(["first", "large", "second"]);
+  await large;
+});
+
+test("capacity rechecks are bounded without releases and queued cancellation releases no inventory", async () => {
+  vi.useFakeTimers();
+  try {
+    const resources = new NativeRecursiveResources({
+      maxTrackedEntries: 10,
+      maxConcurrentAudits: 2,
+    });
+    const existing = resources.createInventoryReservation("existing");
+    existing.setEntryCount(10);
+    const controller = new AbortController();
+    const run = vi.fn(async () => {});
+    const waiting = resources
+      .capacityError({ root: "waiting", scope: "shared", requiredEntries: 4, limit: 10 })
+      .retryWhenAvailable({ signal: controller.signal, recheckAfterMs: 300_000, run });
+    await vi.advanceTimersByTimeAsync(299_999);
+    expect(run).toHaveBeenCalledTimes(0);
+    await vi.advanceTimersByTimeAsync(1);
+    await waiting;
+    expect(run).toHaveBeenCalledExactlyOnceWith("recheck");
+    const cancelled = new AbortController();
+    const cancelledRun = vi.fn(async () => {});
+    const stopped = resources
+      .capacityError({ root: "cancelled", scope: "shared", requiredEntries: 4, limit: 10 })
+      .retryWhenAvailable({ signal: cancelled.signal, recheckAfterMs: 300_000, run: cancelledRun });
+    const rejected = expect(stopped).rejects.toThrow("owner closed");
+    cancelled.abort(new Error("owner closed"));
+    await rejected;
+    existing.release();
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(cancelledRun).toHaveBeenCalledTimes(0);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("per-root capacity waits for a bounded shrink recheck instead of unrelated shared releases", async () => {
+  vi.useFakeTimers();
+  try {
+    const resources = new NativeRecursiveResources({
+      maxTrackedEntries: 10,
+      maxConcurrentAudits: 2,
+    });
+    const existing = resources.createInventoryReservation("existing");
+    existing.setEntryCount(8);
+    const run = vi.fn(async () => {});
+    const waiting = resources
+      .capacityError({ root: "oversized", scope: "root", requiredEntries: 7, limit: 6 })
+      .retryWhenAvailable({ signal: new AbortController().signal, recheckAfterMs: 300_000, run });
+    existing.release();
+    await vi.advanceTimersByTimeAsync(299_999);
+    expect(run).toHaveBeenCalledTimes(0);
+    await vi.advanceTimersByTimeAsync(1);
+    await waiting;
+    expect(run).toHaveBeenCalledExactlyOnceWith("recheck");
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("a partially fitting startup counts its complete bounded footprint before shared rejection", async () => {
+  const root = await mkdtemp(join(tmpdir(), "native-capacity-footprint-"));
+  const existingRoot = join(root, "existing");
+  const waitingRoot = join(root, "waiting");
+  await mkdir(existingRoot);
+  await mkdir(waitingRoot);
+  await Promise.all(
+    Array.from({ length: 6 }, (_, i) => writeFile(join(waitingRoot, `file-${i}`), "data")),
+  );
+  const resources = new NativeRecursiveResources({ maxTrackedEntries: 8, maxConcurrentAudits: 2 });
+  const existing = resources.createInventoryReservation(existingRoot);
+  existing.setEntryCount(6);
+  const waiting = createBackend(waitingRoot, resources);
+  try {
+    await expect(waiting.start()).rejects.toMatchObject({
+      name: "FileObservationCapacityError",
+      requiredEntries: 7,
+      scope: "shared",
+    });
+    expect(waiting.getDiagnostics().nativeTrackedFileCount).toBe(0);
+    existing.release();
+    await waiting.start();
+    expect(waiting.getDiagnostics().nativeTrackedFileCount).toBe(6);
+  } finally {
+    existing.release();
+    await waiting.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("cancelling ready capacity admission prevents its callback and does not strand later waiters", async () => {
+  const resources = new NativeRecursiveResources({ maxTrackedEntries: 10, maxConcurrentAudits: 2 });
+  const controller = new AbortController();
+  const run = vi.fn(async () => {});
+  const ready = resources
+    .capacityError({ root: "ready", scope: "shared", requiredEntries: 4, limit: 10 })
+    .retryWhenAvailable({ signal: controller.signal, recheckAfterMs: 300_000, run });
+  const rejected = expect(ready).rejects.toThrow("closed before admission callback");
+  controller.abort(new Error("closed before admission callback"));
+  const nextRun = vi.fn(async () => {});
+  const next = resources
+    .capacityError({ root: "next", scope: "shared", requiredEntries: 4, limit: 10 })
+    .retryWhenAvailable({
+      signal: new AbortController().signal,
+      recheckAfterMs: 300_000,
+      run: nextRun,
+    });
+  await rejected;
+  await next;
+  expect(run).toHaveBeenCalledTimes(0);
+  expect(nextRun).toHaveBeenCalledExactlyOnceWith("capacity-released");
+});
+
+test("full inventory admission reserves growth before yielding diff publication to another audit", async () => {
+  const root = await mkdtemp(join(tmpdir(), "native-capacity-diff-reservation-"));
+  const firstRoot = join(root, "first"),
+    secondRoot = join(root, "second");
+  await mkdir(firstRoot);
+  await mkdir(secondRoot);
+  await writeFile(join(firstRoot, "original"), "original");
+  const resources = new NativeRecursiveResources({ maxTrackedEntries: 3, maxConcurrentAudits: 2 });
+  const second = createBackend(secondRoot, resources);
+  let competing: Promise<unknown> | null = null;
+  const events: string[] = [];
+  const first = createBackend(firstRoot, resources, {
+    queueEvent: (type, path) => {
+      if (type === "create") {
+        events.push(path);
+        competing = second.start().then(
+          () => null,
+          (error: unknown) => error,
+        );
+      }
+    },
+  });
+  try {
+    await first.start();
+    const added = join(firstRoot, "added");
+    await writeFile(added, "added");
+    await first.updateIgnore();
+    expect(await competing).toMatchObject({
+      name: "FileObservationCapacityError",
+      scope: "shared",
+    });
+    expect(events).toEqual([added]);
+    expect(first.getDiagnostics().nativeTrackedFileCount).toBe(2);
+    expect(second.getDiagnostics().nativeTrackedFileCount).toBe(0);
+  } finally {
+    await Promise.all([first.close(), second.close()]);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("closing during a reserved full diff rolls back growth before releasing the inventory", async () => {
+  const root = await mkdtemp(join(tmpdir(), "native-capacity-diff-close-"));
+  const firstRoot = join(root, "first"),
+    secondRoot = join(root, "second");
+  await mkdir(firstRoot);
+  await mkdir(secondRoot);
+  await writeFile(join(firstRoot, "original"), "original");
+  const resources = new NativeRecursiveResources({ maxTrackedEntries: 3, maxConcurrentAudits: 2 });
+  const second = createBackend(secondRoot, resources);
+  let closing: Promise<void> | null = null;
+  const first = createBackend(firstRoot, resources, {
+    queueEvent: () => {
+      closing = first.close();
+    },
+  });
+  try {
+    await first.start();
+    await writeFile(join(firstRoot, "added"), "added");
+    await first.updateIgnore();
+    await closing;
+    expect(first.getDiagnostics()).toMatchObject({
+      nativeTrackedFileCount: 0,
+      nativeHandleCount: 0,
+      pendingReconciliationWorkCount: 0,
+    });
+    await second.start();
+    expect(second.getDiagnostics().nativeHandleCount).toBe(1);
+    resources.createInventoryReservation("remaining-capacity").setEntryCount(2);
+  } finally {
+    await Promise.all([first.close(), second.close()]);
     await rm(root, { recursive: true, force: true });
   }
 });

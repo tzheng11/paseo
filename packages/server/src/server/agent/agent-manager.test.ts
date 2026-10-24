@@ -2,6 +2,7 @@ import {
   prepareAgentMessage,
   formatAgentMessage,
   formatSystemNotificationPrompt,
+  createAgentMessageDelivery,
 } from "./agent-messages/index.js";
 import { expect, test, vi, onTestFinished } from "vitest";
 import { spawn } from "node:child_process";
@@ -23,7 +24,8 @@ import { MessageReceipts } from "../message-receipts/index.js";
 import { ReloadOperationStore, type ReloadOperation } from "./reload-operation-store.js";
 import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 import { DiskAgentTimelineStore } from "./disk-agent-timeline-store.js";
-import { AgentHistoryReplay } from "./agent-history-replay.js";
+import { streamTimelinePromptIndex } from "./timeline-prompt-index.js";
+import { AgentHistoryReplay, type HistoryWindowInfo } from "./agent-history-replay.js";
 import { toAgentPayload } from "./agent-projections.js";
 import { projectTimelineRows } from "./timeline-projection.js";
 import { getOpenAgentTabLabel, PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
@@ -61,6 +63,7 @@ import type {
   AgentSessionConfig,
   AgentSlashCommand,
   AgentStreamEvent,
+  AgentHistoryStreamOptions,
   AgentTimelineItem,
   ImportProviderSessionInput,
   ImportProviderSessionContext,
@@ -691,6 +694,401 @@ async function startAndSteerThroughManager(
   });
   return { manager, agentId: agent.id, workdir };
 }
+
+class HeldBoundedHistorySession extends ImmediateSteeringTestSession {
+  readonly readStarted = deferred<void>();
+  readonly releaseRead = deferred<void>();
+  readCount = 0;
+  historyWindowInfo: HistoryWindowInfo | undefined;
+  historyGate: { started: Deferred<void>; released: Deferred<void> } | undefined;
+
+  override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+    if (!this.historyGate) return;
+    this.historyGate.started.resolve();
+    await this.historyGate.released.promise;
+    yield { type: "timeline", provider: "codex", item: { type: "user_message", text: "history" } };
+  }
+
+  private async waitForRead(): Promise<void> {
+    this.readCount++;
+    this.readStarted.resolve();
+    await this.releaseRead.promise;
+    // Codex discovers the native history unit while opening its deferred reader.
+    this.historyWindowInfo = {
+      headEvents: 0,
+      tailEvents: 0,
+      gap: null,
+      totalEvents: 0,
+      totalBytes: 0,
+      unit: "provider_items",
+    };
+  }
+
+  async readHistoryPage() {
+    await this.waitForRead();
+    return { entries: [], oversized: [], nextCursor: null };
+  }
+
+  async readHistoryWindows() {
+    await this.waitForRead();
+    return { head: [], tail: [], gap: null, totalEvents: 0, totalBytes: 0 };
+  }
+}
+
+async function createHeldHistoryFixture(options?: { restored?: boolean; stored?: boolean }) {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-history-terminal-progress-"));
+  const session = new HeldBoundedHistorySession({ provider: "codex", cwd: workdir });
+  const client = new (class extends TestAgentClient {
+    override async createSession() {
+      return session;
+    }
+    override async resumeSession(
+      handle: AgentPersistenceHandle,
+      config?: Partial<AgentSessionConfig>,
+    ) {
+      return options?.restored ? session : super.resumeSession(handle, config);
+    }
+  })();
+  const store = new InMemoryAgentTimelineStore();
+  const storage = options?.stored ? new AgentStorage(join(workdir, "agents"), logger) : undefined;
+  const manager = new AgentManager({
+    clients: { codex: client },
+    timelineStore: store,
+    registry: storage,
+    logger,
+  });
+  const agent = options?.restored
+    ? await manager.resumeAgentFromPersistence(session.describePersistence(), { cwd: workdir })
+    : await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+        workspaceId: undefined,
+      });
+  const cleanup = async () => {
+    session.releaseRead.resolve();
+    await manager.closeAgent(agent.id);
+    rmSync(workdir, { recursive: true, force: true });
+  };
+  return { session, manager, agent, store, storage, cleanup };
+}
+
+test.each(["page", "windows"] as const)(
+  "does not hold completion behind a pending history %s",
+  async (operation) => {
+    const { manager, agent, session, cleanup } = await createHeldHistoryFixture();
+    const run = drainAsyncGenerator(manager.streamAgent(agent.id, "initial"));
+    await manager.waitForAgentRunStart(agent.id);
+    let readFinished = false;
+    const history = manager
+      .readTimelineHistory(agent.id, { operation, cursor: 0 })
+      .then((result) => {
+        readFinished = true;
+        return result;
+      });
+    try {
+      await session.readStarted.promise;
+      session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+      await vi.waitFor(() => {
+        const current = manager.getAgent(agent.id)!;
+        expect(current.lifecycle).toBe("idle");
+        expect(toAgentPayload(current).activeTurn).toBeNull();
+      });
+      await run;
+      expect(readFinished).toBe(false);
+      // A message arriving after the native terminal can start before history returns.
+      const nextRun = drainAsyncGenerator(manager.streamAgent(agent.id, "next message"));
+      await manager.waitForAgentRunStart(agent.id);
+      expect(session.startCount).toBe(2);
+      session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-2" });
+      await nextRun;
+      expect(readFinished).toBe(false);
+    } finally {
+      session.releaseRead.resolve();
+      await history;
+      await run;
+      await cleanup();
+    }
+  },
+);
+
+test.each(["page", "windows"] as const)(
+  "starts a queued message after completion while a history %s is still stalled",
+  async (operation) => {
+    const { manager, agent, session, cleanup } = await createHeldHistoryFixture();
+    const initial = drainAsyncGenerator(manager.streamAgent(agent.id, "initial"));
+    await manager.waitForAgentRunStart(agent.id);
+    let readFinished = false;
+    const history = manager.readTimelineHistory(agent.id, { operation, cursor: 0 }).finally(() => {
+      readFinished = true;
+    });
+    let flush: (() => void) | undefined;
+    const errors: unknown[] = [];
+    const delivery = createAgentMessageDelivery({
+      schedule: (_delay, callback) => {
+        flush = callback;
+        return () => {};
+      },
+      dispatch: async (request) => {
+        const result = await startAgentRun(manager, request.recipientId, request.prompt, logger, {
+          replaceRunning: true,
+          activeTurnBehavior: request.activeTurnBehavior,
+          runOptions: { clientMessageId: request.messageIds[0] },
+          onDispatch: request.onDispatch,
+        });
+        return result.disposition;
+      },
+      onError: (error) => errors.push(error),
+    });
+    try {
+      await session.readStarted.promise;
+      const queued = delivery.enqueue({
+        recipientId: agent.id,
+        messageId: "queued-after-native-completion",
+        source: { kind: "agent-message", agentId: "test-sender", title: "Sender" },
+        prompt: "queued follow-up",
+      });
+      expect(queued.status).toBe("queued");
+      expect(session.startCount).toBe(1);
+      session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+      await vi.waitFor(() => {
+        const current = manager.getAgent(agent.id)!;
+        expect(current.lifecycle).toBe("idle");
+        expect(toAgentPayload(current).activeTurn).toBeNull();
+      });
+      await initial;
+      expect(readFinished).toBe(false);
+      flush!();
+      await expect(queued.dispatched).resolves.toBe("turn_started");
+      await manager.waitForAgentRunStart(agent.id);
+      expect(session.startCount).toBe(2);
+      expect(session.startPrompts[1]).toContain("queued follow-up");
+      expect(session.interruptCount).toBe(0);
+      expect(session.steerCount).toBe(0);
+      expect(readFinished).toBe(false);
+      session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-2" });
+      await vi.waitFor(() => expect(manager.getAgent(agent.id)?.lifecycle).toBe("idle"));
+      expect(errors).toEqual([]);
+    } finally {
+      session.releaseRead.resolve();
+      await Promise.allSettled([history, initial, delivery.close()]);
+      await cleanup();
+    }
+  },
+);
+
+test("rejects a late bounded history result after epoch replacement", async () => {
+  const { manager, agent, session, store, cleanup } = await createHeldHistoryFixture();
+  const epoch = manager.getTimelineEpoch(agent.id);
+  const history = manager.readTimelineHistory(agent.id, { operation: "page", cursor: 0, epoch });
+  const rejected = expect(history).rejects.toThrow("History changed during bounded read");
+  try {
+    await session.readStarted.promise;
+    store.initialize(agent.id);
+    session.releaseRead.resolve();
+    await rejected;
+  } finally {
+    await cleanup();
+  }
+});
+
+test("serializes bounded history readers without serializing live completion", async () => {
+  const { manager, agent, session, cleanup } = await createHeldHistoryFixture();
+  const run = drainAsyncGenerator(manager.streamAgent(agent.id, "initial"));
+  await manager.waitForAgentRunStart(agent.id);
+  const first = manager.readTimelineHistory(agent.id, { operation: "page", cursor: 0 });
+  await session.readStarted.promise;
+  const second = manager.readTimelineHistory(agent.id, { operation: "page", cursor: 1 });
+  try {
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+    await run;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(manager.getAgent(agent.id)?.lifecycle).toBe("idle");
+    expect(session.readCount).toBe(1);
+    session.releaseRead.resolve();
+    await Promise.all([first, second]);
+    expect(session.readCount).toBe(2);
+  } finally {
+    session.releaseRead.resolve();
+    await Promise.allSettled([first, second]);
+    await run;
+    await cleanup();
+  }
+});
+
+test.each(["close", "reload"] as const)(
+  "%s joins pending bounded history without holding live completion",
+  async (operation) => {
+    const { manager, agent, session, cleanup } = await createHeldHistoryFixture();
+    const epoch = manager.getTimelineEpoch(agent.id);
+    const run = drainAsyncGenerator(manager.streamAgent(agent.id, "initial"));
+    await manager.waitForAgentRunStart(agent.id);
+    let historyFinished = false;
+    const history = manager
+      .readTimelineHistory(agent.id, { operation: "page", cursor: 0, epoch })
+      .finally(() => {
+        historyFinished = true;
+      });
+    await session.readStarted.promise;
+    const teardown = (
+      operation === "close"
+        ? manager.closeAgent(agent.id)
+        : manager.reloadAgentSession(agent.id, undefined, { preserveHistory: true })
+    ).then(() => {
+      expect(historyFinished).toBe(true);
+      return undefined;
+    });
+    try {
+      // No new readers may enter behind an admitted teardown's reader join.
+      await expect(
+        manager.readTimelineHistory(agent.id, { operation: "page", cursor: 0 }),
+      ).rejects.toThrow("Agent session is changing");
+      expect(session.readCount).toBe(1);
+      session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+      await run;
+      expect(manager.getAgent(agent.id)).not.toBeNull();
+      expect(manager.getAgent(agent.id)?.lifecycle).toBe("idle");
+      expect(historyFinished).toBe(false);
+      session.releaseRead.resolve();
+      await history;
+      await teardown;
+      if (operation === "reload") expect(manager.getTimelineEpoch(agent.id)).toBe(epoch);
+    } finally {
+      session.releaseRead.resolve();
+      await Promise.allSettled([history, teardown]);
+      await run;
+      await cleanup();
+    }
+  },
+);
+
+test("bounded history remains available during an ordinary title write", async () => {
+  const { manager, agent, session, storage, cleanup } = await createHeldHistoryFixture({
+    stored: true,
+  });
+  const started = deferred<void>();
+  const released = deferred<void>();
+  const applySnapshot = storage!.applySnapshot.bind(storage);
+  vi.spyOn(storage!, "applySnapshot").mockImplementationOnce(async (...args) => {
+    started.resolve();
+    await released.promise;
+    return applySnapshot(...args);
+  });
+  const title = manager.setTitle(agent.id, "Updated title");
+  try {
+    await started.promise;
+    session.releaseRead.resolve();
+    await expect(
+      manager.readTimelineHistory(agent.id, { operation: "page", cursor: 0 }),
+    ).resolves.toMatchObject({ entries: [], unit: "provider_items" });
+    expect((await storage!.get(agent.id))?.title).not.toBe("Updated title");
+  } finally {
+    released.resolve();
+    await title;
+    await cleanup();
+  }
+});
+
+test("rejects a stale bounded history epoch before provider IO", async () => {
+  const { manager, agent, session, cleanup } = await createHeldHistoryFixture();
+  try {
+    await expect(
+      manager.readTimelineHistory(agent.id, {
+        operation: "page",
+        cursor: 0,
+        epoch: "old-epoch",
+      }),
+    ).rejects.toThrow("History epoch changed");
+    expect(session.readCount).toBe(0);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("bounded history preserves live appends and discovers its deferred native unit", async () => {
+  const { manager, agent, session, cleanup } = await createHeldHistoryFixture();
+  const epoch = manager.getTimelineEpoch(agent.id);
+  const history = manager.readTimelineHistory(agent.id, { operation: "windows", epoch });
+  try {
+    await session.readStarted.promise;
+    await manager.appendTimelineItem(agent.id, { type: "assistant_message", text: "live append" });
+    session.releaseRead.resolve();
+    expect(await history).toEqual({
+      epoch,
+      head: [],
+      tail: [],
+      gap: null,
+      totalEvents: 0,
+      totalBytes: 0,
+      liveAfterSeq: undefined,
+      unit: "provider_items",
+    });
+    expect(manager.getTimeline(agent.id)).toContainEqual({
+      type: "assistant_message",
+      text: "live append",
+    });
+  } finally {
+    await cleanup();
+  }
+});
+
+test("bounded history failure does not prevent live terminal accounting", async () => {
+  const { manager, agent, session, cleanup } = await createHeldHistoryFixture();
+  const run = drainAsyncGenerator(manager.streamAgent(agent.id, "initial"));
+  await manager.waitForAgentRunStart(agent.id);
+  const history = manager.readTimelineHistory(agent.id, { operation: "page", cursor: 0 });
+  const rejected = expect(history).rejects.toThrow("history reader failed");
+  try {
+    await session.readStarted.promise;
+    session.releaseRead.reject(new Error("history reader failed"));
+    await rejected;
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+    await run;
+    expect(manager.getAgent(agent.id)?.lifecycle).toBe("idle");
+    expect(toAgentPayload(manager.getAgent(agent.id)!).activeTurn).toBeNull();
+  } finally {
+    await cleanup();
+  }
+});
+
+test("bounded history waits for a preceding hydration to publish its complete boundary", async () => {
+  const { manager, agent, session, cleanup } = await createHeldHistoryFixture();
+  const gate = { started: deferred<void>(), released: deferred<void>() };
+  session.historyGate = gate;
+  const hydration = manager.hydrateTimelineFromProvider(agent.id, { force: true });
+  await gate.started.promise;
+  const history = manager.readTimelineHistory(agent.id, { operation: "windows" });
+  try {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(session.readCount).toBe(0);
+    gate.released.resolve();
+    await hydration;
+    await session.readStarted.promise;
+    session.releaseRead.resolve();
+    expect(await history).toMatchObject({
+      epoch: manager.getTimelineEpoch(agent.id),
+      liveAfterSeq: 1,
+      unit: "provider_items",
+    });
+  } finally {
+    gate.released.resolve();
+    await hydration;
+    await cleanup();
+  }
+});
+
+test("rejects a bounded history result when initial hydration changes only its live boundary", async () => {
+  const { manager, agent, session, cleanup } = await createHeldHistoryFixture({ restored: true });
+  const epoch = manager.getTimelineEpoch(agent.id);
+  const history = manager.readTimelineHistory(agent.id, { operation: "windows", epoch });
+  const rejected = expect(history).rejects.toThrow("History changed during bounded read");
+  try {
+    await session.readStarted.promise;
+    await manager.hydrateTimelineFromProvider(agent.id);
+    expect(manager.getTimelineEpoch(agent.id)).toBe(epoch);
+    session.releaseRead.resolve();
+    await rejected;
+  } finally {
+    await cleanup();
+  }
+});
 
 test("uses an injected timeline store without making it a production requirement", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-timeline-store-"));
@@ -14964,3 +15362,107 @@ test.each(["live", "history", "accepted"] as const)(
     }
   },
 );
+
+test("streamed provider message filtering preserves prompt outline positions and forwards user-only demand", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-message-selection-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const requested: Array<AgentHistoryStreamOptions | undefined> = [];
+  class MessageSession extends TestAgentSession {
+    async *streamHistoryEntries(options?: AgentHistoryStreamOptions) {
+      requested.push(options);
+      // An adapter that ignores the hint must still be filtered by the manager.
+      const values: Array<{ index: number; value: AgentStreamEvent }> = [
+        {
+          index: 2,
+          value: {
+            type: "timeline",
+            provider: "codex",
+            timestamp: "2026-10-22T00:00:00.000Z",
+            item: {
+              type: "user_message",
+              messageId: "user-first",
+              text: "  café 🧪\0\n  first prompt  ",
+            },
+          },
+        },
+        {
+          index: 3,
+          value: {
+            type: "timeline",
+            provider: "codex",
+            item: { type: "assistant_message", messageId: "assistant", text: "reply" },
+          },
+        },
+        {
+          index: 27,
+          value: {
+            type: "timeline",
+            provider: "codex",
+            timestamp: "2026-10-22T00:01:00.000Z",
+            item: { type: "user_message", messageId: "user-last", text: "z".repeat(300000) },
+          },
+        },
+      ];
+      for (const entry of values)
+        yield { ...entry, bytes: Buffer.byteLength(JSON.stringify(entry.value)) };
+    }
+  }
+  class MessageClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new MessageSession(config);
+    }
+  }
+  const manager = new AgentManager({
+    clients: { codex: new MessageClient() },
+    registry: storage,
+    logger,
+  });
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    const all = [];
+    for await (const row of manager.streamFullHistoryMessages(agent.id)) all.push(row);
+    expect(all.map((row) => [row.historyIndex, row.seq, row.providerMessageId])).toEqual([
+      [2, 3, "user-first"],
+      [3, 4, "assistant"],
+      [27, 28, "user-last"],
+    ]);
+    const selected = await streamTimelinePromptIndex(
+      "epoch",
+      manager.streamFullHistoryMessages(agent.id, { userOnly: true }),
+    );
+    expect(selected).toEqual(
+      await streamTimelinePromptIndex(
+        "epoch",
+        (async function* () {
+          yield* all;
+        })(),
+      ),
+    );
+    expect(selected.prompts).toEqual([
+      {
+        seq: 3,
+        historyIndex: 2,
+        messageId: "user-first",
+        timestamp: "2026-10-22T00:00:00.000Z",
+        preview: "café 🧪\0 first prompt",
+      },
+      {
+        seq: 28,
+        historyIndex: 27,
+        messageId: "user-last",
+        timestamp: "2026-10-22T00:01:00.000Z",
+        preview: "z".repeat(119) + "…",
+      },
+    ]);
+    expect(requested).toEqual([
+      { messagesOnly: true },
+      { messagesOnly: true, userMessagesOnly: true },
+    ]);
+  } finally {
+    await manager.flush();
+    await storage.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});

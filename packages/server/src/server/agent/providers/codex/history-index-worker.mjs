@@ -7,9 +7,10 @@ const db = new DatabaseSync(workerData.databasePath, { readOnly: true });
 try {
   db.exec("PRAGMA query_only=ON; PRAGMA cache_size=-4096; BEGIN");
   const thread = workerData.threadId;
+  // octet_length(column) reads byte lengths without loading JSON payload pages.
   const stats = db
     .prepare(`SELECT COUNT(*) AS count,
-    COALESCE(SUM(length(CAST(item_json AS BLOB))), 0) AS bytes,
+    COALESCE(SUM(octet_length(item_json)), 0) AS bytes,
     COALESCE(MAX(rollout_ordinal), 0) AS lastOrdinal,
     COALESCE(MAX(updated_at_ordinal), 0) AS lastUpdate
     FROM thread_items WHERE thread_id = ?`)
@@ -17,7 +18,7 @@ try {
   const count = Number(stats.count);
   const totalBytes = Number(stats.bytes);
   const metadata = `SELECT item_id AS itemId, turn_id AS turnId,
-    rollout_ordinal AS ordinal, length(CAST(item_json AS BLOB)) AS bytes
+    rollout_ordinal AS ordinal, octet_length(item_json) AS bytes
     FROM thread_items WHERE thread_id = ?`;
   const previous = db.prepare(`SELECT item_id AS id FROM thread_items
     WHERE thread_id = ? AND turn_id = ? AND rollout_ordinal < ?
@@ -120,6 +121,35 @@ try {
     }
     const next = backwards ? cursor - visited : cursor + visited;
     selection = { entries: refs, oversized, nextCursor: next <= 0 || next >= count ? null : next };
+  } else if (workerData.operation === "messages") {
+    // One metadata pass preserves global positions and exact per-turn anchors.
+    // Do not load item_json, collect tool references, or repeat OFFSET scans.
+    const messages = [];
+    const previousByTurn = new Map();
+    let index = 0;
+    for (const row of db
+      .prepare(`SELECT item_id AS itemId, turn_id AS turnId,
+      rollout_ordinal AS ordinal, octet_length(item_json) AS bytes, item_type AS messageType
+      FROM thread_items WHERE thread_id = ? ORDER BY rollout_ordinal`)
+      .iterate(thread)) {
+      if (
+        row.messageType === "userMessage" ||
+        (!workerData.userOnly && row.messageType === "agentMessage")
+      ) {
+        messages.push({
+          itemId: String(row.itemId),
+          turnId: String(row.turnId),
+          ordinal: Number(row.ordinal),
+          bytes: Number(row.bytes),
+          index,
+          previousItemId: previousByTurn.get(row.turnId) ?? null,
+          messageType: row.messageType,
+        });
+      }
+      previousByTurn.set(row.turnId, String(row.itemId));
+      index++;
+    }
+    selection = { messages };
   } else throw new RangeError("Unknown history operation");
   const userMessages = db
     .prepare(`SELECT item_id AS messageId, turn_id AS turnId

@@ -26,6 +26,7 @@ import {
 } from "./workspace-registry.js";
 import { createNoopWorkspaceGitService } from "./test-utils/workspace-git-service-stub.js";
 import type { WorkspaceGitObserverService } from "./session/workspace-git-observer/workspace-git-observer-service.js";
+import type { StoredAgentRecord } from "./agent/agent-storage.js";
 
 interface SessionInternals {
   buildWorkspaceDescriptorMap: () => Promise<Map<string, unknown>>;
@@ -128,6 +129,7 @@ function createSessionForWorkspaceGitWatchTests(options?: {
   ) => void;
   serviceProxy?: ServiceProxySubsystem;
   scriptRuntimeStore?: WorkspaceScriptRuntimeStore;
+  getStoredAgent?: SessionOptions["agentStorage"]["get"];
 }): {
   session: Session;
   emitted: Array<{ type: string; payload: unknown }>;
@@ -207,7 +209,7 @@ function createSessionForWorkspaceGitWatchTests(options?: {
     }),
     agentStorage: createStub<SessionOptions["agentStorage"]>({
       list: async () => [],
-      get: async () => null,
+      get: options?.getStoredAgent ?? (async () => null),
     }),
     projectRegistry: createStub<SessionOptions["projectRegistry"]>({
       subscribeToMutations: () => () => {},
@@ -319,6 +321,56 @@ function seedGitWorkspace(input: {
 }
 
 describe("workspace git watch targets", () => {
+  test("a visible client's stored agent selection resumes only its checkout coverage", async () => {
+    const { session, workspaceGitService, projects, workspaces } =
+      createSessionForWorkspaceGitWatchTests({
+        getStoredAgent: async (id) => asInternals<StoredAgentRecord>({ id, cwd: REPO_CWD }),
+      });
+    seedGitWorkspace({
+      projects,
+      workspaces,
+      projectId: "first",
+      workspaceId: "selected",
+      cwd: REPO_CWD,
+      name: "selected",
+    });
+    seedGitWorkspace({
+      projects,
+      workspaces,
+      projectId: "second",
+      workspaceId: "other",
+      cwd: path.join(REPO_CWD, "other"),
+      name: "other",
+    });
+    const source = {};
+    session.updateClientCapabilities({}, source);
+    await session.handleMessage(
+      { type: "fetch_workspaces_request", requestId: "initial", subscribe: {} },
+      source,
+    );
+    await session.handleMessage(
+      {
+        type: "client_heartbeat",
+        deviceType: "web",
+        focusedAgentId: "stored-agent",
+        focusedTerminalId: null,
+        lastActivityAt: new Date().toISOString(),
+        appVisible: true,
+      },
+      source,
+    );
+    await vi.waitFor(() =>
+      expect(workspaceGitService.registerWorkspace).toHaveBeenCalledWith(
+        { cwd: REPO_CWD, observeWorkingTree: true },
+        expect.any(Function),
+      ),
+    );
+    expect(workspaceGitService.registerWorkspace).not.toHaveBeenCalledWith(
+      { cwd: path.join(REPO_CWD, "other"), observeWorkingTree: true },
+      expect.any(Function),
+    );
+    await session.cleanup();
+  });
   test("emits one workspace_update when the workspace git service emits a changed snapshot", async () => {
     const { session, emitted, projects, workspaces, workspaceGitService, subscriptions } =
       createSessionForWorkspaceGitWatchTests();
@@ -356,7 +408,7 @@ describe("workspace git watch targets", () => {
     syncGitObserver(session, REPO_CWD, "ws-10");
 
     expect(workspaceGitService.registerWorkspace).toHaveBeenCalledWith(
-      { cwd: REPO_CWD },
+      { cwd: REPO_CWD, observeWorkingTree: false },
       expect.any(Function),
     );
 
@@ -442,7 +494,7 @@ describe("workspace git watch targets", () => {
       requestId: REPO_SUBSCRIPTION_REQUEST_ID,
     });
     expect(workspaceGitService.registerWorkspace).toHaveBeenCalledWith(
-      { cwd: REPO_CWD },
+      { cwd: REPO_CWD, observeWorkingTree: false },
       expect.any(Function),
     );
 

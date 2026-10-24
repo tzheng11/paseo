@@ -3,7 +3,12 @@ import { View } from "react-native";
 import { useTranslation } from "react-i18next";
 import { StyleSheet } from "react-native-unistyles";
 import type { TerminalProfile } from "@getpaseo/protocol/messages";
-import { Combobox, type ComboboxOption, type ComboboxProps } from "@/components/ui/combobox";
+import {
+  Combobox,
+  ComboboxItem,
+  type ComboboxOption,
+  type ComboboxProps,
+} from "@/components/ui/combobox";
 import { HostStatusDot } from "@/components/host-status-dot";
 import { HostPicker } from "@/components/hosts/host-picker";
 import type { LaunchTarget } from "@/new-workspace-launch/target";
@@ -19,6 +24,17 @@ import {
 import { branchIcon, folderIcon, ProjectIcon, pullRequestIcon } from "./icons";
 import { LaunchControl } from "./launch-control";
 import { AddProjectOption, IsolationOption, ProjectOption, RefOption } from "./options";
+import { CornerDownRight } from "lucide-react-native";
+import { withUnistyles } from "react-native-unistyles";
+import type { Theme } from "@/styles/theme";
+
+const ThemedParentIcon = withUnistyles(CornerDownRight);
+const parentIcon = (
+  <ThemedParentIcon
+    size={16}
+    uniProps={(theme: Theme) => ({ color: theme.colors.foregroundMuted })}
+  />
+);
 
 type Isolation = "local" | "worktree";
 type RenderOption = NonNullable<ComboboxProps["renderOption"]>;
@@ -51,6 +67,12 @@ export interface NewWorkspaceFormProps {
     selectedServerId: string;
     onSelect: (id: string) => void;
     onAddHost: () => void;
+  };
+  parent: PickerControl & {
+    options: ComboboxOption[];
+    selectedOptionId: string;
+    triggerLabel: string;
+    onSelect: (id: string) => void;
   };
   isolation: PickerControl & {
     effectiveIsolation: Isolation;
@@ -165,11 +187,25 @@ function useRefRenderOption(itemById: Map<string, PickerItem>, isPending: boolea
  */
 export function useNewWorkspaceForm(props: NewWorkspaceFormProps): ReactElement {
   const { t } = useTranslation();
-  const { isCompact, isPending, project, host, isolation, base, launch } = props;
+  const { isCompact, isPending, project, host, parent, isolation, base, launch } = props;
   const variant: FieldTriggerVariant = isCompact ? "field" : "badge";
   const projectPicker = useProjectPicker(project, isPending);
   const isolationPicker = useIsolationPicker(isolation, isPending);
   const renderRefOption = useRefRenderOption(base.itemById, isPending);
+  const renderParentOption = useCallback<RenderOption>(
+    (row) => (
+      <ComboboxItem
+        label={row.option.label}
+        description={row.option.description}
+        selected={row.selected}
+        active={row.active}
+        onPress={row.onPress}
+        disabled={isPending}
+        testID={`new-workspace-parent-option-${row.option.id}`}
+      />
+    ),
+    [isPending],
+  );
 
   const selectedHostLabel =
     host.allHosts.find((h) => h.serverId === host.selectedServerId)?.label ?? "Host";
@@ -258,6 +294,19 @@ export function useNewWorkspaceForm(props: NewWorkspaceFormProps): ReactElement 
       testID="workspace-create-isolation-trigger"
     />
   ) : null;
+  const parentField = (
+    <FieldTrigger
+      ref={parent.anchorRef}
+      variant={variant}
+      label={t("newWorkspace.parent.label")}
+      tooltip={t("newWorkspace.parent.label")}
+      icon={parentIcon}
+      value={parent.triggerLabel}
+      onPress={parent.open}
+      disabled={isPending}
+      testID="new-workspace-parent-picker-trigger"
+    />
+  );
   const baseField = base.showRefPicker ? (
     <FieldTrigger
       ref={base.anchorRef}
@@ -285,6 +334,21 @@ export function useNewWorkspaceForm(props: NewWorkspaceFormProps): ReactElement 
 
   const pickers = (
     <>
+      <Combobox
+        options={parent.options}
+        value={parent.selectedOptionId}
+        onSelect={parent.onSelect}
+        searchable
+        searchPlaceholder={t("newWorkspace.parent.searchPlaceholder")}
+        title={t("newWorkspace.parent.label")}
+        open={parent.openState}
+        onOpenChange={parent.onOpenChange}
+        desktopPlacement="bottom-start"
+        desktopMinWidth={360}
+        anchorRef={parent.anchorRef}
+        emptyText={t("newWorkspace.parent.empty")}
+        renderOption={renderParentOption}
+      />
       <Combobox
         options={project.options}
         value={project.selectedOptionId}
@@ -335,6 +399,7 @@ export function useNewWorkspaceForm(props: NewWorkspaceFormProps): ReactElement 
       <View testID="new-workspace-ref-picker-row" style={styles.compactStack}>
         {projectField}
         {hostField}
+        {parentField}
         {isolationField}
         {baseField}
         {launchField}
@@ -351,6 +416,7 @@ export function useNewWorkspaceForm(props: NewWorkspaceFormProps): ReactElement 
     <View testID="new-workspace-ref-picker-row" style={styles.desktopRow} pointerEvents="box-none">
       <View style={styles.desktopControl}>{projectField}</View>
       <View style={styles.desktopControl}>{hostField}</View>
+      <View style={styles.desktopControl}>{parentField}</View>
       {isolationField ? <View style={styles.desktopControl}>{isolationField}</View> : null}
       {baseField ? <View style={styles.desktopControl}>{baseField}</View> : null}
       <View style={styles.launchSpacer} pointerEvents="none" />

@@ -100,6 +100,7 @@ export const ja: TranslationResources = {
       addProject: "プロジェクトを追加",
       home: "ホーム",
       groupByProject: "プロジェクトでグループ化",
+      groupByNone: "ワークスペース階層を表示",
       groupByStatus: "ステータスでグループ化",
       modelGroupLabel: "モデル",
       modelSearchKeywords: "モデルを切り替え モデルを変更 モデルを設定 モデルを選択",
@@ -1177,6 +1178,7 @@ export const ja: TranslationResources = {
       trigger: "表示設定",
       heading: "表示",
       grouping: {
+        none: "なし",
         label: "グループ化",
         project: "プロジェクト",
         status: "ステータス",
@@ -1321,6 +1323,7 @@ export const ja: TranslationResources = {
         pending: "保留中: {{count}}",
       },
       actions: {
+        addChild: "子ワークスペースを追加",
         menu: "ワークスペースアクション",
         newWorkspace: "新しいワークスペース",
         showMore: "さらに表示",
@@ -1360,6 +1363,13 @@ export const ja: TranslationResources = {
     },
   },
   newWorkspace: {
+    parent: {
+      label: "親ワークスペース",
+      none: "親なし",
+      searchPlaceholder: "ワークスペースを検索",
+      empty: "利用可能なワークスペースはありません。",
+      unavailable: "ワークスペースを利用できません",
+    },
     title: "新しいワークスペース",
     create: "作成",
     isolation: {

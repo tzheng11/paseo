@@ -1,3 +1,4 @@
+import type { WorkspaceSidebarPlacement } from "./workspace-pin-placement.js";
 import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
 
@@ -37,6 +38,7 @@ export interface CreatePaseoWorktreeInput extends CreateWorktreeCoreInput {
   siblingOrder?: number;
   background?: boolean;
   callerWorkspaceId?: string;
+  sidebarPlacement?: WorkspaceSidebarPlacement;
 }
 
 export interface CreatePaseoWorktreeResult {
@@ -109,6 +111,7 @@ async function createPaseoWorktreeWithPriority(
       siblingOrder: input.siblingOrder,
       background: input.background,
       callerWorkspaceId: input.callerWorkspaceId,
+      sidebarPlacement: input.sidebarPlacement,
       ...(createdWorktree.intent.kind === "checkout-change-request" &&
       createdWorktree.intent.headRepository
         ? {

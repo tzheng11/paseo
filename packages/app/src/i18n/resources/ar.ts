@@ -99,6 +99,7 @@ export const ar: TranslationResources = {
       addProject: "إضافة مشروع",
       home: "بيت",
       groupByProject: "تجميع حسب المشروع",
+      groupByNone: "عرض تسلسل مساحات العمل",
       groupByStatus: "تجميع حسب الحالة",
       modelGroupLabel: "النموذج",
       modelSearchKeywords: "تبديل النموذج تغيير النموذج تعيين النموذج اختيار النموذج",
@@ -1164,6 +1165,7 @@ export const ar: TranslationResources = {
       trigger: "تفضيلات العرض",
       heading: "العرض",
       grouping: {
+        none: "بدون",
         label: "التجميع",
         project: "المشروع",
         status: "الحالة",
@@ -1307,6 +1309,7 @@ export const ar: TranslationResources = {
         pending: "قيد الانتظار: {{count}}",
       },
       actions: {
+        addChild: "إضافة مساحة عمل فرعية",
         menu: "إجراءات Workspace",
         newWorkspace: "مساحة عمل جديدة",
         showMore: "عرض المزيد",
@@ -1346,6 +1349,13 @@ export const ar: TranslationResources = {
     },
   },
   newWorkspace: {
+    parent: {
+      label: "اجعل هذه مساحة فرعية من",
+      none: "بدون أصل",
+      searchPlaceholder: "البحث في مساحات العمل",
+      empty: "لا توجد مساحات عمل متاحة.",
+      unavailable: "مساحة العمل غير متاحة",
+    },
     title: "مساحة عمل جديدة",
     create: "يخلق",
     isolation: {
