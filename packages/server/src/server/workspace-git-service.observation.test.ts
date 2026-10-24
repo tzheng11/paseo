@@ -434,7 +434,7 @@ describe("WorkspaceGitService checkout observation", () => {
     await service.dispose();
   });
 
-  test("waits for the initial watcher inventory before building a cold diff", async () => {
+  test("builds a cold explicit diff before inventory while registration readiness waits", async () => {
     const watcher = createWatcherHarness();
     const inventoryFinished = createDeferred<void>();
     let builds = 0;
@@ -449,12 +449,21 @@ describe("WorkspaceGitService checkout observation", () => {
       },
     });
     const subscription = service.registerWorkspace({ cwd: REPO_CWD }, () => {});
+    let observationReady = false;
+    const opening = subscription.ready?.then(() => {
+      observationReady = true;
+      return observationReady;
+    });
     try {
+      expect(subscription.ready).toBeInstanceOf(Promise);
       const read = service.getCheckoutDiff(REPO_CWD, { mode: "uncommitted" });
       await flushPromises();
-      expect(builds).toBe(0);
+      expect(builds).toBe(1);
+      await expect(read).resolves.toEqual({ diff: "", structured: [] });
+      expect(observationReady).toBe(false);
       inventoryFinished.resolve();
-      await read;
+      await opening;
+      expect(observationReady).toBe(true);
       expect(builds).toBe(1);
     } finally {
       inventoryFinished.resolve();
@@ -1711,14 +1720,18 @@ describe("WorkspaceGitService checkout observation", () => {
     await vi.waitFor(() => {
       expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
     });
-    expect(getCheckoutDiff).toHaveBeenCalledTimes(1);
+    await flushPromises();
+    await vi.advanceTimersByTimeAsync(150);
+    // Initial read and registration-gap reconciliation are distinct phases.
+    expect(getCheckoutDiff).toHaveBeenCalledTimes(2);
+    getCheckoutDiff.mockClear();
 
     watcher.records
       .find((record) => record.directory === REPO_CWD)
       ?.callback(null, [{ path: path.join(REPO_CWD, "tracked.txt"), type: "update" }]);
     await vi.advanceTimersByTimeAsync(1_000);
     await flushPromises();
-    expect(getCheckoutDiff).toHaveBeenCalledTimes(1);
+    expect(getCheckoutDiff).not.toHaveBeenCalled();
 
     watcher.records
       .find((record) => record.directory === GIT_DIR)
@@ -1726,7 +1739,7 @@ describe("WorkspaceGitService checkout observation", () => {
     await vi.advanceTimersByTimeAsync(1_000);
     await vi.advanceTimersByTimeAsync(150);
     await vi.waitFor(() => {
-      expect(getCheckoutDiff).toHaveBeenCalledTimes(2);
+      expect(getCheckoutDiff).toHaveBeenCalledTimes(1);
     });
 
     diffSubscription.unsubscribe();

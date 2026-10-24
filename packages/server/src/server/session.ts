@@ -8130,6 +8130,7 @@ export class Session {
         agentManager: this.agentManager,
         agentStorage: this.agentStorage,
         logger: this.sessionLogger,
+        historyReadMode: "bounded",
       });
       const result = await this.agentManager.readTimelineHistory(msg.agentId, msg);
       const payload =

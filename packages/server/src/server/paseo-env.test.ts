@@ -79,6 +79,20 @@ describe("paseo env contract", () => {
     }
   });
 
+  test("keeps the Darwin watcher choice inside daemon processes", () => {
+    const base = { PASEO_DARWIN_WATCH_BACKEND: "node", PATH: "/usr/bin" };
+    expect(createPaseoInternalEnv(base).PASEO_DARWIN_WATCH_BACKEND).toBe("node");
+    for (const inherited of [base, {}]) {
+      const overlay = { PASEO_DARWIN_WATCH_BACKEND: "node" };
+      expect(
+        createExternalProcessEnv(inherited, overlay).PASEO_DARWIN_WATCH_BACKEND,
+      ).toBeUndefined();
+      expect(
+        createExternalCommandProcessEnv("node", inherited, overlay).PASEO_DARWIN_WATCH_BACKEND,
+      ).toBeUndefined();
+    }
+  });
+
   test("applies non-control overlays to external process env", () => {
     const env = createExternalProcessEnv(baseEnv, { PATH: "/custom/bin" }, { CUSTOM: "value" });
 

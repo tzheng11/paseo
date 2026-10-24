@@ -251,6 +251,7 @@ function createGitHubServiceStub(): ForgeService {
 }
 
 interface CreateServiceTestOptions {
+  getCheckoutDiff?: ReturnType<typeof vi.fn>;
   subscribe?: ReturnType<typeof vi.fn>;
   getCheckoutStatus?: ReturnType<typeof vi.fn>;
   getCheckoutSnapshotFacts?: ReturnType<typeof vi.fn>;
@@ -327,6 +328,60 @@ function createService(options?: CreateServiceTestOptions) {
 }
 
 describe("WorkspaceGitServiceImpl", () => {
+  test("an explicit diff does not wait for queued recursive or metadata observation", async () => {
+    const watch = createDeferred<ReturnType<typeof createAsyncSubscription>>();
+    const getCheckoutDiff = vi.fn(async () => ({ diff: "fresh" }));
+    const service = createService({ subscribe: vi.fn(() => watch.promise), getCheckoutDiff });
+    const owner = service.registerWorkspace({ cwd: REPO_CWD }, () => {});
+    let result: unknown;
+    const reading = service.getCheckoutDiff(REPO_CWD, { mode: "uncommitted" }).then((value) => {
+      result = value;
+      return value;
+    });
+    try {
+      for (let turn = 0; turn < 30; turn++) await Promise.resolve();
+      expect(result).toEqual({ diff: "fresh" });
+      expect(getCheckoutDiff).toHaveBeenCalledTimes(1);
+    } finally {
+      owner.unsubscribe();
+      watch.resolve(createAsyncSubscription());
+      await reading;
+      await service.dispose();
+    }
+  });
+
+  test("registration readiness includes metadata setup after the recursive watcher opens", async () => {
+    const recursive = createDeferred<ReturnType<typeof createAsyncSubscription>>();
+    const metadata = createDeferred<ReturnType<typeof createAsyncSubscription>>();
+    const subscribe = vi.fn((cwd: string) =>
+      cwd === REPO_CWD ? recursive.promise : metadata.promise,
+    );
+    const service = createService({ subscribe });
+    const owner = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    let ready = false;
+    const opening = owner.ready?.then(() => {
+      ready = true;
+      return ready;
+    });
+    try {
+      await vi.waitFor(() => expect(subscribe).toHaveBeenCalledTimes(1));
+      expect(ready).toBe(false);
+      recursive.resolve(createAsyncSubscription());
+      await vi.waitFor(() => expect(subscribe).toHaveBeenCalledTimes(2));
+      expect(subscribe.mock.calls.map(([cwd]) => cwd)).toEqual([REPO_CWD, join(REPO_CWD, ".git")]);
+      expect(ready).toBe(false);
+      metadata.resolve(createAsyncSubscription());
+      await opening;
+      expect(ready).toBe(true);
+    } finally {
+      recursive.resolve(createAsyncSubscription());
+      metadata.resolve(createAsyncSubscription());
+      owner.unsubscribe();
+      await opening;
+      await service.dispose();
+    }
+  });
+
   test("cold snapshots keep progressing while warm refresh generations are held", async () => {
     const warm = Array.from({ length: 3 }, (_, i) => path.resolve(`/tmp/held-warm-${i}`));
     const cold = Array.from({ length: 92 }, (_, i) => path.resolve(`/tmp/progress-cold-${i}`));
@@ -476,7 +531,7 @@ describe("WorkspaceGitServiceImpl", () => {
     const listener = vi.fn();
     const subscription = service.registerWorkspace({ cwd: REPO_CWD }, listener);
 
-    expect(subscription).toEqual({ unsubscribe: expect.any(Function) });
+    expect(subscription).toEqual({ ready: expect.any(Promise), unsubscribe: expect.any(Function) });
     expect("initial" in subscription).toBe(false);
     expect(listener).not.toHaveBeenCalled();
     expect(service.peekSnapshot(REPO_CWD)).toBeNull();

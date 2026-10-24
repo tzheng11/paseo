@@ -1,6 +1,6 @@
 import type { Logger } from "pino";
 
-import type { AgentProvider } from "./agent-sdk-types.js";
+import type { AgentProvider, AgentResumeSessionOptions } from "./agent-sdk-types.js";
 import type { AgentManager, ManagedAgent } from "./agent-manager.js";
 import type { AgentStorage } from "./agent-storage.js";
 import {
@@ -21,10 +21,21 @@ export class AgentNotFoundError extends Error {
 
 interface PendingAgentInitialization {
   promise: Promise<ManagedAgent>;
-  options: { broadcastTimeline: boolean };
+  options: { broadcastTimeline: boolean; historyReadMode?: "bounded" };
 }
 
 const pendingAgentInitializations = new Map<string, PendingAgentInitialization>();
+
+function assertCompatibleHistoryLoad(
+  pending: PendingAgentInitialization | undefined,
+  mode: "bounded" | undefined,
+): void {
+  if (pending && mode === "bounded" && pending.options.historyReadMode !== "bounded") {
+    throw new Error(
+      "Agent history is already loading through a compatible replay; retry when ready",
+    );
+  }
+}
 
 export type AgentLoaderManager = Pick<
   AgentManager,
@@ -41,6 +52,7 @@ export interface EnsureAgentLoadedDeps {
   agentStorage: AgentStorage;
   validProviders?: Iterable<AgentProvider>;
   broadcastTimeline?: boolean;
+  historyReadMode?: "bounded";
   logger: Logger;
 }
 
@@ -71,10 +83,14 @@ export async function ensureAgentLoaded(
   agentId: string,
   deps: EnsureAgentLoadedDeps,
 ): Promise<ManagedAgent> {
+  // The close barrier also waits for a pending provider resume. Reject an
+  // incompatible load before that wait can join its unbounded history work.
+  assertCompatibleHistoryLoad(pendingAgentInitializations.get(agentId), deps.historyReadMode);
   await deps.agentManager.waitForAgentClose?.(agentId);
 
   const inflight = pendingAgentInitializations.get(agentId);
   if (inflight) {
+    assertCompatibleHistoryLoad(inflight, deps.historyReadMode);
     inflight.options.broadcastTimeline ||= deps.broadcastTimeline === true;
     return inflight.promise;
   }
@@ -91,12 +107,14 @@ export async function ensureAgentLoaded(
 
   const laterInflight = pendingAgentInitializations.get(agentId);
   if (laterInflight) {
+    assertCompatibleHistoryLoad(laterInflight, deps.historyReadMode);
     laterInflight.options.broadcastTimeline ||= deps.broadcastTimeline === true;
     return laterInflight.promise;
   }
 
   const pendingOptions = {
     broadcastTimeline: deps.broadcastTimeline === true,
+    historyReadMode: deps.historyReadMode,
   };
   const initPromise = (async () => {
     const record = await deps.agentStorage.get(agentId);
@@ -113,15 +131,26 @@ export async function ensureAgentLoaded(
 
     let snapshot: ManagedAgent;
     if (handle) {
+      let resumeOptions: AgentResumeSessionOptions | undefined;
+      if (record.archivedAt) resumeOptions = { purpose: "history" };
+      if (deps.historyReadMode) {
+        resumeOptions = {
+          purpose: record.archivedAt ? "history" : "interactive",
+          historyReadMode: deps.historyReadMode,
+        };
+      }
       snapshot = await deps.agentManager.resumeAgentFromPersistence(
         handle,
         buildConfigOverrides(record),
         agentId,
         { ...extractTimestamps(record), attention: extractAttention(record) },
-        record.archivedAt ? { purpose: "history" } : undefined,
+        resumeOptions,
       );
       deps.logger.info({ agentId, provider: record.provider }, "Agent resumed from persistence");
     } else {
+      if (deps.historyReadMode === "bounded") {
+        throw new Error("Bounded history requires an existing provider session");
+      }
       // No provider handle to resume: this starts the agent's first session rather than
       // bringing one back, so it stamps activity and carries no stored attention. Records
       // without a handle never got far enough to accumulate either.
