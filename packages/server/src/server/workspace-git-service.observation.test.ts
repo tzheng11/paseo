@@ -9,6 +9,7 @@ import type {
   CheckoutSnapshotFacts,
   CheckoutStatusGit,
 } from "../utils/checkout-git.js";
+import { getCheckoutStatus as getCheckoutStatusUncached } from "../utils/checkout-git.js";
 import { CheckoutDiffManager } from "./checkout-diff-manager.js";
 import type { FileObserver } from "./file-observer/index.js";
 import { WorkspaceGitServiceImpl } from "./workspace-git-service.js";
@@ -1256,6 +1257,171 @@ describe("WorkspaceGitService checkout observation", () => {
 
     subscription.unsubscribe();
     service.dispose();
+  });
+
+  test("structural fetch refresh preserves dirty state until index, HEAD or explicit reads", async () => {
+    const watcher = createWatcherHarness();
+    const fetchStarted = createDeferred<void>();
+    const releaseFetch = createDeferred<void>();
+    let branch = "main";
+    let dirty = true;
+    const runGitCommand = vi.fn(async (args: string[]) => {
+      let stdout = "";
+      if (args[0] === "status") stdout = dirty ? " M tracked.txt\n" : "";
+      else if (args[0] === "rev-list") stdout = "2\t3\n";
+      else if (args[0] === "rev-parse") stdout = `${REPO_CWD}\n`;
+      return { stdout, stderr: "", truncated: false, exitCode: 0, signal: null };
+    });
+    const getCheckoutShortstat = vi.fn(async () => ({ additions: 7, deletions: 1 }));
+    const service = createService(watcher, {
+      getCheckoutStatus: getCheckoutStatusUncached,
+      getCheckoutShortstat,
+      runGitCommand,
+      createRunGitCommand: () => runGitCommand,
+      getCheckoutSnapshotFacts: vi.fn(async (cwd: string) => ({
+        ...createCheckoutFacts(cwd),
+        currentBranch: branch,
+        remoteUrl: REMOTE_URL,
+        comparisonBaseRef: "main",
+        upstreamStatus: { ref: "origin/feature", aheadBehind: { ahead: 4, behind: 5 } },
+      })),
+      hasOriginRemote: vi.fn(async () => true),
+      runGitFetch: vi.fn(async () => {
+        fetchStarted.resolve();
+        await releaseFetch.promise;
+        return { changes: null, error: null };
+      }),
+    });
+    const subscription = service.registerWorkspace(
+      { cwd: REPO_CWD, observeWorkingTree: false },
+      vi.fn(),
+    );
+    try {
+      await fetchStarted.promise;
+      await vi.waitFor(() => {
+        expect(service.peekSnapshot(REPO_CWD)?.git.isDirty).toBe(true);
+        expect(service.getMetrics().workspaceRefreshInFlightCount).toBe(0);
+        expect(getWatcherRecordsForDirectory(watcher, GIT_DIR)).toHaveLength(1);
+      });
+      branch = "feature";
+      dirty = false;
+      runGitCommand.mockClear();
+      getCheckoutShortstat.mockClear();
+      releaseFetch.resolve();
+      await vi.waitFor(() => expect(service.getMetrics().fetchInFlightCount).toBe(0));
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.waitFor(() => {
+        expect(service.peekSnapshot(REPO_CWD)?.git).toMatchObject({
+          currentBranch: "feature",
+          baseRef: "main",
+          aheadBehind: { ahead: 3, behind: 2 },
+          aheadOfOrigin: 4,
+          behindOfOrigin: 5,
+          isDirty: true,
+          diffStat: { additions: 7, deletions: 1 },
+        });
+        expect(service.getMetrics().workspaceRefreshInFlightCount).toBe(0);
+      });
+      expect(runGitCommand.mock.calls.filter(([args]) => args[0] === "status")).toEqual([]);
+      expect(getCheckoutShortstat).not.toHaveBeenCalled();
+
+      getWatcherRecordsForDirectory(watcher, GIT_DIR)[0]!.callback(null, [
+        { path: path.join(GIT_DIR, "index"), type: "update" },
+      ]);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.waitFor(() => expect(service.peekSnapshot(REPO_CWD)?.git.isDirty).toBe(false));
+      expect(runGitCommand.mock.calls.filter(([args]) => args[0] === "status")).toHaveLength(1);
+      expect(getCheckoutShortstat).toHaveBeenCalledTimes(1);
+
+      dirty = true;
+      getWatcherRecordsForDirectory(watcher, GIT_DIR)[0]!.callback(null, [
+        { path: path.join(GIT_DIR, "HEAD"), type: "update" },
+      ]);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.waitFor(() => expect(service.peekSnapshot(REPO_CWD)?.git.isDirty).toBe(true));
+      expect(runGitCommand.mock.calls.filter(([args]) => args[0] === "status")).toHaveLength(2);
+
+      dirty = false;
+      await expect(
+        service.getSnapshot(REPO_CWD, {
+          force: true,
+          includeForge: false,
+          reason: "explicit-dirty-read",
+        }),
+      ).resolves.toMatchObject({ git: { isDirty: false } });
+      expect(runGitCommand.mock.calls.filter(([args]) => args[0] === "status")).toHaveLength(3);
+    } finally {
+      subscription.unsubscribe();
+      await service.dispose();
+    }
+  });
+
+  test("structural refresh reads full worktree state after a non-Git cache becomes Git", async () => {
+    const watcher = createWatcherHarness();
+    const fetchStarted = createDeferred<void>();
+    const releaseFetch = createDeferred<void>();
+    let gitAvailable = true;
+    const runGitCommand = vi.fn(async (args: string[]) => ({
+      stdout: args[0] === "status" ? " M tracked.txt\n" : `${REPO_CWD}\n`,
+      stderr: "",
+      truncated: false,
+      exitCode: 0,
+      signal: null,
+    }));
+    const getCheckoutShortstat = vi.fn(async () => ({ additions: 3, deletions: 4 }));
+    const service = createService(watcher, {
+      getCheckoutStatus: getCheckoutStatusUncached,
+      getCheckoutShortstat,
+      createRunGitCommand: () => runGitCommand,
+      getCheckoutSnapshotFacts: vi.fn(async (cwd: string) =>
+        gitAvailable ? { ...createCheckoutFacts(cwd), remoteUrl: REMOTE_URL } : { isGit: false },
+      ),
+      hasOriginRemote: vi.fn(async () => true),
+      runGitFetch: vi.fn(async () => {
+        fetchStarted.resolve();
+        await releaseFetch.promise;
+        return { changes: null, error: null };
+      }),
+    });
+    const subscription = service.registerWorkspace(
+      { cwd: REPO_CWD, observeWorkingTree: false },
+      vi.fn(),
+    );
+    try {
+      await fetchStarted.promise;
+      await vi.waitFor(() => {
+        expect(service.peekSnapshot(REPO_CWD)?.git.isDirty).toBe(true);
+        expect(service.getMetrics().workspaceRefreshInFlightCount).toBe(0);
+      });
+      gitAvailable = false;
+      await expect(
+        service.getSnapshot(REPO_CWD, {
+          force: true,
+          includeForge: false,
+          reason: "repository-unavailable",
+        }),
+      ).resolves.toMatchObject({ git: { isGit: false, isDirty: null, diffStat: null } });
+
+      gitAvailable = true;
+      runGitCommand.mockClear();
+      getCheckoutShortstat.mockClear();
+      releaseFetch.resolve();
+      await vi.waitFor(() => expect(service.getMetrics().fetchInFlightCount).toBe(0));
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.waitFor(() => {
+        expect(service.peekSnapshot(REPO_CWD)?.git).toMatchObject({
+          isGit: true,
+          isDirty: true,
+          diffStat: { additions: 3, deletions: 4 },
+        });
+      });
+      expect(runGitCommand.mock.calls.filter(([args]) => args[0] === "status")).toHaveLength(1);
+      expect(getCheckoutShortstat).toHaveBeenCalledTimes(1);
+    } finally {
+      releaseFetch.resolve();
+      subscription.unsubscribe();
+      await service.dispose();
+    }
   });
 
   test("resolves metadata batch paths once across 135 worktrees and 256 deleted events", async () => {

@@ -25,6 +25,7 @@ import {
   createPullRequest,
   getCachedCheckoutShortstat,
   getCheckoutSnapshotFacts,
+  getCheckoutIdentity,
   getCurrentBranch,
   getCheckoutDiff,
   getCheckoutShortstat,
@@ -521,6 +522,28 @@ describe("checkout git utilities", () => {
     expect(message).toBe("update file");
   });
 
+  it("refreshes structural status without scanning a cached dirty worktree", async () => {
+    execFileSync("git", ["checkout", "-b", "feature"], { cwd: repoDir });
+    commitFile(repoDir, "feature.txt", "feature\n", "feature commit");
+    writeFileSync(join(repoDir, "file.txt"), "unobserved edit\n");
+
+    startGitCommandMetrics();
+    const structural = await getCheckoutStatus(repoDir, undefined, {
+      cachedWorktree: { isDirty: false },
+    });
+    const metrics = stopGitCommandMetrics();
+
+    expect(structural).toMatchObject({
+      isGit: true,
+      currentBranch: "feature",
+      baseRef: "main",
+      aheadBehind: { ahead: 1, behind: 0 },
+      isDirty: false,
+    });
+    expect(metrics.commands.filter((command) => command.args[0] === "status")).toEqual([]);
+    await expect(getCheckoutStatus(repoDir)).resolves.toMatchObject({ isDirty: true });
+  });
+
   it("honors commit signing configuration", async () => {
     execFileSync("git", ["config", "commit.gpgsign", "true"], { cwd: repoDir });
     execFileSync("git", ["config", "gpg.format", "openpgp"], { cwd: repoDir });
@@ -660,6 +683,86 @@ describe("checkout git utilities", () => {
     expect(diff.diff).toContain("copy from source.txt");
     expect(diff.diff).toContain("copy to copy.txt");
     expect(diff.diff).not.toContain("+added source line");
+  });
+
+  it("reads fresh main, linked and owned checkout identity without ref or PR enrichment", async () => {
+    const linked = join(tempDir, "linked");
+    execFileSync("git", ["worktree", "add", "-b", "linked", linked], { cwd: repoDir });
+    const owned = await createLegacyWorktreeForTest({
+      branchName: "owned",
+      cwd: repoDir,
+      baseBranch: "main",
+      worktreeSlug: "owned",
+      paseoHome,
+    });
+    const remoteUrl = "https://example.test/acme/repo.git";
+    execFileSync("git", ["remote", "add", "origin", remoteUrl], { cwd: repoDir });
+    execFileSync("git", ["config", "branch.main.remote", "origin"], { cwd: repoDir });
+    execFileSync("git", ["config", "branch.main.merge", "refs/heads/main"], { cwd: repoDir });
+    const cases = [
+      { cwd: repoDir, branch: "main", owned: false, base: null },
+      { cwd: linked, branch: "linked", owned: false, base: null },
+      { cwd: owned.worktreePath, branch: "owned", owned: true, base: "refs/heads/main" },
+    ];
+    for (const entry of cases) {
+      startGitCommandMetrics();
+      const identity = await getCheckoutIdentity(entry.cwd, { paseoHome });
+      const metrics = stopGitCommandMetrics();
+      expect(identity).toEqual({
+        isGit: true,
+        worktreeRoot: entry.cwd,
+        currentBranch: entry.branch,
+        remoteUrl,
+        paseoWorktree: entry.owned
+          ? { isPaseoOwnedWorktree: true, worktreeRoot: entry.cwd }
+          : { isPaseoOwnedWorktree: false },
+        resolvedBaseRef: entry.base,
+        mainRepoRoot: repoDir,
+      });
+      expect(
+        metrics.commands.filter(
+          ({ args }) =>
+            ["status", "diff", "rev-list", "for-each-ref", "show-ref", "symbolic-ref"].includes(
+              args[0],
+            ) ||
+            args.join(" ") === "rev-parse HEAD" ||
+            (args[0] === "config" && /^(branch\.|push\.)/.test(args[2] ?? "")),
+        ),
+      ).toEqual([]);
+    }
+
+    execFileSync("git", ["branch", "-m", "renamed"], { cwd: linked });
+    execFileSync("git", ["remote", "set-url", "origin", "https://example.test/new/repo.git"], {
+      cwd: repoDir,
+    });
+    await expect(getCheckoutIdentity(linked, { paseoHome })).resolves.toMatchObject({
+      currentBranch: "renamed",
+      remoteUrl: "https://example.test/new/repo.git",
+    });
+    const nonGit = join(tempDir, "non-git");
+    mkdirSync(nonGit);
+    await expect(getCheckoutIdentity(nonGit, { paseoHome })).resolves.toEqual({ isGit: false });
+  });
+
+  it("retains owned checkout default-base validity when stored metadata is absent", async () => {
+    const owned = await createLegacyWorktreeForTest({
+      branchName: "owned",
+      cwd: repoDir,
+      baseBranch: "main",
+      worktreeSlug: "owned",
+      paseoHome,
+    });
+    rmSync(getPaseoWorktreeMetadataPath(owned.worktreePath));
+    await expect(getCheckoutIdentity(owned.worktreePath, { paseoHome })).resolves.toMatchObject({
+      paseoWorktree: { isPaseoOwnedWorktree: true },
+      resolvedBaseRef: "main",
+    });
+
+    execFileSync("git", ["update-ref", "-d", "refs/heads/main"], { cwd: owned.worktreePath });
+    await expect(getCheckoutIdentity(owned.worktreePath, { paseoHome })).resolves.toMatchObject({
+      paseoWorktree: { isPaseoOwnedWorktree: true },
+      resolvedBaseRef: null,
+    });
   });
 
   it("reads the origin URL once when collecting facts for an origin-tracking branch", async () => {

@@ -16,6 +16,7 @@ import {
   type CheckoutDiffResult,
   getCheckoutDiff,
   getCheckoutRefDerivedState,
+  getCheckoutIdentity,
   getCheckoutSnapshotFacts,
   getCheckoutShortstat,
   getCheckoutStatus,
@@ -376,6 +377,7 @@ type WorkspaceGitRefreshState =
 interface WorkspaceGitServiceDependencies {
   subscribe: SubscribeToFileChanges;
   getCheckoutSnapshotFacts: typeof getCheckoutSnapshotFacts;
+  getCheckoutIdentity: typeof getCheckoutIdentity;
   getCheckoutRefDerivedState: typeof getCheckoutRefDerivedState;
   getCheckoutStatus: typeof getCheckoutStatus;
   getCheckoutShortstat: typeof getCheckoutShortstat;
@@ -583,6 +585,7 @@ function buildDefaultWorkspaceGitServiceDeps(
   return {
     subscribe,
     getCheckoutSnapshotFacts,
+    getCheckoutIdentity,
     getCheckoutRefDerivedState,
     getCheckoutStatus,
     getCheckoutShortstat,
@@ -869,7 +872,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   private async readCheckoutMetadata(normalizedCwd: string): Promise<ProjectCheckoutLitePayload> {
     this.assertNotDisposed();
     // Membership/reconciliation needs identity, never a full dirty-tree scan.
-    const facts = await this.deps.getCheckoutSnapshotFacts(normalizedCwd, {
+    const facts = await this.deps.getCheckoutIdentity(normalizedCwd, {
       paseoHome: this.paseoHome,
       worktreesRoot: this.worktreesRoot,
       logger: this.logger,
@@ -3898,7 +3901,15 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
         ? target.latestFacts
         : await this.loadCheckoutFacts(target, baseContext);
     const context: CheckoutContext = { ...baseContext, facts };
-    const checkoutStatus = await this.deps.getCheckoutStatus(cwd, context);
+    const cachedIsDirty = target.latestGit?.isDirty;
+    const refreshWorktree = request.refreshWorktree || cachedIsDirty == null;
+    const checkoutStatus = await this.deps.getCheckoutStatus(
+      cwd,
+      context,
+      !refreshWorktree && cachedIsDirty != null
+        ? { cachedWorktree: { isDirty: cachedIsDirty } }
+        : undefined,
+    );
     if (!checkoutStatus.isGit) {
       target.latestGit = buildNotGitSnapshot(cwd).git;
       const loadedAtMs = this.deps.now().getTime();
@@ -3908,7 +3919,6 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       return facts;
     }
 
-    const refreshWorktree = request.refreshWorktree || target.latestGit === null;
     const diffStat = refreshWorktree
       ? await this.deps
           .getCheckoutShortstat(cwd, context, {

@@ -255,6 +255,7 @@ interface CreateServiceTestOptions {
   subscribe?: ReturnType<typeof vi.fn>;
   getCheckoutStatus?: ReturnType<typeof vi.fn>;
   getCheckoutSnapshotFacts?: ReturnType<typeof vi.fn>;
+  getCheckoutIdentity?: ReturnType<typeof vi.fn>;
   getCheckoutShortstat?: ReturnType<typeof vi.fn>;
   getCheckoutWorktreeState?: ReturnType<typeof vi.fn>;
   getPullRequestStatus?: ReturnType<typeof vi.fn>;
@@ -274,6 +275,7 @@ function buildDefaultTestServiceDeps() {
       unsubscribe: vi.fn(async () => {}),
     })),
     getCheckoutSnapshotFacts: vi.fn(async (cwd: string) => createCheckoutSnapshotFacts(cwd)),
+    getCheckoutIdentity: vi.fn(async (cwd: string) => createCheckoutSnapshotFacts(cwd)),
     getCheckoutRefDerivedState: vi.fn(async (_cwd, facts, current) => ({
       ...current,
       upstreamStatus: facts.upstreamStatus,
@@ -430,12 +432,19 @@ describe("WorkspaceGitServiceImpl", () => {
     service.dispose();
   });
 
-  test("checkout membership reads use Git facts without reading dirty worktree status", async () => {
-    const getCheckoutSnapshotFacts = vi.fn(async (cwd: string) => createCheckoutSnapshotFacts(cwd));
+  test("checkout membership reads fresh identity without snapshot or dirty-worktree enrichment", async () => {
+    const getCheckoutIdentity = vi.fn(async (cwd: string) => createCheckoutSnapshotFacts(cwd));
+    const getCheckoutSnapshotFacts = vi.fn(async () => {
+      throw new Error("snapshot enrichment must not run");
+    });
     const getCheckoutStatus = vi.fn(async () => {
       throw new Error("status scan must not run");
     });
-    const service = createService({ getCheckoutSnapshotFacts, getCheckoutStatus });
+    const service = createService({
+      getCheckoutIdentity,
+      getCheckoutSnapshotFacts,
+      getCheckoutStatus,
+    });
     await expect(service.getCheckout(REPO_CWD)).resolves.toMatchObject({
       cwd: REPO_CWD,
       isGit: true,
@@ -443,8 +452,28 @@ describe("WorkspaceGitServiceImpl", () => {
       worktreeRoot: REPO_CWD,
     });
     expect(getCheckoutStatus).not.toHaveBeenCalled();
-    expect(getCheckoutSnapshotFacts).toHaveBeenCalledTimes(1);
+    expect(getCheckoutSnapshotFacts).not.toHaveBeenCalled();
+    expect(getCheckoutIdentity).toHaveBeenCalledTimes(1);
     service.dispose();
+  });
+
+  test("checkout identity preserves non-Git membership without snapshot enrichment", async () => {
+    const getCheckoutSnapshotFacts = vi.fn();
+    const service = createService({
+      getCheckoutIdentity: vi.fn(async () => ({ isGit: false })),
+      getCheckoutSnapshotFacts,
+    });
+    await expect(service.getCheckout(REPO_CWD)).resolves.toEqual({
+      cwd: REPO_CWD,
+      isGit: false,
+      currentBranch: null,
+      remoteUrl: null,
+      worktreeRoot: null,
+      isPaseoOwnedWorktree: false,
+      mainRepoRoot: null,
+    });
+    expect(getCheckoutSnapshotFacts).not.toHaveBeenCalled();
+    await service.dispose();
   });
 
   test.each([
@@ -489,7 +518,7 @@ describe("WorkspaceGitServiceImpl", () => {
         paseoWorktree: { isPaseoOwnedWorktree: owned },
         resolvedBaseRef: base,
       };
-      const service = createService({ getCheckoutSnapshotFacts: vi.fn(async () => facts) });
+      const service = createService({ getCheckoutIdentity: vi.fn(async () => facts) });
       await expect(service.getCheckout(REPO_CWD)).resolves.toMatchObject({
         mainRepoRoot: expectedMain,
         isPaseoOwnedWorktree: expectedOwned,
@@ -500,21 +529,21 @@ describe("WorkspaceGitServiceImpl", () => {
 
   test("bulk checkout membership reads stay bounded and share a pending read for the same checkout", async () => {
     const gate = createDeferred<void>();
-    const getCheckoutSnapshotFacts = vi.fn(async (cwd: string) => {
+    const getCheckoutIdentity = vi.fn(async (cwd: string) => {
       await gate.promise;
       return createCheckoutSnapshotFacts(cwd);
     });
-    const service = createService({ getCheckoutSnapshotFacts });
+    const service = createService({ getCheckoutIdentity });
     const roots = Array.from({ length: 92 }, (_, i) => path.resolve(`/tmp/membership-${i}`));
     const reads = roots.map((cwd) => service.getCheckout(cwd));
     const duplicate = service.getCheckout(roots[0]);
-    await vi.waitFor(() => expect(getCheckoutSnapshotFacts).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(getCheckoutIdentity).toHaveBeenCalledTimes(2));
     gate.resolve();
     const result = await Promise.all(reads);
     await expect(duplicate).resolves.toEqual(result[0]);
-    expect(getCheckoutSnapshotFacts).toHaveBeenCalledTimes(92);
+    expect(getCheckoutIdentity).toHaveBeenCalledTimes(92);
     await service.getCheckout(roots[0]);
-    expect(getCheckoutSnapshotFacts).toHaveBeenCalledTimes(93);
+    expect(getCheckoutIdentity).toHaveBeenCalledTimes(93);
     service.dispose();
   });
   beforeEach(() => {
