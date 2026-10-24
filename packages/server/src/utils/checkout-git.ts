@@ -958,6 +958,19 @@ export type CheckoutSnapshotFacts =
       pullRequestLookupTarget: PullRequestStatusLookupTarget | null;
     };
 
+export type CheckoutIdentityFacts =
+  | { isGit: false }
+  | Pick<
+      Extract<CheckoutSnapshotFacts, { isGit: true }>,
+      | "isGit"
+      | "worktreeRoot"
+      | "currentBranch"
+      | "remoteUrl"
+      | "paseoWorktree"
+      | "resolvedBaseRef"
+      | "mainRepoRoot"
+    >;
+
 function isNotGitRepositoryError(error: unknown): boolean {
   return error instanceof Error && /not a git repository/i.test(error.message);
 }
@@ -1852,6 +1865,36 @@ async function inspectCheckoutContext(
   };
 }
 
+/** Fresh membership facts without dirty state, ref counts or forge enrichment. */
+export async function getCheckoutIdentity(
+  cwd: string,
+  context?: CheckoutContext,
+): Promise<CheckoutIdentityFacts> {
+  const inspected = await inspectCheckoutContext(cwd, context);
+  if (!inspected) return { isGit: false };
+
+  // Only Paseo ownership depends on a valid recorded/default base. Ordinary
+  // checkout membership does not need base, upstream or PR discovery.
+  const resolvedBaseRef = inspected.paseoWorktree.isPaseoOwnedWorktree
+    ? (readPaseoWorktreeBaseRef(inspected.paseoWorktree.worktreeRoot) ??
+      (await resolveBaseRef(cwd, context)))
+    : null;
+  const mainRepoRoot = await getMainRepoRootFromCommonDir(
+    cwd,
+    inspected.gitCommonDir,
+    context,
+  ).catch(() => null);
+  return {
+    isGit: true,
+    worktreeRoot: inspected.worktreeRoot,
+    currentBranch: inspected.currentBranch,
+    remoteUrl: inspected.remoteUrl,
+    paseoWorktree: inspected.paseoWorktree,
+    resolvedBaseRef,
+    mainRepoRoot,
+  };
+}
+
 function buildPullRequestLookupTargetFromBranchConfig(
   input: PullRequestLookupTargetBranchConfig,
 ): PullRequestStatusLookupTarget {
@@ -2300,6 +2343,7 @@ async function getUntrackedDiffText(
 export async function getCheckoutStatus(
   cwd: string,
   context?: CheckoutContext,
+  options?: { cachedWorktree?: Pick<CheckoutStatusGit, "isDirty"> },
 ): Promise<CheckoutStatusResult> {
   const facts = await getCheckoutSnapshotFacts(cwd, context);
   if (!facts.isGit) {
@@ -2310,7 +2354,9 @@ export async function getCheckoutStatus(
   const currentBranch = facts.currentBranch;
   const remoteUrl = facts.remoteUrl;
   const paseoWorktree = facts.paseoWorktree;
-  const isDirty = await isWorkingTreeDirty(cwd, context);
+  // Structural refreshes retain the caller's last observed dirty state. An
+  // omitted cache keeps full reads authoritative, including index-only edits.
+  const isDirty = options?.cachedWorktree?.isDirty ?? (await isWorkingTreeDirty(cwd, context));
   const hasRemote = remoteUrl !== null;
   const baseRef = facts.resolvedBaseRef;
   const mainRepoRoot = facts.mainRepoRoot;
