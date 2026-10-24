@@ -2432,6 +2432,128 @@ function fakeCodexEmitting(args: FakeCodexEmitterArgs): AgentClient {
 
 const logger = createTestLogger();
 
+test("coalesces running provider child publications while retaining activity and every timeline event", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const client = new SessionRecordingAgentClient();
+  const manager = new AgentManager({ clients: { codex: client }, logger });
+  const agent = await manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
+    workspaceId: undefined,
+  });
+  const events: Array<Extract<AgentManagerEvent, { type: "provider_subagent" }>["event"]> = [];
+  const unsubscribe = manager.subscribe((event) => {
+    if (event.type === "provider_subagent") events.push(event.event);
+  });
+  const session = client.sessions[0]!;
+  let closed = false;
+  try {
+    session.pushEvent({
+      type: "provider_subagent",
+      provider: "codex",
+      event: { type: "upsert", id: "child", status: "running", title: "Inspect" },
+    });
+    for (let index = 1; index <= 3; index++) {
+      session.pushEvent({
+        type: "provider_subagent",
+        provider: "codex",
+        event: { type: "upsert", id: "child", timestamp: new Date(index).toISOString() },
+      });
+      session.pushEvent({
+        type: "provider_subagent",
+        provider: "codex",
+        event: {
+          type: "timeline",
+          id: "child",
+          item: { type: "assistant_message", text: String(index) },
+        },
+      });
+    }
+    await manager.flush({ coalesced: false });
+    expect(manager.getProviderSubagent(agent.id, "child")).toMatchObject({
+      title: "Inspect",
+      updatedAt: new Date(3).toISOString(),
+    });
+    expect(events.filter((event) => event.type === "upsert")).toHaveLength(1);
+    expect(
+      events.filter((event) => event.type === "timeline").map((event) => event.row),
+    ).toMatchObject([
+      { seq: 1, item: { text: "1" } },
+      { seq: 2, item: { text: "2" } },
+      { seq: 3, item: { text: "3" } },
+    ]);
+    await vi.advanceTimersByTimeAsync(60);
+    expect(events.filter((event) => event.type === "upsert")).toHaveLength(2);
+    expect(manager.fetchProviderSubagentTimeline(agent.id, "child").rows).toMatchObject([
+      { seq: 3, item: { text: "123" } },
+    ]);
+    session.pushEvent({
+      type: "provider_subagent",
+      provider: "codex",
+      event: {
+        type: "upsert",
+        id: "child",
+        subtitle: "last before close",
+        timestamp: new Date(4).toISOString(),
+      },
+    });
+    await manager.flush({ coalesced: false });
+    expect(events.filter((event) => event.type === "upsert")).toHaveLength(2);
+    expect(manager.listProviderSubagentActivity()[0]?.updatedAt).toBe(new Date(4).toISOString());
+    await manager.closeAgent(agent.id);
+    closed = true;
+    expect(events.slice(-2)).toMatchObject([
+      { type: "upsert", subagent: { status: "running", subtitle: "last before close" } },
+      { type: "upsert", subagent: { status: "canceled", subtitle: "last before close" } },
+    ]);
+    const closedEventCount = events.length;
+    await vi.advanceTimersByTimeAsync(60);
+    expect(events).toHaveLength(closedEventCount);
+  } finally {
+    if (!closed) await manager.closeAgent(agent.id);
+    unsubscribe();
+    vi.useRealTimers();
+  }
+});
+
+test("clears buffered provider child publications before deleting retained state", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const client = new SessionRecordingAgentClient();
+  const manager = new AgentManager({ clients: { codex: client }, logger });
+  const agent = await manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
+    workspaceId: undefined,
+  });
+  const events: Array<Extract<AgentManagerEvent, { type: "provider_subagent" }>["event"]> = [];
+  const unsubscribe = manager.subscribe((event) => {
+    if (event.type === "provider_subagent") events.push(event.event);
+  });
+  const session = client.sessions[0]!;
+  const upsert = (title: string) =>
+    session.pushEvent({
+      type: "provider_subagent",
+      provider: "codex",
+      event: { type: "upsert", id: "child", title, status: "running" },
+    });
+  try {
+    upsert("first");
+    upsert("last before reset");
+    await manager.flush({ coalesced: false });
+    await manager.deleteAgentState(agent.id);
+    expect(events).toMatchObject([
+      { type: "upsert", subagent: { title: "first" } },
+      { type: "upsert", subagent: { title: "last before reset" } },
+      { type: "remove", parentAgentId: agent.id, subagentId: "child" },
+    ]);
+    upsert("new child");
+    await manager.flush({ coalesced: false });
+    expect(events.at(-1)).toMatchObject({ type: "upsert", subagent: { title: "new child" } });
+    await vi.advanceTimersByTimeAsync(60);
+    expect(events).toHaveLength(4);
+  } finally {
+    await manager.closeAgent(agent.id);
+    unsubscribe();
+    vi.useRealTimers();
+  }
+});
+
 test("does not register a session that finishes starting after shutdown begins", async () => {
   const client = new HeldAgentCreationClient();
   const manager = new AgentManager({
