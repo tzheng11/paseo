@@ -708,7 +708,20 @@ describe("checkout git utilities", () => {
       startGitCommandMetrics();
       const identity = await getCheckoutIdentity(entry.cwd, { paseoHome });
       const metrics = stopGitCommandMetrics();
-      expect(identity).toEqual({
+      const normalizedIdentity = identity.isGit
+        ? {
+            ...identity,
+            worktreeRoot: realpathSync.native(identity.worktreeRoot),
+            paseoWorktree: identity.paseoWorktree.isPaseoOwnedWorktree
+              ? {
+                  ...identity.paseoWorktree,
+                  worktreeRoot: realpathSync.native(identity.paseoWorktree.worktreeRoot),
+                }
+              : identity.paseoWorktree,
+            mainRepoRoot: identity.mainRepoRoot ? realpathSync.native(identity.mainRepoRoot) : null,
+          }
+        : identity;
+      expect(normalizedIdentity).toEqual({
         isGit: true,
         worktreeRoot: entry.cwd,
         currentBranch: entry.branch,
