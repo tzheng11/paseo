@@ -1940,6 +1940,7 @@ describe("WorkspaceGitServiceImpl", () => {
       ignore: [join(REPO_CWD, ".git")],
       signal: expect.any(AbortSignal),
       onInventoryProgress: expect.any(Function),
+      onInventoryAdmission: expect.any(Function),
     });
 
     subscription.unsubscribe();
@@ -2236,6 +2237,7 @@ describe("WorkspaceGitServiceImpl", () => {
       ignore: [join(plainCwd, ".git")],
       signal: expect.any(AbortSignal),
       onInventoryProgress: expect.any(Function),
+      onInventoryAdmission: expect.any(Function),
     });
     expect(vi.getTimerCount()).toBe(1);
 

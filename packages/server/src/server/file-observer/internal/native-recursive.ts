@@ -95,6 +95,7 @@ class NativeRecursiveBackend implements ObservationBackend {
   private reconcileTail: Promise<void> = Promise.resolve();
   private queueDepth = 0;
   private inFlight = false;
+  private auditAdmissionState: "queued" | "admitted" | null = null;
   private auditTimer: NodeJS.Timeout | null = null;
   private fullAuditTimer: NodeJS.Timeout | null = null;
   private fullAuditRequested = false;
@@ -156,6 +157,8 @@ class NativeRecursiveBackend implements ObservationBackend {
     return {
       nativeHandleCount: this.watchers.size,
       nativeTrackedFileCount: this.files.size,
+      nativeAuditQueuedCount: Number(this.auditAdmissionState === "queued"),
+      nativeAuditAdmittedCount: Number(this.auditAdmissionState === "admitted"),
       pendingReconciliationWorkCount:
         this.localScopes.size +
         this.changeScopes.size +
@@ -332,7 +335,20 @@ class NativeRecursiveBackend implements ObservationBackend {
     this.queueDepth += 1;
     const signal = this.auditCancellation.signal;
     const result = this.reconcileTail
-      .then(() => this.resources.runAudit(() => this.runAudit(emitDiff, generation), signal))
+      .then(async () => {
+        try {
+          return await this.resources.runAudit(
+            () => this.runAudit(emitDiff, generation),
+            signal,
+            (state) => {
+              this.auditAdmissionState = state;
+              this.host.onInventoryAdmission?.(state);
+            },
+          );
+        } finally {
+          this.auditAdmissionState = null;
+        }
+      })
       .catch((error: unknown) => {
         if (error !== CANCELLED_RECONCILIATION) throw error;
       })

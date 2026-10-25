@@ -12,10 +12,13 @@ export interface FileChange {
   type: FileChangeType;
 }
 
+export type FileObserverInventoryAdmission = "queued" | "admitted";
+
 export interface FileObserverOptions {
   ignore?: string[];
   signal?: AbortSignal;
   onInventoryProgress?: () => void;
+  onInventoryAdmission?: (state: FileObserverInventoryAdmission) => void;
 }
 
 export type FileObserverCallback = (error: Error | null, events: FileChange[]) => void;
@@ -29,6 +32,8 @@ export interface FileObserverDiagnostics {
   activeObservationCount: number;
   nativeHandleCount: number;
   nativeTrackedFileCount: number;
+  nativeAuditQueuedCount: number;
+  nativeAuditAdmittedCount: number;
   pendingEventCount: number;
   pendingReconciliationWorkCount: number;
   pendingClassificationCount: number;
@@ -137,6 +142,8 @@ class FileObserverService implements FileObserver {
     const { observations, metrics } = this.state;
     let nativeHandleCount = 0;
     let nativeTrackedFileCount = 0;
+    let nativeAuditQueuedCount = 0;
+    let nativeAuditAdmittedCount = 0;
     let pendingEventCount = 0;
     let pendingReconciliationWorkCount = 0;
     let pendingClassificationCount = 0;
@@ -145,6 +152,8 @@ class FileObserverService implements FileObserver {
       const diagnostics = observation.getDiagnostics();
       nativeHandleCount += diagnostics.nativeHandleCount;
       nativeTrackedFileCount += diagnostics.nativeTrackedFileCount;
+      nativeAuditQueuedCount += diagnostics.nativeAuditQueuedCount ?? 0;
+      nativeAuditAdmittedCount += diagnostics.nativeAuditAdmittedCount ?? 0;
       pendingEventCount += diagnostics.pendingEventCount;
       pendingReconciliationWorkCount += diagnostics.pendingReconciliationWorkCount;
       pendingClassificationCount += diagnostics.pendingClassificationCount;
@@ -154,6 +163,8 @@ class FileObserverService implements FileObserver {
       activeObservationCount: observations.size,
       nativeHandleCount,
       nativeTrackedFileCount,
+      nativeAuditQueuedCount,
+      nativeAuditAdmittedCount,
       pendingEventCount,
       pendingReconciliationWorkCount,
       pendingClassificationCount,
@@ -198,6 +209,8 @@ function emptyDiagnostics(): FileObserverDiagnostics {
     activeObservationCount: 0,
     nativeHandleCount: 0,
     nativeTrackedFileCount: 0,
+    nativeAuditQueuedCount: 0,
+    nativeAuditAdmittedCount: 0,
     pendingEventCount: 0,
     pendingReconciliationWorkCount: 0,
     pendingClassificationCount: 0,

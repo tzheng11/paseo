@@ -1,3 +1,4 @@
+import type { FileObserverInventoryAdmission } from "../index.js";
 import {
   FileObservationCapacityError,
   type FileObservationCapacityFailure,
@@ -28,6 +29,7 @@ interface AuditJob {
   reject: (error: unknown) => void;
   signal: AbortSignal;
   abort: () => void;
+  onAdmission?: (state: FileObserverInventoryAdmission) => void;
 }
 
 interface CapacityRetryJob {
@@ -146,7 +148,11 @@ export class NativeRecursiveResources {
       });
   }
 
-  runAudit(run: () => Promise<void>, signal: AbortSignal): Promise<void> {
+  runAudit(
+    run: () => Promise<void>,
+    signal: AbortSignal,
+    onAdmission?: (state: FileObserverInventoryAdmission) => void,
+  ): Promise<void> {
     if (signal.aborted) return Promise.reject(signal.reason);
     return new Promise<void>((resolve, reject) => {
       const job: AuditJob = {
@@ -154,6 +160,7 @@ export class NativeRecursiveResources {
         resolve,
         reject,
         signal,
+        onAdmission,
         abort: () => {
           const index = this.queue.indexOf(job);
           if (index !== -1) this.queue.splice(index, 1);
@@ -162,6 +169,17 @@ export class NativeRecursiveResources {
       };
       signal.addEventListener("abort", job.abort, { once: true });
       this.queue.push(job);
+      if (this.activeAudits >= this.limits.maxConcurrentAudits) {
+        try {
+          onAdmission?.("queued");
+        } catch (error) {
+          const index = this.queue.indexOf(job);
+          if (index !== -1) this.queue.splice(index, 1);
+          signal.removeEventListener("abort", job.abort);
+          reject(error);
+          return;
+        }
+      }
       this.pumpAudits();
     });
   }
@@ -172,7 +190,12 @@ export class NativeRecursiveResources {
       job.signal.removeEventListener("abort", job.abort);
       this.activeAudits += 1;
       void Promise.resolve()
-        .then(job.run)
+        .then(() => {
+          job.signal.throwIfAborted();
+          job.onAdmission?.("admitted");
+          job.signal.throwIfAborted();
+          return job.run();
+        })
         .then(job.resolve, job.reject)
         .finally(() => {
           this.activeAudits -= 1;
