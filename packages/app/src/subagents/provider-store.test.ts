@@ -3,6 +3,7 @@ import { afterEach, describe, expect, test } from "vitest";
 import type { ProviderSubagentDescriptorPayload } from "@getpaseo/protocol/messages";
 import {
   observeProviderSubagentTimeline,
+  observeProviderSubagents,
   providerSubagentKey,
   refreshProviderSubagents,
   resyncProviderSubagents,
@@ -18,7 +19,7 @@ afterEach(() => {
     descriptors: new Map(),
     timelines: new Map(),
     hiddenFromTrack: new Set(),
-    trackedParents: new Set(),
+    trackedParents: new Map(),
   });
 });
 
@@ -770,13 +771,237 @@ describe("resyncing after the update feed resubscribes", () => {
     };
   }
 
+  function controlledDaemon() {
+    const requests: {
+      parentAgentId: string;
+      complete(subagents?: ProviderSubagentDescriptorPayload[]): void;
+    }[] = [];
+    const listeners = new Set<() => void>();
+    let active = 0;
+    let peakActive = 0;
+    return {
+      requests,
+      peakActive: () => peakActive,
+      async untilRequested(count: number) {
+        if (requests.length >= count) return;
+        await new Promise<void>((resolve) => {
+          const listener = () => {
+            if (requests.length < count) return;
+            listeners.delete(listener);
+            resolve();
+          };
+          listeners.add(listener);
+        });
+      },
+      client: {
+        listProviderSubagents(parentAgentId: string) {
+          active++;
+          peakActive = Math.max(peakActive, active);
+          return new Promise<{
+            requestId: string;
+            parentAgentId: string;
+            subagents: ProviderSubagentDescriptorPayload[];
+            error: null;
+          }>((resolve) => {
+            requests.push({
+              parentAgentId,
+              complete(subagents = []) {
+                active--;
+                resolve({ requestId: "controlled", parentAgentId, subagents, error: null });
+              },
+            });
+            for (const listener of listeners) listener();
+          });
+        },
+      },
+    };
+  }
+
   const status = (parentAgentId: string, subagentId: string) =>
     useProviderSubagentStore
       .getState()
       .descriptors.get(providerSubagentKey(SERVER_ID, parentAgentId, subagentId))?.status;
 
+  test("keeps a shared parent tracked until its last consumer leaves without deleting cached history", async () => {
+    const daemon = fakeDaemon({ [PARENT_ID]: [child("child-1", PARENT_ID, "running")] });
+    const releaseFirst = observeProviderSubagents(daemon.client, SERVER_ID, PARENT_ID);
+    const releaseSecond = observeProviderSubagents(daemon.client, SERVER_ID, PARENT_ID);
+    await refreshProviderSubagents(daemon.client, SERVER_ID, PARENT_ID);
+    useProviderSubagentStore.getState().applyUpdate(SERVER_ID, {
+      kind: "timeline",
+      parentAgentId: PARENT_ID,
+      subagentId: "child-1",
+      provider: "claude",
+      epoch: "cached-child",
+      seq: 1,
+      timestamp: "2026-10-07T10:00:01.000Z",
+      item: { type: "assistant_message", text: "Preserved child history" },
+    });
+    const cachedDescriptors = useProviderSubagentStore.getState().descriptors;
+    const cachedTimelines = useProviderSubagentStore.getState().timelines;
+    expect(daemon.requested).toEqual([PARENT_ID]);
+    expect(
+      useProviderSubagentStore.getState().trackedParents.get(`${SERVER_ID}\0${PARENT_ID}\0`),
+    ).toBe(2);
+
+    releaseFirst();
+    releaseFirst();
+    expect(
+      useProviderSubagentStore.getState().trackedParents.get(`${SERVER_ID}\0${PARENT_ID}\0`),
+    ).toBe(1);
+    daemon.requested.length = 0;
+    await resyncProviderSubagents(daemon.client, SERVER_ID);
+    expect(daemon.requested).toEqual([PARENT_ID]);
+
+    const latestDescriptors = useProviderSubagentStore.getState().descriptors;
+    const latestTimelines = useProviderSubagentStore.getState().timelines;
+    releaseSecond();
+    expect(useProviderSubagentStore.getState().trackedParents.size).toBe(0);
+    daemon.requested.length = 0;
+    await resyncProviderSubagents(daemon.client, SERVER_ID);
+    expect(daemon.requested).toEqual([]);
+    expect(useProviderSubagentStore.getState().descriptors).toBe(latestDescriptors);
+    expect(useProviderSubagentStore.getState().timelines).toBe(latestTimelines);
+    expect(status(PARENT_ID, "child-1")).toBe("running");
+    expect(cachedDescriptors.size).toBe(1);
+    expect(cachedTimelines.size).toBe(1);
+  });
+
+  test("caps reconnect resync at four requests across superseding snapshots and skips released queued parents", async () => {
+    const daemon = controlledDaemon();
+    const parents = Array.from({ length: 8 }, (_, index) => `parent-${index}`);
+    for (const id of parents) useProviderSubagentStore.getState().trackParent(SERVER_ID, id);
+    const first = resyncProviderSubagents(daemon.client, SERVER_ID);
+    await daemon.untilRequested(4);
+    expect(daemon.requests.map((request) => request.parentAgentId)).toEqual(parents.slice(0, 4));
+
+    const latest = resyncProviderSubagents(daemon.client, SERVER_ID);
+    useProviderSubagentStore.getState().untrackParent(SERVER_ID, parents[4]);
+    expect(daemon.requests).toHaveLength(4);
+    for (const request of daemon.requests.slice(0, 4)) request.complete();
+    await daemon.untilRequested(8);
+    expect(daemon.requests.slice(4).map((request) => request.parentAgentId)).toEqual(
+      parents.slice(0, 4),
+    );
+    for (const request of daemon.requests.slice(4, 8)) request.complete();
+    await daemon.untilRequested(11);
+    expect(daemon.requests.slice(8).map((request) => request.parentAgentId)).toEqual(
+      parents.slice(5),
+    );
+    for (const request of daemon.requests.slice(8)) request.complete();
+    await Promise.all([first, latest]);
+    expect(daemon.peakActive()).toBe(4);
+    expect(daemon.requests.some((request) => request.parentAgentId === parents[4])).toBe(false);
+  });
+
+  test("discards an obsolete feed's queued requests and stale results without cancelling shared reads", async () => {
+    const daemon = controlledDaemon();
+    for (let index = 0; index < 6; index++) {
+      useProviderSubagentStore.getState().trackParent(SERVER_ID, `parent-${index}`);
+    }
+    const controller = new AbortController();
+    const recovery = resyncProviderSubagents(daemon.client, SERVER_ID, {
+      signal: controller.signal,
+    });
+    await daemon.untilRequested(4);
+    useProviderSubagentStore.getState().applyUpdate(SERVER_ID, {
+      kind: "upsert",
+      subagent: child("child-1", "parent-0", "completed"),
+    });
+    controller.abort();
+    expect(daemon.requests).toHaveLength(4);
+    for (const request of daemon.requests) {
+      request.complete([child("child-1", request.parentAgentId, "running")]);
+    }
+    await recovery;
+    expect(daemon.requests).toHaveLength(4);
+    expect(status("parent-0", "child-1")).toBe("completed");
+    expect(status("parent-1", "child-1")).toBeUndefined();
+  });
+
+  test("a replacement client result cannot be overwritten by an older client's late list", async () => {
+    const oldClient = controlledDaemon();
+    const newClient = fakeDaemon({ [PARENT_ID]: [child("child-1", PARENT_ID, "completed")] });
+    const oldRead = refreshProviderSubagents(oldClient.client, SERVER_ID, PARENT_ID);
+    await oldClient.untilRequested(1);
+    await refreshProviderSubagents(newClient.client, SERVER_ID, PARENT_ID);
+    oldClient.requests[0].complete([child("child-1", PARENT_ID, "running")]);
+    await oldRead;
+    expect(status(PARENT_ID, "child-1")).toBe("completed");
+  });
+
+  test("a new feed snapshot waits for a shared old list before requesting its fresh baseline", async () => {
+    const daemon = controlledDaemon();
+    const release = observeProviderSubagents(daemon.client, SERVER_ID, PARENT_ID);
+    const recovery = resyncProviderSubagents(daemon.client, SERVER_ID);
+    expect(daemon.requests).toHaveLength(1);
+    daemon.requests[0].complete([child("child-1", PARENT_ID, "running")]);
+    await daemon.untilRequested(2);
+    expect(daemon.requests.map((request) => request.parentAgentId)).toEqual([PARENT_ID, PARENT_ID]);
+    daemon.requests[1].complete([child("child-1", PARENT_ID, "completed")]);
+    await recovery;
+    expect(status(PARENT_ID, "child-1")).toBe("completed");
+    expect(daemon.peakActive()).toBe(1);
+    release();
+  });
+
+  test("a new consumer requests its initial baseline after an obsolete resync list finishes", async () => {
+    const daemon = controlledDaemon();
+    useProviderSubagentStore.getState().trackParent(SERVER_ID, PARENT_ID);
+    const controller = new AbortController();
+    const recovery = resyncProviderSubagents(daemon.client, SERVER_ID, {
+      signal: controller.signal,
+    });
+    await daemon.untilRequested(1);
+    controller.abort();
+    const release = observeProviderSubagents(daemon.client, SERVER_ID, PARENT_ID);
+    daemon.requests[0].complete([child("child-1", PARENT_ID, "running")]);
+    await recovery;
+    expect(daemon.requests).toHaveLength(2);
+    daemon.requests[1].complete([child("child-1", PARENT_ID, "completed")]);
+    await refreshProviderSubagents(daemon.client, SERVER_ID, PARENT_ID);
+    expect(status(PARENT_ID, "child-1")).toBe("completed");
+    expect(daemon.peakActive()).toBe(1);
+    release();
+    useProviderSubagentStore.getState().untrackParent(SERVER_ID, PARENT_ID);
+  });
+
+  test("releasing the last consumer while an older list settles prevents a new resync read", async () => {
+    const daemon = controlledDaemon();
+    const release = observeProviderSubagents(daemon.client, SERVER_ID, PARENT_ID);
+    const recovery = resyncProviderSubagents(daemon.client, SERVER_ID);
+    release();
+    daemon.requests[0].complete([child("child-1", PARENT_ID, "running")]);
+    await recovery;
+    expect(daemon.requests).toHaveLength(1);
+    expect(status(PARENT_ID, "child-1")).toBe("running");
+  });
+
+  test("an obsolete host feed does not stop another host's recovery on the same client", async () => {
+    const daemon = controlledDaemon();
+    useProviderSubagentStore.getState().trackParent(SERVER_ID, PARENT_ID);
+    useProviderSubagentStore.getState().trackParent("other-host", "other-parent");
+    const controller = new AbortController();
+    const oldHost = resyncProviderSubagents(daemon.client, SERVER_ID, {
+      signal: controller.signal,
+    });
+    const otherHost = resyncProviderSubagents(daemon.client, "other-host");
+    await daemon.untilRequested(2);
+    controller.abort();
+    daemon.requests[0].complete([child("child-1", PARENT_ID, "running")]);
+    daemon.requests[1].complete([child("other-child", "other-parent", "completed")]);
+    await Promise.all([oldHost, otherHost]);
+    expect(status(PARENT_ID, "child-1")).toBeUndefined();
+    expect(
+      useProviderSubagentStore
+        .getState()
+        .descriptors.get(providerSubagentKey("other-host", "other-parent", "other-child"))?.status,
+    ).toBe("completed");
+  });
+
   test("catches up on children that finished or started while updates were not delivered", async () => {
     const daemon = fakeDaemon({ [PARENT_ID]: [child("child-1", PARENT_ID, "running")] });
+    const release = observeProviderSubagents(daemon.client, SERVER_ID, PARENT_ID);
     await refreshProviderSubagents(daemon.client, SERVER_ID, PARENT_ID);
     expect(status(PARENT_ID, "child-1")).toBe("running");
 
@@ -789,6 +1014,7 @@ describe("resyncing after the update feed resubscribes", () => {
 
     expect(status(PARENT_ID, "child-1")).toBe("completed");
     expect(status(PARENT_ID, "child-2")).toBe("completed");
+    release();
   });
 
   test("catches up on a parent whose first list failed while disconnected", async () => {
@@ -798,6 +1024,7 @@ describe("resyncing after the update feed resubscribes", () => {
         throw new DaemonConnectionError("Transport not connected");
       },
     };
+    const release = observeProviderSubagents(disconnected, SERVER_ID, PARENT_ID);
     await expect(
       refreshProviderSubagents(disconnected, SERVER_ID, PARENT_ID),
     ).rejects.toBeInstanceOf(DaemonConnectionError);
@@ -811,16 +1038,21 @@ describe("resyncing after the update feed resubscribes", () => {
     await resyncProviderSubagents(daemon.client, SERVER_ID);
 
     expect(status(PARENT_ID, "child-1")).toBe("completed");
+    release();
   });
 
   test("lists again only the parents this server was showing", async () => {
     const daemon = fakeDaemon({});
+    const releaseFirst = observeProviderSubagents(daemon.client, SERVER_ID, PARENT_ID);
     await refreshProviderSubagents(daemon.client, SERVER_ID, PARENT_ID);
+    const releaseSecond = observeProviderSubagents(daemon.client, "server-2", "other-parent");
     await refreshProviderSubagents(daemon.client, "server-2", "other-parent");
     daemon.requested.length = 0;
 
     await resyncProviderSubagents(daemon.client, SERVER_ID);
 
     expect(daemon.requested).toEqual([PARENT_ID]);
+    releaseFirst();
+    releaseSecond();
   });
 });
