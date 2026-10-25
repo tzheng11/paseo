@@ -390,6 +390,71 @@ describe("Claude credential maintenance", () => {
     }
   });
 
+  test.each([
+    {
+      reason: "a different native session id",
+      previousSessionId: "6f237dcc-f14d-48f1-b288-9067da29ad58",
+      closePrevious: true,
+    },
+    { reason: "a previous session still open", previousSessionId: sessionId, closePrevious: false },
+  ])(
+    "maintenance with $reason replays history and accepts a later plain prompt",
+    async (scenario) => {
+      const h = harness();
+      writeTranscript("previous transcript");
+      const previous = await h.client.resumeSession(
+        { provider: "claude", sessionId: scenario.previousSessionId },
+        { cwd },
+      );
+      if (scenario.closePrevious) await previous.close();
+      writeTranscript("requested session history after fallback");
+      try {
+        const replacement = await h.client.resumeSession(
+          { provider: "claude", sessionId },
+          { cwd },
+          undefined,
+          { purpose: "maintenance", previousSession: previous },
+        );
+        const events: AgentStreamEvent[] = [];
+        replacement.subscribe((event) => events.push(event));
+        try {
+          const { turnId } = await replacement.startTurn("plain prompt after maintenance fallback");
+          await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+          const history: AgentStreamEvent[] = [];
+          for await (const event of replacement.streamHistory()) history.push(event);
+          await h.query.emit({
+            type: "result",
+            subtype: "success",
+            uuid: "fallback-complete",
+            session_id: sessionId,
+            result: "done",
+            is_error: false,
+            usage: {},
+            modelUsage: {},
+          });
+          expect(history).toContainEqual({
+            type: "timeline",
+            provider: "claude",
+            timestamp: "2026-10-17T10:00:00.000Z",
+            item: {
+              type: "user_message",
+              text: "requested session history after fallback",
+              messageId: "history-user",
+            },
+          });
+          expect(events).toContainEqual({ type: "turn_started", provider: "claude", turnId });
+          expect(events).toContainEqual(
+            expect.objectContaining({ type: "turn_completed", provider: "claude", turnId }),
+          );
+        } finally {
+          await replacement.close();
+        }
+      } finally {
+        await previous.close();
+      }
+    },
+  );
+
   test("registered provider wrappers retain task and rewind state across maintenance", async () => {
     const h = harness();
     const definition = getAgentProviderDefinition("claude");

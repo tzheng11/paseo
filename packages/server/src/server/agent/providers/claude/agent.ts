@@ -2461,7 +2461,15 @@ class ClaudeAgentSession implements AgentSession {
 
   inheritMaintenanceHistory(previous: ClaudeAgentSession): void {
     if (!previous.closed || previous.claudeSessionId !== this.claudeSessionId) {
-      throw new Error("Claude maintenance history requires the retired native session");
+      this.logger.warn(
+        {
+          previousSessionId: previous.claudeSessionId,
+          sessionId: this.claudeSessionId,
+          previousClosed: previous.closed,
+        },
+        "Skipping Claude maintenance history inheritance; falling back to transcript replay",
+      );
+      return;
     }
     if (!previous.historyReplayComplete) return;
     // Replaying every sidechain before the first input can take longer than run admission.
