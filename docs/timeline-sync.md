@@ -217,6 +217,12 @@ Child transcripts use the same projected-page reconciliation as the main convers
 retains rendered items and sequence cursors, never a second cache of source events. Pagination
 uses the projected display anchor; live updates advance the source cursor without moving tools.
 
+Child-list recovery follows mounted parent and child panes. Releasing the last consumer stops
+future reconnect reads without deleting cached descriptors or transcripts. Reconnect snapshots
+share four request slots per client and host; replacing or aborting a snapshot discards its queued
+work and stale responses. Already-started shared server loads finish normally, so this admission
+limit does not bound the number of provider replays still running after client timeouts.
+
 Clients advertising `projected_subagent_timeline` receive child streams and projected fetches.
 Updated clients require `features.projectedSubagentTimeline` for child history; older hosts show
 an update-host notice for that pane.
