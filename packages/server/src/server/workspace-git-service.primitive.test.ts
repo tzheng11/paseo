@@ -2234,6 +2234,7 @@ describe("WorkspaceGitServiceImpl D2 read methods", () => {
         ignore: [join(repoDir, ".git"), ignoredRoot],
         signal: expect.any(AbortSignal),
         onInventoryProgress: expect.any(Function),
+        onInventoryAdmission: expect.any(Function),
       });
 
       subscription.unsubscribe();

@@ -1,10 +1,16 @@
-import type { FileChangeType, FileObserverDiagnostics } from "../index.js";
+import type {
+  FileChangeType,
+  FileObserverDiagnostics,
+  FileObserverInventoryAdmission,
+} from "../index.js";
 
 export interface ObserverMetrics extends Omit<
   FileObserverDiagnostics,
   | "activeObservationCount"
   | "nativeHandleCount"
   | "nativeTrackedFileCount"
+  | "nativeAuditQueuedCount"
+  | "nativeAuditAdmittedCount"
   | "pendingEventCount"
   | "pendingReconciliationWorkCount"
   | "pendingClassificationCount"
@@ -14,6 +20,8 @@ export interface ObserverMetrics extends Omit<
 export interface BackendDiagnostics {
   nativeHandleCount: number;
   nativeTrackedFileCount: number;
+  nativeAuditQueuedCount?: number;
+  nativeAuditAdmittedCount?: number;
   pendingReconciliationWorkCount: number;
   pendingClassificationCount: number;
   reconciliationInFlight: boolean;
@@ -34,6 +42,7 @@ export interface ObservationHost {
   isIgnored(path: string): boolean;
   isPathInside(root: string, path: string): boolean;
   onInventoryProgress?(): void;
+  onInventoryAdmission?(state: FileObserverInventoryAdmission): void;
   queueEvent(type: FileChangeType, path: string): void;
   fail(error: Error): void;
 }

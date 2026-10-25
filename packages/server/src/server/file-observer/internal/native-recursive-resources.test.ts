@@ -65,6 +65,7 @@ function createBackend(
     isIgnored?: (path: string) => boolean;
     ignoredRoots?: string[];
     progress?: () => void;
+    admission?: (state: "queued" | "admitted") => void;
     queueEvent?: (type: "create" | "update" | "delete", path: string) => void;
     observe?: Parameters<typeof createNativeRecursiveBackend>[2];
   } = {},
@@ -79,6 +80,7 @@ function createBackend(
       ignoredRoots: options.ignoredRoots,
       isPathInside: paths.isInside,
       onInventoryProgress: options.progress,
+      onInventoryAdmission: options.admission,
       queueEvent: options.queueEvent ?? (() => {}),
       fail: (error) => {
         throw error;
@@ -174,6 +176,20 @@ test("an ignored subtree releases retained capacity for another observation", as
   }
 });
 
+test("admission callback cancellation never runs its audit or strands the next waiter", async () => {
+  const resources = new NativeRecursiveResources({ maxTrackedEntries: 20, maxConcurrentAudits: 1 });
+  const controller = new AbortController();
+  const audit = vi.fn(async () => {});
+  const reason = new Error("closed during admission callback");
+  const canceled = resources.runAudit(audit, controller.signal, () => controller.abort(reason));
+  const following = vi.fn(async () => {});
+  const next = resources.runAudit(following, new AbortController().signal);
+  await expect(canceled).rejects.toBe(reason);
+  await next;
+  expect(audit).not.toHaveBeenCalled();
+  expect(following).toHaveBeenCalledOnce();
+});
+
 test("audits share two slots and closing a queued root does not wait for busy roots", async () => {
   const root = await mkdtemp(join(tmpdir(), "native-shared-audits-"));
   const resources = new NativeRecursiveResources({ maxTrackedEntries: 20, maxConcurrentAudits: 2 });
@@ -188,11 +204,13 @@ test("audits share two slots and closing a queued root does not wait for busy ro
   const gate = new Promise<void>((resolve) => {
     release = resolve;
   });
+  const admissions: string[][] = roots.map(() => []);
   let started = 0;
   let active = 0;
   let peak = 0;
-  const backends = roots.map((directory) =>
+  const backends = roots.map((directory, index) =>
     createBackend(directory, resources, {
+      admission: (state) => admissions[index]!.push(state),
       observe: async () => {
         started += 1;
         active += 1;
@@ -206,6 +224,13 @@ test("audits share two slots and closing a queued root does not wait for busy ro
   const starting = backends.slice(0, 3).map((backend) => backend.start());
   try {
     await expect.poll(() => started).toBe(2);
+    expect(admissions.slice(0, 3)).toEqual([["admitted"], ["admitted"], ["queued"]]);
+    expect(backends.map((backend) => backend.getDiagnostics().nativeAuditQueuedCount)).toEqual([
+      0, 0, 1, 0,
+    ]);
+    expect(backends.map((backend) => backend.getDiagnostics().nativeAuditAdmittedCount)).toEqual([
+      1, 1, 0, 0,
+    ]);
     await backends[2]!.close();
     await starting[2];
     expect(started).toBe(2);
@@ -214,9 +239,13 @@ test("audits share two slots and closing a queued root does not wait for busy ro
     release();
     await Promise.all([...starting, fourth]);
     expect(started).toBe(3);
+    expect(admissions[2]).toEqual(["queued"]);
+    expect(admissions[3]).toEqual(["queued", "admitted"]);
     expect(peak).toBe(2);
     expect(backends[2]!.getDiagnostics()).toMatchObject({
       nativeHandleCount: 0,
+      nativeAuditQueuedCount: 0,
+      nativeAuditAdmittedCount: 0,
       pendingReconciliationWorkCount: 0,
       reconciliationInFlight: false,
     });

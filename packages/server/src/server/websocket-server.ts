@@ -307,6 +307,8 @@ function createFallbackWorkspaceGitService(): WorkspaceGitService {
         activeObservationCount: 0,
         nativeHandleCount: 0,
         nativeTrackedFileCount: 0,
+        nativeAuditQueuedCount: 0,
+        nativeAuditAdmittedCount: 0,
         pendingEventCount: 0,
         pendingReconciliationWorkCount: 0,
         pendingClassificationCount: 0,

@@ -73,6 +73,7 @@ import {
   type FileObserverCallback,
   type FileObserver,
   type FileObserverOptions,
+  type FileObserverInventoryAdmission,
   type FileObserverSubscription,
   type SubscribeToFileChanges,
   createFileObserver,
@@ -564,6 +565,7 @@ type WorkingTreeWatchFallbackReason =
   | "not_a_git_checkout"
   | "watcher_error"
   | "watcher_setup_failed"
+  | "watcher_admission_pending"
   | "watcher_update_failed";
 
 interface WorkspaceGitAuxiliaryReadCacheEntry<T> {
@@ -1689,6 +1691,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     options: FileObserverOptions,
     onSubscribeSettled: () => void,
     timeoutMs = WORKSPACE_GIT_WATCHER_SUBSCRIBE_TIMEOUT_MS,
+    beforeAccept?: (subscription: FileObserverSubscription) => Promise<void>,
   ): Promise<FileObserverSubscription> {
     this.assertNotDisposed();
     const signal = options.signal
@@ -1699,9 +1702,37 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     let timeout: NodeJS.Timeout | null = null;
     let removeAbortListener = () => {};
     let unsubscribePromise: Promise<void> | null = null;
+    let openedSubscription: FileObserverSubscription | null = null;
+    const closeOpenedSubscription = () => {
+      if (openedSubscription) {
+        unsubscribePromise ??= this.unsubscribeWatcherSubscription(openedSubscription, watchPath);
+      }
+      return unsubscribePromise;
+    };
     let renewInventoryDeadline = () => {};
     const startedAt = performance.now();
-    const hardDeadline = startedAt + WATCH_RECOVERY_SUBSCRIBE_TIMEOUT_MS;
+    let hardDeadline = startedAt + WATCH_RECOVERY_SUBSCRIBE_TIMEOUT_MS;
+    let queuedAt: number | null = null;
+    let inventoryAdmitted = false;
+    const onInventoryAdmission = (state: FileObserverInventoryAdmission) => {
+      if (outcome !== "pending") return;
+      const now = performance.now();
+      if (state === "queued") {
+        queuedAt ??= now;
+        if (timeout) clearTimeout(timeout);
+        timeout = null;
+      } else {
+        // Only actual global admission starts the inventory budget. Later
+        // queue waits preserve its remaining active time rather than reset it.
+        hardDeadline = inventoryAdmitted
+          ? hardDeadline + (queuedAt === null ? 0 : now - queuedAt)
+          : now + WATCH_RECOVERY_SUBSCRIBE_TIMEOUT_MS;
+        inventoryAdmitted = true;
+        queuedAt = null;
+        renewInventoryDeadline();
+      }
+      options.onInventoryAdmission?.(state);
+    };
     let subscriptionPromise: Promise<FileObserverSubscription>;
     try {
       subscriptionPromise = this.deps
@@ -1709,6 +1740,19 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
           ...options,
           signal: subscriptionController.signal,
           onInventoryProgress: () => renewInventoryDeadline(),
+          onInventoryAdmission,
+        })
+        .then(async (subscription) => {
+          openedSubscription = subscription;
+          try {
+            subscriptionController.signal.throwIfAborted();
+            await beforeAccept?.(subscription);
+            subscriptionController.signal.throwIfAborted();
+            return subscription;
+          } catch (error) {
+            await closeOpenedSubscription();
+            throw error;
+          }
         })
         .finally(onSubscribeSettled);
     } catch (error) {
@@ -1731,10 +1775,11 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
         const elapsedMs = Math.max(timeoutMs, Math.round(performance.now() - startedAt));
         const error = new WorkspaceGitWatcherSubscriptionTimeoutError(watchPath, elapsedMs);
         subscriptionController.abort(error);
+        void closeOpenedSubscription();
         reject(error);
       };
       renewInventoryDeadline = () => {
-        if (outcome !== "pending") return;
+        if (outcome !== "pending" || queuedAt !== null) return;
         if (timeout) clearTimeout(timeout);
         timeout = setTimeout(
           expire,
@@ -1747,6 +1792,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       const rejectForDisposal = () => {
         outcome = "expired";
         subscriptionController.abort(signal.reason);
+        void closeOpenedSubscription();
         reject(signal.reason);
       };
       if (signal.aborted) {
@@ -1831,8 +1877,16 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     await target.subscriptionClosePromise;
     if (!this.hasWorkingTreeObservationDemand(target)) return false;
     const replaceFallback = options?.replaceFallback === true;
-    const ignore = this.workingTreeIgnoreList(target);
+    let ignore = this.workingTreeIgnoreList(target);
     let watcherErrored = false;
+    let admissionFallbackOwned = false;
+    let queuedForAdmission = false;
+    const canAccept = () =>
+      this.hasWorkingTreeObservationDemand(target) &&
+      !this.disposed &&
+      !watcherErrored &&
+      !target.subscription &&
+      (!target.fallbackPolling || replaceFallback || admissionFallbackOwned);
     let subscribeSettled = false;
     const markSubscribeSettled = () => {
       subscribeSettled = true;
@@ -1875,19 +1929,32 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
           }
           this.notifyWorkingTreeChanged(target, "working-tree-watch");
         },
-        { ignore, signal: target.closeController.signal },
+        {
+          ignore,
+          signal: target.closeController.signal,
+          onInventoryAdmission: (state) => {
+            if (state === "queued") queuedForAdmission = true;
+            if (state === "queued" && !target.fallbackPolling && !target.closed) {
+              admissionFallbackOwned = true;
+              this.startWorkingTreeWatchFallback(target, "watcher_admission_pending");
+            }
+          },
+        },
         markSubscribeSettled,
         replaceFallback ? WATCH_RECOVERY_SUBSCRIBE_TIMEOUT_MS : undefined,
+        async (opened) => {
+          if (queuedForAdmission && target.repoRoot !== null && canAccept()) {
+            const next = await this.validateQueuedWorkingTreeIgnores(
+              target,
+              opened,
+              ignore,
+              canAccept,
+            );
+            if (next) ignore = next;
+          }
+        },
       );
-      if (watcherErrored) {
-        await this.unsubscribeWatcherSubscription(subscription, target.watchPath);
-        return false;
-      }
-      if (
-        !this.hasWorkingTreeObservationDemand(target) ||
-        (target.fallbackPolling && !replaceFallback) ||
-        target.subscription
-      ) {
+      if (!canAccept()) {
         await this.unsubscribeWatcherSubscription(subscription, target.watchPath);
         return false;
       }
@@ -1900,7 +1967,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       // `scheduleWorkingTreeWatchRecovery` only resets the ladder once this
       // one has survived long enough to prove itself durable.
       target.recovery.establishedAt = this.deps.now().getTime();
-      if (replaceFallback && target.repoRoot !== null) {
+      if ((replaceFallback || admissionFallbackOwned) && target.repoRoot !== null) {
         target.fallbackPolling = false;
         if (target.fallbackPollTimer) {
           clearTimeout(target.fallbackPollTimer);
@@ -1934,6 +2001,26 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       }
       return false;
     }
+  }
+
+  private async validateQueuedWorkingTreeIgnores(
+    target: WorkingTreeWatchTarget,
+    subscription: FileObserverSubscription,
+    previous: string[],
+    canAccept: () => boolean,
+  ): Promise<string[] | null> {
+    const fresh = await this.refreshWorkingTreeIgnoredDirectories(target, { force: true });
+    if (!canAccept()) return null;
+    if (!fresh) throw new Error("Failed to validate Git ignores after queued native admission");
+    const next = this.workingTreeIgnoreList(target);
+    if (!this.haveSamePaths(new Set(previous), new Set(next))) {
+      await subscription.updateIgnore(next);
+    }
+    if (!canAccept()) return null;
+    if (!this.haveSamePaths(new Set(next), new Set(this.workingTreeIgnoreList(target)))) {
+      throw new Error("Git ignores changed while accepting queued native observation");
+    }
+    return next;
   }
 
   private degradedPollDelayMs(quietTickCount: number): number {
@@ -1978,7 +2065,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
           }
           const changed = await this.refreshDegradedPollTarget(workspaceTarget, {
             force: false,
-            refreshStructure: target.repoRoot === null,
+            refreshStructure: target.repoRoot === null || reason === "watcher_admission_pending",
             refreshWorktree: true,
             includeForge: false,
             reason: "working-tree-watch-fallback",
@@ -2614,6 +2701,8 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     const canary = this.deps.createWatcherLivenessCanary(target.repoGitRoot);
     let openedSubscription: FileObserverSubscription | null = null;
     let watcherErrored = false;
+    let admissionFallbackOwned = false;
+    const replacesFallback = () => options?.replaceFallback === true || admissionFallbackOwned;
     let subscribeSettled = false;
     const markSubscribeSettled = () => {
       subscribeSettled = true;
@@ -2672,7 +2761,15 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
             }
           }
         },
-        { ignore },
+        {
+          ignore,
+          onInventoryAdmission: (state) => {
+            if (state === "queued" && !target.fallbackPolling && !target.closed) {
+              admissionFallbackOwned = true;
+              this.startRepoMetadataFallback(target);
+            }
+          },
+        },
         markSubscribeSettled,
         options?.replaceFallback ? WATCH_RECOVERY_SUBSCRIBE_TIMEOUT_MS : undefined,
       );
@@ -2684,7 +2781,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       }
       if (
         target.closed ||
-        (target.fallbackPolling && !options?.replaceFallback) ||
+        (target.fallbackPolling && !replacesFallback()) ||
         this.repoTargets.get(target.repoGitRoot) !== target
       ) {
         await this.unsubscribeWatcherSubscription(subscription, target.repoGitRoot);
@@ -2695,7 +2792,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       // subscribe success alone, only record when this subscription was
       // established.
       target.recovery.establishedAt = this.deps.now().getTime();
-      if (options?.replaceFallback) {
+      if (replacesFallback()) {
         target.fallbackPolling = false;
         if (target.fallbackPollTimer) {
           clearTimeout(target.fallbackPollTimer);
