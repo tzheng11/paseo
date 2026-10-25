@@ -1,12 +1,92 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import pino from "pino";
 import { createDaemonTestContext } from "../test-utils/daemon-test-context.js";
 import { CodexAppServerAgentSession } from "./providers/codex-app-server-agent.js";
 import { createFakeCodexAppServer } from "./providers/codex/test-utils/fake-app-server.js";
 import type { AgentClient, AgentTimelineItem } from "./agent-sdk-types.js";
+
+test("a cold bounded history RPC refuses full replay without publishing a new writer", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "paseo-history-cold-api-"));
+  const app = createFakeCodexAppServer({
+    initialize: () => ({ userAgent: "paseo/0.159.2" }),
+    "thread/read": () => ({ thread: { historyMode: "legacy", turns: [] } }),
+  });
+  const killed = vi.spyOn(app.child, "kill");
+  const makeSession = (purpose?: "interactive" | "history" | "maintenance", mode?: "bounded") =>
+    new CodexAppServerAgentSession(
+      { provider: "codex", cwd, model: "gpt-5.4" },
+      { sessionId: "cold-native-thread" },
+      pino({ level: "silent" }),
+      async () => app.child,
+      {},
+      false,
+      false,
+      false,
+      undefined,
+      purpose,
+      mode,
+    );
+  const provider: AgentClient = {
+    provider: "codex",
+    capabilities: makeSession().capabilities,
+    isAvailable: async () => true,
+    createSession: async () => {
+      throw new Error("A history read must not create a provider session");
+    },
+    resumeSession: async (_handle, _overrides, _context, options) => {
+      const session = makeSession(options?.purpose, options?.historyReadMode);
+      await session.connect();
+      return session;
+    },
+    fetchCatalog: async () => ({ models: [], modes: [] }),
+  };
+  const ctx = await createDaemonTestContext({
+    pluginsEnabled: false,
+    relayEnabled: false,
+    agentClients: { codex: provider },
+  });
+  const id = "00000000-0000-4000-8000-000000000701";
+  try {
+    const storage = ctx.daemon.daemon.agentStorage;
+    await storage.upsert({
+      id,
+      provider: "codex",
+      cwd,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      lastStatus: "closed",
+      labels: {},
+      config: { model: "gpt-5.4" },
+      persistence: {
+        provider: "codex",
+        sessionId: "cold-native-thread",
+        metadata: { provider: "codex", cwd },
+      },
+    });
+    const before = await storage.get(id);
+    await expect(
+      ctx.client.fetchAgentTimelineHistory({ agentId: id, operation: "windows" }),
+    ).rejects.toThrow("Codex cannot read bounded native history for this thread");
+    expect(ctx.daemon.daemon.agentManager.getAgent(id)).toBeNull();
+    expect(await storage.get(id)).toEqual(before);
+    expect(
+      app.requests().filter((request) => String(request.method).startsWith("thread/")),
+    ).toEqual([
+      expect.objectContaining({
+        method: "thread/read",
+        params: { threadId: "cold-native-thread", includeTurns: false },
+      }),
+    ]);
+    expect(killed).toHaveBeenCalledTimes(1);
+    app.assertNoErrors();
+  } finally {
+    await ctx.cleanup();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
 
 test("serves complete expanded projection pages and health requests on an isolated daemon", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "paseo-history-page-"));

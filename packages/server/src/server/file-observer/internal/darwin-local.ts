@@ -1,6 +1,11 @@
+import { watch } from "node:fs";
 import { realpath } from "node:fs/promises";
 import { join, relative } from "node:path";
 import type { WatchDirectory } from "./native-recursive.js";
+import { createDarwinEventPathFilter, resolveDarwinWatchBackend } from "./darwin-watch-backend.js";
+
+// Validate again in the native child, before accepting any watch commands.
+const backend = resolveDarwinWatchBackend();
 
 // Loaded only in the native watcher child, never on the daemon event loop.
 export const watchDarwinDirectoryLocal: WatchDirectory = async (
@@ -9,10 +14,51 @@ export const watchDarwinDirectoryLocal: WatchDirectory = async (
   _recursive,
   ignored = [],
 ) => {
-  const { subscribe } = await import("@parcel/watcher");
   // FSEvents reports physical paths (e.g. /private/var for /var). Resolve once
   // at admission, then keep consumers and ignores in their lexical namespace.
   const physicalRoot = await realpath(root);
+  if (backend === "node") {
+    const filter = createDarwinEventPathFilter({ root, physicalRoot, ignored });
+    let closing = false;
+    let closed = false;
+    let onError: ((error: Error) => void) | undefined;
+    let pendingError: Error | undefined;
+    let resolveClosed!: () => void;
+    const closeBarrier = new Promise<void>((resolve) => {
+      resolveClosed = resolve;
+    });
+    const watcher = watch(physicalRoot, { recursive: true }, (event, filename) => {
+      if (closing || closed) return;
+      const path = filter(filename);
+      if (path !== undefined) listener(event, path);
+    });
+    watcher.once("close", () => {
+      closed = true;
+      resolveClosed();
+    });
+    watcher.on("error", (error) => {
+      if (closing) return;
+      if (onError) onError(error);
+      else pendingError = error;
+    });
+    return {
+      close: () => {
+        closing = true;
+        watcher.close();
+        return closeBarrier;
+      },
+      on: (_event, callback) => {
+        onError = callback;
+        if (pendingError) {
+          queueMicrotask(() => {
+            if (!closing) callback(pendingError!);
+          });
+        }
+      },
+    };
+  }
+
+  const { subscribe } = await import("@parcel/watcher");
   let onError: ((error: Error) => void) | undefined;
   let pendingError: Error | undefined;
   const subscription = await subscribe(

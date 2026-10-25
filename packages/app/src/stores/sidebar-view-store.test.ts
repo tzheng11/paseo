@@ -237,11 +237,19 @@ describe("sidebar view store", () => {
   it("never keeps project filters from state the schema rejects", () => {
     expect(migrateSidebarViewState({ projectFilters: "project-a" })).toEqual({
       showBackground: false,
-      groupMode: "project",
+      groupMode: "none",
       hostFilters: [],
       projectFilters: [],
       labelFilter: { labels: [] },
     });
+  });
+
+  it("defaults to the workspace hierarchy and preserves each explicit grouping preference", () => {
+    expect(migrateSidebarViewState({}).groupMode).toBe("none");
+    for (const groupMode of ["none", "project", "status"] as const) {
+      expect(migrateSidebarViewState({ groupMode }).groupMode).toBe(groupMode);
+    }
+    expect(migrateSidebarViewState({ groupMode: "label" }).groupMode).toBe("project");
   });
 
   it("falls back to the legacy storage key when the new key is empty", async () => {

@@ -5,6 +5,136 @@ import {
   resolveNewWorkspaceAutomaticServerId,
   resolveNewWorkspaceInitialServerId,
 } from "./new-workspace-initial-context";
+import {
+  buildChildWorkspacePlacement,
+  openWorkspaceParentSelection,
+  type WorkspaceParentEntry,
+  workspaceParentRevealKeys,
+} from "./new-workspace/parent-selection";
+
+function parentEntry(overrides: Partial<WorkspaceParentEntry> = {}): WorkspaceParentEntry {
+  return {
+    workspaceKey: "parent-host:parent",
+    workspaceId: "parent",
+    projectViewKey: "project",
+    serverId: "parent-host",
+    name: "Parent",
+    projectName: "Project",
+    archivingAt: null,
+    pinnedAt: null,
+    superpinnedAt: null,
+    ...overrides,
+  };
+}
+
+describe("new workspace parent selection", () => {
+  it("keeps human New workspace at the root until a parent is selected", () => {
+    const model = openWorkspaceParentSelection();
+    model.applyCatalog([parentEntry()]);
+    expect(model.getState()).toEqual({ workspaceKey: null, display: null });
+    expect(
+      buildChildWorkspacePlacement({ parentWorkspaceKey: null, workspaces: [] }),
+    ).toBeUndefined();
+  });
+
+  it("resolves a routed parent after hydration and keeps its display through catalog churn", () => {
+    const model = openWorkspaceParentSelection("parent-host:parent");
+    model.applyCatalog([]);
+    model.applyCatalog([parentEntry()]);
+    model.applyCatalog([parentEntry({ name: "Renamed elsewhere" })]);
+    model.applyCatalog([]);
+    expect(model.getState()).toEqual({ workspaceKey: "parent-host:parent", display: "Parent" });
+    model.select(null);
+    model.applyCatalog([parentEntry()]);
+    expect(model.getState()).toEqual({ workspaceKey: null, display: null });
+  });
+
+  it.each(["unpinned", "pinned", "superpinned"] as const)(
+    "appends a cross-host child in the parent's %s section after every existing sibling",
+    (section) => {
+      const flags = {
+        pinnedAt: section === "unpinned" ? null : "2026-10-22T00:00:00Z",
+        superpinnedAt: section === "superpinned" ? "2026-10-22T00:00:00Z" : null,
+      };
+      const parent = parentEntry(flags);
+      const child = parentEntry({
+        ...flags,
+        workspaceKey: "other-host:child",
+        serverId: "other-host",
+        pinPlacement: { parentWorkspaceKey: parent.workspaceKey, siblingOrder: 8192, revision: 1 },
+      });
+      const anotherSection = parentEntry({
+        workspaceKey: "another:child",
+        pinnedAt: section === "unpinned" ? "now" : null,
+        pinPlacement: { parentWorkspaceKey: parent.workspaceKey, siblingOrder: 99999, revision: 1 },
+      });
+      expect(
+        buildChildWorkspacePlacement({
+          parentWorkspaceKey: parent.workspaceKey,
+          workspaces: [parent, child, anotherSection],
+        }),
+      ).toEqual({ parentWorkspaceKey: parent.workspaceKey, siblingOrder: 9216, section });
+    },
+  );
+
+  it("does not silently create a root when the selected parent is removed", () => {
+    expect(() =>
+      buildChildWorkspacePlacement({ parentWorkspaceKey: "gone:parent", workspaces: [] }),
+    ).toThrow("Parent workspace is no longer available");
+  });
+
+  it("appends after legacy same-project children before their first universal placement", () => {
+    const parent = parentEntry();
+    const child = parentEntry({
+      workspaceKey: "parent-host:old-child",
+      workspaceId: "old-child",
+      parentWorkspaceId: parent.workspaceId,
+      siblingOrder: 8192,
+    });
+    expect(
+      buildChildWorkspacePlacement({
+        parentWorkspaceKey: parent.workspaceKey,
+        workspaces: [parent, child],
+      }),
+    ).toEqual({ parentWorkspaceKey: parent.workspaceKey, siblingOrder: 9216, section: "unpinned" });
+    expect([
+      ...workspaceParentRevealKeys({
+        parentWorkspaceKey: child.workspaceKey,
+        section: "unpinned",
+        workspaces: [parent, child],
+      }),
+    ]).toEqual([child.workspaceKey, parent.workspaceKey]);
+  });
+
+  it("reveals only the selected parent's same-section ancestor chain", () => {
+    const parent = parentEntry({
+      pinnedAt: "now",
+      pinPlacement: {
+        parentWorkspaceKey: "ancestor:one",
+        siblingOrder: 1,
+        revision: 1,
+      },
+    });
+    const ancestor = parentEntry({
+      workspaceKey: "ancestor:one",
+      pinnedAt: "now",
+      pinPlacement: { parentWorkspaceKey: "different:section", siblingOrder: 1, revision: 1 },
+    });
+    const differentSection = parentEntry({ workspaceKey: "different:section" });
+    expect([
+      ...workspaceParentRevealKeys({
+        parentWorkspaceKey: parent.workspaceKey,
+        section: "pinned",
+        workspaces: [
+          parent,
+          ancestor,
+          differentSection,
+          parentEntry({ workspaceKey: "unrelated:one" }),
+        ],
+      }),
+    ]).toEqual([parent.workspaceKey, ancestor.workspaceKey]);
+  });
+});
 
 function projectFor(serverId: string, key = "project"): HostProjectListItem {
   return {

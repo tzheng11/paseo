@@ -100,6 +100,7 @@ export const fr: TranslationResources = {
       addProject: "Ajouter un projet",
       home: "Accueil",
       groupByProject: "Grouper par projet",
+      groupByNone: "Afficher la hiérarchie des espaces de travail",
       groupByStatus: "Grouper par statut",
       modelGroupLabel: "Modèle",
       modelSearchKeywords:
@@ -1193,6 +1194,7 @@ export const fr: TranslationResources = {
       trigger: "Préférences d’affichage",
       heading: "Affichage",
       grouping: {
+        none: "Aucun",
         label: "Regroupement",
         project: "Projet",
         status: "Statut",
@@ -1338,6 +1340,7 @@ export const fr: TranslationResources = {
         pending: "En attente : {{count}}",
       },
       actions: {
+        addChild: "Ajouter un espace de travail enfant",
         menu: "Actions de l’espace de travail",
         newWorkspace: "Nouvel espace de travail",
         showMore: "Afficher plus",
@@ -1377,6 +1380,13 @@ export const fr: TranslationResources = {
     },
   },
   newWorkspace: {
+    parent: {
+      label: "Définir comme enfant de",
+      none: "Aucun parent",
+      searchPlaceholder: "Rechercher des espaces de travail",
+      empty: "Aucun espace de travail disponible.",
+      unavailable: "Espace de travail indisponible",
+    },
     title: "Nouvel espace de travail",
     create: "Créer",
     isolation: {

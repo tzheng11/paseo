@@ -42,17 +42,22 @@ apply independently. A notice separates these ranges for clients without middle-
 On Codex 0.159.2+, local paginated history uses the native SQLite projection as a metadata index.
 The reader respects the provider's separate `CODEX_SQLITE_HOME`, asks it to index missing history
 through a metadata-only turn page, and selects item identifiers and UTF-8 sizes in a worker.
-Only selected items pass through the provider decoder. Native item anchors preserve cursor
-positions without requesting every intervening page. The same loader serves refresh, resume,
+Only selected items pass through the provider decoder. Fetch adjacent selected items in bounded
+small batches; never cross a turn, omitted range or oversized record to fill a batch. Native item
+anchors preserve cursor positions without requesting every intervening page. The same loader serves refresh, resume,
 archived reads and imports; it does not build a complete normalized replay before these reads.
 
 `agent.timeline.history.request` returns head/tail windows or a middle page. The omitted range
 reports its source count and bytes. Its `unit` distinguishes native provider items from normalized
 replay events; these counts are not projected UI-row counts. A page skips an oversized source
 record, reports its size and advances. Selected items remain bounded by serialized bytes and event
-count after normalization. History-page clients use a separate read-only provider connection,
-so an export or page failure cannot close an agent's writer channel. `streamAllHistory` is the
-explicit full provider replay path.
+count after normalization. Cold bounded reads use a separate read-only provider connection;
+resuming a writer can load its entire transcript or start an autonomous goal even when its
+response excludes turns. The read requires a paginated native index and fails explicitly when
+that contract is unavailable. Ordinary compatible history access and `streamAllHistory` retain
+their existing replay paths. An unarchived agent starts its writer only for a later interactive
+action, preserving its selected model and speed tier; archived reads stay read-only. Page and
+export failures cannot close an existing writer channel.
 
 Provider positions are separate from live-stream cursors. The client gates middle paging on
 `server_info.features.boundedTimelineHistory` and the agent's `supportsBoundedHistory` capability,
@@ -66,7 +71,11 @@ still traverses provider pages. Older binaries and other adapters can retain lar
 buffers. The projection row-cache budget does not cover explicit `limit: 0` responses.
 Turn-end hooks carry bounded projection edges, `timelineGap`, and `providerHistoryGap` when
 provider history is unloaded; they do not clone the complete timeline. Search and prompt indexing
-explicitly stream provider messages when the client supports middle pages. Results carry a
+explicitly stream provider messages when the client supports middle pages. The native Codex index
+selects message references before decoding, so tool output is never transferred just to discard it.
+Prompt outlines select only user messages; search includes assistant messages. Preserve positions
+in the complete provider history even when skipping items. Finish the metadata snapshot before
+provider decoding so a long stream does not pin a SQLite reader transaction. Results carry a
 provider index for loading their bounded window; that index never becomes a live stream cursor.
 Clients without middle-page support search their readable projection.
 

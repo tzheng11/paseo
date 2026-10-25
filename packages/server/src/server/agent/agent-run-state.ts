@@ -14,10 +14,11 @@ export interface PendingForegroundRun {
   token: string;
   kind: "foreground";
   stagedEvents: AgentStreamEvent[];
+  providerDispatched?: boolean;
   start:
     | { status: "pending" }
     | { status: "started"; turnId: string }
-    | { status: "failed"; error: string };
+    | { status: "failed"; error: string; cause?: Error };
   settled: boolean;
   settledPromise: Promise<void>;
   resolveSettled: () => void;

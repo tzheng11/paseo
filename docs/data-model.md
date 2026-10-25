@@ -503,15 +503,29 @@ Sibling ranks are finite floating-point numbers shared by clients. A move insert
 the registry renumbers that sibling group atomically when the gap no longer has a representable
 midpoint. Expanded and collapsed workspace preferences stay on the client.
 
-The sidebar renders independent navigation trees only in Pinned and SuperPinned. Their layout
-is persisted with this app/browser's existing sidebar ordering preferences, using full
-`serverId:workspaceId` parent keys and finite fractional sibling ranks. A pin tree can span
-projects and hosts without changing workspace ownership, directory paths, or registry parent
-fields. Explicit pin priority determines section membership. Missing, filtered, or unpinned
-parents leave their children visible as roots, while stored edges remain available if the parent
-returns. Legacy registry parents are used only when both workspaces are explicitly in the same
-pin section and the client has no saved layout override. Pin membership changes still use the
-workspace's own host; rearranging an existing pin tree is a client-local operation.
+The sidebar renders navigation trees in Pinned, Superpinned, and the ordinary Workspaces list
+when **Group by → None** is selected. Each workspace's owning
+host persists its `pinPlacement`: a full `serverId:workspaceId` parent key, finite fractional
+sibling rank, and revision. Every connected client reads these placements through directory
+sync. Cross-host nesting changes navigation without moving directories, agents, or project
+membership. Explicit pin priority determines section membership. Missing, filtered, or off-section
+parents leave children visible as roots; their stored edges remain available when the parent
+returns. Concurrent cross-host cycles are rendered as roots so no workspace disappears.
+
+Pin writes require `features.workspacePinPlacement` and compare the captured revision before
+saving. Rebalance writes precede the source move; failed writes stay visible as errors and are
+not stored as a private layout. Legacy client layouts require an explicit **Share saved layout**
+import, which only fills placements that have never been shared. Old clients cannot silently
+replace shared nesting with stale browser preferences. Expansion and sort-mode preferences
+remain local.
+
+New Workspace's parent selection and MCP workspace placement use this same navigation
+relationship. Child creation inherits the parent's section and appends to its children;
+agent-scoped creation defaults to the caller's workspace, while an explicit null parent creates
+a root. This organization never changes agent parentage or worktree ownership. The creation
+request commits placement and pin priority before publishing the workspace, so a newly created
+IC workspace does not first appear as an unrelated root. These operations require
+`features.workspaceSidebarPlacement`.
 
 Client directory replicas persist parent IDs and ranks alongside their sync checkpoint. The
 checkpoint format changes when older cached projections cannot represent hierarchy; retaining

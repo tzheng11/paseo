@@ -100,6 +100,7 @@ export const es: TranslationResources = {
       addProject: "Agregar proyecto",
       home: "Hogar",
       groupByProject: "Agrupar por proyecto",
+      groupByNone: "Mostrar jerarquía de espacios de trabajo",
       groupByStatus: "Agrupar por estado",
       modelGroupLabel: "Modelo",
       modelSearchKeywords: "cambiar modelo modificar modelo establecer modelo seleccionar modelo",
@@ -1200,6 +1201,7 @@ export const es: TranslationResources = {
       trigger: "Preferencias de visualización",
       heading: "Visualización",
       grouping: {
+        none: "Ninguna",
         label: "Agrupación",
         project: "Proyecto",
         status: "Estado",
@@ -1344,6 +1346,7 @@ export const es: TranslationResources = {
         pending: "Pendientes: {{count}}",
       },
       actions: {
+        addChild: "Añadir espacio de trabajo hijo",
         menu: "AccionesWorkspace",
         newWorkspace: "Nuevo espacio de trabajo",
         showMore: "Mostrar más",
@@ -1383,6 +1386,13 @@ export const es: TranslationResources = {
     },
   },
   newWorkspace: {
+    parent: {
+      label: "Hacer hijo de",
+      none: "Sin padre",
+      searchPlaceholder: "Buscar espacios de trabajo",
+      empty: "No hay espacios de trabajo disponibles.",
+      unavailable: "Espacio de trabajo no disponible",
+    },
     title: "Nuevo espacio de trabajo",
     create: "Crear",
     isolation: {

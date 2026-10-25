@@ -2,6 +2,7 @@ import { ClaudeSessionSchedulers, hasRuntimeShellChild } from "./idle-agent-unlo
 import { ensureAgentLoaded } from "./agent-loading.js";
 import { hasActiveVoiceModeSystemPrompt } from "../voice-config.js";
 import type { MessageReceipts } from "../message-receipts/index.js";
+import { MessageNotDispatchedError } from "../message-receipts/index.js";
 import { startAgentRun, type AgentRunController } from "./agent-prompt.js";
 import { prepareAgentMessage } from "./agent-messages/index.js";
 import {
@@ -75,6 +76,7 @@ import {
   type AgentSessionConfig,
   type SteerResult,
   type AgentStreamEvent,
+  type AgentHistoryStreamOptions,
   type AgentTimelineItem,
   type AgentUsage,
   type AgentRuntimeInfo,
@@ -174,8 +176,11 @@ const IDLE_RELOAD_ERRORS = {
   },
 } as const;
 
-function reloadResumeOptions(preserveHistory?: boolean): AgentResumeSessionOptions | undefined {
-  return preserveHistory ? { purpose: "maintenance" } : undefined;
+function reloadResumeOptions(
+  previousSession: AgentSession,
+  preserveHistory?: boolean,
+): AgentResumeSessionOptions | undefined {
+  return preserveHistory ? { purpose: "maintenance", previousSession } : undefined;
 }
 
 export class AgentIdleReloadError extends Error {
@@ -503,8 +508,10 @@ interface ManagedAgentBase {
   activeTurnStartedAt: Date | null;
   lastUsage?: AgentUsage;
   lastError?: string;
+  lastRunStartError?: Error;
   credentialGeneration?: string;
   credentialChangedAt?: string;
+  credentialLoadedAt?: string;
   quotaTurnCheckpoint?: QuotaTurnCheckpoint;
   quotaTurnRevision?: number;
   attention: AttentionState;
@@ -866,6 +873,16 @@ export interface RetiredInternalAgent {
   lastMessage: string | null;
 }
 
+function matchesHistorySelection(
+  item: AgentTimelineItem,
+  options?: AgentHistoryStreamOptions,
+): boolean {
+  if (options?.userMessagesOnly) return item.type === "user_message";
+  return (
+    !options?.messagesOnly || item.type === "user_message" || item.type === "assistant_message"
+  );
+}
+
 function resolveRescueTimeouts(options: AgentManagerOptions["rescueTimeouts"]) {
   return {
     reloadSessionCloseMs: options?.reloadSessionCloseMs ?? RELOAD_SESSION_CLOSE_TIMEOUT_MS,
@@ -890,6 +907,8 @@ export class AgentManager {
   private readonly idleReloads = new Set<string>();
   private readonly timelineStore: AgentRuntimeTimelineStore;
   private readonly historySourceBoundarySeq = new Map<string, number>();
+  private readonly historyReadTails = new Map<string, Promise<void>>();
+  private readonly historyReadBarriers = new Map<string, number>();
   private readonly providerSubagents = new ProviderSubagentStore();
   private readonly agentsAwaitingInitialSnapshotPersist = new Set<string>();
   private readonly sessionEventTails = new Map<string, Promise<void>>();
@@ -1562,13 +1581,19 @@ export class AgentManager {
   }
 
   /** Search and prompt indexing explicitly traverse the unloaded provider middle. */
-  async *streamFullHistoryMessages(id: string): AsyncGenerator<AgentTimelineRow> {
-    yield* this.streamFullHistoryRows(id, { messagesOnly: true });
+  async *streamFullHistoryMessages(
+    id: string,
+    options?: { userOnly?: boolean },
+  ): AsyncGenerator<AgentTimelineRow> {
+    yield* this.streamFullHistoryRows(id, {
+      messagesOnly: true,
+      ...(options?.userOnly ? { userMessagesOnly: true } : {}),
+    });
   }
 
   async *streamFullHistoryRows(
     id: string,
-    options?: { messagesOnly?: boolean },
+    options?: AgentHistoryStreamOptions,
   ): AsyncGenerator<AgentTimelineRow> {
     const agent = this.requireSessionAgent(id);
     if (!agent.session.streamHistoryEntries)
@@ -1579,19 +1604,9 @@ export class AgentManager {
         throw new Error("History changed during streamed read");
       const event = entry.value;
       if (event.type !== "timeline") continue;
-      if (
-        options?.messagesOnly &&
-        event.item.type !== "user_message" &&
-        event.item.type !== "assistant_message"
-      )
-        continue;
+      if (!matchesHistorySelection(event.item, options)) continue;
       for (const projected of projectAgentMessages(event.item)) {
-        if (
-          options?.messagesOnly &&
-          projected.type !== "user_message" &&
-          projected.type !== "assistant_message"
-        )
-          continue;
+        if (!matchesHistorySelection(projected, options)) continue;
         const item = limitAgentTimelineItemContent(projected);
         yield {
           seq: entry.index + 1,
@@ -1617,30 +1632,49 @@ export class AgentManager {
       epoch?: string;
     },
   ) {
-    const agent = this.requireSessionAgent(id);
-    return this.runSessionOperation(id, async () => {
-      const epoch = this.timelineStore.getEpoch(id);
-      if (request.epoch !== undefined && request.epoch !== epoch)
-        throw new Error("History epoch changed; reload its windows");
-      if (request.operation === "windows") {
-        if (!agent.session.readHistoryWindows)
-          throw new Error("Provider does not support bounded history");
-        const windows = await agent.session.readHistoryWindows(DEFAULT_HISTORY_WINDOWS);
+    return this.trackHistoryRead(id, async () => {
+      const snapshot = await this.runSessionOperation(id, async () => {
+        this.assertHistoryReadAdmission(id);
+        const agent = this.requireSessionAgent(id);
+        const epoch = this.timelineStore.getEpoch(id);
+        if (request.epoch !== undefined && request.epoch !== epoch)
+          throw new Error("History epoch changed; reload its windows");
         return {
+          agent,
+          session: agent.session,
           epoch,
-          ...windows,
           liveAfterSeq: this.historySourceBoundarySeq.get(id),
-          unit: agent.session.historyWindowInfo?.unit ?? ("events" as const),
         };
-      }
-      if (!agent.session.readHistoryPage || request.cursor === undefined)
-        throw new Error("Provider history requires a supported page cursor");
-      const page = await agent.session.readHistoryPage({
-        cursor: request.cursor,
-        direction: request.direction ?? "after",
-        limit: request.limit ?? { events: 128, bytes: 256 * 1024 },
       });
-      return { epoch, ...page, unit: agent.session.historyWindowInfo?.unit ?? ("events" as const) };
+      const { agent, session, epoch, liveAfterSeq } = snapshot;
+      // Provider history can wait on a separate reader process. Keep that IO out
+      // of the live-event lane so a terminal event can settle the active turn.
+      const history = await (async () => {
+        if (request.operation === "windows") {
+          if (!session.readHistoryWindows)
+            throw new Error("Provider does not support bounded history");
+          return { ...(await session.readHistoryWindows(DEFAULT_HISTORY_WINDOWS)), liveAfterSeq };
+        }
+        if (!session.readHistoryPage || request.cursor === undefined)
+          throw new Error("Provider history requires a supported page cursor");
+        return session.readHistoryPage({
+          cursor: request.cursor,
+          direction: request.direction ?? "after",
+          limit: request.limit ?? { events: 128, bytes: 256 * 1024 },
+        });
+      })();
+      return await this.runSessionOperation(id, async () => {
+        if (
+          this.agents.get(id) !== agent ||
+          agent.session !== session ||
+          !this.timelineStore.has(id) ||
+          this.timelineStore.getEpoch(id) !== epoch ||
+          this.historySourceBoundarySeq.get(id) !== liveAfterSeq
+        ) {
+          throw new Error("History changed during bounded read; reload its windows");
+        }
+        return { epoch, ...history, unit: session.historyWindowInfo?.unit ?? ("events" as const) };
+      });
     });
   }
 
@@ -1832,7 +1866,10 @@ export class AgentManager {
     // agent whose working directory may be gone.
     const record = this.registry ? await this.registry.get(resolvedAgentId) : null;
     const currentResumeOptions = record
-      ? { purpose: record.archivedAt ? ("history" as const) : ("interactive" as const) }
+      ? {
+          ...resumeOptions,
+          purpose: record.archivedAt ? ("history" as const) : ("interactive" as const),
+        }
       : resumeOptions;
     const purpose = currentResumeOptions?.purpose ?? "interactive";
 
@@ -1842,6 +1879,12 @@ export class AgentManager {
       { purpose },
     );
     const client = this.requireClient(handle.provider);
+    if (
+      currentResumeOptions?.historyReadMode === "bounded" &&
+      !client.capabilities.supportsBoundedHistory
+    ) {
+      throw new Error(`Provider '${handle.provider}' does not support bounded history loading`);
+    }
     const available = await client.isAvailable();
     if (!available) {
       throw new Error(
@@ -2139,11 +2182,18 @@ export class AgentManager {
               },
             },
           });
-          await withTimeout(
-            this.waitForAgentRunStart(agentId),
-            30_000,
-            "Quota continuation startup unconfirmed",
-          );
+          try {
+            await withTimeout(
+              this.waitForAgentRunStart(agentId),
+              30_000,
+              "Quota continuation startup unconfirmed",
+            );
+          } catch (error) {
+            if (error instanceof Error && (await this.failPendingAgentRunStart(agentId, error))) {
+              throw new MessageNotDispatchedError(error.message, { cause: error });
+            }
+            throw error;
+          }
           if (!dispatched) throw new Error("Quota continuation input was not dispatched");
         },
       });
@@ -2160,6 +2210,10 @@ export class AgentManager {
         );
       }
       const failure = admissionFailure ?? error;
+      this.logger.warn(
+        { err: failure, agentId, failedTurnId: checkpoint.turnId, messageId, dispatched },
+        "Quota continuation was not confirmed",
+      );
       if (
         !dispatched &&
         failure instanceof Error &&
@@ -2167,6 +2221,8 @@ export class AgentManager {
         (failure.code === "quota_recovery_superseded" || failure.code === "agent_reload_busy")
       )
         return { status: "refused", ...identity, reasonCode: "QUOTA_RECOVERY_SUPERSEDED_OR_BUSY" };
+      if (!dispatched && failure instanceof MessageNotDispatchedError)
+        return { status: "refused", ...identity, reasonCode: "QUOTA_CONTINUATION_NOT_DISPATCHED" };
       return { status: "unknown", ...identity, reasonCode: "QUOTA_CONTINUATION_UNKNOWN" };
     } finally {
       this.quotaContinuationGuards.delete(agentId);
@@ -2247,9 +2303,11 @@ export class AgentManager {
     overrides?: Partial<AgentSessionConfig>,
     options?: { rehydrateFromDisk?: boolean; preserveHistory?: boolean },
   ): Promise<ManagedAgent> {
-    return this.trackAgentRegistrationOperation(
-      this.runLifecycleMutation(agentId, () =>
-        this.reloadAgentSessionInternal(agentId, overrides, options),
+    return this.withHistoryReadBarrier(agentId, () =>
+      this.trackAgentRegistrationOperation(
+        this.runLifecycleMutation(agentId, () =>
+          this.reloadAgentSessionInternal(agentId, overrides, options),
+        ),
       ),
     );
   }
@@ -2311,6 +2369,7 @@ export class AgentManager {
     try {
       // A persisted thread can have only one writer, even when its turn is idle.
       await this.closeReloadedSession(existing.session, agentId, options.preserveHistory);
+      await this.drainHistoryReads(agentId);
       await this.drainSessionEvents(agentId);
       this.cancelRunningProviderSubagents(agentId);
       closedExisting = this.prepareAgentForClosure(
@@ -2327,7 +2386,7 @@ export class AgentManager {
             handle,
             providerLaunchConfig,
             launchContext,
-            reloadResumeOptions(options.preserveHistory),
+            reloadResumeOptions(existing.session, options.preserveHistory),
           )
         : await client.createSession(providerLaunchConfig, launchContext);
       await this.requireExternalMcpSupport(session, storedConfig);
@@ -2533,7 +2592,11 @@ export class AgentManager {
     return close;
   }
 
-  private async closeAgentRuntime(agentId: string): Promise<void> {
+  private closeAgentRuntime(agentId: string): Promise<void> {
+    return this.withHistoryReadBarrier(agentId, () => this.closeAgentRuntimeUnlocked(agentId));
+  }
+
+  private async closeAgentRuntimeUnlocked(agentId: string): Promise<void> {
     const agent = this.requireAgent(agentId);
     this.logger.trace(
       {
@@ -2547,6 +2610,7 @@ export class AgentManager {
       },
       "agent.manager.close.start",
     );
+    await this.drainHistoryReads(agentId);
     await this.drainSessionEvents(agentId);
     // Retain ownership until shutdown succeeds. A failed close may still own a
     // native writer, so publishing a resumable closed snapshot would orphan it.
@@ -3442,15 +3506,31 @@ export class AgentManager {
     const { agent, agentId, pendingRun, prompt, options } = params;
     try {
       agent.quotaTurnRevision = this.quotaActivityRevisions.get(agentId) ?? 0;
+      if (agent.session.getRuntimeProcessId?.() === null) {
+        agent.credentialLoadedAt = new Date().toISOString();
+      }
       await this.persistSnapshot(agent);
       this.quotaContinuationGuards.get(agentId)?.();
-      const result = await agent.session.startTurn(prompt, options);
-      if (pendingRun.settled) {
+      const result = await agent.session.startTurn(prompt, {
+        ...options,
+        beforeProviderSend: () => {
+          if (pendingRun.settled || pendingRun.start.status === "failed") {
+            throw new MessageNotDispatchedError("Agent run was canceled before provider dispatch");
+          }
+          options?.beforeProviderSend?.();
+          pendingRun.providerDispatched = true;
+        },
+      });
+      const startupFailure = pendingRun.stagedEvents.find((event) => event.type === "turn_failed");
+      if (pendingRun.providerDispatched === false && startupFailure?.type === "turn_failed") {
+        throw new MessageNotDispatchedError(startupFailure.error);
+      }
+      if (pendingRun.settled || pendingRun.start.status === "failed") {
         throw new Error(`Agent ${agentId} run was canceled before its turn started`);
       }
       return result.turnId;
     } catch (error) {
-      if (pendingRun.settled) {
+      if (pendingRun.settled || pendingRun.start.status === "failed") {
         throw error;
       }
       if (isStaleProviderSessionError(error)) {
@@ -3462,7 +3542,12 @@ export class AgentManager {
       }
       agent.pendingReplacement = false;
       const errorMsg = error instanceof Error ? error.message : "Failed to start turn";
-      pendingRun.start = { status: "failed", error: errorMsg };
+      const cause =
+        pendingRun.providerDispatched === false
+          ? new MessageNotDispatchedError(errorMsg, { cause: error })
+          : undefined;
+      pendingRun.start = { status: "failed", error: errorMsg, cause };
+      agent.lastRunStartError = cause;
       // A terminal rejection belongs after the submitted prompt even though no provider turn exists.
       if (options?.clientMessageId) {
         this.recordSubmittedPrompt(agent, prompt, options.clientMessageId, "rejected", {
@@ -3476,7 +3561,7 @@ export class AgentManager {
       });
       this.finalizeForegroundTurn(agent);
       this.runs.settleForegroundRun(agentId, pendingRun.token);
-      throw error;
+      throw cause ?? error;
     }
   }
 
@@ -3531,8 +3616,12 @@ export class AgentManager {
     const agent = existingAgent;
     const isReplacement = agent.pendingReplacement;
     agent.lastError = undefined;
+    agent.lastRunStartError = undefined;
 
     const pendingRun = this.runs.createPendingRun(agentId);
+    if (agent.provider === "claude" || agent.provider === "codex") {
+      pendingRun.providerDispatched = false;
+    }
 
     const streamForwarder = async function* streamForwarder(this: AgentManager) {
       let turnId: string;
@@ -3943,7 +4032,7 @@ export class AgentManager {
     }
 
     if (!snapshot.activeForegroundTurnId && !pendingRun && !snapshot.pendingReplacement) {
-      throw new Error(`Agent ${agentId} has no pending run`);
+      throw snapshot.lastRunStartError ?? new Error(`Agent ${agentId} has no pending run`);
     }
 
     if (options?.signal?.aborted) {
@@ -3995,6 +4084,10 @@ export class AgentManager {
       }
 
       const checkCurrentState = () => {
+        if (pendingRun?.start.status === "failed") {
+          finishErr(pendingRun.start.cause ?? new Error(pendingRun.start.error));
+          return true;
+        }
         const current = this.getAgent(agentId);
         if (!current) {
           finishErr(new Error(`Agent ${agentId} not found`));
@@ -4016,7 +4109,10 @@ export class AgentManager {
         }
 
         if (current.lifecycle === "error" && !currentPendingRun) {
-          finishErr(new Error(current.lastError ?? `Agent ${agentId} failed to start`));
+          finishErr(
+            current.lastRunStartError ??
+              new Error(current.lastError ?? `Agent ${agentId} failed to start`),
+          );
           return true;
         }
 
@@ -4040,6 +4136,27 @@ export class AgentManager {
 
       checkCurrentState();
     });
+  }
+
+  async failPendingAgentRunStart(agentId: string, error: Error): Promise<boolean> {
+    const run = this.runs.getPendingRun(agentId);
+    if (!run || run.start.status !== "pending" || run.providerDispatched !== false) return false;
+    const agent = this.requireSessionAgent(agentId);
+    const cause = new MessageNotDispatchedError(error.message, { cause: error });
+    agent.lastRunStartError = cause;
+    // Close admission before interrupting: a late SDK startup must never submit this input.
+    run.start = { status: "failed", error: cause.message, cause };
+    await this.interruptSession(agent.session, agentId);
+    if (this.runs.getPendingRun(agentId) !== run) return true;
+    agent.pendingReplacement = false;
+    await this.handleStreamEvent(agent, {
+      type: "turn_failed",
+      provider: agent.provider,
+      error: cause.message,
+    });
+    this.finalizeForegroundTurn(agent);
+    this.runs.settleForegroundRun(agentId, run.token);
+    return true;
   }
 
   async respondToPermission(
@@ -4831,6 +4948,7 @@ export class AgentManager {
       lastError: options?.lastError,
       credentialGeneration: quotaState.credentialGeneration,
       credentialChangedAt: quotaState.credentialChangedAt,
+      credentialLoadedAt: now.toISOString(),
       quotaTurnCheckpoint: quotaState.quotaTurnCheckpoint,
       attention: resolveInitialAttention(options?.attention),
       internal: config.internal ?? false,
@@ -4969,6 +5087,58 @@ export class AgentManager {
     }).catch((err) => {
       this.logger.error({ err, agentId, eventType: event.type }, "Failed to process session event");
     });
+  }
+
+  private async withHistoryReadBarrier<T>(
+    agentId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    this.historyReadBarriers.set(agentId, (this.historyReadBarriers.get(agentId) ?? 0) + 1);
+    try {
+      return await operation();
+    } finally {
+      const remaining = this.historyReadBarriers.get(agentId)! - 1;
+      if (remaining) this.historyReadBarriers.set(agentId, remaining);
+      else this.historyReadBarriers.delete(agentId);
+    }
+  }
+
+  private assertHistoryReadAdmission(agentId: string): void {
+    if (
+      this.historyReadBarriers.has(agentId) ||
+      this.idleReloads.has(agentId) ||
+      this.inFlightAgentCloses.has(agentId)
+    )
+      throw new Error("Agent session is changing; read history after it completes");
+  }
+
+  private trackHistoryRead<T>(agentId: string, operation: () => Promise<T>): Promise<T> {
+    this.assertHistoryReadAdmission(agentId);
+    const finish = this.beginAgentActivity(agentId);
+    // Preserve one provider history reader per agent without serializing live
+    // events behind it. A timed-out client may still own a pending native read.
+    const previous = this.historyReadTails.get(agentId) ?? Promise.resolve();
+    const read = previous.then(operation);
+    const settled = read
+      .then(
+        () => undefined,
+        () => undefined,
+      )
+      .finally(() => {
+        if (this.historyReadTails.get(agentId) === settled) this.historyReadTails.delete(agentId);
+        finish();
+      });
+    this.historyReadTails.set(agentId, settled);
+    this.trackBackgroundTask(settled);
+    return read;
+  }
+
+  private async drainHistoryReads(agentId: string): Promise<void> {
+    // Teardown still owns these readers through disposal. Waiting here must not
+    // put their IO back ahead of live turn completion in sessionEventTails.
+    while (this.historyReadTails.has(agentId)) {
+      await this.historyReadTails.get(agentId);
+    }
   }
 
   private runSessionOperation<T>(agentId: string, operation: () => Promise<T>): Promise<T> {
@@ -5773,6 +5943,7 @@ export class AgentManager {
         turnId: eventTurnId,
         sessionId: agent.persistence.sessionId,
         failedAt: new Date().toISOString(),
+        credentialLoadedAt: agent.credentialLoadedAt,
         ...(agent.credentialGeneration
           ? {
               credentialGeneration: agent.credentialGeneration,
