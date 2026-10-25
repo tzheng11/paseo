@@ -663,6 +663,8 @@ export interface AgentResumeSessionOptions {
   historyReadMode?: "bounded";
   /** See AgentCreateSessionOptions.configuredModelIds. */
   configuredModelIds?: readonly string[];
+  /** Retired in-process adapter, only for a maintenance reload of the same native session. */
+  previousSession?: AgentSession;
 }
 
 /**

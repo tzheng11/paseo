@@ -1676,8 +1676,12 @@ export class ClaudeAgentClient implements AgentClient {
       resolveBinary: this.resolveBinary,
       rewindSdk: this.rewindSdk,
     });
-    if (options?.purpose === "maintenance") await session.initializeMaintenance();
-    else await session.initializeHistory();
+    if (options?.purpose === "maintenance") {
+      if (options.previousSession instanceof ClaudeAgentSession) {
+        session.inheritMaintenanceHistory(options.previousSession);
+      }
+      await session.initializeMaintenance();
+    } else await session.initializeHistory();
     return session;
   }
 
@@ -2297,6 +2301,7 @@ class ClaudeAgentSession implements AgentSession {
   private historyLoad: Promise<void> | null = null;
   private historyTransition: Promise<void> | null = null;
   private historyAbort: AbortController | null = null;
+  private historyReplayComplete = false;
   private missingResumeRecovery: Promise<void> | null = null;
   private turnAdmissionEpoch = 0;
   private readonly runtimeSafety = new ClaudeRuntimeSafety();
@@ -2331,7 +2336,7 @@ class ClaudeAgentSession implements AgentSession {
   private autonomousTurn: AutonomousTurnState | null = null;
   private readonly subscribers = new Set<(event: AgentStreamEvent) => void>();
   private readonly timelineAssembler = new TimelineAssembler();
-  private readonly taskState = new ClaudeTaskState();
+  private taskState = new ClaudeTaskState();
   private readonly backgroundTasks = new ClaudeBackgroundTasks();
   private readonly taskProtocolSource = new ClaudeTaskProtocolSource({
     getToolInput: (toolUseId) => this.toolUseCache.get(toolUseId)?.input ?? null,
@@ -2433,6 +2438,7 @@ class ClaudeAgentSession implements AgentSession {
     } else {
       this.claudeSessionId = null;
       this.persistence = null;
+      this.historyReplayComplete = true;
     }
 
     // Validate mode if provided
@@ -2451,6 +2457,28 @@ class ClaudeAgentSession implements AgentSession {
 
   async initializeHistory(): Promise<void> {
     await this.loadDeferredHistory();
+  }
+
+  inheritMaintenanceHistory(previous: ClaudeAgentSession): void {
+    if (!previous.closed || previous.claudeSessionId !== this.claudeSessionId) {
+      throw new Error("Claude maintenance history requires the retired native session");
+    }
+    if (!previous.historyReplayComplete) return;
+    // Replaying every sidechain before the first input can take longer than run admission.
+    // Keep operational state as well as history: a bare replay skip loses TaskUpdate and rewind.
+    this.deferredHistorySessionId = null;
+    this.historyReplayComplete = true;
+    this.taskState = previous.taskState;
+    this.toolUseCache = previous.toolUseCache;
+    this.toolUseIndexToId = previous.toolUseIndexToId;
+    this.toolUseInputBuffers = previous.toolUseInputBuffers;
+    this.subagentHandbackIds = previous.subagentHandbackIds;
+    this.userMessageIds = previous.userMessageIds;
+    for (const id of previous.emittedUserMessageIds) this.emittedUserMessageIds.add(id);
+    this.rewindTurnAnchors.push(...previous.rewindTurnAnchors);
+    this.persistedHistory = previous.persistedHistory;
+    this.persistedProviderSubagentEvents = previous.persistedProviderSubagentEvents;
+    this.historyPending = previous.historyPending;
   }
 
   async initializeMaintenance(): Promise<void> {
@@ -3410,6 +3438,7 @@ class ClaudeAgentSession implements AgentSession {
     this.taskState.reset();
     this.historyAbort?.abort();
     this.deferredHistorySessionId = sessionId;
+    this.historyReplayComplete = false;
     if (oldSessionId && oldSessionId !== sessionId) {
       this.dispatchEvents([
         {
@@ -5522,6 +5551,7 @@ class ClaudeAgentSession implements AgentSession {
     this.historyLoad = load;
     try {
       await load;
+      this.historyReplayComplete = !controller.signal.aborted;
     } finally {
       if (this.historyLoad === load) {
         this.historyLoad = null;

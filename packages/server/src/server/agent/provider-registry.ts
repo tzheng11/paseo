@@ -434,9 +434,10 @@ function mergeModelAdditions(
 
 // Every session member must cross this boundary, including optional capabilities.
 type ForwardedAgentSession = { [K in keyof Required<AgentSession>]: AgentSession[K] };
+const nativeSessions = new WeakMap<AgentSession, AgentSession>();
 
 export function wrapSessionProvider(provider: AgentProvider, inner: AgentSession): AgentSession {
-  return {
+  const session = {
     provider,
     get id() {
       return inner.id;
@@ -522,6 +523,8 @@ export function wrapSessionProvider(provider: AgentProvider, inner: AgentSession
     revertBoth: inner.revertBoth?.bind(inner),
     tryHandleOutOfBand: inner.tryHandleOutOfBand?.bind(inner),
   } satisfies ForwardedAgentSession;
+  nativeSessions.set(session, nativeSessions.get(inner) ?? inner);
+  return session;
 }
 
 function wrapClientProvider(
@@ -572,7 +575,13 @@ function wrapClientProvider(
             providerOptions: mergeProviderOptions(providerOptions, overrides?.providerOptions),
           },
           launchContext,
-          { ...options, configuredModelIds },
+          {
+            ...options,
+            configuredModelIds,
+            previousSession: options?.previousSession
+              ? (nativeSessions.get(options.previousSession) ?? options.previousSession)
+              : undefined,
+          },
         ),
       ),
     fetchCatalog: async (options, context) => {
