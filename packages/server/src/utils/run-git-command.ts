@@ -62,6 +62,8 @@ export interface GitCommandOptions {
   timeout?: number;
   maxOutputBytes?: number;
   acceptExitCodes?: number[];
+  /** User-requested ignore inventories share high-priority read admission. */
+  inventoryLane?: "interactive";
 }
 
 export interface GitCommandResult<Output = string> {
@@ -304,8 +306,9 @@ function executeGitCommand<Output>(
   const isInventory =
     getGitOperation(args) === "ls-files" &&
     ["-o", "-i", "--directory", "--exclude-standard"].every((flag) => args.includes(flag));
-  const scheduler = isInventory ? inventoryProcessScheduler : gitProcessScheduler;
-  const runtimeMetrics = isInventory ? inventoryRuntimeMetrics : gitRuntimeMetrics;
+  const isBackgroundInventory = isInventory && options.inventoryLane !== "interactive";
+  const scheduler = isBackgroundInventory ? inventoryProcessScheduler : gitProcessScheduler;
+  const runtimeMetrics = isBackgroundInventory ? inventoryRuntimeMetrics : gitRuntimeMetrics;
   const commandProvenance = isInventory
     ? `git-ignore-inventory${provenance ? `:${provenance}` : ""}`
     : provenance;
@@ -425,7 +428,7 @@ function executeGitCommand<Output>(
         // octal-escaping non-ASCII bytes (e.g. `测试文件.txt` vs `"\346\265\213..."`).
         // `core.fsmonitor=false` prevents repository config from launching a command.
         const gitArgs = ["-c", "core.quotepath=false", "-c", "core.fsmonitor=false", ...args];
-        const lowerPriority = isInventory && process.platform !== "win32";
+        const lowerPriority = isBackgroundInventory && process.platform !== "win32";
         child = spawnProcess(
           lowerPriority ? "nice" : "git",
           lowerPriority ? ["-n", "10", "git", ...gitArgs] : gitArgs,
@@ -591,9 +594,12 @@ function executeGitCommand<Output>(
     return { result: resultPromise, exited };
   };
   const promise = scheduler.run(startCommand, {
-    // Initial watcher seeds can pass warm re-inventories within this lane;
-    // neither class takes a shared Git process slot.
-    priority: gitCommandPriority.getStore() ?? "normal",
+    // Native watcher seeds keep their high priority within the background lane.
+    // Only explicitly interactive inventory uses high-priority shared read slots.
+    priority:
+      isInventory && options.inventoryLane === "interactive"
+        ? "high"
+        : (gitCommandPriority.getStore() ?? "normal"),
   });
   runtimeMetrics.observeLimiter(scheduler.activeCount, scheduler.pendingCount);
   return promise;

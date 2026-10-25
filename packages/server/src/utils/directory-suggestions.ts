@@ -787,6 +787,7 @@ async function loadGitIgnoredPaths(root: string): Promise<Set<string>> {
     ["ls-files", "-o", "-i", "--directory", "--exclude-standard", "-z"],
     {
       cwd: root,
+      inventoryLane: "interactive",
       envOverlay: { GIT_OPTIONAL_LOCKS: "0" },
       timeout: 10_000,
     },
