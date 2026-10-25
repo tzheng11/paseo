@@ -5,6 +5,7 @@ import {
   type AgentMessageDelivery,
 } from "./agent-messages/index.js";
 import type { Logger } from "pino";
+import { MessageNotDispatchedError } from "../message-receipts/index.js";
 
 import type {
   AgentPermissionRequest,
@@ -290,6 +291,11 @@ export async function waitForAgentRunStartWithTimeout(
     await agentManager.waitForAgentRunStart(agentId, {
       signal: signal ? AbortSignal.any([startAbort.signal, signal]) : startAbort.signal,
     });
+  } catch (error) {
+    if (error instanceof Error && (await agentManager.failPendingAgentRunStart(agentId, error))) {
+      throw new MessageNotDispatchedError(error.message, { cause: error });
+    }
+    throw error;
   } finally {
     clearTimeout(startTimeout);
   }

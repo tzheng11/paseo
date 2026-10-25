@@ -9,6 +9,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
+import pino from "pino";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import {
@@ -13168,7 +13169,10 @@ test.each(["codex", "claude"] as const)(
       const before = manager.getTimeline(agent.id);
       const epoch = manager.getTimelineEpoch(agent.id);
       await manager.reloadIdleAgentSession(agent.id, { preserveHistory: true });
-      expect(resume).toHaveBeenCalledWith({ purpose: "maintenance" });
+      expect(resume).toHaveBeenCalledWith({
+        purpose: "maintenance",
+        previousSession: agent.session,
+      });
       expect(replay).not.toHaveBeenCalled();
       expect(manager.getTimeline(agent.id)).toEqual(before);
       expect(manager.getTimelineEpoch(agent.id)).toBe(epoch);
@@ -13470,7 +13474,7 @@ function waitForQuota<T>(callback: () => T) {
   return vi.waitFor(callback, { timeout: 10_000, interval: 25 });
 }
 
-async function quotaRecoveryFixture(provider: "claude" | "codex" = "claude") {
+async function quotaRecoveryFixture(provider: "claude" | "codex" = "claude", quotaLogger = logger) {
   const workdir = mkdtempSync(join(tmpdir(), "quota-recovery-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
   const prompts: Array<{ prompt: AgentPromptInput; messageId?: string }> = [];
@@ -13511,7 +13515,7 @@ async function quotaRecoveryFixture(provider: "claude" | "codex" = "claude") {
       return true;
     }
     getRuntimeProcessId() {
-      return null;
+      return undefined;
     }
   }
   class QuotaClient extends TestAgentClient {
@@ -13532,7 +13536,7 @@ async function quotaRecoveryFixture(provider: "claude" | "codex" = "claude") {
   const messages = new MessageReceipts(join(workdir, "messages"));
   const manager = new AgentManager({
     clients: { [provider]: client },
-    logger,
+    logger: quotaLogger,
     registry: storage,
     reloadOperations: new ReloadOperationStore(join(workdir, "operations"), logger),
     recoveryMessages: messages,
@@ -13635,6 +13639,72 @@ test("quota recovery preserves checkpoint through ordinary maintenance then cont
     expect(f.prompts).toHaveLength(2);
     expect((await f.storage.get(f.agent.id))?.quotaTurnCheckpoint).toBeUndefined();
   } finally {
+    await f.cleanup();
+  }
+});
+
+test("quota recovery continues an old runtime failure timestamped after the account switch once", async () => {
+  const f = await quotaRecoveryFixture();
+  try {
+    await waitForQuota(() => expect(Date.now()).toBeGreaterThan(f.agent.createdAt.getTime() + 3));
+    const change = await f.change();
+    await f.fail();
+    expect((await f.reload("late-old-process-failure", change))?.continuation?.status).toBe(
+      "submitted",
+    );
+    await waitForQuota(() => expect(f.manager.hasInFlightRun(f.agent.id)).toBe(false));
+    expect((await f.reload("same-switch-again", change))?.continuation?.status).toBe("not_needed");
+    expect(f.prompts).toHaveLength(2);
+    await f.manager.runAgent(f.agent.id, "plain prompt after quota reload");
+    expect(f.prompts).toHaveLength(3);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("an undispatched quota startup timeout releases later sends and fences late input", async () => {
+  const warnings: string[] = [];
+  const quotaLogger = pino({ level: "warn" }, { write: (line) => warnings.push(line) });
+  const f = await quotaRecoveryFixture("claude", quotaLogger);
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  try {
+    await f.fail();
+    f.setBeforeSend(async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    const change = await f.change();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    await f.manager.reloadAgentCredentials(f.agent.id, "blocked-start", change);
+    await entered.promise;
+    await vi.advanceTimersByTimeAsync(30_001);
+    await vi.waitFor(async () =>
+      expect((await f.manager.getReloadOperation("blocked-start"))?.continuation).toMatchObject({
+        status: "refused",
+        reasonCode: "QUOTA_CONTINUATION_NOT_DISPATCHED",
+      }),
+    );
+    vi.useRealTimers();
+    expect(f.manager.hasInFlightRun(f.agent.id)).toBe(false);
+    expect(warnings.map((line) => JSON.parse(line))).toContainEqual(
+      expect.objectContaining({
+        msg: "Quota continuation was not confirmed",
+        dispatched: false,
+        err: expect.objectContaining({
+          message: expect.stringContaining("Quota continuation startup unconfirmed"),
+        }),
+      }),
+    );
+    f.setBeforeSend(undefined);
+    await f.manager.runAgent(f.agent.id, "later send starts");
+    expect(f.prompts).toHaveLength(2);
+    release.resolve();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(f.prompts).toHaveLength(2);
+  } finally {
+    release.resolve();
+    vi.useRealTimers();
     await f.cleanup();
   }
 });
@@ -13844,6 +13914,8 @@ test("quota recovery lost acknowledgement stays unknown and neither same nor fre
       status: "not_needed",
     });
     expect(f.prompts).toHaveLength(2);
+    await f.manager.runAgent(f.agent.id, "later prompt after unknown continuation");
+    expect(f.prompts).toHaveLength(3);
   } finally {
     await f.cleanup();
   }
