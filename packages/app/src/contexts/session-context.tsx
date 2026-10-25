@@ -483,6 +483,7 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
 
   // Daemon message handlers - directly update Zustand store
   useEffect(() => {
+    const providerSubagentResync = new AbortController();
     const feeds = client.observeEvents(
       [
         "agent_attention_required",
@@ -516,7 +517,7 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
 
     const unsubProviderSubagentUpdate = feeds.subscribe({
       snapshot: () => {
-        void resyncProviderSubagents(client, serverId);
+        void resyncProviderSubagents(client, serverId, { signal: providerSubagentResync.signal });
       },
       update: (message) => {
         if (message.type !== "agent.provider_subagents.update") return;
@@ -681,6 +682,7 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
     });
 
     return () => {
+      providerSubagentResync.abort();
       void feeds
         .release()
         .catch((error) => console.warn("[Session] Failed to release feeds", error));
