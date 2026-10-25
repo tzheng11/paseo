@@ -389,6 +389,118 @@ describe("WorkspaceGitService checkout observation", () => {
     },
   );
 
+  test("releasing the last metadata owner cancels an audit queued behind two busy roots", async () => {
+    const resources = new NativeRecursiveResources({
+      maxTrackedEntries: 20,
+      maxConcurrentAudits: 2,
+    });
+    const occupied = createDeferred<void>();
+    const waitForOccupancy = () => occupied.promise;
+    const blockers = [0, 1].map(() =>
+      resources.runAudit(waitForOccupancy, new AbortController().signal),
+    );
+    const watcher = createWatcherHarness();
+    const normal = watcher.subscribe.getMockImplementation()!;
+    const openMetadata = vi.fn(async () => {});
+    let signal: AbortSignal | undefined;
+    watcher.subscribe.mockImplementation(async (directory, callback, options) => {
+      if (directory === GIT_DIR) {
+        signal = options?.signal;
+        await resources.runAudit(openMetadata, options!.signal!, options?.onInventoryAdmission);
+      }
+      return normal(directory, callback, options);
+    });
+    const getCheckoutStatus = vi.fn(async (cwd: string) => createCheckoutStatus(cwd));
+    const verifyCanary = vi.fn(async () => {});
+    const logger = createLogger();
+    const service = createService(
+      watcher,
+      {
+        getCheckoutStatus,
+        createWatcherLivenessCanary: () => ({
+          path: "",
+          filterEvents: (events: WatchEvent[]) => events,
+          verify: verifyCanary,
+        }),
+      },
+      logger,
+    );
+    const owner = service.registerWorkspace({ cwd: REPO_CWD, observeWorkingTree: false }, vi.fn());
+    try {
+      await vi.waitFor(() => expect(signal).toBeDefined());
+      expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(1);
+      owner.unsubscribe();
+      expect(signal?.aborted).toBe(true);
+      await vi.waitFor(() =>
+        expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0),
+      );
+      expect(service.getMetrics()).toMatchObject({
+        repositoryTargetCount: 0,
+        workspaceObservationSetupInFlightCount: 0,
+      });
+      occupied.resolve();
+      await Promise.all(blockers);
+      await flushPromises();
+      expect(openMetadata).not.toHaveBeenCalled();
+      expect(getWatcherRecordsForDirectory(watcher, GIT_DIR)).toHaveLength(0);
+      expect(verifyCanary).not.toHaveBeenCalled();
+      getCheckoutStatus.mockClear();
+      vi.mocked(logger.warn).mockClear();
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect(getWatcherSubscribeCallCount(watcher, GIT_DIR)).toBe(1);
+      expect(getCheckoutStatus).not.toHaveBeenCalled();
+      expect(logger.warn).not.toHaveBeenCalled();
+    } finally {
+      owner.unsubscribe();
+      occupied.resolve();
+      await Promise.all(blockers);
+      await service.dispose();
+    }
+  });
+
+  test("releasing the last metadata owner cancels its pending liveness canary", async () => {
+    const watcher = createWatcherHarness();
+    let canarySignal: AbortSignal | undefined;
+    function verifyCanary(signal?: AbortSignal): Promise<void> {
+      if (!signal) throw new Error("metadata canary requires its owner's signal");
+      canarySignal = signal;
+      const ownerSignal = signal;
+      return new Promise<void>((_resolve, reject) => {
+        function rejectForAbort() {
+          reject(ownerSignal.reason);
+        }
+        ownerSignal.addEventListener("abort", rejectForAbort, { once: true });
+      });
+    }
+    const service = createService(watcher, {
+      createWatcherLivenessCanary: () => ({
+        path: "",
+        filterEvents: (events: WatchEvent[]) => events,
+        verify: verifyCanary,
+      }),
+    });
+    const owner = service.registerWorkspace({ cwd: REPO_CWD, observeWorkingTree: false }, vi.fn());
+    try {
+      await vi.waitFor(() => expect(canarySignal).toBeDefined());
+      const opened = getWatcherRecordsForDirectory(watcher, GIT_DIR)[0]!;
+      owner.unsubscribe();
+      expect(canarySignal?.aborted).toBe(true);
+      await vi.waitFor(() =>
+        expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0),
+      );
+      expect(opened.unsubscribe).toHaveBeenCalledOnce();
+      expect(service.getMetrics()).toMatchObject({
+        repositoryTargetCount: 0,
+        workspaceObservationSetupInFlightCount: 0,
+      });
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect(getWatcherSubscribeCallCount(watcher, GIT_DIR)).toBe(1);
+    } finally {
+      owner.unsubscribe();
+      await service.dispose();
+    }
+  });
+
   test.each(["none", "load", "update", "close", "timeout"] as const)(
     "queued working-tree admission revalidates exclusions before acceptance: %s",
     async (failure) => {

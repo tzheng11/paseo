@@ -434,7 +434,7 @@ class WorkspaceGitWatcherSubscriptionTimeoutError extends Error {
 
 class WorkspaceGitObservationCancelledError extends Error {
   constructor() {
-    super("Working-tree observation no longer needed");
+    super("Workspace Git observation no longer needed");
     this.name = "WorkspaceGitObservationCancelledError";
   }
 }
@@ -483,6 +483,7 @@ interface RepoGitTarget {
     { change: WorkspaceGitRemoteRefChange; expiresAtMs: number }
   >;
   knownRemoteRefs: Set<string> | null;
+  closeController: AbortController;
   closed: boolean;
 }
 
@@ -2652,6 +2653,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       bufferedFetchMetadataEvents: [],
       recentFetchRemoteRefChanges: new Map(),
       knownRemoteRefs: null,
+      closeController: new AbortController(),
       closed: false,
     };
     this.repoTargets.set(repoGitRoot, repoTarget);
@@ -2763,6 +2765,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
         },
         {
           ignore,
+          signal: target.closeController.signal,
           onInventoryAdmission: (state) => {
             if (state === "queued" && !target.fallbackPolling && !target.closed) {
               admissionFallbackOwned = true;
@@ -2774,7 +2777,8 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
         options?.replaceFallback ? WATCH_RECOVERY_SUBSCRIBE_TIMEOUT_MS : undefined,
       );
       openedSubscription = subscription;
-      await canary.verify(this.disposeController.signal);
+      target.closeController.signal.throwIfAborted();
+      await canary.verify(target.closeController.signal);
       if (watcherErrored) {
         await this.unsubscribeWatcherSubscription(subscription, target.repoGitRoot);
         return false;
@@ -4449,6 +4453,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
 
   private closeRepoTarget(target: RepoGitTarget): void {
     target.closed = true;
+    target.closeController.abort(new WorkspaceGitObservationCancelledError());
     if (target.intervalId) {
       clearInterval(target.intervalId);
       target.intervalId = null;
