@@ -15,6 +15,10 @@ export interface AgentTimelineCursor {
   seq: number;
 }
 
+export interface AgentTimelineStreamOptions {
+  userMessagesOnly?: boolean;
+}
+
 export type AgentTimelineFetchDirection = "tail" | "before" | "after";
 
 export interface AgentTimelineFetchOptions {

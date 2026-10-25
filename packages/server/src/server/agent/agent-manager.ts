@@ -97,6 +97,7 @@ import type {
   AgentTimelineFetchResult,
   AgentTimelineRow,
   AgentTimelineStore,
+  AgentTimelineStreamOptions,
 } from "./agent-timeline-store-types.js";
 import {
   AGENT_STREAM_COALESCE_DEFAULT_WINDOW_MS,
@@ -1552,7 +1553,10 @@ export class AgentManager {
   }
 
   /** Search, export and hooks must consume rows incrementally. */
-  async *streamTimelineRows(id: string): AsyncGenerator<AgentTimelineRow> {
+  async *streamTimelineRows(
+    id: string,
+    options?: AgentTimelineStreamOptions,
+  ): AsyncGenerator<AgentTimelineRow> {
     this.requireAgent(id);
     if (this.durableTimelineStore) {
       const initial = await this.durableTimelineStore.fetchCommitted(id, { limit: 1 });
@@ -1565,14 +1569,16 @@ export class AgentManager {
         });
         if (page.epoch !== initial.epoch || page.window.maxSeq !== initial.window.maxSeq)
           throw new Error("History changed during streamed read");
-        for (const row of page.rows) yield row;
+        for (const row of page.rows) {
+          if (!options?.userMessagesOnly || row.item.type === "user_message") yield row;
+        }
         if (page.endSeq === null || page.endSeq <= seq)
           throw new Error("Streamed history page did not advance");
         seq = page.endSeq;
       }
       return;
     }
-    yield* this.timelineStore.streamRows(id);
+    yield* this.timelineStore.streamRows(id, options);
   }
 
   getHistoryWindowInfo(id: string): HistoryWindowInfo | undefined {

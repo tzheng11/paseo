@@ -6,6 +6,7 @@ import type {
   AgentTimelineFetchOptions,
   AgentTimelineFetchResult,
   AgentTimelineRow,
+  AgentTimelineStreamOptions,
 } from "./agent-timeline-store-types.js";
 
 export interface SeedAgentTimelineOptions {
@@ -120,7 +121,10 @@ export class InMemoryAgentTimelineStore {
     return this.requireState(agentId).projection.getRows();
   }
 
-  async *streamRows(agentId: string): AsyncGenerator<ProjectedTimelineRow> {
+  async *streamRows(
+    agentId: string,
+    options?: AgentTimelineStreamOptions,
+  ): AsyncGenerator<ProjectedTimelineRow> {
     // This store is for tests and small provider-subagent projections. The
     // production disk store decodes one row at a time without collecting it.
     const state = this.requireState(agentId);
@@ -128,6 +132,7 @@ export class InMemoryAgentTimelineStore {
     for (const row of state.projection.getRows()) {
       if (this.states.get(agentId) !== state || state.nextSeq !== nextSeq)
         throw new Error("History changed during streamed read");
+      if (options?.userMessagesOnly && row.item.type !== "user_message") continue;
       yield cloneRow(row);
     }
   }

@@ -7,6 +7,73 @@ import { createDaemonTestContext } from "../test-utils/daemon-test-context.js";
 import { CodexAppServerAgentSession } from "./providers/codex-app-server-agent.js";
 import { createFakeCodexAppServer } from "./providers/codex/test-utils/fake-app-server.js";
 import type { AgentClient, AgentTimelineItem } from "./agent-sdk-types.js";
+import { DiskAgentTimelineStore } from "./disk-agent-timeline-store.js";
+import type { ProjectedTimelineRow } from "./timeline-projection.js";
+import { streamTimelinePromptIndex } from "./timeline-prompt-index.js";
+
+test("cached prompt outlines read only user payloads and retain projected prompt positions", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "paseo-cached-prompts-api-"));
+  const ctx = await createDaemonTestContext({ pluginsEnabled: false, relayEnabled: false });
+  const payloads = vi.spyOn(
+    DiskAgentTimelineStore.prototype as unknown as {
+      readRow(state: unknown, pos: number): ProjectedTimelineRow;
+    },
+    "readRow",
+  );
+  try {
+    const agent = await ctx.client.createAgent({ provider: "codex", cwd });
+    const manager = ctx.daemon.daemon.agentManager;
+    await manager.appendTimelineItem(agent.id, {
+      type: "user_message",
+      text: "  First\n prompt 🧪 ",
+      clientMessageId: "first",
+    });
+    for (let index = 0; index < 100; index++) {
+      await manager.appendTimelineItem(agent.id, {
+        type: "tool_call",
+        callId: `tool-${index}`,
+        status: "completed",
+        name: "shell",
+        error: null,
+        detail: { type: "plain_text", text: "x".repeat(32768) },
+      });
+    }
+    await manager.appendTimelineItem(agent.id, {
+      type: "user_message",
+      text: "Second",
+      clientMessageId: "second",
+    });
+    await manager.appendTimelineItem(agent.id, { type: "assistant_message", text: "not a prompt" });
+    await manager.appendTimelineItem(agent.id, {
+      type: "user_message",
+      text: "  First\n prompt 🧪 ",
+      clientMessageId: "first",
+    });
+    const expected = await streamTimelinePromptIndex(
+      manager.getTimelineEpoch(agent.id),
+      manager.streamTimelineRows(agent.id),
+    );
+    payloads.mockClear();
+    expect(
+      await ctx.client.listAgentTimelinePrompts(agent.id, { requestId: "cached-prompts" }),
+    ).toEqual({
+      requestId: "cached-prompts",
+      agentId: agent.id,
+      ...expected,
+      error: null,
+    });
+    expect(payloads.mock.calls.map(([, pos]) => pos)).toEqual([0, 101, 103]);
+    expect(payloads.mock.results.map((result) => result.value.item.type)).toEqual([
+      "user_message",
+      "user_message",
+      "user_message",
+    ]);
+  } finally {
+    payloads.mockRestore();
+    await ctx.cleanup();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
 
 test("a cold bounded history RPC refuses full replay without publishing a new writer", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "paseo-history-cold-api-"));

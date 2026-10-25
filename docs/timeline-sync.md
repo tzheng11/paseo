@@ -78,6 +78,8 @@ in the complete provider history even when skipping items. Finish the metadata s
 provider decoding so a long stream does not pin a SQLite reader transaction. Results carry a
 provider index for loading their bounded window; that index never becomes a live stream cursor.
 Clients without middle-page support search their readable projection.
+Disk-projection prompt outlines use the user-row metadata index before reading payloads;
+building an outline must not page tool output or assistant responses into the daemon's main thread.
 
 Full-history consumers have distinct contracts:
 

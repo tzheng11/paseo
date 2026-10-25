@@ -8321,7 +8321,7 @@ export class Session {
       });
       const rows = msg.includeProviderHistory
         ? this.agentManager.streamFullHistoryMessages(msg.agentId, { userOnly: true })
-        : this.agentManager.streamTimelineRows(msg.agentId);
+        : this.agentManager.streamTimelineRows(msg.agentId, { userMessagesOnly: true });
       const epoch = this.agentManager.getTimelineEpoch(msg.agentId);
       const index = await streamTimelinePromptIndex(epoch, rows);
       this.emitForSource(
