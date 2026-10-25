@@ -1,8 +1,8 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, expect, test } from "vitest";
-import { MessageReceipts } from "./index.js";
+import { MessageReceipts, MessageNotDispatchedError } from "./index.js";
 
 const directories: string[] = [];
 afterEach(async () => {
@@ -74,4 +74,27 @@ test("failed local message preparation does not leave an ambiguous receipt", asy
   available = false;
   await requests.send(input);
   expect(sends).toBe(1);
+});
+
+test("a fenced startup failure is durable and never remains pending or silently replays", async () => {
+  const { requests, directory } = await fixture();
+  let attempts = 0;
+  const input = {
+    agentId: "agent",
+    messageId: "startup",
+    request: {},
+    send: async () => {
+      attempts++;
+      throw new MessageNotDispatchedError("run did not start");
+    },
+  };
+  await expect(requests.send(input)).rejects.toThrow("run did not start");
+  const files = await readdir(directory);
+  expect(files).toHaveLength(1);
+  expect(JSON.parse(await readFile(path.join(directory, files[0]), "utf8"))).toMatchObject({
+    state: "failed",
+    error: "run did not start",
+  });
+  await expect(new MessageReceipts(directory).send(input)).rejects.toThrow("run did not start");
+  expect(attempts).toBe(1);
 });

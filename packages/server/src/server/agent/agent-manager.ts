@@ -2,6 +2,7 @@ import { ClaudeSessionSchedulers, hasRuntimeShellChild } from "./idle-agent-unlo
 import { ensureAgentLoaded } from "./agent-loading.js";
 import { hasActiveVoiceModeSystemPrompt } from "../voice-config.js";
 import type { MessageReceipts } from "../message-receipts/index.js";
+import { MessageNotDispatchedError } from "../message-receipts/index.js";
 import { startAgentRun, type AgentRunController } from "./agent-prompt.js";
 import { prepareAgentMessage } from "./agent-messages/index.js";
 import {
@@ -175,8 +176,11 @@ const IDLE_RELOAD_ERRORS = {
   },
 } as const;
 
-function reloadResumeOptions(preserveHistory?: boolean): AgentResumeSessionOptions | undefined {
-  return preserveHistory ? { purpose: "maintenance" } : undefined;
+function reloadResumeOptions(
+  previousSession: AgentSession,
+  preserveHistory?: boolean,
+): AgentResumeSessionOptions | undefined {
+  return preserveHistory ? { purpose: "maintenance", previousSession } : undefined;
 }
 
 export class AgentIdleReloadError extends Error {
@@ -504,8 +508,10 @@ interface ManagedAgentBase {
   activeTurnStartedAt: Date | null;
   lastUsage?: AgentUsage;
   lastError?: string;
+  lastRunStartError?: Error;
   credentialGeneration?: string;
   credentialChangedAt?: string;
+  credentialLoadedAt?: string;
   quotaTurnCheckpoint?: QuotaTurnCheckpoint;
   quotaTurnRevision?: number;
   attention: AttentionState;
@@ -2176,11 +2182,18 @@ export class AgentManager {
               },
             },
           });
-          await withTimeout(
-            this.waitForAgentRunStart(agentId),
-            30_000,
-            "Quota continuation startup unconfirmed",
-          );
+          try {
+            await withTimeout(
+              this.waitForAgentRunStart(agentId),
+              30_000,
+              "Quota continuation startup unconfirmed",
+            );
+          } catch (error) {
+            if (error instanceof Error && (await this.failPendingAgentRunStart(agentId, error))) {
+              throw new MessageNotDispatchedError(error.message, { cause: error });
+            }
+            throw error;
+          }
           if (!dispatched) throw new Error("Quota continuation input was not dispatched");
         },
       });
@@ -2197,6 +2210,10 @@ export class AgentManager {
         );
       }
       const failure = admissionFailure ?? error;
+      this.logger.warn(
+        { err: failure, agentId, failedTurnId: checkpoint.turnId, messageId, dispatched },
+        "Quota continuation was not confirmed",
+      );
       if (
         !dispatched &&
         failure instanceof Error &&
@@ -2204,6 +2221,8 @@ export class AgentManager {
         (failure.code === "quota_recovery_superseded" || failure.code === "agent_reload_busy")
       )
         return { status: "refused", ...identity, reasonCode: "QUOTA_RECOVERY_SUPERSEDED_OR_BUSY" };
+      if (!dispatched && failure instanceof MessageNotDispatchedError)
+        return { status: "refused", ...identity, reasonCode: "QUOTA_CONTINUATION_NOT_DISPATCHED" };
       return { status: "unknown", ...identity, reasonCode: "QUOTA_CONTINUATION_UNKNOWN" };
     } finally {
       this.quotaContinuationGuards.delete(agentId);
@@ -2367,7 +2386,7 @@ export class AgentManager {
             handle,
             providerLaunchConfig,
             launchContext,
-            reloadResumeOptions(options.preserveHistory),
+            reloadResumeOptions(existing.session, options.preserveHistory),
           )
         : await client.createSession(providerLaunchConfig, launchContext);
       await this.requireExternalMcpSupport(session, storedConfig);
@@ -3487,15 +3506,31 @@ export class AgentManager {
     const { agent, agentId, pendingRun, prompt, options } = params;
     try {
       agent.quotaTurnRevision = this.quotaActivityRevisions.get(agentId) ?? 0;
+      if (agent.session.getRuntimeProcessId?.() === null) {
+        agent.credentialLoadedAt = new Date().toISOString();
+      }
       await this.persistSnapshot(agent);
       this.quotaContinuationGuards.get(agentId)?.();
-      const result = await agent.session.startTurn(prompt, options);
-      if (pendingRun.settled) {
+      const result = await agent.session.startTurn(prompt, {
+        ...options,
+        beforeProviderSend: () => {
+          if (pendingRun.settled || pendingRun.start.status === "failed") {
+            throw new MessageNotDispatchedError("Agent run was canceled before provider dispatch");
+          }
+          options?.beforeProviderSend?.();
+          pendingRun.providerDispatched = true;
+        },
+      });
+      const startupFailure = pendingRun.stagedEvents.find((event) => event.type === "turn_failed");
+      if (pendingRun.providerDispatched === false && startupFailure?.type === "turn_failed") {
+        throw new MessageNotDispatchedError(startupFailure.error);
+      }
+      if (pendingRun.settled || pendingRun.start.status === "failed") {
         throw new Error(`Agent ${agentId} run was canceled before its turn started`);
       }
       return result.turnId;
     } catch (error) {
-      if (pendingRun.settled) {
+      if (pendingRun.settled || pendingRun.start.status === "failed") {
         throw error;
       }
       if (isStaleProviderSessionError(error)) {
@@ -3507,7 +3542,12 @@ export class AgentManager {
       }
       agent.pendingReplacement = false;
       const errorMsg = error instanceof Error ? error.message : "Failed to start turn";
-      pendingRun.start = { status: "failed", error: errorMsg };
+      const cause =
+        pendingRun.providerDispatched === false
+          ? new MessageNotDispatchedError(errorMsg, { cause: error })
+          : undefined;
+      pendingRun.start = { status: "failed", error: errorMsg, cause };
+      agent.lastRunStartError = cause;
       // A terminal rejection belongs after the submitted prompt even though no provider turn exists.
       if (options?.clientMessageId) {
         this.recordSubmittedPrompt(agent, prompt, options.clientMessageId, "rejected", {
@@ -3521,7 +3561,7 @@ export class AgentManager {
       });
       this.finalizeForegroundTurn(agent);
       this.runs.settleForegroundRun(agentId, pendingRun.token);
-      throw error;
+      throw cause ?? error;
     }
   }
 
@@ -3576,8 +3616,12 @@ export class AgentManager {
     const agent = existingAgent;
     const isReplacement = agent.pendingReplacement;
     agent.lastError = undefined;
+    agent.lastRunStartError = undefined;
 
     const pendingRun = this.runs.createPendingRun(agentId);
+    if (agent.provider === "claude" || agent.provider === "codex") {
+      pendingRun.providerDispatched = false;
+    }
 
     const streamForwarder = async function* streamForwarder(this: AgentManager) {
       let turnId: string;
@@ -3988,7 +4032,7 @@ export class AgentManager {
     }
 
     if (!snapshot.activeForegroundTurnId && !pendingRun && !snapshot.pendingReplacement) {
-      throw new Error(`Agent ${agentId} has no pending run`);
+      throw snapshot.lastRunStartError ?? new Error(`Agent ${agentId} has no pending run`);
     }
 
     if (options?.signal?.aborted) {
@@ -4040,6 +4084,10 @@ export class AgentManager {
       }
 
       const checkCurrentState = () => {
+        if (pendingRun?.start.status === "failed") {
+          finishErr(pendingRun.start.cause ?? new Error(pendingRun.start.error));
+          return true;
+        }
         const current = this.getAgent(agentId);
         if (!current) {
           finishErr(new Error(`Agent ${agentId} not found`));
@@ -4061,7 +4109,10 @@ export class AgentManager {
         }
 
         if (current.lifecycle === "error" && !currentPendingRun) {
-          finishErr(new Error(current.lastError ?? `Agent ${agentId} failed to start`));
+          finishErr(
+            current.lastRunStartError ??
+              new Error(current.lastError ?? `Agent ${agentId} failed to start`),
+          );
           return true;
         }
 
@@ -4085,6 +4136,27 @@ export class AgentManager {
 
       checkCurrentState();
     });
+  }
+
+  async failPendingAgentRunStart(agentId: string, error: Error): Promise<boolean> {
+    const run = this.runs.getPendingRun(agentId);
+    if (!run || run.start.status !== "pending" || run.providerDispatched !== false) return false;
+    const agent = this.requireSessionAgent(agentId);
+    const cause = new MessageNotDispatchedError(error.message, { cause: error });
+    agent.lastRunStartError = cause;
+    // Close admission before interrupting: a late SDK startup must never submit this input.
+    run.start = { status: "failed", error: cause.message, cause };
+    await this.interruptSession(agent.session, agentId);
+    if (this.runs.getPendingRun(agentId) !== run) return true;
+    agent.pendingReplacement = false;
+    await this.handleStreamEvent(agent, {
+      type: "turn_failed",
+      provider: agent.provider,
+      error: cause.message,
+    });
+    this.finalizeForegroundTurn(agent);
+    this.runs.settleForegroundRun(agentId, run.token);
+    return true;
   }
 
   async respondToPermission(
@@ -4876,6 +4948,7 @@ export class AgentManager {
       lastError: options?.lastError,
       credentialGeneration: quotaState.credentialGeneration,
       credentialChangedAt: quotaState.credentialChangedAt,
+      credentialLoadedAt: now.toISOString(),
       quotaTurnCheckpoint: quotaState.quotaTurnCheckpoint,
       attention: resolveInitialAttention(options?.attention),
       internal: config.internal ?? false,
@@ -5870,6 +5943,7 @@ export class AgentManager {
         turnId: eventTurnId,
         sessionId: agent.persistence.sessionId,
         failedAt: new Date().toISOString(),
+        credentialLoadedAt: agent.credentialLoadedAt,
         ...(agent.credentialGeneration
           ? {
               credentialGeneration: agent.credentialGeneration,

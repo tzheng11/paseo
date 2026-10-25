@@ -36,6 +36,19 @@ test("a known old session can fail after a preemptive switch without becoming st
   ).toBe("CREDENTIAL_CHANGE_PRECEDES_BASELINE");
 });
 
+test("process load baseline admits an old process's late failure and refuses new credentials", () => {
+  const checkpoint = { ...failed, credentialLoadedAt: "2026-10-17T11:00:00Z" };
+  const switchBeforeFailure = { ...next, credentialChangedAt: "2026-10-17T11:59:00Z" };
+  expect(quotaRecoveryRefusal(checkpoint, switchBeforeFailure, now)).toBeNull();
+  expect(
+    quotaRecoveryRefusal(
+      { ...checkpoint, credentialLoadedAt: "2026-10-17T11:59:30Z" },
+      switchBeforeFailure,
+      now,
+    ),
+  ).toBe("CREDENTIAL_CHANGE_PRECEDES_BASELINE");
+});
+
 test("the same failed turn and credential generation retain one delivery identity", () => {
   const id = quotaRecoveryMessageId("agent", failed, next);
   expect(quotaRecoveryMessageId("agent", { ...failed }, { ...next })).toBe(id);
