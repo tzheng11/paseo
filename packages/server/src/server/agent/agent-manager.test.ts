@@ -13905,6 +13905,7 @@ test("quota recovery checkpoint survives daemon shutdown and cold restoration", 
   try {
     await f.fail();
     const checkpoint = f.manager.getAgent(f.agent.id)!.quotaTurnCheckpoint!;
+    const change = await f.change();
     f.manager.prepareForShutdown();
     await f.manager.closeAgent(f.agent.id);
     await f.manager.flushForShutdown();
@@ -13925,7 +13926,7 @@ test("quota recovery checkpoint survives daemon shutdown and cold restoration", 
       { purpose: "maintenance" },
     );
     expect(restored.getAgent(f.agent.id)?.quotaTurnCheckpoint).toEqual(checkpoint);
-    await restored.reloadAgentCredentials(f.agent.id, "cold-recovery", await f.change());
+    await restored.reloadAgentCredentials(f.agent.id, "cold-recovery", change);
     await waitForQuota(async () =>
       expect(await restored!.getReloadOperation("cold-recovery")).toMatchObject({
         status: "completed",
