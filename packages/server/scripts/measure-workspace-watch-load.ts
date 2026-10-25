@@ -353,6 +353,12 @@ async function runChild() {
       );
     }
   }
+  // Seed an ignored file before any observation, including reused fixtures:
+  // Git's initial ignored-directory inventory must discover the build root.
+  for (const root of roots) {
+    await mkdir(join(root, ".next"), { recursive: true });
+    await writeFile(join(root, ".next", ".paseo-ignore-seed"), "watcher load fixture\n");
+  }
   let phase = "native-pressure";
   let maxStallMs = 0;
   const windowStarted = performance.now();
@@ -703,10 +709,6 @@ async function runChild() {
         join(root, "next.config.mjs"),
         "export default { experimental: { cpus: 2 } };\n",
       );
-      // All observers must incorporate new .gitignored output roots before the
-      // measurement; the build creates .next only after that barrier.
-      await mkdir(join(root, ".next"), { recursive: true });
-      await sleep(2_000);
       // Count the same build through a second, intentionally unpruned native
       // stream. This comparison includes identical FSEvents coalescing.
       const control = createFileObserver();
