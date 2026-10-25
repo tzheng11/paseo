@@ -120,10 +120,11 @@ class FakeChildProcess extends EventEmitter {
       }, 0);
     }
 
-    if (this.behavior.emitError) {
+    const emitError = this.behavior.emitError;
+    if (emitError) {
       this.schedule(() => {
         if (this.closed) return;
-        this.finishError(this.behavior.emitError);
+        this.finishError(emitError);
       }, this.behavior.delayMs ?? 0);
       return;
     }
@@ -293,6 +294,67 @@ describe("runGitCommand", () => {
     expect(reinventory).toBeGreaterThan(newWatcher);
     expect(fakeSpawnController.peakActiveCount).toBe(1);
   });
+
+  it("interactive inventories bypass a held background backlog within shared read limits", async () => {
+    vi.stubEnv("PASEO_GIT_MAX_PROCESSES_PER_SECOND", "64");
+    const { runGitCommand, runWithGitCommandPriority, snapshotGitCommandRuntimeMetrics } =
+      await loadRunGitCommand(1);
+    const { spawn } = await import("node:child_process");
+    const callsBefore = vi.mocked(spawn).mock.calls.length;
+    const args = ["ls-files", "-o", "-i", "--directory", "--exclude-standard", "-z"];
+    enqueueSpawnBehaviors({ delayMs: 60_000 }, { delayMs: 60_000 });
+    const background = [runGitCommand(args, { cwd: "/background-held" })];
+    await vi.waitFor(() => expect(fakeSpawnController.processes).toHaveLength(1));
+    background.push(
+      runGitCommand(args, { cwd: "/background-queued-1" }),
+      runGitCommand(args, { cwd: "/background-queued-2" }),
+      runWithGitCommandPriority("high", () => runGitCommand(args, { cwd: "/watcher-seed" })),
+    );
+    const read = runGitCommand(["status"], { cwd: "/read-held" });
+    await vi.waitFor(() => expect(fakeSpawnController.processes).toHaveLength(2));
+    const heldBackground = fakeSpawnController.processes[0]!;
+    const heldRead = fakeSpawnController.processes[1]!;
+    enqueueSpawnBehaviors(...Array.from({ length: 4 }, () => ({ delayMs: 25 })));
+    const normal = runGitCommand(["status"], { cwd: "/normal-read-queued" });
+    let completed = 0;
+    const recordCompletion = () => ++completed;
+    const interactive = Array.from({ length: 3 }, (_, i) =>
+      runGitCommand(args, { cwd: `/interactive-${i}`, inventoryLane: "interactive" }).then(
+        recordCompletion,
+      ),
+    );
+    const release = (child: FakeChildProcess) => {
+      if (child.exited) return;
+      child.dispose();
+      child.emit("exit", 0, null);
+      child.emit("close", 0, null);
+    };
+    try {
+      release(heldRead);
+      await vi.waitFor(() => expect(completed).toBe(3), { timeout: 1_500 });
+      await normal;
+      expect(heldBackground.exited).toBe(false);
+      expect(snapshotGitCommandRuntimeMetrics()).toMatchObject({
+        concurrencyLimit: 1,
+        maxProcessesPerSecond: 64,
+        active: 0,
+        pending: 0,
+        peakActive: 1,
+        inventory: { concurrencyLimit: 1, maxProcessesPerSecond: 2, active: 1, pending: 3 },
+      });
+      const cwds = vi
+        .mocked(spawn)
+        .mock.calls.slice(callsBefore)
+        .map(([, , options]) => options?.cwd);
+      expect(cwds.slice(2, 5)).toEqual(["/interactive-0", "/interactive-1", "/interactive-2"]);
+      expect(cwds[5]).toBe("/normal-read-queued");
+      expect(fakeSpawnController.peakActiveCount).toBe(2);
+    } finally {
+      release(heldRead);
+      release(heldBackground);
+      await Promise.all([...background, read, normal, ...interactive]);
+    }
+  }, 10_000);
 
   it("throttles concurrent git commands to the configured limit", async () => {
     const { runGitCommand } = await loadRunGitCommand(2);
@@ -489,7 +551,8 @@ describe("runGitCommand", () => {
       paseoHome: process.cwd(),
       deps: {
         getCheckoutSnapshotFacts: async (cwd, context) => {
-          const result = await context.runGitCommand!(["rev-parse", "live"], { cwd });
+          if (!context?.runGitCommand) throw new Error("Live checkout must carry its Git runner");
+          const result = await context.runGitCommand(["rev-parse", "live"], { cwd });
           factsOutput = result.stdout;
           return { isGit: false };
         },

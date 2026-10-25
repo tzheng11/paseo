@@ -140,6 +140,10 @@ class Observation implements ManagedObservation, ObservationHost {
     return this.input.paths.isInside(root, path);
   }
 
+  onInventoryAdmission(state: "queued" | "admitted"): void {
+    if (this.isActive()) this.input.options.onInventoryAdmission?.(state);
+  }
+
   onInventoryProgress(): void {
     if (this.isActive()) this.input.options.onInventoryProgress?.();
   }

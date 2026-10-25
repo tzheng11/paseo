@@ -23,6 +23,7 @@ import { MessageReceipts } from "../message-receipts/index.js";
 import { ReloadOperationStore, type ReloadOperation } from "./reload-operation-store.js";
 import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 import { DiskAgentTimelineStore } from "./disk-agent-timeline-store.js";
+import { streamTimelinePromptIndex } from "./timeline-prompt-index.js";
 import { AgentHistoryReplay } from "./agent-history-replay.js";
 import { toAgentPayload } from "./agent-projections.js";
 import { projectTimelineRows } from "./timeline-projection.js";
@@ -61,6 +62,7 @@ import type {
   AgentSessionConfig,
   AgentSlashCommand,
   AgentStreamEvent,
+  AgentHistoryStreamOptions,
   AgentTimelineItem,
   ImportProviderSessionInput,
   ImportProviderSessionContext,
@@ -2429,6 +2431,128 @@ function fakeCodexEmitting(args: FakeCodexEmitterArgs): AgentClient {
 }
 
 const logger = createTestLogger();
+
+test("coalesces running provider child publications while retaining activity and every timeline event", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const client = new SessionRecordingAgentClient();
+  const manager = new AgentManager({ clients: { codex: client }, logger });
+  const agent = await manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
+    workspaceId: undefined,
+  });
+  const events: Array<Extract<AgentManagerEvent, { type: "provider_subagent" }>["event"]> = [];
+  const unsubscribe = manager.subscribe((event) => {
+    if (event.type === "provider_subagent") events.push(event.event);
+  });
+  const session = client.sessions[0]!;
+  let closed = false;
+  try {
+    session.pushEvent({
+      type: "provider_subagent",
+      provider: "codex",
+      event: { type: "upsert", id: "child", status: "running", title: "Inspect" },
+    });
+    for (let index = 1; index <= 3; index++) {
+      session.pushEvent({
+        type: "provider_subagent",
+        provider: "codex",
+        event: { type: "upsert", id: "child", timestamp: new Date(index).toISOString() },
+      });
+      session.pushEvent({
+        type: "provider_subagent",
+        provider: "codex",
+        event: {
+          type: "timeline",
+          id: "child",
+          item: { type: "assistant_message", text: String(index) },
+        },
+      });
+    }
+    await manager.flush({ coalesced: false });
+    expect(manager.getProviderSubagent(agent.id, "child")).toMatchObject({
+      title: "Inspect",
+      updatedAt: new Date(3).toISOString(),
+    });
+    expect(events.filter((event) => event.type === "upsert")).toHaveLength(1);
+    expect(
+      events.filter((event) => event.type === "timeline").map((event) => event.row),
+    ).toMatchObject([
+      { seq: 1, item: { text: "1" } },
+      { seq: 2, item: { text: "2" } },
+      { seq: 3, item: { text: "3" } },
+    ]);
+    await vi.advanceTimersByTimeAsync(60);
+    expect(events.filter((event) => event.type === "upsert")).toHaveLength(2);
+    expect(manager.fetchProviderSubagentTimeline(agent.id, "child").rows).toMatchObject([
+      { seq: 3, item: { text: "123" } },
+    ]);
+    session.pushEvent({
+      type: "provider_subagent",
+      provider: "codex",
+      event: {
+        type: "upsert",
+        id: "child",
+        subtitle: "last before close",
+        timestamp: new Date(4).toISOString(),
+      },
+    });
+    await manager.flush({ coalesced: false });
+    expect(events.filter((event) => event.type === "upsert")).toHaveLength(2);
+    expect(manager.listProviderSubagentActivity()[0]?.updatedAt).toBe(new Date(4).toISOString());
+    await manager.closeAgent(agent.id);
+    closed = true;
+    expect(events.slice(-2)).toMatchObject([
+      { type: "upsert", subagent: { status: "running", subtitle: "last before close" } },
+      { type: "upsert", subagent: { status: "canceled", subtitle: "last before close" } },
+    ]);
+    const closedEventCount = events.length;
+    await vi.advanceTimersByTimeAsync(60);
+    expect(events).toHaveLength(closedEventCount);
+  } finally {
+    if (!closed) await manager.closeAgent(agent.id);
+    unsubscribe();
+    vi.useRealTimers();
+  }
+});
+
+test("clears buffered provider child publications before deleting retained state", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const client = new SessionRecordingAgentClient();
+  const manager = new AgentManager({ clients: { codex: client }, logger });
+  const agent = await manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
+    workspaceId: undefined,
+  });
+  const events: Array<Extract<AgentManagerEvent, { type: "provider_subagent" }>["event"]> = [];
+  const unsubscribe = manager.subscribe((event) => {
+    if (event.type === "provider_subagent") events.push(event.event);
+  });
+  const session = client.sessions[0]!;
+  const upsert = (title: string) =>
+    session.pushEvent({
+      type: "provider_subagent",
+      provider: "codex",
+      event: { type: "upsert", id: "child", title, status: "running" },
+    });
+  try {
+    upsert("first");
+    upsert("last before reset");
+    await manager.flush({ coalesced: false });
+    await manager.deleteAgentState(agent.id);
+    expect(events).toMatchObject([
+      { type: "upsert", subagent: { title: "first" } },
+      { type: "upsert", subagent: { title: "last before reset" } },
+      { type: "remove", parentAgentId: agent.id, subagentId: "child" },
+    ]);
+    upsert("new child");
+    await manager.flush({ coalesced: false });
+    expect(events.at(-1)).toMatchObject({ type: "upsert", subagent: { title: "new child" } });
+    await vi.advanceTimersByTimeAsync(60);
+    expect(events).toHaveLength(4);
+  } finally {
+    await manager.closeAgent(agent.id);
+    unsubscribe();
+    vi.useRealTimers();
+  }
+});
 
 test("does not register a session that finishes starting after shutdown begins", async () => {
   const client = new HeldAgentCreationClient();
@@ -13781,6 +13905,7 @@ test("quota recovery checkpoint survives daemon shutdown and cold restoration", 
   try {
     await f.fail();
     const checkpoint = f.manager.getAgent(f.agent.id)!.quotaTurnCheckpoint!;
+    const change = await f.change();
     f.manager.prepareForShutdown();
     await f.manager.closeAgent(f.agent.id);
     await f.manager.flushForShutdown();
@@ -13801,7 +13926,7 @@ test("quota recovery checkpoint survives daemon shutdown and cold restoration", 
       { purpose: "maintenance" },
     );
     expect(restored.getAgent(f.agent.id)?.quotaTurnCheckpoint).toEqual(checkpoint);
-    await restored.reloadAgentCredentials(f.agent.id, "cold-recovery", await f.change());
+    await restored.reloadAgentCredentials(f.agent.id, "cold-recovery", change);
     await waitForQuota(async () =>
       expect(await restored!.getReloadOperation("cold-recovery")).toMatchObject({
         status: "completed",
@@ -14964,3 +15089,107 @@ test.each(["live", "history", "accepted"] as const)(
     }
   },
 );
+
+test("streamed provider message filtering preserves prompt outline positions and forwards user-only demand", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-message-selection-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const requested: Array<AgentHistoryStreamOptions | undefined> = [];
+  class MessageSession extends TestAgentSession {
+    async *streamHistoryEntries(options?: AgentHistoryStreamOptions) {
+      requested.push(options);
+      // An adapter that ignores the hint must still be filtered by the manager.
+      const values: Array<{ index: number; value: AgentStreamEvent }> = [
+        {
+          index: 2,
+          value: {
+            type: "timeline",
+            provider: "codex",
+            timestamp: "2026-10-22T00:00:00.000Z",
+            item: {
+              type: "user_message",
+              messageId: "user-first",
+              text: "  café 🧪\0\n  first prompt  ",
+            },
+          },
+        },
+        {
+          index: 3,
+          value: {
+            type: "timeline",
+            provider: "codex",
+            item: { type: "assistant_message", messageId: "assistant", text: "reply" },
+          },
+        },
+        {
+          index: 27,
+          value: {
+            type: "timeline",
+            provider: "codex",
+            timestamp: "2026-10-22T00:01:00.000Z",
+            item: { type: "user_message", messageId: "user-last", text: "z".repeat(300000) },
+          },
+        },
+      ];
+      for (const entry of values)
+        yield { ...entry, bytes: Buffer.byteLength(JSON.stringify(entry.value)) };
+    }
+  }
+  class MessageClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new MessageSession(config);
+    }
+  }
+  const manager = new AgentManager({
+    clients: { codex: new MessageClient() },
+    registry: storage,
+    logger,
+  });
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    const all = [];
+    for await (const row of manager.streamFullHistoryMessages(agent.id)) all.push(row);
+    expect(all.map((row) => [row.historyIndex, row.seq, row.providerMessageId])).toEqual([
+      [2, 3, "user-first"],
+      [3, 4, "assistant"],
+      [27, 28, "user-last"],
+    ]);
+    const selected = await streamTimelinePromptIndex(
+      "epoch",
+      manager.streamFullHistoryMessages(agent.id, { userOnly: true }),
+    );
+    expect(selected).toEqual(
+      await streamTimelinePromptIndex(
+        "epoch",
+        (async function* () {
+          yield* all;
+        })(),
+      ),
+    );
+    expect(selected.prompts).toEqual([
+      {
+        seq: 3,
+        historyIndex: 2,
+        messageId: "user-first",
+        timestamp: "2026-10-22T00:00:00.000Z",
+        preview: "café 🧪\0 first prompt",
+      },
+      {
+        seq: 28,
+        historyIndex: 27,
+        messageId: "user-last",
+        timestamp: "2026-10-22T00:01:00.000Z",
+        preview: "z".repeat(119) + "…",
+      },
+    ]);
+    expect(requested).toEqual([
+      { messagesOnly: true },
+      { messagesOnly: true, userMessagesOnly: true },
+    ]);
+  } finally {
+    await manager.flush();
+    await storage.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});

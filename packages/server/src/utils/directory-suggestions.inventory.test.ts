@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, expect, test, vi } from "vitest";
@@ -33,6 +33,10 @@ test("workspace suggestions share an inventory throughout a long queue wait and 
   try {
     const first = search();
     await vi.waitFor(() => expect(runInventory).toHaveBeenCalledTimes(1));
+    expect(runInventory).toHaveBeenCalledWith(
+      ["ls-files", "-o", "-i", "--directory", "--exclude-standard", "-z"],
+      expect.objectContaining({ cwd: await realpath(root), inventoryLane: "interactive" }),
+    );
     vi.setSystemTime(20_000);
     const second = search();
     expect(runInventory).toHaveBeenCalledTimes(1);

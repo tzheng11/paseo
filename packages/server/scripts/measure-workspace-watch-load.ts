@@ -11,6 +11,7 @@ import { createFileObserver, type FileObserver } from "../src/server/file-observ
 import {
   WorkspaceGitServiceImpl,
   WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY,
+  WORKSPACE_GIT_REFRESH_CONCURRENCY,
 } from "../src/server/workspace-git-service.js";
 import { createTestPaseoDaemon } from "../src/server/test-utils/paseo-daemon.js";
 import { DaemonClient } from "../src/server/test-utils/daemon-client.js";
@@ -143,7 +144,12 @@ async function runAllPollingAdmissionLoad(base: string, roots: string[]) {
     );
     step = "holding-polling-refreshes";
     holdRefreshes = true;
-    await until(() => blocked.size >= 3, "polling occupies refresh admission", 30_000);
+    const blockedRefreshes = expectStarvation ? 3 : WORKSPACE_GIT_REFRESH_CONCURRENCY - 2;
+    await until(
+      () => blocked.size >= blockedRefreshes,
+      "polling occupies refresh admission",
+      30_000,
+    );
     if (expectStarvation) {
       await until(
         () => service.getMetrics().workspaceRefreshAdmissionPendingCount >= roots.length - 4,
@@ -250,6 +256,11 @@ const count = Number(process.env.PASEO_WATCH_LOAD_WORKSPACES ?? 85);
 const packages = Number(process.env.PASEO_WATCH_LOAD_PACKAGES ?? 160);
 const fdLimit = Number(process.env.PASEO_WATCH_LOAD_FD_LIMIT ?? 256);
 const timeoutMs = Number(process.env.PASEO_WATCH_LOAD_TIMEOUT_MS ?? 600_000);
+const windowMs = Number(process.env.PASEO_WATCH_LOAD_WINDOW_MS ?? 0);
+if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2_147_483_647)
+  throw new Error("PASEO_WATCH_LOAD_TIMEOUT_MS must be a positive integer within the timer limit");
+if (!Number.isSafeInteger(windowMs) || windowMs < 0 || windowMs >= timeoutMs)
+  throw new Error("PASEO_WATCH_LOAD_WINDOW_MS must be an integer >= 0 and below the timeout");
 const sleep = (ms: number) => new Promise<void>((done) => setTimeout(done, ms));
 function report(value: object) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -282,7 +293,7 @@ async function parent() {
       stdio: ["ignore", "pipe", "inherit"],
     },
   );
-  report({ phase: "child", pid: child.pid, fdLimit, timeoutMs });
+  report({ phase: "child", pid: child.pid, fdLimit, timeoutMs, windowMs });
   child.stdout.pipe(process.stdout);
   const timer = setTimeout(() => {
     report({
@@ -307,7 +318,7 @@ async function runChild() {
     process.env.PASEO_WATCH_LOAD_FIXTURE ?? (await mkdtemp(join(tmpdir(), "paseo-watch-load-"))),
   );
   const roots = Array.from({ length: count }, (_, i) => join(base, `workspace-${i}`));
-  report({ phase: "fixture", base, count, packages, fdLimit, node: process.version });
+  report({ phase: "fixture", base, count, packages, fdLimit, windowMs, node: process.version });
   if (!process.env.PASEO_WATCH_LOAD_FIXTURE) {
     for (const root of roots) {
       await mkdir(root, { recursive: true });
@@ -342,6 +353,12 @@ async function runChild() {
       );
     }
   }
+  // Seed an ignored file before any observation, including reused fixtures:
+  // Git's initial ignored-directory inventory must discover the build root.
+  for (const root of roots) {
+    await mkdir(join(root, ".next"), { recursive: true });
+    await writeFile(join(root, ".next", ".paseo-ignore-seed"), "watcher load fixture\n");
+  }
   let phase = "native-pressure";
   let maxStallMs = 0;
   const windowStarted = performance.now();
@@ -363,6 +380,13 @@ async function runChild() {
       histogram.count ? histogram.percentile(99) / 1_000_000 : null,
     );
   const progress = setInterval(() => report({ phase, heartbeat: true, maxStallMs }), 1_000);
+  async function finishMeasurementWindow() {
+    const remainingMs = windowMs - (performance.now() - windowStarted);
+    if (remainingMs <= 0) return;
+    phase = "measurement-window";
+    report({ phase, remainingMs, windowMs });
+    await sleep(remainingMs);
+  }
   try {
     // A preserved compiled bfe0010 entry lets this exact fixture run red without
     // changing the writer branch. Do not point it at a serving runtime.
@@ -476,6 +500,7 @@ async function runChild() {
     });
     if (entry) {
       await sleep(50);
+      await finishMeasurementWindow();
       report({
         phase: "native-verdict",
         functionalPassed: true,
@@ -512,6 +537,7 @@ async function runChild() {
     phase = "all-polling-admission";
     await runAllPollingAdmissionLoad(base, roots);
     if (process.env.PASEO_WATCH_LOAD_POLLING_ONLY === "1") {
+      await finishMeasurementWindow();
       report({
         phase: "polling-verdict",
         functionalPassed: true,
@@ -583,12 +609,21 @@ async function runChild() {
       logger: pino({ level: "info" }, log),
     });
     const client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
+    const workingTreeDemand: ReturnType<WorkspaceGitServiceImpl["registerWorkspace"]>[] = [];
     try {
       await client.connect();
       await client.fetchAgents();
       const events = client.observeEvents(["checkout_status_update"]);
       await events.ready;
       await until(() => Boolean(service), "cold workspace registrations");
+      // Event subscriptions without focused/running agents need only metadata.
+      // Own full observation demand for every scratch checkout, but do not await
+      // setup before the uncached protocol reads exercise the cold queue.
+      roots.forEach((cwd) => {
+        workingTreeDemand.push(
+          service!.registerWorkspace({ cwd, observeWorkingTree: true }, () => {}),
+        );
+      });
       const coldBefore = service!.getMetrics();
       const reads = await Promise.all(
         roots.slice(-4).map(async (root) => {
@@ -609,6 +644,7 @@ async function runChild() {
         const m = service!.getMetrics();
         return (
           m.workingTreeWatchTargetCount === count &&
+          m.fileObserver.nativeHandleCount === 2 * count &&
           m.workspaceObservationSetupInFlightCount === 0 &&
           m.workingTreeWatchSetupInFlightCount === 0 &&
           m.workspaceInitialRefreshPendingCount === 0 &&
@@ -673,10 +709,6 @@ async function runChild() {
         join(root, "next.config.mjs"),
         "export default { experimental: { cpus: 2 } };\n",
       );
-      // All observers must incorporate new .gitignored output roots before the
-      // measurement; the build creates .next only after that barrier.
-      await mkdir(join(root, ".next"), { recursive: true });
-      await sleep(2_000);
       // Count the same build through a second, intentionally unpruned native
       // stream. This comparison includes identical FSEvents coalescing.
       const control = createFileObserver();
@@ -739,12 +771,14 @@ async function runChild() {
       await events.release();
     } finally {
       phase = "daemon-teardown";
+      workingTreeDemand.forEach((subscription) => subscription.unsubscribe());
       await client.close();
       await daemon.close();
       capture.mock.restore();
       log.end();
     }
     await sleep(50);
+    await finishMeasurementWindow();
     report({
       phase: "verdict",
       functionalPassed: true,

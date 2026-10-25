@@ -75,6 +75,7 @@ import {
   type AgentSessionConfig,
   type SteerResult,
   type AgentStreamEvent,
+  type AgentHistoryStreamOptions,
   type AgentTimelineItem,
   type AgentUsage,
   type AgentRuntimeInfo,
@@ -96,11 +97,13 @@ import type {
   AgentTimelineFetchResult,
   AgentTimelineRow,
   AgentTimelineStore,
+  AgentTimelineStreamOptions,
 } from "./agent-timeline-store-types.js";
 import {
   AGENT_STREAM_COALESCE_DEFAULT_WINDOW_MS,
   AgentStreamCoalescer,
 } from "./agent-stream-coalescer.js";
+import { ProviderSubagentEventCoalescer } from "./provider-subagent-event-coalescer.js";
 import { limitAgentTimelineItemContent } from "./agent-timeline-content.js";
 import {
   AgentRunState,
@@ -866,6 +869,16 @@ export interface RetiredInternalAgent {
   lastMessage: string | null;
 }
 
+function matchesHistorySelection(
+  item: AgentTimelineItem,
+  options?: AgentHistoryStreamOptions,
+): boolean {
+  if (options?.userMessagesOnly) return item.type === "user_message";
+  return (
+    !options?.messagesOnly || item.type === "user_message" || item.type === "assistant_message"
+  );
+}
+
 function resolveRescueTimeouts(options: AgentManagerOptions["rescueTimeouts"]) {
   return {
     reloadSessionCloseMs: options?.reloadSessionCloseMs ?? RELOAD_SESSION_CLOSE_TIMEOUT_MS,
@@ -910,6 +923,7 @@ export class AgentManager {
   private readonly reloadedSessionCloses = new WeakMap<AgentSession, Promise<void>>();
   private readonly lifecycleMutationTails = new Map<string, Promise<void>>();
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
+  private readonly providerSubagentEventCoalescer: ProviderSubagentEventCoalescer;
   private mcpBaseUrl: string | null;
   private readonly mcpAuthToken: string | null;
   private paseoToolsEnabled = true;
@@ -960,6 +974,11 @@ export class AgentManager {
         const event = this.recordAndDispatchTimelineItem(agentId, item, provider, turnId);
         this.notifyForegroundTurnWaiters(agentId, event);
       },
+    });
+    this.providerSubagentEventCoalescer = new ProviderSubagentEventCoalescer({
+      windowMs: options.agentStreamCoalesceWindowMs ?? AGENT_STREAM_COALESCE_DEFAULT_WINDOW_MS,
+      timers: { setTimeout, clearTimeout },
+      onPublish: (event) => this.dispatch({ type: "provider_subagent", event }),
     });
     this.updateProviderRegistry({
       providerDefinitions: options.providerDefinitions ?? {},
@@ -1534,7 +1553,10 @@ export class AgentManager {
   }
 
   /** Search, export and hooks must consume rows incrementally. */
-  async *streamTimelineRows(id: string): AsyncGenerator<AgentTimelineRow> {
+  async *streamTimelineRows(
+    id: string,
+    options?: AgentTimelineStreamOptions,
+  ): AsyncGenerator<AgentTimelineRow> {
     this.requireAgent(id);
     if (this.durableTimelineStore) {
       const initial = await this.durableTimelineStore.fetchCommitted(id, { limit: 1 });
@@ -1547,14 +1569,16 @@ export class AgentManager {
         });
         if (page.epoch !== initial.epoch || page.window.maxSeq !== initial.window.maxSeq)
           throw new Error("History changed during streamed read");
-        for (const row of page.rows) yield row;
+        for (const row of page.rows) {
+          if (!options?.userMessagesOnly || row.item.type === "user_message") yield row;
+        }
         if (page.endSeq === null || page.endSeq <= seq)
           throw new Error("Streamed history page did not advance");
         seq = page.endSeq;
       }
       return;
     }
-    yield* this.timelineStore.streamRows(id);
+    yield* this.timelineStore.streamRows(id, options);
   }
 
   getHistoryWindowInfo(id: string): HistoryWindowInfo | undefined {
@@ -1562,13 +1586,19 @@ export class AgentManager {
   }
 
   /** Search and prompt indexing explicitly traverse the unloaded provider middle. */
-  async *streamFullHistoryMessages(id: string): AsyncGenerator<AgentTimelineRow> {
-    yield* this.streamFullHistoryRows(id, { messagesOnly: true });
+  async *streamFullHistoryMessages(
+    id: string,
+    options?: { userOnly?: boolean },
+  ): AsyncGenerator<AgentTimelineRow> {
+    yield* this.streamFullHistoryRows(id, {
+      messagesOnly: true,
+      ...(options?.userOnly ? { userMessagesOnly: true } : {}),
+    });
   }
 
   async *streamFullHistoryRows(
     id: string,
-    options?: { messagesOnly?: boolean },
+    options?: AgentHistoryStreamOptions,
   ): AsyncGenerator<AgentTimelineRow> {
     const agent = this.requireSessionAgent(id);
     if (!agent.session.streamHistoryEntries)
@@ -1579,19 +1609,9 @@ export class AgentManager {
         throw new Error("History changed during streamed read");
       const event = entry.value;
       if (event.type !== "timeline") continue;
-      if (
-        options?.messagesOnly &&
-        event.item.type !== "user_message" &&
-        event.item.type !== "assistant_message"
-      )
-        continue;
+      if (!matchesHistorySelection(event.item, options)) continue;
       for (const projected of projectAgentMessages(event.item)) {
-        if (
-          options?.messagesOnly &&
-          projected.type !== "user_message" &&
-          projected.type !== "assistant_message"
-        )
-          continue;
+        if (!matchesHistorySelection(projected, options)) continue;
         const item = limitAgentTimelineItemContent(projected);
         yield {
           seq: entry.index + 1,
@@ -1832,7 +1852,10 @@ export class AgentManager {
     // agent whose working directory may be gone.
     const record = this.registry ? await this.registry.get(resolvedAgentId) : null;
     const currentResumeOptions = record
-      ? { purpose: record.archivedAt ? ("history" as const) : ("interactive" as const) }
+      ? {
+          ...resumeOptions,
+          purpose: record.archivedAt ? ("history" as const) : ("interactive" as const),
+        }
       : resumeOptions;
     const purpose = currentResumeOptions?.purpose ?? "interactive";
 
@@ -1842,6 +1865,12 @@ export class AgentManager {
       { purpose },
     );
     const client = this.requireClient(handle.provider);
+    if (
+      currentResumeOptions?.historyReadMode === "bounded" &&
+      !client.capabilities.supportsBoundedHistory
+    ) {
+      throw new Error(`Provider '${handle.provider}' does not support bounded history loading`);
+    }
     const available = await client.isAvailable();
     if (!available) {
       throw new Error(
@@ -1950,7 +1979,7 @@ export class AgentManager {
       });
       for (const event of imported.providerSubagentEvents ?? []) {
         const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
-        this.dispatch({ type: "provider_subagent", event: update });
+        this.providerSubagentEventCoalescer.publish(update, { coalesce: false });
       }
       return agent;
     } finally {
@@ -2336,9 +2365,10 @@ export class AgentManager {
       if (rehydrateFromDisk) {
         // Wipe the in-memory timeline so registerSession mints a new epoch and
         // hydrateTimelineFromProvider re-streams the freshly read provider history.
+        this.providerSubagentEventCoalescer.flushAndDiscardParent(agentId);
         this.timelineStore.delete(agentId);
         for (const event of this.providerSubagents.deleteParent(agentId)) {
-          this.dispatch({ type: "provider_subagent", event });
+          this.providerSubagentEventCoalescer.publish(event, { coalesce: false });
         }
       }
 
@@ -2585,7 +2615,7 @@ export class AgentManager {
         id: subagent.id,
         status: "canceled",
       });
-      this.dispatch({ type: "provider_subagent", event });
+      this.providerSubagentEventCoalescer.publish(event, { coalesce: false });
     }
   }
 
@@ -4857,6 +4887,7 @@ export class AgentManager {
     preserveRuntimeDemand = false,
   ): ManagedAgentClosed {
     this.agentStreamCoalescer.flushAndDiscard(agent.id);
+    this.providerSubagentEventCoalescer.flushAndDiscardParent(agent.id);
     this.agents.delete(agent.id);
     this.sessionSchedulers.delete(agent.id);
     if (!preserveRuntimeDemand) this.lastRuntimeDemand.delete(agent.id);
@@ -4890,11 +4921,12 @@ export class AgentManager {
   }
 
   private discardRetainedAgentState(agentId: string): void {
+    this.providerSubagentEventCoalescer.flushAndDiscardParent(agentId);
     this.timelineStore.delete(agentId);
     this.timelinesAwaitingProviderHistory.delete(agentId);
     this.paseoToolPolicies.delete(agentId);
     for (const event of this.providerSubagents.deleteParent(agentId)) {
-      this.dispatch({ type: "provider_subagent", event });
+      this.providerSubagentEventCoalescer.publish(event, { coalesce: false });
     }
   }
 
@@ -5042,7 +5074,7 @@ export class AgentManager {
   ): Promise<void> {
     if (event.type === "provider_subagent") {
       const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
-      this.dispatch({ type: "provider_subagent", event: update });
+      this.providerSubagentEventCoalescer.publish(update, { coalesce: true });
       return;
     }
     const turnId = getAgentStreamEventTurnId(event);
@@ -5223,15 +5255,16 @@ export class AgentManager {
       try {
         this.agentStreamCoalescer.flushAndDiscard(agent.id);
         await this.deleteCommittedTimeline(agent.id);
+        this.providerSubagentEventCoalescer.flushAndDiscardParent(agent.id);
         this.timelineStore.delete(agent.id);
         this.timelineStore.initialize(agent.id, { timestamp: new Date().toISOString() });
         for (const event of this.providerSubagents.deleteParent(agent.id)) {
-          if (broadcast) this.dispatch({ type: "provider_subagent", event });
+          if (broadcast) this.providerSubagentEventCoalescer.publish(event, { coalesce: false });
         }
         for await (const event of history.events()) {
           if (event.type !== "provider_subagent") continue;
           const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
-          if (broadcast) this.dispatch({ type: "provider_subagent", event: update });
+          if (broadcast) this.providerSubagentEventCoalescer.publish(update, { coalesce: false });
         }
         for await (const batch of historyTimelineBatches(history)) {
           const rows = await this.recordHistoryTimelineBatch(agent.id, batch);
@@ -5284,13 +5317,13 @@ export class AgentManager {
         const deferredBroadcast = typeof broadcast === "function";
         // These descriptors are also retained by ProviderSubagentStore. Timeline
         // payloads stay in the staged file, including during deferred publication.
-        const providerSubagentEvents: AgentManagerEvent[] = [];
+        const providerSubagentEvents: ProviderSubagentStoreEvent[] = [];
         for await (const event of history.events()) {
           if (event.type !== "provider_subagent") continue;
           const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
-          const managerEvent: AgentManagerEvent = { type: "provider_subagent", event: update };
-          if (deferredBroadcast) providerSubagentEvents.push(managerEvent);
-          else if (broadcast) this.dispatch(managerEvent);
+          if (deferredBroadcast) providerSubagentEvents.push(update);
+          else if (broadcast)
+            this.providerSubagentEventCoalescer.publish(update, { coalesce: false });
         }
         const startSeq = this.timelineStore.getNextSeq(agent.id);
         for await (const batch of historyTimelineBatches(history)) {
@@ -5321,7 +5354,8 @@ export class AgentManager {
           });
         }
         if (typeof broadcast !== "function" || !broadcast()) return;
-        for (const event of providerSubagentEvents) this.dispatch(event);
+        for (const event of providerSubagentEvents)
+          this.providerSubagentEventCoalescer.publish(event, { coalesce: false });
         let seq = startSeq;
         for await (const event of history.events()) {
           if (event.type !== "timeline") continue;
@@ -6289,7 +6323,10 @@ export class AgentManager {
     includeAgentRegistrations: boolean;
     coalesced: boolean;
   }): Promise<void> {
-    if (options.coalesced) this.agentStreamCoalescer.flushAll();
+    if (options.coalesced) {
+      this.agentStreamCoalescer.flushAll();
+      this.providerSubagentEventCoalescer.flushAll();
+    }
     // Drain tasks, including tasks spawned while awaiting.
     while (
       this.backgroundTasks.size > 0 ||
@@ -6300,7 +6337,10 @@ export class AgentManager {
         : [...this.backgroundTasks];
       await Promise.allSettled(pending);
       // Queued provider events can create new buffers while the drain is awaiting.
-      if (options.coalesced) this.agentStreamCoalescer.flushAll();
+      if (options.coalesced) {
+        this.agentStreamCoalescer.flushAll();
+        this.providerSubagentEventCoalescer.flushAll();
+      }
     }
   }
 

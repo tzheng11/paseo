@@ -10,6 +10,9 @@ export interface CodexHistoryItemReference {
   index: number;
   bytes: number;
 }
+export interface CodexHistoryMessageReference extends CodexHistoryItemReference {
+  messageType: "userMessage" | "agentMessage";
+}
 export interface CodexHistoryIndexResult {
   totalEvents: number;
   totalBytes: number;
@@ -21,6 +24,7 @@ export interface CodexHistoryIndexResult {
   tail?: CodexHistoryItemReference[];
   gap?: { startIndex: number; endIndex: number; count: number; bytes: number } | null;
   entries?: CodexHistoryItemReference[];
+  messages?: CodexHistoryMessageReference[];
   oversized?: Array<{ index: number; bytes: number }>;
   nextCursor?: number | null;
 }
@@ -29,6 +33,7 @@ export type CodexHistoryIndexRequest = {
   threadId: string;
   retainedItemIds?: string[];
 } & (
+  | { operation: "messages"; userOnly?: boolean }
   | { operation: "windows"; head: HistoryReadLimit; tail: HistoryReadLimit }
   | { operation: "page"; cursor: number; direction: "before" | "after"; limit: HistoryReadLimit }
 );
@@ -45,22 +50,27 @@ export function readCodexHistoryIndex(
         const worker = new Worker(new URL("./history-index-worker.mjs", import.meta.url), {
           workerData: request,
         });
-        let settled = false;
-        worker.once(
-          "message",
-          (reply: { ok: boolean; result?: CodexHistoryIndexResult; errorName?: string }) => {
-            settled = true;
-            if (reply.ok && reply.result) resolve(reply.result);
-            else
-              reject(
-                new Error(`Native history index read failed (${reply.errorName ?? "unknown"})`),
-              );
-          },
-        );
-        worker.once("error", reject);
+        let reply:
+          | { ok: boolean; result?: CodexHistoryIndexResult; errorName?: string }
+          | undefined;
+        let failure: Error | undefined;
+        // A reply does not prove SQLite handles or isolate resources are closed.
+        // Keep the admission slot until exit on every path, including worker errors.
+        worker.once("message", (message: NonNullable<typeof reply>) => {
+          reply = message;
+        });
+        worker.once("error", (error) => {
+          failure = error;
+        });
         worker.once("exit", (code) => {
-          if (!settled)
+          if (failure) reject(failure);
+          else if (code !== 0)
+            reject(new Error(`Native history index worker exited unsuccessfully (${code})`));
+          else if (!reply)
             reject(new Error(`Native history index worker exited before replying (${code})`));
+          else if (reply.ok && reply.result) resolve(reply.result);
+          else
+            reject(new Error(`Native history index read failed (${reply.errorName ?? "unknown"})`));
         });
       }),
   );

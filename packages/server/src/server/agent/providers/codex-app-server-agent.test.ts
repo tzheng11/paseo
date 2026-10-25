@@ -497,6 +497,26 @@ function archivedThreadHandle() {
   };
 }
 
+async function createColdNativeIndex(itemCount: number): Promise<string> {
+  const home = await mkdtemp(path.join(tmpdir(), "codex-cold-native-"));
+  mkdirSync(path.join(home, "sessions"));
+  const db = new DatabaseSync(path.join(home, "thread_history_1.sqlite"));
+  try {
+    db.exec(`CREATE TABLE thread_items(thread_id TEXT, turn_id TEXT, item_id TEXT,
+      rollout_ordinal INTEGER, updated_at_ordinal INTEGER, item_type TEXT, item_json TEXT);`);
+    const insert = db.prepare(
+      "INSERT INTO thread_items VALUES ('archived-thread-id', 'turn-old', ?, ?, ?, 'agentMessage', ?)",
+    );
+    db.exec("BEGIN");
+    for (let index = 0; index < itemCount; index++)
+      insert.run(String(index), index, index, "invalid middle must never be decoded");
+    db.exec("COMMIT");
+  } finally {
+    db.close();
+  }
+  return home;
+}
+
 function archivedThreadErrorMessage(threadId: string): string {
   return (
     `session ${threadId} is archived. ` +
@@ -2006,6 +2026,387 @@ describe("Codex app-server provider", () => {
       }
     },
   );
+
+  test("a bounded cold resume rejects legacy history before starting its writer or reading turns", async () => {
+    const appServer = createFakeCodexAppServer({
+      initialize: () => ({ userAgent: "paseo/0.159.2" }),
+      "thread/read": () => ({ thread: { historyMode: "legacy", turns: [] } }),
+      "thread/turns/list": () => ({ data: [], nextCursor: null }),
+    });
+    const provider = createProviderWithFakeAppServer(appServer);
+    const killed = vi.spyOn(appServer.child, "kill");
+
+    await expect(
+      provider
+        .resumeSession(archivedThreadHandle(), undefined, undefined, {
+          historyReadMode: "bounded",
+        })
+        .then(async (session) => {
+          await session.close();
+          return session;
+        }),
+    ).rejects.toThrow("Codex cannot read bounded native history for this thread");
+
+    expect(
+      appServer.requests().filter((request) => String(request.method).startsWith("thread/")),
+    ).toEqual([
+      expect.objectContaining({
+        method: "thread/read",
+        params: { threadId: "archived-thread-id", includeTurns: false },
+      }),
+    ]);
+    expect(killed).toHaveBeenCalled();
+    appServer.assertNoErrors();
+  });
+
+  test.each(["old-version", "missing-index", "unowned-source"] as const)(
+    "a bounded cold resume refuses unsupported native coverage (%s)",
+    async (reason) => {
+      const home = await mkdtemp(path.join(tmpdir(), "codex-cold-unsupported-"));
+      if (reason === "unowned-source")
+        writeFileSync(path.join(home, "thread_history_1.sqlite"), "");
+      const appServer = createFakeCodexAppServer({
+        initialize: () => ({
+          userAgent: reason === "old-version" ? "paseo/0.159.1" : "paseo/0.159.2",
+        }),
+        "thread/read": () => ({
+          thread: {
+            historyMode: "paginated",
+            path: path.join(
+              reason === "unowned-source" ? path.dirname(home) : home,
+              "sessions",
+              "rollout.jsonl",
+            ),
+          },
+        }),
+      });
+      const provider = createProviderWithFakeAppServer(appServer, {
+        runtimeSettings: { env: { CODEX_HOME: home } },
+      });
+      const killed = vi.spyOn(appServer.child, "kill");
+      try {
+        await expect(
+          provider.resumeSession(archivedThreadHandle(), undefined, undefined, {
+            historyReadMode: "bounded",
+          }),
+        ).rejects.toThrow("Codex cannot read bounded native history for this thread");
+        expect(
+          appServer
+            .requests()
+            .filter((request) =>
+              ["thread/resume", "thread/turns/list", "thread/items/list"].includes(
+                String(request.method),
+              ),
+            ),
+        ).toEqual([]);
+        expect(
+          appServer
+            .requests()
+            .filter((request) => request.method === "thread/read")
+            .map((request) => request.params),
+        ).toEqual(
+          reason === "old-version" ? [] : [{ threadId: "archived-thread-id", includeTurns: false }],
+        );
+        expect(killed).toHaveBeenCalled();
+        appServer.assertNoErrors();
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("a bounded cold native resume keeps exact edges and supports the next normal turn", async () => {
+    const home = await createColdNativeIndex(1000);
+    const models = {
+      data: ["gpt-5.4", "gpt-updated-after-reading"].map((id) => ({
+        id,
+        isDefault: id === "gpt-5.4",
+        serviceTiers: [{ id: "priority", name: "Fast", description: "Faster processing" }],
+      })),
+    };
+    const decoded: number[] = [];
+    let loaded = false;
+    const appServer = createFakeCodexAppServer({
+      initialize: () => ({ userAgent: "paseo/0.159.2" }),
+      "model/list": () => models,
+      "thread/read": (raw) => {
+        expect(raw).toEqual({ threadId: "archived-thread-id", includeTurns: false });
+        return {
+          thread: { historyMode: "paginated", path: path.join(home, "sessions", "rollout.jsonl") },
+        };
+      },
+      "thread/turns/list": () => ({ data: [{ id: "turn-old", items: [] }], nextCursor: null }),
+      "thread/items/list": (raw) => {
+        const params = z
+          .object({
+            limit: z.number().int().min(1).max(8),
+            cursor: z.object({ itemId: z.string() }).optional(),
+          })
+          .parse(raw);
+        const start = params.cursor ? Number(params.cursor.itemId) + 1 : 0;
+        const end = Math.min(start + params.limit, 1000);
+        const data = Array.from({ length: end - start }, (_, offset) => {
+          const index = start + offset;
+          decoded.push(index);
+          return {
+            turnId: "turn-old",
+            item: { type: "agentMessage", id: String(index), text: `row ${index} 🙂` },
+          };
+        });
+        return { data, nextCursor: end < 1000 ? String(end - 1) : null };
+      },
+      "thread/loaded/list": () => ({ data: loaded ? ["archived-thread-id"] : [] }),
+      "thread/resume": (params) => {
+        expect(params).toEqual({ threadId: "archived-thread-id", excludeTurns: true });
+        loaded = true;
+        return { thread: { id: "archived-thread-id" } };
+      },
+    });
+    const writerApp = createFakeCodexAppServer({
+      initialize: () => ({ userAgent: "paseo/0.159.2" }),
+      "model/list": () => models,
+      "thread/loaded/list": () => ({ data: loaded ? ["archived-thread-id"] : [] }),
+      "thread/resume": (params) => {
+        expect(params).toEqual({ threadId: "archived-thread-id", excludeTurns: true });
+        loaded = true;
+        return { thread: { id: "archived-thread-id" } };
+      },
+    });
+    const provider = createProviderWithFakeAppServer(appServer, {
+      runtimeSettings: { env: { CODEX_HOME: home } },
+    });
+    let spawns = 0;
+    castInternals<{ spawnAppServer: () => Promise<ChildProcessWithoutNullStreams> }>(
+      provider,
+    ).spawnAppServer = async () => (spawns++ === 0 ? appServer.child : writerApp.child);
+    let session: AgentSession | undefined;
+    try {
+      session = await provider.resumeSession(
+        archivedThreadHandle(),
+        { featureValues: { service_tier: "priority" } },
+        undefined,
+        { historyReadMode: "bounded" },
+      );
+      const windows = await session.readHistoryWindows!({
+        head: { events: 64, bytes: 256 * 1024 },
+        tail: { events: 256, bytes: 2 * 1024 * 1024 },
+      });
+      expect(
+        windows.head.map((entry) => [
+          entry.index,
+          entry.value.type === "timeline" ? entry.value.item : null,
+        ]),
+      ).toEqual(
+        Array.from({ length: 64 }, (_, index) => [
+          index,
+          { type: "assistant_message", text: `row ${index} 🙂`, messageId: String(index) },
+        ]),
+      );
+      expect(windows.tail.map((entry) => entry.index)).toEqual(
+        Array.from({ length: 256 }, (_, index) => 744 + index),
+      );
+      expect(windows.gap).toMatchObject({ startIndex: 64, endIndex: 743, count: 680 });
+      expect(decoded.toSorted((left, right) => left - right)).toEqual([
+        ...Array.from({ length: 64 }, (_, index) => index),
+        ...Array.from({ length: 256 }, (_, index) => 744 + index),
+      ]);
+      const methods = appServer.requests().map((request) => request.method);
+      expect(
+        methods.filter((method) => ["thread/resume", "thread/unarchive"].includes(String(method))),
+      ).toEqual([]);
+      expect(spawns).toBe(1);
+      await session.setModel!("gpt-updated-after-reading");
+      await session.setThinkingOption!("high");
+      expect(session.features).toContainEqual(
+        expect.objectContaining({ id: "service_tier", value: "priority" }),
+      );
+      await session.setFeature!("service_tier", "priority");
+      await session.startTurn("continue after the bounded read");
+      await writerApp.waitForTurnStart();
+      writerApp.startsTurn({ threadId: "archived-thread-id", turnId: "turn-new" });
+      writerApp.completeTurn({ threadId: "archived-thread-id" });
+      expect(spawns).toBe(2);
+      expect(
+        writerApp.requests().filter((request) => request.method === "thread/resume"),
+      ).toHaveLength(1);
+      expect(writerApp.requests().filter((request) => request.method === "turn/start")).toEqual([
+        expect.objectContaining({
+          params: expect.objectContaining({
+            model: "gpt-updated-after-reading",
+            effort: "high",
+            serviceTier: "priority",
+          }),
+        }),
+      ]);
+      expect(
+        writerApp
+          .requests()
+          .filter((request) =>
+            ["thread/read", "thread/turns/list", "thread/items/list"].includes(
+              String(request.method),
+            ),
+          ),
+      ).toEqual([]);
+      appServer.assertNoErrors();
+      writerApp.assertNoErrors();
+    } finally {
+      await session?.close();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("bounded cold reader promotion is single-flight for concurrent interactive callers", async () => {
+    const home = await createColdNativeIndex(1);
+    const metadata = deferred<unknown>();
+    const entered = deferred<void>();
+    const reader = createFakeCodexAppServer({
+      initialize: () => ({ userAgent: "paseo/0.159.2" }),
+      "thread/read": () => {
+        entered.resolve();
+        return metadata.promise;
+      },
+      "thread/turns/list": () => ({ data: [{ id: "turn-old", items: [] }], nextCursor: null }),
+      "thread/items/list": () => ({
+        data: [{ turnId: "turn-old", item: { type: "agentMessage", id: "0", text: "preserved" } }],
+        nextCursor: null,
+      }),
+    });
+    const writer = createFakeCodexAppServer({ initialize: () => ({ userAgent: "paseo/0.159.2" }) });
+    const readerKill = vi.spyOn(reader.child, "kill");
+    const writerKill = vi.spyOn(writer.child, "kill");
+    let spawns = 0;
+    const session = new CodexAppServerAgentSession(
+      createConfig(),
+      archivedThreadHandle(),
+      createTestLogger(),
+      async () => (spawns++ === 0 ? reader.child : writer.child),
+      { codexHome: home },
+      false,
+      false,
+      false,
+      undefined,
+      "interactive",
+      "bounded",
+    );
+    const loading = session.connect();
+    try {
+      await entered.promise;
+      const first = session.connect(true);
+      const second = session.connect(true);
+      const ordinary = session.connect();
+      metadata.resolve({
+        thread: { historyMode: "paginated", path: path.join(home, "sessions", "rollout.jsonl") },
+      });
+      await Promise.all([loading, first, second, ordinary]);
+      expect(spawns).toBe(2);
+      expect(readerKill).toHaveBeenCalledTimes(1);
+      expect(
+        writer.requests().filter((request) => request.method === "thread/resume"),
+      ).toHaveLength(1);
+      expect(
+        writer
+          .requests()
+          .filter((request) =>
+            ["thread/read", "thread/turns/list", "thread/items/list"].includes(
+              String(request.method),
+            ),
+          ),
+      ).toEqual([]);
+      reader.assertNoErrors();
+      writer.assertNoErrors();
+    } finally {
+      metadata.resolve({
+        thread: { historyMode: "paginated", path: path.join(home, "sessions", "rollout.jsonl") },
+      });
+      await loading;
+      await session.close();
+      rmSync(home, { recursive: true, force: true });
+    }
+    expect(writerKill).toHaveBeenCalledTimes(1);
+  });
+
+  test("bounded cold history remains unloadable only while its proven native source exists", async () => {
+    const home = await createColdNativeIndex(1);
+    const sourcePath = path.join(home, "sessions", "rollout.jsonl");
+    writeFileSync(sourcePath, "preserved native history\n");
+    const appServer = createFakeCodexAppServer({
+      initialize: () => ({ userAgent: "paseo/0.159.2" }),
+      "model/list": () => ({ data: [] }),
+      "thread/read": () => ({ thread: { historyMode: "paginated", path: sourcePath } }),
+      "thread/turns/list": () => ({ data: [{ id: "turn-old", items: [] }], nextCursor: null }),
+      "thread/items/list": () => ({
+        data: [{ turnId: "turn-old", item: { type: "agentMessage", id: "0", text: "preserved" } }],
+        nextCursor: null,
+      }),
+    });
+    const provider = createProviderWithFakeAppServer(appServer, {
+      runtimeSettings: { env: { CODEX_HOME: home } },
+    });
+    const session = await provider.resumeSession(archivedThreadHandle(), undefined, undefined, {
+      historyReadMode: "bounded",
+    });
+    const requestsAfterLoad = appServer.requests();
+    try {
+      expect(await session.hasPersistedSession?.()).toBe(true);
+      writeFileSync(sourcePath, "");
+      expect(await session.hasPersistedSession?.()).toBe(false);
+      rmSync(sourcePath);
+      expect(await session.hasPersistedSession?.()).toBe(false);
+      writeFileSync(sourcePath, "preserved native history\n");
+      expect(await session.hasPersistedSession?.()).toBe(true);
+      await session.close();
+      expect(await session.hasPersistedSession?.()).toBe(false);
+      expect(appServer.requests()).toEqual(requestsAfterLoad);
+      expect(appServer.requests().some((request) => request.method === "thread/resume")).toBe(
+        false,
+      );
+      appServer.assertNoErrors();
+    } finally {
+      await session.close();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("bounded archived history never promotes to a writer", async () => {
+    const home = await createColdNativeIndex(1);
+    const appServer = createFakeCodexAppServer({
+      initialize: () => ({ userAgent: "paseo/0.159.2" }),
+      "thread/read": () => ({
+        thread: { historyMode: "paginated", path: path.join(home, "sessions", "rollout.jsonl") },
+      }),
+      "thread/turns/list": () => ({ data: [{ id: "turn-old", items: [] }], nextCursor: null }),
+      "thread/items/list": () => ({
+        data: [{ turnId: "turn-old", item: { type: "agentMessage", id: "0", text: "preserved" } }],
+        nextCursor: null,
+      }),
+    });
+    const provider = createProviderWithFakeAppServer(appServer, {
+      runtimeSettings: { env: { CODEX_HOME: home } },
+    });
+    const session = await provider.resumeSession(archivedThreadHandle(), undefined, undefined, {
+      purpose: "history",
+      historyReadMode: "bounded",
+    });
+    try {
+      expect(session.historyWindowInfo?.totalEvents).toBe(1);
+      await expect(session.startTurn("do not run archived history")).rejects.toThrow(
+        "Archived Codex history is read-only",
+      );
+      expect(
+        appServer
+          .requests()
+          .filter((request) =>
+            ["thread/resume", "thread/unarchive", "model/list", "turn/start"].includes(
+              String(request.method),
+            ),
+          ),
+      ).toEqual([]);
+      appServer.assertNoErrors();
+    } finally {
+      await session.close();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
 
   test("maintenance resume skips historical reads until explicitly requested and supports a turn", async () => {
     const appServer = createFakeCodexAppServer({
@@ -5000,18 +5401,25 @@ describe("Codex app-server provider", () => {
           return { data: [{ id: "turn", items: [] }], nextCursor: null };
         if (method !== "thread/items/list") throw new Error("Full history endpoint was requested");
         const params = z
-          .object({ limit: z.literal(1), cursor: z.object({ itemId: z.string() }).optional() })
+          .object({
+            limit: z.number().int().min(1).max(8),
+            cursor: z.object({ itemId: z.string() }).optional(),
+          })
           .parse(raw);
         const index = params.cursor ? Number(params.cursor.itemId) + 1 : 0;
-        decoded.push(index);
+        const indices: number[] = [];
+        const data = [];
+        for (let itemIndex = index; itemIndex < Math.min(index + params.limit, 1000); itemIndex++) {
+          indices.push(itemIndex);
+          data.push({
+            turnId: "turn",
+            item: { type: "agentMessage", id: String(itemIndex), text: String(itemIndex) },
+          });
+        }
+        decoded.push(...indices);
         return {
-          data: [
-            {
-              turnId: "turn",
-              item: { type: "agentMessage", id: String(index), text: String(index) },
-            },
-          ],
-          nextCursor: null,
+          data,
+          nextCursor: index + indices.length < 1000 ? String(index + indices.length - 1) : null,
         };
       });
       session.client = { request };
@@ -5020,8 +5428,13 @@ describe("Codex app-server provider", () => {
         const events: AgentStreamEvent[] = [];
         for await (const event of session.streamHistory()) events.push(event);
         expect(events).toHaveLength(321);
-        expect(decoded).toHaveLength(320);
-        expect(decoded.every((index) => index < 64 || index >= 744)).toBe(true);
+        expect(decoded.toSorted((left, right) => left - right)).toEqual([
+          ...Array.from({ length: 64 }, (_, index) => index),
+          ...Array.from({ length: 256 }, (_, index) => 744 + index),
+        ]);
+        expect(
+          request.mock.calls.filter(([method]) => method === "thread/items/list"),
+        ).toHaveLength(40);
         const primaryRequest = vi.fn(async () => {
           throw new Error("History must not use the writer's RPC channel");
         });

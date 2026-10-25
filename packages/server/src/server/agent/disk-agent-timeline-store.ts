@@ -16,6 +16,7 @@ import type {
   AgentTimelineFetchOptions,
   AgentTimelineFetchResult,
   AgentTimelineRow,
+  AgentTimelineStreamOptions,
 } from "./agent-timeline-store-types.js";
 import {
   mergeProjectedTimelineRow,
@@ -212,18 +213,51 @@ export class DiskAgentTimelineStore implements AgentRuntimeTimelineStore {
   }
 
   /** Explicit full-history access without an array of decoded payloads. */
-  async *streamRows(agentId: string): AsyncGenerator<ProjectedTimelineRow> {
+  async *streamRows(
+    agentId: string,
+    options?: AgentTimelineStreamOptions,
+  ): AsyncGenerator<ProjectedTimelineRow> {
     const state = this.requireState(agentId);
     const count = state.count,
       nextSeq = state.nextSeq;
     let lastYield = performance.now();
-    for (let pos = 0; pos < count; pos++) {
+    let decoded = 0;
+    const assertCurrent = () => {
       if (this.states.get(agentId) !== state || state.nextSeq !== nextSeq)
         throw new Error("History changed during streamed read");
+    };
+    const positions = options?.userMessagesOnly
+      ? this.userMessagePositions(state, count, assertCurrent)
+      : this.rowPositions(0, count);
+    for (const pos of positions) {
+      assertCurrent();
       yield this.readRow(state, pos);
-      if (performance.now() - lastYield >= 4) {
+      if (++decoded >= 32 || performance.now() - lastYield >= 4) {
         await setImmediate();
+        decoded = 0;
         lastYield = performance.now();
+      }
+    }
+    assertCurrent();
+  }
+
+  private *userMessagePositions(
+    state: TimelineState,
+    count: number,
+    assertCurrent: () => void,
+  ): Generator<number> {
+    let after = -1;
+    while (after < count - 1) {
+      assertCurrent();
+      // rows_type covers this metadata page. Tool and assistant payloads never
+      // enter the row cache or decoder just to build the prompt outline.
+      const page = this.statement(`SELECT pos FROM rows
+        WHERE sid = ? AND item_type = 'user_message' AND pos > ? AND pos < ?
+        ORDER BY pos LIMIT 128`).all(state.key, after, count);
+      if (!page.length) return;
+      for (const row of page) {
+        after = Number(row.pos);
+        yield after;
       }
     }
   }

@@ -56,8 +56,8 @@ describe("snapshot mutation ownership boundary", () => {
       const persisted = await daemonHandle.daemon.agentStorage.get(snapshot.id);
       expect(persisted?.config?.model).toBe("gpt-5.4");
     } finally {
-      rmSync(cwd, { recursive: true, force: true });
       await daemonHandle.close();
+      rmSync(cwd, { recursive: true, force: true });
     }
   });
 

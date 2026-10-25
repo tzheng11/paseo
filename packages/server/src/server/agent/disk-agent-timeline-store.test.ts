@@ -2,10 +2,12 @@ import { mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { setImmediate } from "node:timers/promises";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 import { DiskAgentTimelineStore } from "./disk-agent-timeline-store.js";
 import type { AgentTimelineItem } from "./agent-sdk-types.js";
+import type { ProjectedTimelineRow } from "./timeline-projection.js";
+import { streamTimelinePromptIndex } from "./timeline-prompt-index.js";
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -20,6 +22,11 @@ function createStore(cacheBytes = 1024) {
   );
   return store;
 }
+async function collect<T>(rows: AsyncIterable<T>): Promise<T[]> {
+  const result: T[] = [];
+  for await (const row of rows) result.push(row);
+  return result;
+}
 const tool = (callId: string, status: "running" | "completed"): AgentTimelineItem => ({
   type: "tool_call",
   callId,
@@ -30,6 +37,86 @@ const tool = (callId: string, status: "running" | "completed"): AgentTimelineIte
 });
 
 describe("DiskAgentTimelineStore", () => {
+  it("indexes cached prompts without reading interleaved nonuser payloads", async () => {
+    const store = createStore();
+    const memory = new InMemoryAgentTimelineStore();
+    const items: AgentTimelineItem[] = [
+      { type: "user_message", text: "  café 🧪\0\n first  ", clientMessageId: "first" },
+      ...Array.from({ length: 160 }, (_, index) => ({
+        ...tool(`large-${index}`, "completed"),
+        detail: { type: "plain_text" as const, label: "tool", text: "x".repeat(32768) },
+      })),
+      { type: "user_message", text: "z".repeat(100000), clientMessageId: "second" },
+      { type: "assistant_message", messageId: "reply", text: "y".repeat(100000) },
+      { type: "user_message", text: "", clientMessageId: "empty" },
+    ];
+    for (const target of [store, memory]) {
+      target.initialize("prompts", { epoch: "epoch", items, timestamp: "start" });
+      // Repeated prompt IDs remain distinct rows; an old tool update keeps its anchor.
+      target.append(
+        "prompts",
+        {
+          type: "user_message",
+          text: "  café 🧪\0\n first  ",
+          clientMessageId: "first",
+        },
+        { timestamp: "echo" },
+      );
+      target.append("prompts", tool("large-0", "completed"), { timestamp: "tool-update" });
+    }
+    // Count the real SQLite payload boundary, after fixture writes have evicted the cache.
+    const payloads = vi.spyOn(
+      store as unknown as {
+        readRow(state: unknown, pos: number): ProjectedTimelineRow;
+      },
+      "readRow",
+    );
+    const expectedRows = memory
+      .getRows("prompts")
+      .filter((row) => row.item.type === "user_message");
+    const selected = [];
+    for await (const row of store.streamRows("prompts", { userMessagesOnly: true }))
+      selected.push(row);
+    expect(selected).toEqual(expectedRows);
+    expect(selected.map((row) => row.seq)).toEqual([1, 162, 164, 165]);
+    expect(memory.getRows("prompts")[1]).toMatchObject({ seqStart: 2, seqEnd: 166 });
+    expect(payloads.mock.calls.map(([, pos]) => pos)).toEqual([0, 161, 163, 164]);
+    expect(
+      await streamTimelinePromptIndex(
+        "epoch",
+        store.streamRows("prompts", { userMessagesOnly: true }),
+      ),
+    ).toEqual(await streamTimelinePromptIndex("epoch", memory.streamRows("prompts")));
+    payloads.mockRestore();
+    expect(await collect(store.streamRows("prompts"))).toEqual(memory.getRows("prompts"));
+  });
+
+  it("pages cached prompt metadata, yields, and rejects a changed projection", async () => {
+    const store = createStore();
+    store.initialize("prompts", {
+      epoch: "before",
+      items: Array.from({ length: 300 }, (_, index) => ({
+        type: "user_message",
+        text: String(index),
+        clientMessageId: String(index),
+      })),
+    });
+    let completed = false;
+    const probe = setImmediate().then(() => completed);
+    const reading = collect(store.streamRows("prompts", { userMessagesOnly: true })).then(
+      (rows) => {
+        completed = true;
+        return rows;
+      },
+    );
+    expect(await probe).toBe(false);
+    expect(await reading).toHaveLength(300);
+    const iterator = store.streamRows("prompts", { userMessagesOnly: true });
+    expect((await iterator.next()).value?.item).toMatchObject({ type: "user_message", text: "0" });
+    store.initialize("prompts", { epoch: "after" });
+    await expect(iterator.next()).rejects.toThrow("History changed during streamed read");
+  });
+
   it("serves other event-loop work while reading a tail expanded by an old tool", async () => {
     const store = createStore();
     store.initialize("busy", { epoch: "epoch" });

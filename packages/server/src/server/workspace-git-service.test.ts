@@ -16,12 +16,15 @@ import {
   type WorkspaceGitRuntimeSnapshot,
 } from "./workspace-git-service.js";
 
+import { NativeRecursiveResources } from "./file-observer/internal/native-recursive-resources.js";
+
 const REPO_CWD = path.resolve("/tmp/repo");
 
 function createLogger() {
   const logger = {
     child: () => logger,
     debug: vi.fn(),
+    info: vi.fn(),
     warn: vi.fn(),
   };
   return logger;
@@ -248,9 +251,11 @@ function createGitHubServiceStub(): ForgeService {
 }
 
 interface CreateServiceTestOptions {
+  getCheckoutDiff?: ReturnType<typeof vi.fn>;
   subscribe?: ReturnType<typeof vi.fn>;
   getCheckoutStatus?: ReturnType<typeof vi.fn>;
   getCheckoutSnapshotFacts?: ReturnType<typeof vi.fn>;
+  getCheckoutIdentity?: ReturnType<typeof vi.fn>;
   getCheckoutShortstat?: ReturnType<typeof vi.fn>;
   getCheckoutWorktreeState?: ReturnType<typeof vi.fn>;
   getPullRequestStatus?: ReturnType<typeof vi.fn>;
@@ -270,6 +275,7 @@ function buildDefaultTestServiceDeps() {
       unsubscribe: vi.fn(async () => {}),
     })),
     getCheckoutSnapshotFacts: vi.fn(async (cwd: string) => createCheckoutSnapshotFacts(cwd)),
+    getCheckoutIdentity: vi.fn(async (cwd: string) => createCheckoutSnapshotFacts(cwd)),
     getCheckoutRefDerivedState: vi.fn(async (_cwd, facts, current) => ({
       ...current,
       upstreamStatus: facts.upstreamStatus,
@@ -324,6 +330,60 @@ function createService(options?: CreateServiceTestOptions) {
 }
 
 describe("WorkspaceGitServiceImpl", () => {
+  test("an explicit diff does not wait for queued recursive or metadata observation", async () => {
+    const watch = createDeferred<ReturnType<typeof createAsyncSubscription>>();
+    const getCheckoutDiff = vi.fn(async () => ({ diff: "fresh" }));
+    const service = createService({ subscribe: vi.fn(() => watch.promise), getCheckoutDiff });
+    const owner = service.registerWorkspace({ cwd: REPO_CWD }, () => {});
+    let result: unknown;
+    const reading = service.getCheckoutDiff(REPO_CWD, { mode: "uncommitted" }).then((value) => {
+      result = value;
+      return value;
+    });
+    try {
+      for (let turn = 0; turn < 30; turn++) await Promise.resolve();
+      expect(result).toEqual({ diff: "fresh" });
+      expect(getCheckoutDiff).toHaveBeenCalledTimes(1);
+    } finally {
+      owner.unsubscribe();
+      watch.resolve(createAsyncSubscription());
+      await reading;
+      await service.dispose();
+    }
+  });
+
+  test("registration readiness includes metadata setup after the recursive watcher opens", async () => {
+    const recursive = createDeferred<ReturnType<typeof createAsyncSubscription>>();
+    const metadata = createDeferred<ReturnType<typeof createAsyncSubscription>>();
+    const subscribe = vi.fn((cwd: string) =>
+      cwd === REPO_CWD ? recursive.promise : metadata.promise,
+    );
+    const service = createService({ subscribe });
+    const owner = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    let ready = false;
+    const opening = owner.ready?.then(() => {
+      ready = true;
+      return ready;
+    });
+    try {
+      await vi.waitFor(() => expect(subscribe).toHaveBeenCalledTimes(1));
+      expect(ready).toBe(false);
+      recursive.resolve(createAsyncSubscription());
+      await vi.waitFor(() => expect(subscribe).toHaveBeenCalledTimes(2));
+      expect(subscribe.mock.calls.map(([cwd]) => cwd)).toEqual([REPO_CWD, join(REPO_CWD, ".git")]);
+      expect(ready).toBe(false);
+      metadata.resolve(createAsyncSubscription());
+      await opening;
+      expect(ready).toBe(true);
+    } finally {
+      recursive.resolve(createAsyncSubscription());
+      metadata.resolve(createAsyncSubscription());
+      owner.unsubscribe();
+      await opening;
+      await service.dispose();
+    }
+  });
+
   test("cold snapshots keep progressing while warm refresh generations are held", async () => {
     const warm = Array.from({ length: 3 }, (_, i) => path.resolve(`/tmp/held-warm-${i}`));
     const cold = Array.from({ length: 92 }, (_, i) => path.resolve(`/tmp/progress-cold-${i}`));
@@ -372,12 +432,19 @@ describe("WorkspaceGitServiceImpl", () => {
     service.dispose();
   });
 
-  test("checkout membership reads use Git facts without reading dirty worktree status", async () => {
-    const getCheckoutSnapshotFacts = vi.fn(async (cwd: string) => createCheckoutSnapshotFacts(cwd));
+  test("checkout membership reads fresh identity without snapshot or dirty-worktree enrichment", async () => {
+    const getCheckoutIdentity = vi.fn(async (cwd: string) => createCheckoutSnapshotFacts(cwd));
+    const getCheckoutSnapshotFacts = vi.fn(async () => {
+      throw new Error("snapshot enrichment must not run");
+    });
     const getCheckoutStatus = vi.fn(async () => {
       throw new Error("status scan must not run");
     });
-    const service = createService({ getCheckoutSnapshotFacts, getCheckoutStatus });
+    const service = createService({
+      getCheckoutIdentity,
+      getCheckoutSnapshotFacts,
+      getCheckoutStatus,
+    });
     await expect(service.getCheckout(REPO_CWD)).resolves.toMatchObject({
       cwd: REPO_CWD,
       isGit: true,
@@ -385,8 +452,28 @@ describe("WorkspaceGitServiceImpl", () => {
       worktreeRoot: REPO_CWD,
     });
     expect(getCheckoutStatus).not.toHaveBeenCalled();
-    expect(getCheckoutSnapshotFacts).toHaveBeenCalledTimes(1);
+    expect(getCheckoutSnapshotFacts).not.toHaveBeenCalled();
+    expect(getCheckoutIdentity).toHaveBeenCalledTimes(1);
     service.dispose();
+  });
+
+  test("checkout identity preserves non-Git membership without snapshot enrichment", async () => {
+    const getCheckoutSnapshotFacts = vi.fn();
+    const service = createService({
+      getCheckoutIdentity: vi.fn(async () => ({ isGit: false })),
+      getCheckoutSnapshotFacts,
+    });
+    await expect(service.getCheckout(REPO_CWD)).resolves.toEqual({
+      cwd: REPO_CWD,
+      isGit: false,
+      currentBranch: null,
+      remoteUrl: null,
+      worktreeRoot: null,
+      isPaseoOwnedWorktree: false,
+      mainRepoRoot: null,
+    });
+    expect(getCheckoutSnapshotFacts).not.toHaveBeenCalled();
+    await service.dispose();
   });
 
   test.each([
@@ -431,7 +518,7 @@ describe("WorkspaceGitServiceImpl", () => {
         paseoWorktree: { isPaseoOwnedWorktree: owned },
         resolvedBaseRef: base,
       };
-      const service = createService({ getCheckoutSnapshotFacts: vi.fn(async () => facts) });
+      const service = createService({ getCheckoutIdentity: vi.fn(async () => facts) });
       await expect(service.getCheckout(REPO_CWD)).resolves.toMatchObject({
         mainRepoRoot: expectedMain,
         isPaseoOwnedWorktree: expectedOwned,
@@ -442,21 +529,21 @@ describe("WorkspaceGitServiceImpl", () => {
 
   test("bulk checkout membership reads stay bounded and share a pending read for the same checkout", async () => {
     const gate = createDeferred<void>();
-    const getCheckoutSnapshotFacts = vi.fn(async (cwd: string) => {
+    const getCheckoutIdentity = vi.fn(async (cwd: string) => {
       await gate.promise;
       return createCheckoutSnapshotFacts(cwd);
     });
-    const service = createService({ getCheckoutSnapshotFacts });
+    const service = createService({ getCheckoutIdentity });
     const roots = Array.from({ length: 92 }, (_, i) => path.resolve(`/tmp/membership-${i}`));
     const reads = roots.map((cwd) => service.getCheckout(cwd));
     const duplicate = service.getCheckout(roots[0]);
-    await vi.waitFor(() => expect(getCheckoutSnapshotFacts).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(getCheckoutIdentity).toHaveBeenCalledTimes(2));
     gate.resolve();
     const result = await Promise.all(reads);
     await expect(duplicate).resolves.toEqual(result[0]);
-    expect(getCheckoutSnapshotFacts).toHaveBeenCalledTimes(92);
+    expect(getCheckoutIdentity).toHaveBeenCalledTimes(92);
     await service.getCheckout(roots[0]);
-    expect(getCheckoutSnapshotFacts).toHaveBeenCalledTimes(93);
+    expect(getCheckoutIdentity).toHaveBeenCalledTimes(93);
     service.dispose();
   });
   beforeEach(() => {
@@ -473,7 +560,7 @@ describe("WorkspaceGitServiceImpl", () => {
     const listener = vi.fn();
     const subscription = service.registerWorkspace({ cwd: REPO_CWD }, listener);
 
-    expect(subscription).toEqual({ unsubscribe: expect.any(Function) });
+    expect(subscription).toEqual({ ready: expect.any(Promise), unsubscribe: expect.any(Function) });
     expect("initial" in subscription).toBe(false);
     expect(listener).not.toHaveBeenCalled();
     expect(service.peekSnapshot(REPO_CWD)).toBeNull();
@@ -1853,6 +1940,7 @@ describe("WorkspaceGitServiceImpl", () => {
       ignore: [join(REPO_CWD, ".git")],
       signal: expect.any(AbortSignal),
       onInventoryProgress: expect.any(Function),
+      onInventoryAdmission: expect.any(Function),
     });
 
     subscription.unsubscribe();
@@ -1885,6 +1973,229 @@ describe("WorkspaceGitServiceImpl", () => {
     expect(unsubscribe).toHaveBeenCalledTimes(1);
 
     service.dispose();
+  });
+
+  test("capacity recovery waits for released headroom without repeating ignore inventories or delaying explicit reads", async () => {
+    const resources = new NativeRecursiveResources({
+      maxTrackedEntries: 10,
+      maxConcurrentAudits: 2,
+    });
+    const existing = resources.createInventoryReservation("existing");
+    existing.setEntryCount(8);
+    const failure = resources.capacityError({
+      root: REPO_CWD,
+      scope: "shared",
+      requiredEntries: 4,
+      limit: 10,
+    });
+    const subscribe = vi
+      .fn()
+      .mockRejectedValueOnce(failure)
+      .mockResolvedValue(createAsyncSubscription());
+    const runGitCommand = buildDefaultTestServiceDeps().runGitCommand;
+    const service = createService({ subscribe, runGitCommand, now: () => new Date() });
+    const subscription = await service.requestWorkingTreeWatch(REPO_CWD, vi.fn());
+    const ignoredInventoryCount = () =>
+      runGitCommand.mock.calls.filter(([args]) => args[0] === "ls-files").length;
+    expect(ignoredInventoryCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(299_999);
+    expect(subscribe).toHaveBeenCalledTimes(1);
+    expect(ignoredInventoryCount()).toBe(1);
+    await expect(
+      service.getSnapshot(REPO_CWD, { force: true, reason: "capacity-explicit-read" }),
+    ).resolves.toMatchObject({ git: { isGit: true } });
+    existing.release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(subscribe).toHaveBeenCalledTimes(2);
+    expect(ignoredInventoryCount()).toBe(2);
+    expect(service.getMetrics().workingTreeWatchSetupInFlightCount).toBe(0);
+    subscription.unsubscribe();
+    await service.dispose();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  test("capacity recovery rechecks shrinking roots every five minutes and cancels after the final consumer closes", async () => {
+    const resources = new NativeRecursiveResources({
+      maxTrackedEntries: 10,
+      maxConcurrentAudits: 2,
+    });
+    const existing = resources.createInventoryReservation("existing");
+    existing.setEntryCount(8);
+    const failure = resources.capacityError({
+      root: REPO_CWD,
+      scope: "shared",
+      requiredEntries: 4,
+      limit: 10,
+    });
+    const subscribe = vi.fn().mockRejectedValue(failure);
+    const runGitCommand = buildDefaultTestServiceDeps().runGitCommand;
+    const service = createService({ subscribe, runGitCommand, now: () => new Date() });
+    const subscription = await service.requestWorkingTreeWatch(REPO_CWD, vi.fn());
+    await vi.advanceTimersByTimeAsync(299_999);
+    expect(subscribe).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(subscribe).toHaveBeenCalledTimes(2);
+    expect(runGitCommand.mock.calls.filter(([args]) => args[0] === "ls-files")).toHaveLength(2);
+    subscription.unsubscribe();
+    await service.dispose();
+    existing.release();
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(subscribe).toHaveBeenCalledTimes(2);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  test("capacity release waits for previous unsubscribe and cannot resurrect a closed target", async () => {
+    const resources = new NativeRecursiveResources({
+      maxTrackedEntries: 10,
+      maxConcurrentAudits: 2,
+    });
+    const existing = resources.createInventoryReservation("existing");
+    existing.setEntryCount(8);
+    const failure = resources.capacityError({
+      root: REPO_CWD,
+      scope: "shared",
+      requiredEntries: 4,
+      limit: 10,
+    });
+    const closing = createDeferred<void>();
+    const unsubscribe = vi.fn(() => closing.promise);
+    const updateIgnore = vi.fn(async () => {});
+    let watcherError: (error: Error, events: []) => void = () => {};
+    const subscribe = vi.fn(async (_cwd, callback) => {
+      watcherError = callback;
+      return { updateIgnore, unsubscribe };
+    });
+    const service = createService({ subscribe });
+    const subscription = await service.requestWorkingTreeWatch(REPO_CWD, vi.fn());
+    watcherError(failure, []);
+    existing.release();
+    await flushPromises();
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
+    expect(subscribe).toHaveBeenCalledTimes(1);
+    subscription.unsubscribe();
+    closing.resolve();
+    await vi.advanceTimersByTimeAsync(0);
+    await service.dispose();
+    expect(subscribe).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  test("capacity admission refreshes ignore rules changed during the wait before restoring coverage", async () => {
+    const resources = new NativeRecursiveResources({
+      maxTrackedEntries: 10,
+      maxConcurrentAudits: 2,
+    });
+    const existing = resources.createInventoryReservation("existing");
+    existing.setEntryCount(8);
+    const failure = resources.capacityError({
+      root: REPO_CWD,
+      scope: "shared",
+      requiredEntries: 4,
+      limit: 10,
+    });
+    let ignored = true;
+    const runGitCommand = vi.fn(async (args: string[]) => ({
+      stdout: args[0] === "ls-files" && ignored ? "previously-ignored/\n" : `${REPO_CWD}\n`,
+      stderr: "",
+      truncated: false,
+      exitCode: 0,
+      signal: null,
+    }));
+    const callbacks: Array<
+      (error: Error | null, events: Array<{ path: string; type: "update" }>) => void
+    > = [];
+    const subscribe = vi.fn(async (_cwd, callback) => {
+      callbacks.push(callback);
+      if (callbacks.length === 1) throw failure;
+      return createAsyncSubscription();
+    });
+    const service = createService({ subscribe, runGitCommand, now: () => new Date() });
+    const listener = vi.fn();
+    const subscription = await service.requestWorkingTreeWatch(REPO_CWD, listener);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(runGitCommand.mock.calls.filter(([args]) => args[0] === "ls-files")).toHaveLength(1);
+    ignored = false;
+    existing.release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(subscribe).toHaveBeenCalledTimes(2);
+    expect(subscribe.mock.calls[1]?.[2]).toMatchObject({ ignore: [join(REPO_CWD, ".git")] });
+    expect(runGitCommand.mock.calls.filter(([args]) => args[0] === "ls-files")).toHaveLength(2);
+    listener.mockClear();
+    callbacks[1]!(null, [
+      { path: join(REPO_CWD, "previously-ignored", "tracked.ts"), type: "update" },
+    ]);
+    expect(listener).toHaveBeenCalledTimes(1);
+    subscription.unsubscribe();
+    await service.dispose();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  test("failed admitted ignore validation keeps polling and retries with backoff instead of a capacity busy loop", async () => {
+    const resources = new NativeRecursiveResources({
+      maxTrackedEntries: 10,
+      maxConcurrentAudits: 2,
+    });
+    const existing = resources.createInventoryReservation("existing");
+    existing.setEntryCount(8);
+    const failure = resources.capacityError({
+      root: REPO_CWD,
+      scope: "shared",
+      requiredEntries: 4,
+      limit: 10,
+    });
+    const subscribe = vi
+      .fn()
+      .mockRejectedValueOnce(failure)
+      .mockResolvedValue(createAsyncSubscription());
+    const runGitCommand = buildDefaultTestServiceDeps().runGitCommand;
+    const service = createService({ subscribe, runGitCommand, now: () => new Date() });
+    const subscription = await service.requestWorkingTreeWatch(REPO_CWD, vi.fn());
+    runGitCommand.mockRejectedValueOnce(new Error("ignore inventory temporarily unavailable"));
+    existing.release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(subscribe).toHaveBeenCalledTimes(1);
+    expect(runGitCommand.mock.calls.filter(([args]) => args[0] === "ls-files")).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(subscribe).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(subscribe).toHaveBeenCalledTimes(2);
+    expect(runGitCommand.mock.calls.filter(([args]) => args[0] === "ls-files")).toHaveLength(3);
+    subscription.unsubscribe();
+    await service.dispose();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  test("closing during admitted ignore validation prevents a late native subscription", async () => {
+    const resources = new NativeRecursiveResources({
+      maxTrackedEntries: 10,
+      maxConcurrentAudits: 2,
+    });
+    const existing = resources.createInventoryReservation("existing");
+    existing.setEntryCount(8);
+    const failure = resources.capacityError({
+      root: REPO_CWD,
+      scope: "shared",
+      requiredEntries: 4,
+      limit: 10,
+    });
+    const subscribe = vi
+      .fn()
+      .mockRejectedValueOnce(failure)
+      .mockResolvedValue(createAsyncSubscription());
+    const runGitCommand = buildDefaultTestServiceDeps().runGitCommand;
+    const service = createService({ subscribe, runGitCommand, now: () => new Date() });
+    const subscription = await service.requestWorkingTreeWatch(REPO_CWD, vi.fn());
+    const query = createDeferred<Awaited<ReturnType<typeof runGitCommand>>>();
+    runGitCommand.mockImplementationOnce(() => query.promise);
+    existing.release();
+    await flushPromises();
+    expect(runGitCommand.mock.calls.filter(([args]) => args[0] === "ls-files")).toHaveLength(2);
+    subscription.unsubscribe();
+    query.resolve({ stdout: "", stderr: "", truncated: false, exitCode: 0, signal: null });
+    await vi.advanceTimersByTimeAsync(0);
+    await service.dispose();
+    expect(subscribe).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   test("sets bounded polling and recovery when recursive observation is unavailable", async () => {
@@ -1926,6 +2237,7 @@ describe("WorkspaceGitServiceImpl", () => {
       ignore: [join(plainCwd, ".git")],
       signal: expect.any(AbortSignal),
       onInventoryProgress: expect.any(Function),
+      onInventoryAdmission: expect.any(Function),
     });
     expect(vi.getTimerCount()).toBe(1);
 

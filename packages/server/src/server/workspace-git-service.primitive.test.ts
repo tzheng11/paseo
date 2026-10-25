@@ -317,6 +317,7 @@ function createGitHubServiceStub(): ForgeService {
 interface CreateServiceOptions {
   subscribe?: ReturnType<typeof vi.fn>;
   getCheckoutSnapshotFacts?: ReturnType<typeof vi.fn>;
+  getCheckoutIdentity?: ReturnType<typeof vi.fn>;
   getCheckoutStatus?: ReturnType<typeof vi.fn>;
   getCheckoutShortstat?: ReturnType<typeof vi.fn>;
   getCheckoutWorktreeState?: ReturnType<typeof vi.fn>;
@@ -342,6 +343,7 @@ function buildDefaultServiceDeps() {
       unsubscribe: vi.fn(async () => {}),
     })),
     getCheckoutSnapshotFacts: vi.fn(async (cwd: string) => createCheckoutFacts(cwd)),
+    getCheckoutIdentity: vi.fn(async (cwd: string) => createCheckoutFacts(cwd)),
     getCheckoutRefDerivedState: vi.fn(async (_cwd, facts, current) => ({
       ...current,
       upstreamStatus: facts.upstreamStatus,
@@ -424,7 +426,7 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
 
   test("getCheckout surfaces an unexpected Git read failure", async () => {
     const service = createService({
-      getCheckoutSnapshotFacts: vi.fn(async () => {
+      getCheckoutIdentity: vi.fn(async () => {
         throw new Error("Git read failed");
       }),
     });
@@ -563,7 +565,7 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
 
     const subscription = service.registerWorkspace({ cwd: REPO_CWD }, listener);
 
-    expect(subscription).toEqual({ unsubscribe: expect.any(Function) });
+    expect(subscription).toEqual({ ready: expect.any(Promise), unsubscribe: expect.any(Function) });
     expect(getCheckoutStatus).not.toHaveBeenCalled();
     expect(listener).not.toHaveBeenCalled();
     expect(service.peekSnapshot(REPO_CWD)).toBeNull();
@@ -2232,6 +2234,7 @@ describe("WorkspaceGitServiceImpl D2 read methods", () => {
         ignore: [join(repoDir, ".git"), ignoredRoot],
         signal: expect.any(AbortSignal),
         onInventoryProgress: expect.any(Function),
+        onInventoryAdmission: expect.any(Function),
       });
 
       subscription.unsubscribe();

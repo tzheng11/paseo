@@ -140,6 +140,7 @@ describe.each(["claude", "codex", "opencode"] as const)("live model switching (%
 
         expect(updated.model).toBe(modelB);
       } finally {
+        await ctx.cleanup();
         rmSync(cwd, { recursive: true, force: true });
       }
     },
@@ -175,6 +176,7 @@ test("live thinking switching works for Claude (off -> on)", async () => {
 
     expect(updated.thinkingOptionId).toBe("on");
   } finally {
+    await ctx.cleanup();
     rmSync(cwd, { recursive: true, force: true });
   }
 }, 120000);
@@ -213,6 +215,7 @@ test.runIf(hasCodex)(
 
       expect(updated.thinkingOptionId).toBe(thinkingOptionId);
     } finally {
+      await ctx.cleanup();
       rmSync(cwd, { recursive: true, force: true });
     }
   },
@@ -251,6 +254,7 @@ test.runIf(hasOpenCode)(
       );
       expect(updatedThinking.thinkingOptionId).toBe(thinkingOptionId);
     } finally {
+      await ctx.cleanup();
       rmSync(cwd, { recursive: true, force: true });
     }
   },
