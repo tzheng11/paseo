@@ -31,7 +31,7 @@ Trusted server plugins retain the authority of their runtime; they are not sandb
 
 ## Delegating agents
 
-Agent MCP discovers destination IDs with `list_hosts`. `create_workspace`, `list_workspaces`,
+Agent MCP discovers destination IDs with `list_hosts`. `create_workspace`, `move_workspace`, `list_workspaces`,
 `create_agent`, `send_agent_prompt`, `get_agent_status`, `get_agent_activity`, and `list_agents`
 accept `serverId`; omission selects the calling daemon. Remote creation requires a
 destination workspace and explicit provider/model. Caller filesystem defaults apply only on the

@@ -37,6 +37,7 @@ import { SidebarHelpMenu } from "@/components/sidebar/sidebar-help-menu";
 import { SidebarResizeHandle } from "@/components/sidebar-resize-handle";
 import { DensityIcon } from "@/components/ui/density-icon";
 import { SidebarSectionHeader } from "@/components/sidebar/sidebar-section-header";
+import { UngroupedWorkspaceSortMenu } from "@/components/sidebar/workspace-sort-menu";
 import { Shortcut } from "@/components/ui/shortcut";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { HEADER_INNER_HEIGHT, useIsCompactFormFactor } from "@/constants/layout";
@@ -806,8 +807,10 @@ function DesktopSidebar({
 }
 
 function WorkspacesSectionHeader() {
+  const groupMode = useSidebarViewStore((state) => state.groupMode);
   return (
     <SidebarSectionHeader title="Workspaces">
+      {groupMode === "none" ? <UngroupedWorkspaceSortMenu /> : null}
       <Tooltip delayDuration={300}>
         <TooltipTrigger asChild>
           <View>

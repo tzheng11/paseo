@@ -157,7 +157,7 @@ describe("WorkspaceShortcutTargetsSubscriber", () => {
   });
 
   it.each(["project", "status"] as const)(
-    "publishes A–Z pinned shortcuts and restores manual order in %s mode",
+    "publishes A–Z pinned shortcuts and restores shared manual order in %s mode",
     async (groupMode) => {
       act(() => {
         useSidebarViewStore.getState().setGroupMode(groupMode);
@@ -169,6 +169,7 @@ describe("WorkspaceShortcutTargetsSubscriber", () => {
               {
                 ...workspaceDescriptor({ id: "ws-z", name: "Zeta" }),
                 pinnedAt: "2026-10-01T00:00:00.000Z",
+                pinPlacement: { parentWorkspaceKey: null, siblingOrder: 0, revision: 1 },
               },
             ],
             [
@@ -176,11 +177,12 @@ describe("WorkspaceShortcutTargetsSubscriber", () => {
               {
                 ...workspaceDescriptor({ id: "ws-a", name: "Alpha" }),
                 pinnedAt: "2026-10-02T00:00:00.000Z",
+                pinPlacement: { parentWorkspaceKey: null, siblingOrder: 1024, revision: 1 },
               },
             ],
           ]),
         );
-        useSidebarOrderStore.getState().setPinnedWorkspaceOrder(["srv:ws-z", "srv:ws-a"]);
+        useSidebarOrderStore.getState().setPinnedWorkspaceOrder(["srv:ws-a", "srv:ws-z"]);
         useSidebarOrderStore.getState().setPinnedWorkspaceSortMode("alphabetical");
       });
 

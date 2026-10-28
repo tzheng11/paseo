@@ -113,6 +113,7 @@ beforeEach(async () => {
   await workspaceRegistry.initialize();
   await projectRegistry.initialize();
   provisioning = createWorkspaceProvisioningService({
+    serverId: "test-host",
     workspaceRegistry,
     projectRegistry,
     workspaceGitService: gitService(),
@@ -148,6 +149,7 @@ test("background workspace creation preserves hooks, inheritance and durable vis
   const dir = path.join(tmpDir, "plain");
   const events: string[] = [];
   provisioning = createWorkspaceProvisioningService({
+    serverId: "test-host",
     workspaceRegistry,
     projectRegistry,
     workspaceGitService: gitService(),
@@ -237,6 +239,7 @@ test("persists manual worktree ownership separately from its workspace kind", as
   const cwd = path.join(tmpDir, "manual-worktree");
   const mainRepoRoot = path.join(tmpDir, "main-repo");
   const manualWorktreeProvisioning = createWorkspaceProvisioningService({
+    serverId: "test-host",
     workspaceRegistry,
     projectRegistry,
     isDirectory,
@@ -324,6 +327,7 @@ test("reopening archived exact-root records restores the fresh Git project", asy
   await workspaceRegistry.upsert(workspace);
   await projectRegistry.archive(project.projectId, ARCHIVED_AT);
   const archivedProvisioning = createWorkspaceProvisioningService({
+    serverId: "test-host",
     workspaceRegistry,
     projectRegistry,
     isDirectory,
@@ -375,6 +379,7 @@ test("uses one workspace snapshot when reopening an archived workspace", async (
     remove: (workspaceId) => workspaceRegistry.remove(workspaceId),
   };
   const snapshotProvisioning = createWorkspaceProvisioningService({
+    serverId: "test-host",
     workspaceRegistry: snapshotRegistry,
     projectRegistry,
     workspaceGitService: gitService(),
@@ -607,6 +612,108 @@ test("worktree creation returns the committed append rank and parent membership"
     projectId: parent.projectId,
   });
   expect(second).toEqual(await workspaceRegistry.get(second.workspaceId));
+});
+
+test("shared sidebar creation inherits caller section across projects, appends, and accepts an explicit root", async () => {
+  const parent = await provisioning.createWorkspaceForDirectory(
+    path.join(tmpDir, "parent"),
+    "Manager",
+    undefined,
+    {
+      sidebarPlacement: { parentWorkspaceKey: null, section: "superpinned", siblingOrder: 4096 },
+    },
+  );
+  const first = await provisioning.createWorkspaceForDirectory(
+    path.join(tmpDir, "first"),
+    "IC",
+    undefined,
+    { callerWorkspaceId: parent.workspaceId },
+  );
+  const second = await provisioning.createWorkspaceForWorktree({
+    sourceCwd: parent.cwd,
+    repoRoot: parent.cwd,
+    cwd: path.join(tmpDir, "second"),
+    worktreeRoot: path.join(tmpDir, "second"),
+    branch: "ic",
+    baseBranch: "main",
+    title: "IC 2",
+    callerWorkspaceId: parent.workspaceId,
+  });
+  expect(first.projectId).not.toBe(parent.projectId);
+  expect(first.pinPlacement).toEqual({
+    parentWorkspaceKey: `test-host:${parent.workspaceId}`,
+    siblingOrder: 1024,
+    revision: 1,
+  });
+  expect(second.pinPlacement).toEqual({
+    parentWorkspaceKey: `test-host:${parent.workspaceId}`,
+    siblingOrder: 2048,
+    revision: 1,
+  });
+  expect(first.superpinnedAt).toBeTypeOf("string");
+  expect(second.superpinnedAt).toBeTypeOf("string");
+  const root = await provisioning.createWorkspaceForDirectory(first.cwd, undefined, undefined, {
+    callerWorkspaceId: parent.workspaceId,
+    sidebarPlacement: { parentWorkspaceKey: null, section: "unpinned" },
+  });
+  expect(root.pinPlacement?.parentWorkspaceKey).toBeNull();
+  expect(root.superpinnedAt).toBeNull();
+  const remote = await provisioning.createWorkspaceForDirectory(first.cwd, undefined, undefined, {
+    sidebarPlacement: {
+      parentWorkspaceKey: "remote-host:manager",
+      section: "pinned",
+      siblingOrder: 8192,
+    },
+  });
+  expect(remote.pinPlacement).toEqual({
+    parentWorkspaceKey: "remote-host:manager",
+    siblingOrder: 8192,
+    revision: 1,
+  });
+  expect(remote.pinnedAt).toBeTypeOf("string");
+  expect((await workspaceRegistry.get(remote.workspaceId))?.pinPlacement).toEqual(
+    remote.pinPlacement,
+  );
+  await expect(
+    provisioning.createWorkspaceForDirectory(first.cwd, undefined, undefined, {
+      sidebarPlacement: {
+        parentWorkspaceKey: `test-host:${parent.workspaceId}`,
+        section: "unpinned",
+      },
+    }),
+  ).rejects.toThrow("parent workspace's section");
+});
+
+test("caller child creation appends after a real legacy sibling without comparing unrelated project ranks", async () => {
+  const cwd = path.join(tmpDir, "parent");
+  const parent = await provisioning.createWorkspaceForDirectory(cwd);
+  const legacyChild = await provisioning.createWorkspaceForDirectory(
+    cwd,
+    undefined,
+    parent.projectId,
+    {
+      parentWorkspaceId: parent.workspaceId,
+      siblingOrder: 8192,
+      callerWorkspaceId: parent.workspaceId,
+    },
+  );
+  expect(legacyChild.pinPlacement).toBeUndefined();
+  await provisioning.createWorkspaceForDirectory(
+    path.join(tmpDir, "unrelated"),
+    undefined,
+    undefined,
+    { siblingOrder: 999999 },
+  );
+  const child = await provisioning.createWorkspaceForDirectory(
+    path.join(tmpDir, "child"),
+    undefined,
+    undefined,
+    { callerWorkspaceId: parent.workspaceId },
+  );
+  expect(child.pinPlacement).toMatchObject({
+    parentWorkspaceKey: `test-host:${parent.workspaceId}`,
+    siblingOrder: 9216,
+  });
 });
 
 test("directory creation persists the live branch and a trimmed title", async () => {
@@ -907,6 +1014,7 @@ test("a failed import keeps an archived worktree's placement when its directory 
   });
   await workspaceRegistry.upsert(archived);
   const realCheckoutProvisioning = createWorkspaceProvisioningService({
+    serverId: "test-host",
     workspaceRegistry,
     projectRegistry,
     logger,
@@ -980,6 +1088,7 @@ test("a directory that goes away while the git read is in flight keeps its place
   const created = await provisioning.findOrCreateWorkspaceForDirectory(repo);
   expect(created).toMatchObject({ kind: "local_checkout", branch: "feature/vanishing" });
   const vanishingProvisioning = createWorkspaceProvisioningService({
+    serverId: "test-host",
     workspaceRegistry,
     projectRegistry,
     isDirectory,

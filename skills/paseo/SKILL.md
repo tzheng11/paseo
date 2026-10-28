@@ -9,7 +9,7 @@ Paseo is a remote daemon that manages coding agents, terminals. Control it throu
 
 Call `list_hosts` to discover the calling daemon (`self`) and its registered destinations (`hosts`). Use a destination's `serverId` for tool calls; labels are display names.
 
-`create_workspace`, `list_workspaces`, `create_agent`, `send_agent_prompt`, `get_agent_status`, `get_agent_activity`, and `list_agents` accept `serverId`. Omit it for the calling daemon. Other MCP tools operate on the calling daemon.
+`create_workspace`, `move_workspace`, `list_workspaces`, `create_agent`, `send_agent_prompt`, `get_agent_status`, `get_agent_activity`, and `list_agents` accept `serverId`. Omit it for the calling daemon. Other MCP tools operate on the calling daemon.
 
 Keep an agent's `{ serverId, agentId }` together. For example, call `send_agent_prompt` with:
 
@@ -42,7 +42,7 @@ For a local daemon, `project create` defaults to the current directory and resol
 
 ## Workspaces
 
-**`create_workspace`** — create a workspace independently of any agent. Required: `isolation` (`local` or `worktree`). Worktree isolation supports `mode: "branch-off" | "checkout-branch" | "checkout-pr"`: use `branchName`/`baseBranch` for a new branch, `branch` for an existing branch, or `prNumber` plus optional `forge` for a change request. Use `path` for a local directory or source checkout and `projectId` for the owning project; when no path is supplied, a worktree may resolve its source from `projectId`. `worktreeSlug` controls the managed path. Returns the workspace descriptor centered on `workspaceId`.
+**`create_workspace`** — create a workspace independently of any agent. Required: `isolation` (`local` or `worktree`). Worktree isolation supports `mode: "branch-off" | "checkout-branch" | "checkout-pr"`: use `branchName`/`baseBranch` for a new branch, `branch` for an existing branch, or `prNumber` plus optional `forge` for a change request. Use `path` for a local directory or source checkout and `projectId` for the owning project; when no path is supplied, a worktree may resolve its source from `projectId`. `worktreeSlug` controls the managed path. Use `parentWorkspaceKey` (serverId:workspaceId) for a parent on any host; omit it to place a new IC workspace below your calling workspace, or use null for a root. A child inherits its parent’s Pinned, Superpinned, or unpinned section and appends after its children. `siblingOrder` sets an explicit shared rank. `section` selects a root section; a disconnected parent needs both its saved `section` and `siblingOrder`. Legacy `parentWorkspaceId` is scoped to the destination project. Returns the workspace descriptor centered on `workspaceId`, with shared `pinPlacement` and `section`.
 
 `background: true` hides a workspace from default lists and the sidebar while its contents remain durable and accessible; omit `background` to inherit your current workspace’s value (false without a caller), and override it only when the user explicitly asks.
 
@@ -51,6 +51,8 @@ Choose `baseBranch` explicitly: `origin/main` selects the remote-tracking branch
 **`list_workspaces`** — list active workspaces, excluding background workspaces unless `includeBackground: true`.
 
 **`archive_workspace`** — `{ workspaceId }`. Archives the workspace, its agents, and its terminals. Local directories remain; Paseo removes an owned worktree only after its final active workspace reference is archived.
+
+**`move_workspace`** — `{ workspaceId, parentWorkspaceKey?, siblingOrder?, beforeWorkspaceKey?, section?, serverId? }`. Moves or reorders an existing workspace in the shared sidebar. Omit the parent to keep it; null moves to a root. A child inherits its parent’s section. A section change includes the whole subtree across registered hosts; reconnect all registered hosts before moving it. Shared sidebar placement changes no directories, project ownership, or agent parentage.
 
 **`rename_workspace`** — `{ workspaceId, name }`. Rename workspace.
 

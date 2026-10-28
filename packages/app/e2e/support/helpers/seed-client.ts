@@ -1,6 +1,7 @@
 import path from "node:path";
 import { readFileSync } from "node:fs";
 import type { TerminalActivity } from "@getpaseo/protocol/terminal-activity";
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { connectDaemonClient } from "./daemon-client-loader";
 import { withProjectOwnership } from "./project-ownership";
 import { createTempDirectory, createTempGitRepo } from "./workspace";
@@ -19,6 +20,7 @@ export interface SeedWorkspaceDescriptor {
   fieldValues?: Record<string, string>;
   pinnedAt?: string | null;
   superpinnedAt?: string | null;
+  pinPlacement?: { parentWorkspaceKey: string | null; siblingOrder: number; revision: number };
 }
 
 interface SeedProjectDescriptor {
@@ -33,6 +35,7 @@ interface SeedProjectDescriptor {
  * prefer those wrappers over reaching for this client directly.
  */
 export interface SeedDaemonClient {
+  setWorkspacePinPlacement: DaemonClient["setWorkspacePinPlacement"];
   connect(): Promise<void>;
   close(): Promise<void>;
   addProject(cwd: string): Promise<{
@@ -90,6 +93,11 @@ export interface SeedDaemonClient {
     title?: string;
     parentWorkspaceId?: string | null;
     siblingOrder?: number;
+    sidebarPlacement?: {
+      parentWorkspaceKey: string | null;
+      siblingOrder?: number;
+      section: "unpinned" | "pinned" | "superpinned";
+    };
     background?: boolean;
   }): Promise<{
     workspace: SeedWorkspaceDescriptor | null;

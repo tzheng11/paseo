@@ -50,6 +50,7 @@ describe("buildWorkspaceStructureProjects", () => {
       ...workspace("second", "prj_a", "/repo"),
       parentWorkspaceId: "first",
       siblingOrder: 10,
+      pinPlacement: { parentWorkspaceKey: "other-host:parent", siblingOrder: 512, revision: 2 },
     };
     const result = buildWorkspaceStructureProjects({
       sessions: [
@@ -63,7 +64,11 @@ describe("buildWorkspaceStructureProjects", () => {
     expect(result[0]?.workspaceKeys).toEqual(["host-a:second", "host-a:first"]);
     expect(result[0]?.workspaceHierarchy).toEqual({
       "host-a:first": { parentWorkspaceId: null, siblingOrder: 20 },
-      "host-a:second": { parentWorkspaceId: "first", siblingOrder: 10 },
+      "host-a:second": {
+        parentWorkspaceId: "first",
+        siblingOrder: 10,
+        pinPlacement: second.pinPlacement,
+      },
     });
   });
 

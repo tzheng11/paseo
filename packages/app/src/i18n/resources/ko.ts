@@ -100,6 +100,7 @@ export const ko: TranslationResources = {
       addProject: "프로젝트 추가",
       home: "홈",
       groupByProject: "프로젝트별 그룹화",
+      groupByNone: "워크스페이스 계층 표시",
       groupByStatus: "상태별 그룹화",
       modelGroupLabel: "모델",
       modelSearchKeywords: "모델 전환 모델 변경 모델 설정 모델 선택",
@@ -1184,6 +1185,7 @@ export const ko: TranslationResources = {
         updateHost: "작업 공간을 정렬하려면 호스트를 업데이트하세요",
       },
       grouping: {
+        none: "없음",
         label: "그룹화",
         project: "프로젝트",
         status: "상태",
@@ -1327,6 +1329,7 @@ export const ko: TranslationResources = {
         pending: "대기 중: {{count}}개",
       },
       actions: {
+        addChild: "하위 워크스페이스 추가",
         menu: "워크스페이스 작업",
         newWorkspace: "새 워크스페이스",
         showMore: "더 보기",
@@ -1366,6 +1369,13 @@ export const ko: TranslationResources = {
     },
   },
   newWorkspace: {
+    parent: {
+      label: "상위 워크스페이스",
+      none: "상위 없음",
+      searchPlaceholder: "워크스페이스 검색",
+      empty: "사용 가능한 워크스페이스가 없습니다.",
+      unavailable: "워크스페이스를 사용할 수 없습니다",
+    },
     title: "새 워크스페이스",
     create: "생성",
     isolation: {

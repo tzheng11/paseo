@@ -101,6 +101,7 @@ export const ptBR: TranslationResources = {
       addProject: "Adicionar projeto",
       home: "Início",
       groupByProject: "Agrupar por projeto",
+      groupByNone: "Mostrar hierarquia de espaços de trabalho",
       groupByStatus: "Agrupar por status",
       modelGroupLabel: "Modelo",
       modelSearchKeywords: "trocar modelo mudar modelo definir modelo selecionar modelo",
@@ -1203,6 +1204,7 @@ export const ptBR: TranslationResources = {
         updateHost: "Atualize os hosts para ordenar os espaços de trabalho",
       },
       grouping: {
+        none: "Nenhum",
         label: "Agrupamento",
         project: "Projeto",
         status: "Status",
@@ -1347,6 +1349,7 @@ export const ptBR: TranslationResources = {
         pending: "Pendentes: {{count}}",
       },
       actions: {
+        addChild: "Adicionar espaço de trabalho filho",
         menu: "Ações do workspace",
         newWorkspace: "Novo workspace",
         showMore: "Mostrar mais",
@@ -1386,6 +1389,13 @@ export const ptBR: TranslationResources = {
     },
   },
   newWorkspace: {
+    parent: {
+      label: "Tornar filho de",
+      none: "Sem pai",
+      searchPlaceholder: "Buscar espaços de trabalho",
+      empty: "Nenhum espaço de trabalho disponível.",
+      unavailable: "Espaço de trabalho indisponível",
+    },
     title: "Novo workspace",
     create: "Criar",
     isolation: {

@@ -81,6 +81,7 @@ import type { DraggableListDragHandleProps } from "@/components/draggable-list.t
 import { SidebarWorkspaceTreeList } from "./workspace-tree/list";
 import { WorkspaceTreeScrollView } from "./workspace-tree";
 import { useLongPressDragInteraction } from "@/components/sidebar/use-long-press-drag-interaction";
+import { UNGROUPED_WORKSPACE_SORT_KEY } from "./workspace-sort";
 
 // Themed icon wrappers
 const mutedGroupIconProps = densityIconProps("sm", (theme) => ({
@@ -161,6 +162,10 @@ export function SidebarStatusWorkspaceList({
   );
   const sortPinnedSiblings = useSidebarOrderStore(
     (state) => state.pinnedWorkspaceSortMode === "manual",
+  );
+  const sortUngroupedSiblings = useSidebarOrderStore(
+    (state) =>
+      (state.workspaceSortModeByProject[UNGROUPED_WORKSPACE_SORT_KEY] ?? "manual") === "manual",
   );
   const pinnedCollapsed = useSidebarCollapsedSectionsStore((state) => state.collapsedPinned);
   const togglePinnedCollapsed = useSidebarCollapsedSectionsStore(
@@ -252,6 +257,7 @@ export function SidebarStatusWorkspaceList({
           hostBadgeByServerId={hostBadgeByServerId}
           supportsPinningByServerId={supportsPinningByServerId}
           onToggleWorkspacePin={onToggleWorkspacePin}
+          sortUngroupedSiblings={sortUngroupedSiblings}
         />
       )}
     </>
@@ -281,6 +287,7 @@ function StatusGroupList({
   hostBadgeByServerId,
   supportsPinningByServerId,
   onToggleWorkspacePin,
+  sortUngroupedSiblings,
 }: {
   groups: SidebarWorkspaceGroup[];
   collapsedWorkspaceGroupKeys: ReadonlySet<string>;
@@ -291,6 +298,7 @@ function StatusGroupList({
   hostBadgeByServerId: ReadonlyMap<string, HostBadgeModel>;
   supportsPinningByServerId: ReadonlyMap<string, boolean>;
   onToggleWorkspacePin: ToggleSidebarWorkspacePin;
+  sortUngroupedSiblings: boolean;
 }) {
   return (
     <>
@@ -306,6 +314,7 @@ function StatusGroupList({
           hostBadgeByServerId={hostBadgeByServerId}
           supportsPinningByServerId={supportsPinningByServerId}
           onToggleWorkspacePin={onToggleWorkspacePin}
+          sortUngroupedSiblings={sortUngroupedSiblings}
         />
       ))}
     </>
@@ -327,6 +336,7 @@ function StatusGroupRows({
   hostBadgeByServerId,
   supportsPinningByServerId,
   onToggleWorkspacePin,
+  sortUngroupedSiblings,
 }: {
   group: SidebarWorkspaceGroup;
   collapsed: boolean;
@@ -337,6 +347,7 @@ function StatusGroupRows({
   hostBadgeByServerId: ReadonlyMap<string, HostBadgeModel>;
   supportsPinningByServerId: ReadonlyMap<string, boolean>;
   onToggleWorkspacePin: ToggleSidebarWorkspacePin;
+  sortUngroupedSiblings: boolean;
 }) {
   const {
     visibleItems: visibleWorkspaces,
@@ -344,6 +355,43 @@ function StatusGroupRows({
     canToggle: canToggleWorkspaces,
     toggleExpanded: toggleWorkspacesExpanded,
   } = useLimitedSidebarGroup(group.rows, STATUS_GROUP_VISIBILITY);
+
+  const renderWorkspace = useCallback(
+    ({ item: workspace }: DraggableRenderItemInfo<SidebarWorkspaceEntry>) => (
+      <StatusWorkspaceRow
+        workspace={workspace}
+        {...buildStatusRowProjectPresentation({
+          workspace,
+          projectIconByProjectViewKey,
+          hostBadgeByServerId,
+        })}
+        inStatusGroup={false}
+        shortcutNumber={shortcutIndex.get(workspace.workspaceKey) ?? null}
+        showShortcutBadge={showShortcutBadges}
+        canPin={supportsPinningByServerId.get(workspace.serverId) === true}
+        onToggleWorkspacePin={onToggleWorkspacePin}
+        onWorkspacePress={onWorkspacePress}
+      />
+    ),
+    [
+      hostBadgeByServerId,
+      onToggleWorkspacePin,
+      onWorkspacePress,
+      projectIconByProjectViewKey,
+      shortcutIndex,
+      showShortcutBadges,
+      supportsPinningByServerId,
+    ],
+  );
+  if (group.leading.kind === "workspaces")
+    return (
+      <SidebarWorkspaceTreeList
+        testID="sidebar-ungrouped-list"
+        data={group.rows}
+        sortSiblings={sortUngroupedSiblings}
+        renderItem={renderWorkspace}
+      />
+    );
 
   return (
     <View style={collapsed ? undefined : styles.statusGroupBlockExpanded}>
@@ -470,7 +518,7 @@ function StatusGroupLeadingVisual({
   collapsed: boolean;
   showChevron: boolean;
 }) {
-  if (!showChevron) {
+  if (!showChevron && leading.kind === "status") {
     return <StatusGroupIcon bucket={leading.bucket} />;
   }
   if (collapsed) {

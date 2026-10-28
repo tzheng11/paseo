@@ -1,6 +1,11 @@
 import type { AgentStreamEvent } from "../agent-sdk-types.js";
+import { workspaceSidebarSection } from "../../workspace-pin-placement.js";
 import { parentAddressLabels } from "@getpaseo/protocol/agent-labels";
-import type { ActiveTurnBehavior, AgentSnapshotPayload } from "@getpaseo/protocol/messages";
+import {
+  WorkspaceSidebarPlacementSchema,
+  type ActiveTurnBehavior,
+  type AgentSnapshotPayload,
+} from "@getpaseo/protocol/messages";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import {
@@ -38,6 +43,7 @@ export type HostOperation = (
 export interface HostOperations {
   createAgent: HostOperation;
   createWorkspace: HostOperation;
+  moveWorkspace: HostOperation;
   listWorkspaces: HostOperation;
   sendPrompt: HostOperation;
   getStatus: HostOperation;
@@ -167,6 +173,26 @@ export function createToolHosts(hosts: ConnectedHosts): ToolHosts {
       }
     },
   };
+}
+
+export async function fetchAllAutomationWorkspaces(
+  client: DaemonClient,
+): Promise<FetchWorkspacesEntry[]> {
+  const rows: FetchWorkspacesEntry[] = [];
+  const seen = new Set<string>();
+  let cursor: string | undefined;
+  do {
+    const page = await client.fetchWorkspaces({
+      includeBackground: true,
+      page: { limit: 200, ...(cursor ? { cursor } : {}) },
+    });
+    rows.push(...page.entries);
+    cursor = page.pageInfo.hasMore ? (page.pageInfo.nextCursor ?? undefined) : undefined;
+    if (cursor && seen.has(cursor))
+      throw new Error("Workspace catalog pagination did not advance.");
+    if (cursor) seen.add(cursor);
+  } while (cursor);
+  return rows;
 }
 
 const remoteCreate = z
@@ -335,7 +361,11 @@ export function createHostResolver(input: {
             const { entries } = await client.fetchWorkspaces({
               includeBackground: args.includeBackground === true,
             });
-            return result({ workspaces: entries.map(workspaceSummary) });
+            return result({
+              workspaces: entries.map((row) =>
+                workspaceSummary(row, client.getLastServerInfoMessage()?.serverId),
+              ),
+            });
           },
           async createWorkspace(args) {
             const isolation = z.enum(["local", "worktree"]).parse(args.isolation);
@@ -362,25 +392,64 @@ export function createHostResolver(input: {
               background: args.background as boolean | undefined,
               parentWorkspaceId: args.parentWorkspaceId as string | null | undefined,
               siblingOrder: args.siblingOrder as number | undefined,
+              sidebarPlacement:
+                args.sidebarPlacement === undefined
+                  ? undefined
+                  : WorkspaceSidebarPlacementSchema.parse(args.sidebarPlacement),
             });
             if (response.error || !response.workspace)
               throw new Error(response.error ?? "Workspace creation failed");
-            return result(workspaceSummary(response.workspace));
+            return result(
+              workspaceSummary(response.workspace, client.getLastServerInfoMessage()?.serverId),
+            );
+          },
+          async moveWorkspace(args) {
+            if (args.sidebarPlacement === undefined)
+              throw new Error("Remote moves require universal sidebar placement.");
+            const placement = WorkspaceSidebarPlacementSchema.parse(args.sidebarPlacement);
+            if (placement.siblingOrder === undefined)
+              throw new Error("Workspace siblingOrder is required.");
+            await client.setWorkspacePinPlacement({
+              workspaceId: args.workspaceId as string,
+              placement: {
+                parentWorkspaceKey: placement.parentWorkspaceKey,
+                siblingOrder: placement.siblingOrder,
+              },
+              section: placement.section,
+              sectionState:
+                args.sectionState === undefined
+                  ? undefined
+                  : z
+                      .object({
+                        pinnedAt: z.string().nullable(),
+                        superpinnedAt: z.string().nullable(),
+                      })
+                      .parse(args.sectionState),
+              expectedRevision: z.number().int().nonnegative().parse(args.expectedRevision),
+            });
+            const row = (await fetchAllAutomationWorkspaces(client)).find(
+              (candidate) => candidate.id === args.workspaceId,
+            );
+            if (!row) throw new Error("Moved workspace is no longer active.");
+            return result(workspaceSummary(row, client.getLastServerInfoMessage()?.serverId));
           },
         }),
       );
     },
   };
 }
-function workspaceSummary(workspace: FetchWorkspacesEntry) {
+function workspaceSummary(workspace: FetchWorkspacesEntry, serverId?: string) {
   return {
     workspaceId: workspace.id,
+    ...(serverId ? { workspaceKey: `${serverId}:${workspace.id}` } : {}),
     projectId: workspace.projectId,
     cwd: workspace.workspaceDirectory,
     isolation: workspace.workspaceKind === "worktree" ? "worktree" : "local",
     kind: workspace.workspaceKind === "checkout" ? "local_checkout" : workspace.workspaceKind,
     title: workspace.title,
     background: workspace.background,
+    section: workspaceSidebarSection(workspace),
+    ...(workspace.pinPlacement ? { pinPlacement: workspace.pinPlacement } : {}),
     // COMPAT(workspaceHierarchy): old connected hosts omit hierarchy; remove after 2027-04-21.
     parentWorkspaceId: workspace.parentWorkspaceId ?? null,
     siblingOrder: workspace.siblingOrder ?? 0,

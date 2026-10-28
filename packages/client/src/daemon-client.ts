@@ -500,6 +500,7 @@ export type WorkspaceMoveOptions = Pick<
 >;
 
 export interface CreateWorkspaceRequestOptions {
+  sidebarPlacement?: WorkspaceCreateRequest["sidebarPlacement"];
   parentWorkspaceId?: string | null;
   siblingOrder?: number;
   source: WorkspaceCreateRequest["source"];
@@ -3432,6 +3433,30 @@ export class DaemonClient {
     return { value: payload.value };
   }
 
+  async setWorkspacePinPlacement(input: {
+    workspaceId: string;
+    placement: { parentWorkspaceKey: string | null; siblingOrder: number };
+    section?: NonNullable<WorkspaceCreateRequest["sidebarPlacement"]>["section"];
+    sectionState?: { pinnedAt: string | null; superpinnedAt: string | null };
+    expectedRevision: number;
+    requestId?: string;
+  }) {
+    // COMPAT(universalPins): added in v0.13.0-beta.1; remove gate after 2027-04-22.
+    if (this.lastServerInfoMessage?.features?.workspacePinPlacement !== true)
+      throw new Error("Update this host to sync pin nesting across clients.");
+    if (input.section !== undefined || input.sectionState !== undefined)
+      this.requireWorkspaceSidebarPlacement();
+    const { requestId, ...message } = input;
+    const payload = await this.sendCorrelatedSessionRequest({
+      requestId,
+      message: { type: "workspace.pin.placement.set.request", ...message },
+      responseType: "workspace.pin.placement.set.response",
+    });
+    if (!payload.accepted || !payload.placement)
+      throw new Error(payload.error ?? "Unable to save pin layout.");
+    return payload.placement;
+  }
+
   async moveWorkspace(
     workspaceId: string,
     input: WorkspaceMoveOptions,
@@ -3446,6 +3471,11 @@ export class DaemonClient {
       throw new Error(payload.error ?? "Workspace move rejected");
     }
     return { parentWorkspaceId: payload.parentWorkspaceId, siblingOrder: payload.siblingOrder };
+  }
+
+  private requireWorkspaceSidebarPlacement(): void {
+    if (this.lastServerInfoMessage?.features?.workspaceSidebarPlacement !== true)
+      throw new Error("Update this host to create and move child workspaces.");
   }
 
   private requireWorkspaceHierarchy(): void {
@@ -5111,6 +5141,7 @@ export class DaemonClient {
     if (input.background !== undefined || input.callerAgentId) this.requireBackgroundWorkspaces();
     if (input.parentWorkspaceId !== undefined || input.siblingOrder !== undefined)
       this.requireWorkspaceHierarchy();
+    if (input.sidebarPlacement !== undefined) this.requireWorkspaceSidebarPlacement();
     if (input.agent?.background !== undefined)
       throw new Error("Configure background on the workspace, not its initial agent.");
     const result = await this.creations.createWorkspace({
@@ -5142,6 +5173,9 @@ export class DaemonClient {
           : {}),
         ...(input.siblingOrder !== undefined ? { siblingOrder: input.siblingOrder } : {}),
         source: input.source,
+        ...(input.sidebarPlacement !== undefined
+          ? { sidebarPlacement: input.sidebarPlacement }
+          : {}),
         // COMPAT(workspaceRequestReceipts): added in v0.8.0; remove after 2027-03-15 once the daemon floor supports workspace receipts.
         ...(this.lastServerInfoMessage?.features?.workspaceRequestReceipts &&
         input.idempotencyKey !== undefined

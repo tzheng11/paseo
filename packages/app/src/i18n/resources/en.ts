@@ -96,6 +96,7 @@ export const en = {
       addProject: "Add project",
       home: "Home",
       groupByProject: "Group by project",
+      groupByNone: "Show workspace hierarchy",
       groupByStatus: "Group by status",
       modelGroupLabel: "Model",
       modelSearchKeywords: "switch model change model set model select model",
@@ -1185,6 +1186,7 @@ export const en = {
         updateHost: "Update hosts to sort workspaces",
       },
       grouping: {
+        none: "None",
         label: "Grouping",
         project: "Project",
         status: "Status",
@@ -1336,6 +1338,7 @@ export const en = {
         copyPath: "Copy path",
         copyBranchName: "Copy branch name",
         rename: "Rename workspace",
+        addChild: "Add child workspace",
         pin: "Pin to top",
         unpin: "Unpin",
         archive: "Archive",
@@ -1367,6 +1370,13 @@ export const en = {
     },
   },
   newWorkspace: {
+    parent: {
+      label: "Make this child of",
+      none: "No parent",
+      searchPlaceholder: "Search workspaces",
+      empty: "No workspaces available.",
+      unavailable: "Workspace unavailable",
+    },
     title: "New workspace",
     create: "Create",
     isolation: {

@@ -100,6 +100,7 @@ export const zhCN: TranslationResources = {
       addProject: "添加 project",
       home: "首页",
       groupByProject: "按项目分组",
+      groupByNone: "显示工作区层级",
       groupByStatus: "按状态分组",
       modelGroupLabel: "模型",
       modelSearchKeywords: "切换模型 更改模型 设置模型 选择模型",
@@ -1169,6 +1170,7 @@ export const zhCN: TranslationResources = {
         updateHost: "请更新主机以排序工作区",
       },
       grouping: {
+        none: "无",
         label: "分组",
         project: "项目",
         status: "状态",
@@ -1310,6 +1312,7 @@ export const zhCN: TranslationResources = {
         pending: "等待中: {{count}}",
       },
       actions: {
+        addChild: "添加子工作区",
         menu: "Workspace 操作",
         newWorkspace: "新建 workspace",
         showMore: "显示更多",
@@ -1348,6 +1351,13 @@ export const zhCN: TranslationResources = {
     },
   },
   newWorkspace: {
+    parent: {
+      label: "设为此工作区的子项",
+      none: "无父级",
+      searchPlaceholder: "搜索工作区",
+      empty: "暂无可用工作区。",
+      unavailable: "工作区不可用",
+    },
     title: "新建 workspace",
     create: "创建",
     isolation: {

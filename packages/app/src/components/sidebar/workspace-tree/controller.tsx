@@ -28,6 +28,7 @@ export interface WorkspaceTreeProviderProps {
   workspaces: readonly SidebarWorkspacePlacement[];
   allWorkspaces?: readonly SidebarWorkspacePlacement[];
   supportedServerIds: ReadonlyMap<string, boolean>;
+  supportedPinnedServerIds: ReadonlyMap<string, boolean>;
   onMove: (drop: WorkspaceTreeDrop) => Promise<void>;
   children: ReactNode;
 }
@@ -53,6 +54,7 @@ export function WorkspaceTreeController({
   workspaces,
   allWorkspaces = workspaces,
   supportedServerIds,
+  supportedPinnedServerIds,
   onMove,
   children,
 }: WorkspaceTreeProviderProps) {
@@ -177,10 +179,10 @@ export function WorkspaceTreeController({
   }, [drop?.position, drop?.targetWorkspaceKey]);
   const enabled = useCallback(
     (workspace: SidebarWorkspacePlacement) =>
-      (workspace.sidebarSection !== undefined ||
-        supportedServerIds.get(workspace.serverId) === true) &&
-      !pending,
-    [pending, supportedServerIds],
+      (workspace.sidebarSection !== undefined ? supportedPinnedServerIds : supportedServerIds).get(
+        workspace.serverId,
+      ) === true && !pending,
+    [pending, supportedServerIds, supportedPinnedServerIds],
   );
   const activeSubtreeKeys = useMemo(
     () =>

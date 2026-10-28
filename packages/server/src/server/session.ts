@@ -1,6 +1,7 @@
 import { WorkspaceFieldError } from "@getpaseo/protocol/workspace-fields";
 import { setWorkspaceFieldValue } from "./workspace-fields.js";
 import { type WorkspaceRuntimeStore } from "./workspace-runtime-store/index.js";
+import { setWorkspacePinPlacement } from "./workspace-pin-placement.js";
 import type { AgentMessageDelivery } from "./agent/agent-messages/index.js";
 import { AgentDirectory } from "./agent/directory.js";
 import { ConnectedHostSession } from "./connected-hosts/index.js";
@@ -835,6 +836,7 @@ export class Session {
   private readonly daemonSession: DaemonSession;
   private readonly fleetSession: FleetSession;
   private readonly hubExecutionController: HubExecutionController | null;
+  private readonly pinServerId: string | undefined;
   private readonly workspaceScripts: WorkspaceScriptsService;
   private readonly messageReceipts: Pick<MessageReceipts, "send">;
   private readonly agentMessages: AgentMessageDelivery;
@@ -900,6 +902,7 @@ export class Session {
       daemonRuntimeConfig,
       getWebSocketRuntimeMetrics,
     } = options;
+    this.pinServerId = serverId;
     this.browserToolsBroker = options.browserToolsBroker;
     this.clientId = clientId;
     this.authorization = new SessionAuthorization(permissions);
@@ -3109,6 +3112,15 @@ export class Session {
         return this.handleWorkspaceFieldValueSetRequest(msg);
       case "workspace.move.request":
         return this.handleWorkspaceMoveRequest(msg);
+      default:
+        return this.dispatchWorkspacePinMessage(msg);
+    }
+  }
+
+  private dispatchWorkspacePinMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+    switch (msg.type) {
+      case "workspace.pin.placement.set.request":
+        return this.handleWorkspacePinPlacementSetRequest(msg);
       case "workspace.title.set.request":
         return this.handleWorkspaceTitleSetRequest(msg.workspaceId, msg.title, msg.requestId);
       case "workspace.superpin.set.request":
@@ -3880,6 +3892,35 @@ export class Session {
           accepted: false,
           removedWorkspaceIds: [],
           error: getErrorMessageOr(error, "Failed to remove project"),
+        },
+      });
+    }
+  }
+
+  private async handleWorkspacePinPlacementSetRequest(
+    request: Extract<SessionInboundMessage, { type: "workspace.pin.placement.set.request" }>,
+  ): Promise<void> {
+    const { requestId, workspaceId } = request;
+    try {
+      const placement = await setWorkspacePinPlacement(
+        this.workspaceRegistry,
+        request,
+        this.pinServerId,
+      );
+      this.emit({
+        type: "workspace.pin.placement.set.response",
+        payload: { requestId, workspaceId, accepted: true, placement, error: null },
+      });
+      await this.emitWorkspaceUpdatesForWorkspaceIds([workspaceId]);
+    } catch (error) {
+      this.emit({
+        type: "workspace.pin.placement.set.response",
+        payload: {
+          requestId,
+          workspaceId,
+          accepted: false,
+          placement: null,
+          error: getErrorMessageOr(error, "Unable to save pin layout"),
         },
       });
     }
@@ -5932,6 +5973,7 @@ export class Session {
     return {
       id: workspace.workspaceId,
       parentWorkspaceId: workspace.parentWorkspaceId,
+      pinPlacement: workspace.pinPlacement,
       siblingOrder: workspace.siblingOrder,
       projectId: workspace.projectId,
       projectDisplayName: resolvedProjectRecord
@@ -6028,6 +6070,7 @@ export class Session {
     return {
       id: result.workspace.workspaceId,
       parentWorkspaceId: result.workspace.parentWorkspaceId,
+      pinPlacement: result.workspace.pinPlacement,
       siblingOrder: result.workspace.siblingOrder,
       projectId: result.workspace.projectId,
       projectDisplayName: projectRecord
@@ -7118,6 +7161,7 @@ export class Session {
         background: request.background,
         parentWorkspaceId: request.parentWorkspaceId,
         siblingOrder: request.siblingOrder,
+        sidebarPlacement: request.sidebarPlacement,
         callerWorkspaceId: await this.getCallerWorkspaceId(request.callerAgentId),
       },
     );
@@ -7184,6 +7228,7 @@ export class Session {
         background: request.background,
         parentWorkspaceId: request.parentWorkspaceId,
         siblingOrder: request.siblingOrder,
+        sidebarPlacement: request.sidebarPlacement,
         callerWorkspaceId: await this.getCallerWorkspaceId(request.callerAgentId),
       },
       source.baseBranch

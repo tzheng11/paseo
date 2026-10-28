@@ -20,7 +20,7 @@ export interface WorkspaceStructureProject {
   workspaceKeys: string[];
   workspaceHierarchy?: Record<
     string,
-    Pick<WorkspaceDescriptor, "parentWorkspaceId" | "siblingOrder">
+    Pick<WorkspaceDescriptor, "parentWorkspaceId" | "siblingOrder" | "pinPlacement">
   >;
 }
 
@@ -59,6 +59,7 @@ interface WorkspaceStructureItem extends WorkspaceSortItem {
   workspaceKey: string;
   parentWorkspaceId?: string | null;
   siblingOrder?: number;
+  pinPlacement?: WorkspaceDescriptor["pinPlacement"];
 }
 
 /** The single app boundary that turns host-local projects into grouped display projects. */
@@ -110,6 +111,7 @@ export function buildWorkspaceStructureProjects(input: {
         workspaceName: workspace.name,
         workspaceKey: `${session.serverId}:${workspace.id}`,
         parentWorkspaceId: workspace.parentWorkspaceId,
+        pinPlacement: workspace.pinPlacement,
         siblingOrder: workspace.siblingOrder,
       });
     }
@@ -254,7 +256,10 @@ function workspaceHierarchy(
 ): Pick<WorkspaceStructureProject, "workspaceHierarchy"> {
   const entries = workspaces
     .filter(
-      (workspace) => workspace.siblingOrder !== undefined || workspace.parentWorkspaceId != null,
+      (workspace) =>
+        workspace.siblingOrder !== undefined ||
+        workspace.parentWorkspaceId != null ||
+        workspace.pinPlacement !== undefined,
     )
     .map(
       (workspace) =>
@@ -262,6 +267,7 @@ function workspaceHierarchy(
           workspace.workspaceKey,
           {
             parentWorkspaceId: workspace.parentWorkspaceId ?? null,
+            ...(workspace.pinPlacement ? { pinPlacement: workspace.pinPlacement } : {}),
             siblingOrder: workspace.siblingOrder,
           },
         ] as const,

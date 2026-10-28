@@ -303,6 +303,13 @@ const StoredWorkspaceSchema = z.strictObject({
   id: z.string(),
   // COMPAT(workspaceHierarchyCache): added in v0.11.2; remove optional parsing after 2027-04-21.
   parentWorkspaceId: z.string().nullable().optional(),
+  pinPlacement: z
+    .object({
+      parentWorkspaceKey: z.string().nullable(),
+      siblingOrder: z.number().finite(),
+      revision: z.number().int().nonnegative(),
+    })
+    .optional(),
   siblingOrder: z.number().finite().optional(),
   projectId: z.string(),
   projectDisplayName: z.string(),
@@ -394,22 +401,23 @@ const DirectoryCheckpointSchema = z.strictObject({
 // Revalidate those directories once without evicting cached rows or timelines.
 const StoredDirectoryCheckpointSchema = z.strictObject({
   version: z.union([z.literal(1), z.literal(2)]),
-  workspaceFieldsVersion: z.union([z.literal(1), z.literal(2)]).optional(),
+  workspaceFieldsVersion: z.union([z.literal(1), z.literal(2), z.literal(3)]).optional(),
   cursors: DirectoryCheckpointSchema,
 });
 
 function serializeDirectoryCheckpoint(cursors: DirectoryCheckpoint) {
-  return { version: 2 as const, workspaceFieldsVersion: 2 as const, cursors };
+  return { version: 2 as const, workspaceFieldsVersion: 3 as const, cursors };
 }
 
 function deserializeDirectoryCheckpoint(payload: string): DirectoryCheckpoint {
   const stored = parseStoredPayload(StoredDirectoryCheckpointSchema, payload);
   const cursors = { ...stored.cursors };
   // COMPAT(workspaceFieldCache): added in v0.11.3; remove after 2027-04-15.
-  // Earlier workspace rows omitted Info values. Refresh that baseline even when
+  // COMPAT(shared-pin-cache): added in v0.13.0-beta.1; remove after 2027-04-22.
+  // Earlier workspace rows omitted shared pin placements. Refresh even when
   // its cursor is current, preserving other cached directories and timelines.
   // COMPAT(workspaceSuperpinCache): older rows omitted superpinnedAt while their cursor stayed current.
-  const refreshWorkspaces = stored.version < 2 || stored.workspaceFieldsVersion !== 2;
+  const refreshWorkspaces = stored.version < 2 || stored.workspaceFieldsVersion !== 3;
   if (refreshWorkspaces) delete cursors.workspaces;
   if (refreshWorkspaces && stored.cursors.workspaces && Object.keys(cursors).length === 0) {
     throw new Error("Cached workspace directory requires refresh");
@@ -720,6 +728,7 @@ function serializeWorkspace(workspace: WorkspaceDescriptor): StoredWorkspace {
     lastUserMessageAt: workspace.lastUserMessageAt?.toISOString() ?? null,
     id: workspace.id,
     parentWorkspaceId: workspace.parentWorkspaceId,
+    pinPlacement: workspace.pinPlacement,
     siblingOrder: workspace.siblingOrder,
     projectId: workspace.projectId,
     projectDisplayName: workspace.projectDisplayName,

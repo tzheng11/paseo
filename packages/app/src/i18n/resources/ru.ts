@@ -101,6 +101,7 @@ export const ru: TranslationResources = {
       addProject: "Добавить проект",
       home: "Главная",
       groupByProject: "Группировать по проекту",
+      groupByNone: "Показать иерархию рабочих пространств",
       groupByStatus: "Группировать по статусу",
       modelGroupLabel: "Модель",
       modelSearchKeywords: "Сменить, изменить, выбрать или установить модель",
@@ -1194,6 +1195,7 @@ export const ru: TranslationResources = {
         updateHost: "Обновите хосты для сортировки рабочих пространств",
       },
       grouping: {
+        none: "Нет",
         label: "Группировка",
         project: "Проект",
         status: "Статус",
@@ -1339,6 +1341,7 @@ export const ru: TranslationResources = {
         pending: "Ожидают: {{count}}",
       },
       actions: {
+        addChild: "Добавить дочернее рабочее пространство",
         menu: "Действия рабочего пространства",
         newWorkspace: "Новое рабочее пространство",
         showMore: "Показать ещё",
@@ -1378,6 +1381,13 @@ export const ru: TranslationResources = {
     },
   },
   newWorkspace: {
+    parent: {
+      label: "Сделать дочерним для",
+      none: "Без родителя",
+      searchPlaceholder: "Поиск рабочих пространств",
+      empty: "Нет доступных рабочих пространств.",
+      unavailable: "Рабочее пространство недоступно",
+    },
     title: "Новое рабочее пространство",
     create: "Создать",
     isolation: {

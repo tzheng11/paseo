@@ -1353,6 +1353,90 @@ test("cancelling a logical scope during admission settles it and releases its ow
 });
 
 test(
+  "MCP creates and reorders universal children across hosts and moves the complete pin group",
+  { timeout: 60000 },
+  async () => {
+    const a = await daemon();
+    const b = await daemon();
+    const origin = await api(a);
+    const destination = await api(b);
+    await origin.paseo.hosts.add({ connection: `127.0.0.1:${b.port}` });
+    const directory = await online(origin.paseo);
+    const localId = directory.self.serverId;
+    const remoteId = directory.hosts[0]!.serverId!;
+    const parent = await origin.paseo.workspaces.create({
+      source: { kind: "directory", path: a.staticDir },
+      title: "Universal manager",
+    });
+    await origin.client.setWorkspacePinned(parent.id, true);
+    const parentKey = `${localId}:${parent.id}`;
+    const mcp = new Client({ name: "universal-sidebar-placement", version: "1" });
+    cleanup.push(() => mcp.close());
+    await mcp.connect(
+      new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${a.port}/mcp/agents`)),
+    );
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const result = await mcp.callTool({ name, arguments: args });
+      expect(result.isError, JSON.stringify(result)).not.toBe(true);
+      return z.record(z.string(), z.unknown()).parse(result.structuredContent);
+    };
+    const first = await call("create_workspace", {
+      serverId: remoteId,
+      isolation: "local",
+      path: b.staticDir,
+      title: "Remote IC",
+      parentWorkspaceKey: parentKey,
+    });
+    const second = await call("create_workspace", {
+      isolation: "local",
+      path: a.staticDir,
+      title: "Local IC",
+      parentWorkspaceKey: parentKey,
+    });
+    const firstId = z.string().parse(first.workspaceId);
+    const secondId = z.string().parse(second.workspaceId);
+    const remoteBefore = (await destination.client.fetchWorkspaces()).entries.find(
+      (row) => row.id === firstId,
+    )!;
+    const localBefore = (await origin.client.fetchWorkspaces()).entries.find(
+      (row) => row.id === secondId,
+    )!;
+    expect(remoteBefore.pinnedAt).toBeTruthy();
+    expect(localBefore.pinPlacement!.siblingOrder).toBeGreaterThan(
+      remoteBefore.pinPlacement!.siblingOrder,
+    );
+    await call("move_workspace", {
+      workspaceId: secondId,
+      beforeWorkspaceKey: `${remoteId}:${firstId}`,
+    });
+    const reordered = (await origin.client.fetchWorkspaces()).entries.find(
+      (row) => row.id === secondId,
+    )!;
+    expect(reordered.pinPlacement!.parentWorkspaceKey).toBe(parentKey);
+    expect(reordered.pinPlacement!.siblingOrder).toBeLessThan(
+      remoteBefore.pinPlacement!.siblingOrder,
+    );
+    await call("move_workspace", {
+      workspaceId: parent.id,
+      parentWorkspaceKey: null,
+      section: "superpinned",
+    });
+    const localRows = (await origin.client.fetchWorkspaces()).entries;
+    const remoteAfter = (await destination.client.fetchWorkspaces()).entries.find(
+      (row) => row.id === firstId,
+    )!;
+    const localAfter = localRows.find((row) => row.id === secondId)!;
+    expect(localRows.find((row) => row.id === parent.id)?.superpinnedAt).toBeTruthy();
+    expect(remoteAfter.superpinnedAt).toBeTruthy();
+    expect(localAfter.superpinnedAt).toBeTruthy();
+    expect(remoteAfter.pinPlacement!.parentWorkspaceKey).toBe(parentKey);
+    expect(localAfter.pinPlacement!.siblingOrder).toBe(reordered.pinPlacement!.siblingOrder);
+    expect(remoteAfter.workspaceDirectory).toBe(b.staticDir);
+    expect(localAfter.workspaceDirectory).toBe(a.staticDir);
+  },
+);
+
+test(
   "agent MCP preserves remote workspace hierarchy and fractional ranks",
   { timeout: 30000 },
   async () => {

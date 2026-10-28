@@ -18,6 +18,7 @@ import {
 import { fillComposerDraft } from "../support/helpers/composer";
 import { pressSubmitBeforeTheNextRender } from "../support/helpers/creation";
 import { createAgentTabFromMenu } from "../support/helpers/workspace-tabs";
+import { seedProjectSidebarGrouping } from "../support/helpers/sidebar";
 
 for (const version of ["0.2.5", "0.7.2", "0.8.0"]) {
   let daemon: Awaited<ReturnType<typeof startIsolatedHostDaemon>>;
@@ -157,6 +158,7 @@ for (const version of ["0.2.5", "0.7.2", "0.8.0"]) {
     }
 
     async function openOldHost(page: Page, workspaceId: string) {
+      await seedProjectSidebarGrouping(page);
       const host = buildSeededHost({
         serverId: daemon.serverId,
         endpoint: `127.0.0.1:${daemon.port}`,

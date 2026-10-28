@@ -743,6 +743,31 @@ describe("normalizeWorkspaceDescriptor", () => {
 });
 
 describe("mergeWorkspaces", () => {
+  it("keeps acknowledged shared pin revisions across delayed directory snapshots", () => {
+    const store = useSessionStore.getState();
+    store.initializeSession("test-server", null as unknown as DaemonClient);
+    const acknowledged = createWorkspace({
+      id: "pin",
+      pinPlacement: { parentWorkspaceKey: "remote:parent", siblingOrder: 512, revision: 3 },
+    });
+    store.mergeWorkspaces("test-server", [acknowledged]);
+    const delayed = createWorkspace({
+      id: "pin",
+      pinPlacement: { parentWorkspaceKey: null, siblingOrder: 0, revision: 2 },
+    });
+    store.mergeWorkspaces("test-server", [delayed]);
+    store.setWorkspaces("test-server", new Map([["pin", delayed]]));
+    expect(
+      useSessionStore.getState().sessions["test-server"].workspaces.get("pin")?.pinPlacement,
+    ).toEqual(acknowledged.pinPlacement);
+    store.mergeWorkspaces("test-server", [
+      { ...delayed, pinPlacement: { ...delayed.pinPlacement!, revision: 4 } },
+    ]);
+    expect(
+      useSessionStore.getState().sessions["test-server"].workspaces.get("pin")?.pinPlacement
+        ?.revision,
+    ).toBe(4);
+  });
   it("preserves scripts on merged workspace entries", () => {
     const store = useSessionStore.getState();
     store.initializeSession("test-server", null as unknown as DaemonClient);
