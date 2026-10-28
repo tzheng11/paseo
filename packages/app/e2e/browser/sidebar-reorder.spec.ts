@@ -602,6 +602,14 @@ test("pinned nesting names its cross-project target, confirms local persistence,
   }
 });
 
+async function beginKeyboardWorkspaceDrag(page: Page, handle: Locator) {
+  await expect(handle).toBeEnabled();
+  await handle.focus();
+  await expect(handle).toBeFocused();
+  await page.keyboard.press("Space");
+  await expect(page.getByTestId("workspace-tree-drag-preview")).toBeVisible();
+}
+
 test("keyboard pinned dragging uses full host keys to reorder, nest Right, and lift Left", async ({
   page,
 }) => {
@@ -641,23 +649,20 @@ test("keyboard pinned dragging uses full host keys to reorder, nest Right, and l
     await expect(treeNode(page, secondKey)).toBeVisible();
     await dragWorkspace(page, firstKey, secondKey, "before");
     await expectTreeOrder(page, [firstKey, secondKey]);
-    await handle().focus();
-    await page.keyboard.press("Space");
+    await beginKeyboardWorkspaceDrag(page, handle());
     await page.keyboard.press("ArrowDown");
     await expect(page.getByTestId("workspace-tree-drop-after")).toBeVisible();
     await page.keyboard.press("Space");
     await expectTreeOrder(page, [secondKey, firstKey]);
     await expect.poll(() => treeIndent(page, firstKey, secondKey)).toBe(0);
-    await handle().focus();
-    await page.keyboard.press("Space");
+    await beginKeyboardWorkspaceDrag(page, handle());
     await page.keyboard.press("ArrowRight");
     await expect(page.getByTestId("workspace-tree-drop-inside")).toBeVisible();
     await page.keyboard.press("Space");
     await expect.poll(() => treeIndent(page, firstKey, secondKey)).toBe(16);
     await reloadPreservingHostRegistry(page);
     await expect.poll(() => treeIndent(page, firstKey, secondKey)).toBe(16);
-    await handle().focus();
-    await page.keyboard.press("Space");
+    await beginKeyboardWorkspaceDrag(page, handle());
     await page.keyboard.press("ArrowLeft");
     await expect(page.getByTestId("workspace-tree-drop-after")).toBeVisible();
     await page.keyboard.press("Space");
