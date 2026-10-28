@@ -4,6 +4,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { once } from "node:events";
 import { createServer as createHttpServer } from "node:http";
 import { gzipSync } from "node:zlib";
+import { getDefaultHighWaterMark } from "node:stream";
 import * as modelCatalog from "./model-catalog.js";
 
 const downloadDirectoryGate = vi.hoisted(() => ({
@@ -105,6 +106,9 @@ async function waitForSocketClose(socket: Socket): Promise<void> {
 }
 
 const logger = pino({ level: "silent" });
+// Fill the response Readable without leaving bytes buffered in the socket.
+// Otherwise the FIN gate waits for body consumption on Windows' smaller buffer.
+const pausedBodySize = getDefaultHighWaterMark(false);
 
 describe("sherpa model downloader", () => {
   afterEach(() => {
@@ -115,7 +119,7 @@ describe("sherpa model downloader", () => {
   });
 
   test("keeps built-in streamed fetch compatible with the fixed shared transport", async () => {
-    const body = Buffer.alloc(64 * 1024, 0x61);
+    const body = Buffer.alloc(pausedBodySize, 0x61);
     const sockets = new Set<Socket>();
     const errors: Error[] = [];
     const server = createFinServer(body, "length", sockets, errors);
@@ -158,8 +162,10 @@ describe("sherpa model downloader", () => {
       }
       const archive = path.join(root, "fixture.tar");
       execFileSync("tar", ["cf", archive, "-C", path.dirname(sourceDir), spec.extractedDir]);
-      const body = Buffer.alloc(64 * 1024);
-      readFileSync(archive).copy(body);
+      const body = Buffer.alloc(pausedBodySize);
+      const archiveBytes = readFileSync(archive);
+      expect(archiveBytes.length).toBeLessThanOrEqual(body.length);
+      archiveBytes.copy(body);
       let socketEnded = false;
       let resolveEnd!: () => void;
       const ended = new Promise<void>((resolve) => {
