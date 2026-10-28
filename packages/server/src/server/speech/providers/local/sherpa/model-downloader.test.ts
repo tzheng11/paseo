@@ -49,9 +49,19 @@ function makeTmpDir(): string {
 
 type Framing = "length" | "eof" | "truncated-length" | "truncated-chunked";
 
+const fixtureSocketClosures = new WeakMap<Socket, Promise<void>>();
+
 function trackSocket(sockets: Set<Socket>, errors: Error[], socket: Socket): void {
   sockets.add(socket);
-  socket.on("close", () => sockets.delete(socket));
+  fixtureSocketClosures.set(
+    socket,
+    new Promise<void>((resolve) => {
+      socket.once("close", () => {
+        sockets.delete(socket);
+        resolve();
+      });
+    }),
+  );
   socket.on("error", (error) => errors.push(error));
 }
 
@@ -89,8 +99,9 @@ async function closeServer(server: Server): Promise<void> {
 }
 
 async function waitForSocketClose(socket: Socket): Promise<void> {
-  if (socket.closed) return;
-  await new Promise<void>((resolve) => socket.once("close", () => resolve()));
+  const closed = fixtureSocketClosures.get(socket);
+  if (!closed) throw new Error("Socket was not tracked at acceptance");
+  await closed;
 }
 
 const logger = pino({ level: "silent" });
