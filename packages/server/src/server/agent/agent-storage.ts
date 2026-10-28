@@ -108,7 +108,7 @@ export class AgentStorage {
   private daemonExecutionKeysByAgentId: Map<string, string> = new Map();
   private loaded = false;
   private baseDir: string;
-  private loadPromise: Promise<StoredAgentRecord[]> | null = null;
+  private loadPromise: Promise<void> | null = null;
   private logger: Logger;
 
   constructor(baseDir: string, logger: Logger) {
@@ -283,9 +283,9 @@ export class AgentStorage {
     await Promise.allSettled(writes);
   }
 
-  private async load(): Promise<StoredAgentRecord[]> {
+  private async load(): Promise<void> {
     if (this.loaded) {
-      return Array.from(this.cache.values());
+      return;
     }
 
     if (!this.loadPromise) {
@@ -295,7 +295,7 @@ export class AgentStorage {
     return this.loadPromise;
   }
 
-  private async doLoad(): Promise<StoredAgentRecord[]> {
+  private async doLoad(): Promise<void> {
     this.cache.clear();
     this.pathById.clear();
     this.pathsById.clear();
@@ -303,28 +303,25 @@ export class AgentStorage {
     this.daemonExecutionKeysByAgentId.clear();
 
     try {
-      const records = await this.scanDisk();
+      await this.scanDisk();
       this.loaded = true;
-      return records;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
         this.loaded = true;
-        return [];
+        return;
       }
       this.logger.error({ err: error }, "Failed to load agents");
       this.loaded = true;
-      return [];
     }
   }
 
-  private async scanDisk(): Promise<StoredAgentRecord[]> {
-    const records: StoredAgentRecord[] = [];
+  private async scanDisk(): Promise<void> {
     let entries: Dirent[] = [];
     try {
       entries = await fs.readdir(this.baseDir, { withFileTypes: true });
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        return [];
+        return;
       }
       throw error;
     }
@@ -361,14 +358,11 @@ export class AgentStorage {
     for (const item of loaded) {
       if (!item) continue;
       const { record, filePath } = item;
-      records.push(record);
       this.cache.set(record.id, record);
       this.indexOwner(record);
       this.pathById.set(record.id, filePath);
       this.addIndexedPath(record.id, filePath);
     }
-
-    return records;
   }
 
   private async readRecordFile(filePath: string): Promise<StoredAgentRecord | null> {

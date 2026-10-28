@@ -1,4 +1,4 @@
-import { describe, expect, test, beforeEach, afterEach } from "vitest";
+import { describe, expect, test, beforeEach, afterEach, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
@@ -315,6 +315,35 @@ describe("AgentStorage", () => {
     const reloaded = new AgentStorage(storagePath, logger);
     const persisted = await reloaded.get("agent-2");
     expect(persisted?.title).toBe("Fix Login Bug");
+  });
+
+  test("loaded point reads and title updates do not enumerate unrelated stored agents", async () => {
+    await storage.applySnapshot(createManagedAgent({ id: "point-target" }));
+    await storage.applySnapshot(createManagedAgent({ id: "unrelated-1" }));
+    await storage.applySnapshot(createManagedAgent({ id: "unrelated-2" }));
+    const cache = Reflect.get(storage, "cache") as Map<string, unknown>;
+    const values = vi.spyOn(cache, "values");
+    const entries = vi.spyOn(cache, Symbol.iterator);
+    try {
+      await storage.initialize();
+      await expect(storage.get("point-target")).resolves.toMatchObject({ id: "point-target" });
+      await expect(storage.get("missing-agent")).resolves.toBeNull();
+      await storage.setTitle("point-target", "Updated without a registry scan");
+      await expect(storage.get("point-target")).resolves.toMatchObject({
+        title: "Updated without a registry scan",
+      });
+      expect(values).not.toHaveBeenCalled();
+      expect(entries).not.toHaveBeenCalled();
+    } finally {
+      values.mockRestore();
+      entries.mockRestore();
+    }
+
+    const first = await storage.list();
+    const second = await storage.list();
+    expect(first).toEqual(second);
+    expect(first).not.toBe(second);
+    expect(first).toHaveLength(3);
   });
 
   test("setTitle throws when the agent record does not exist", async () => {
