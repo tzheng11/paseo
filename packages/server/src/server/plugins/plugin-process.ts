@@ -1,3 +1,4 @@
+import { configureHttpTransport } from "../http-transport.js";
 import { PluginAgentTools } from "./agent-tools.js";
 import { PluginHookHandlers } from "./lifecycle/index.js";
 import { evaluateBundle } from "./bundle-evaluator.js";
@@ -584,6 +585,7 @@ export function createPluginWorker(options: {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  configureHttpTransport();
   let worker: ReturnType<typeof createPluginWorker> | null = null;
   const handlers = new Set<(message: PluginProcessRequest) => void>();
   const channel: PluginWorkerChannel = {

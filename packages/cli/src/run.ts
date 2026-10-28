@@ -1,3 +1,4 @@
+import { configureHttpTransport } from "@getpaseo/server/http-transport";
 import { renderError, toCommandError, defaultOutputOptions } from "./output/render.js";
 import { createCli } from "./cli.js";
 import { classifyInvocation } from "./classify.js";
@@ -47,6 +48,7 @@ function ignoreClosedStdout(error: NodeJS.ErrnoException): void {
 }
 
 export async function runCli(argv: string[], options: RunCliOptions = {}): Promise<number> {
+  configureHttpTransport();
   if (!process.stdout.listeners("error").includes(ignoreClosedStdout)) {
     process.stdout.on("error", ignoreClosedStdout);
   }

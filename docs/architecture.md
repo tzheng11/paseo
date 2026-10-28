@@ -66,6 +66,18 @@ WebSocket message schemas. Shared configuration schemas belong in protocol leaf 
 retaining the daemon's runtime and wire-schema allocations. The server export tests guard
 these dependency trees with tree-shaking disabled to match unbundled production imports.
 
+The daemon, CLI entry point and plugin worker explicitly select the server's pinned Undici
+transport once per process before running user work. Electron's embedded parser can crash when
+FIN arrives while a response body is paused; importing a newer Undici alone leaves a warmed
+embedded dispatcher in place. The public dispatcher bridge preserves native `fetch`, `Request`
+and `Response`, including references captured before initialization. The default Agent lives until
+process exit and is not closed with one embedded daemon. Existing in-flight responses and external
+provider processes keep their original transport. The model downloader retains its separate owned
+Agent. Both dispatcher owners preserve Node's explicitly enabled HTTP(S)\_PROXY/NO_PROXY policy
+using the resolved proxy configuration in the supported Node22/24 global HTTP Agent. Merely
+setting a proxy URL does not enable it. Embedders that configure a custom default transport must
+do so after Paseo initialization.
+
 Project identity is daemon-global rather than session-owned. After registry bootstrap, the daemon's
 project Git observer keeps one non-recursive watch on each lexically equivalent active project root
 and listens only for the root `.git` entry, with a slow rescan as a missed-event fallback. It runs

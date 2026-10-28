@@ -4,7 +4,8 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type pino from "pino";
-import { Agent, fetch } from "undici";
+import { fetch } from "undici";
+import { createHttpDispatcher } from "../../../../http-transport.js";
 
 import { getSherpaOnnxModelSpec, type SherpaOnnxModelId } from "./model-catalog.js";
 import { spawnProcess } from "../../../../../utils/spawn.js";
@@ -57,7 +58,7 @@ async function downloadToFile(options: DownloadToFileOptions): Promise<void> {
   // Electron's embedded fetch can crash when a slow response consumer meets FIN
   // (undici#5474). Own the fixed transport so an ambient dispatcher cannot restore
   // the old parser, and release it even if headers, mkdir or streaming fails.
-  const dispatcher = new Agent();
+  const dispatcher = createHttpDispatcher();
   try {
     const res = await fetch(url, { signal: options.signal, dispatcher });
     if (!res.ok) {

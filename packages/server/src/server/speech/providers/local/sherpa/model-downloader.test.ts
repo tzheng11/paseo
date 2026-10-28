@@ -6,6 +6,7 @@ import { createServer as createHttpServer } from "node:http";
 import { gzipSync } from "node:zlib";
 import { getDefaultHighWaterMark } from "node:stream";
 import * as modelCatalog from "./model-catalog.js";
+import { configureHttpTransport } from "../../../../http-transport.js";
 
 const downloadDirectoryGate = vi.hoisted(() => ({
   directory: "",
@@ -118,7 +119,8 @@ describe("sherpa model downloader", () => {
     downloadDirectoryGate.error = undefined;
   });
 
-  test("keeps built-in streamed fetch compatible with the fixed shared transport", async () => {
+  test("keeps built-in streamed fetch compatible after process transport initialization", async () => {
+    configureHttpTransport();
     const body = Buffer.alloc(pausedBodySize, 0x61);
     const sockets = new Set<Socket>();
     const errors: Error[] = [];

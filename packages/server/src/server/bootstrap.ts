@@ -1,3 +1,4 @@
+import { configureHttpTransport } from "./http-transport.js";
 import { setWorkspacePinPlacement } from "./workspace-pin-placement.js";
 import { MessageReceipts } from "./message-receipts/index.js";
 import { MainHostStore } from "./fleet/main-host-store.js";
@@ -627,6 +628,7 @@ export async function createPaseoDaemon(
   rootLogger: Logger,
   dependencies: PaseoDaemonDependencies = {},
 ): Promise<PaseoDaemon> {
+  configureHttpTransport();
   configureGitProcessPolicy(config.git ?? resolveGitProcessPolicy({ env: process.env }));
   const logger = rootLogger.child({ module: "bootstrap" });
   const obsoleteTimelineDirectory = path.join(config.paseoHome, "agent-timelines");

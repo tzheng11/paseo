@@ -67,6 +67,11 @@
       "types": "./dist/server/server/agent/reload-cleanup-recovery.d.ts",
       "source": "./src/server/agent/reload-cleanup-recovery.ts",
       "default": "./dist/server/server/agent/reload-cleanup-recovery.js"
+    },
+    "./http-transport": {
+      "types": "./dist/server/server/http-transport.d.ts",
+      "source": "./src/server/http-transport.ts",
+      "default": "./dist/server/server/http-transport.js"
     }
   },
   "publishConfig": {
