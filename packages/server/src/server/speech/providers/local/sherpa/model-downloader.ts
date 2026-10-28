@@ -4,6 +4,7 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type pino from "pino";
+import { Agent, fetch } from "undici";
 
 import { getSherpaOnnxModelSpec, type SherpaOnnxModelId } from "./model-catalog.js";
 import { spawnProcess } from "../../../../../utils/spawn.js";
@@ -53,34 +54,40 @@ interface DownloadToFileOptions {
 
 async function downloadToFile(options: DownloadToFileOptions): Promise<void> {
   const { url, outputPath } = options;
-  const res = await fetch(url, { signal: options.signal });
-  if (!res.ok) {
-    throw new Error(`Failed to download ${url}: ${res.status} ${res.statusText}`);
-  }
-  if (!res.body) {
-    throw new Error(`Failed to download ${url}: missing response body`);
-  }
-
-  const tmpPath = `${outputPath}.tmp-${Date.now()}`;
-  await mkdir(path.dirname(outputPath), { recursive: true });
-
-  // The fetch ReadableStream type is slightly different from what Readable.fromWeb expects
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const nodeStream = Readable.fromWeb(res.body as any);
-  const contentLength = Number(res.headers.get("content-length"));
-  const totalBytes = contentLength > 0 ? contentLength : options.expectedBytes;
-  let receivedBytes = 0;
-  nodeStream.on("data", (chunk: Buffer) => {
-    receivedBytes += chunk.length;
-    options.onProgress?.(receivedBytes, totalBytes);
-  });
-
+  // Electron's embedded fetch can crash when a slow response consumer meets FIN
+  // (undici#5474). Own the fixed transport so an ambient dispatcher cannot restore
+  // the old parser, and release it even if headers, mkdir or streaming fails.
+  const dispatcher = new Agent();
   try {
-    await pipeline(nodeStream, createWriteStream(tmpPath), { signal: options.signal });
-    await rename(tmpPath, outputPath);
-  } catch (error) {
-    await rm(tmpPath, { force: true }).catch(() => undefined);
-    throw error;
+    const res = await fetch(url, { signal: options.signal, dispatcher });
+    if (!res.ok) {
+      throw new Error(`Failed to download ${url}: ${res.status} ${res.statusText}`);
+    }
+    if (!res.body) {
+      throw new Error(`Failed to download ${url}: missing response body`);
+    }
+
+    const tmpPath = `${outputPath}.tmp-${Date.now()}`;
+    await mkdir(path.dirname(outputPath), { recursive: true });
+
+    const nodeStream = Readable.fromWeb(res.body);
+    const contentLength = Number(res.headers.get("content-length"));
+    const totalBytes = contentLength > 0 ? contentLength : options.expectedBytes;
+    let receivedBytes = 0;
+    nodeStream.on("data", (chunk: Buffer) => {
+      receivedBytes += chunk.length;
+      options.onProgress?.(receivedBytes, totalBytes);
+    });
+
+    try {
+      await pipeline(nodeStream, createWriteStream(tmpPath), { signal: options.signal });
+      await rename(tmpPath, outputPath);
+    } catch (error) {
+      await rm(tmpPath, { force: true }).catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    await dispatcher.destroy();
   }
 }
 
