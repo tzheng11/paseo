@@ -260,7 +260,20 @@ test("large source diffs stay renderable for reads, subscriptions, and commit fi
     const subscription = ctx.client.observeCheckoutDiff(cwd, { mode: "uncommitted" });
     try {
       let latest = await subscription.ready;
-      check(latest.files[0], "43");
+      const checkHighlightedSubscription = async (value: string) => {
+        // Registration can supersede bootstrap highlighting. Require the
+        // settled live snapshot to retain syntax, including after later edits.
+        await expect
+          .poll(
+            () =>
+              latest.files[0]?.hunks
+                .flatMap((hunk) => hunk.lines)
+                .find((line) => line.type === "add")?.tokens,
+            { timeout: 15_000 },
+          )
+          .toContainEqual({ text: value, style: "number" });
+        check(latest.files[0], value);
+      };
       subscription.subscribe({
         snapshot: (snapshot) => {
           latest = snapshot;
@@ -269,16 +282,9 @@ test("large source diffs stay renderable for reads, subscriptions, and commit fi
           if (message.type === "checkout_diff_update") latest = message.payload;
         },
       });
+      await checkHighlightedSubscription("43");
       await writeFile(join(cwd, "generated.ts"), original.replace("42", "44"));
-      await expect
-        .poll(
-          () =>
-            latest.files[0]?.hunks.flatMap((hunk) => hunk.lines).find((line) => line.type === "add")
-              ?.content,
-          { timeout: 15_000 },
-        )
-        .toBe("const value = Math.max(44, 7);");
-      check(latest.files[0], "44");
+      await checkHighlightedSubscription("44");
     } finally {
       await subscription.release();
     }
