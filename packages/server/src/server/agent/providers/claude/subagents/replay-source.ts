@@ -357,20 +357,18 @@ interface ClaudeReplayInput {
   convertEntry: (entry: ClaudeReplayEntry) => AgentTimelineItem[];
 }
 
-export function observeReplaySubagents(input: ClaudeReplayInput): {
-  observations: SubagentObservation[];
-  toolOwners: ReadonlyMap<string, string>;
-} {
-  const toolOwners = new Map<string, string>();
-  const observations: SubagentObservation[] = [];
-  for (const observation of replaySubagents(input, toolOwners)) {
-    if (observation && observation.kind !== "read_entry") observations.push(observation);
-  }
-  return { observations, toolOwners };
+export async function observeReplaySubagents(
+  input: Omit<ClaudeReplayInput, "convertEntry"> & {
+    convertEntry: (entry: ClaudeReplayEntry) => AgentTimelineItem[] | Promise<AgentTimelineItem[]>;
+  },
+): Promise<{ observations: SubagentObservation[]; toolOwners: ReadonlyMap<string, string> }> {
+  return observeReplaySubagentsAsync(input, new AbortController().signal);
 }
 
 export async function observeReplaySubagentsAsync(
-  input: ClaudeReplayInput & {
+  input: Omit<ClaudeReplayInput, "convertEntry"> & {
+    convertEntry: (entry: ClaudeReplayEntry) => AgentTimelineItem[] | Promise<AgentTimelineItem[]>;
+  } & {
     readEntry?: (entry: ClaudeReplayEntry) => Promise<ClaudeReplayEntry>;
   },
   signal: AbortSignal,
@@ -380,7 +378,8 @@ export async function observeReplaySubagentsAsync(
 }> {
   const toolOwners = new Map<string, string>();
   const observations: SubagentObservation[] = [];
-  const replay = replaySubagents(input, toolOwners);
+  let converted: AgentTimelineItem[] = [];
+  const replay = replaySubagents({ ...input, convertEntry: () => converted }, toolOwners);
   let step = replay.next();
   try {
     while (!step.done) {
@@ -392,6 +391,7 @@ export async function observeReplaySubagentsAsync(
         const entry = input.readEntry
           ? await input.readEntry(observation.entry)
           : observation.entry;
+        converted = await input.convertEntry(entry);
         step = replay.next(entry);
       } else {
         if (observation) observations.push(observation);

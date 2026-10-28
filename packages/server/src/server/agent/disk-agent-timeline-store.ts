@@ -1,12 +1,13 @@
 import { pruneAbandonedHistoryCaches } from "./agent-history-cache-directory.js";
 import type { HistoryReadLimit, HistoryWindows } from "./agent-history-replay.js";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 import { LRUCache } from "lru-cache";
 import { setImmediate } from "node:timers/promises";
 import { timelineItemIdentity } from "@getpaseo/protocol/timeline-identity";
+import { continuesTimelineTurn, isTimelineTurnTrigger } from "@getpaseo/protocol/timeline-turn";
 import type { AgentTimelineItem } from "./agent-sdk-types.js";
 import type {
   AgentRuntimeTimelineStore,
@@ -40,6 +41,11 @@ interface PreparedTimelineFetch {
   finish(entries: ProjectedTimelineRow[]): AgentTimelineFetchResult;
 }
 
+interface WholeTurnSelection {
+  positions: Iterable<number>;
+  page: Pick<AgentTimelineFetchResult, "startSeq" | "endSeq" | "hasOlder" | "hasNewer">;
+}
+
 /** Disposable projection cache. Provider transcripts remain authoritative. */
 export class DiskAgentTimelineStore implements AgentRuntimeTimelineStore {
   private readonly database: DatabaseSync;
@@ -48,19 +54,34 @@ export class DiskAgentTimelineStore implements AgentRuntimeTimelineStore {
   private readonly statements = new Map<string, StatementSync>();
   private readonly cache: LRUCache<string, string>;
   private closed = false;
+  private closePromise: Promise<void> | undefined;
 
-  constructor(options: { directory: string; cacheBytes?: number }) {
-    mkdirSync(options.directory, { recursive: true, mode: 0o700 });
-    pruneAbandonedHistoryCaches(options.directory, "timeline-");
-    this.directory = mkdtempSync(path.join(options.directory, `timeline-${process.pid}-`));
+  static async create(options: {
+    directory: string;
+    cacheBytes?: number;
+  }): Promise<DiskAgentTimelineStore> {
+    await mkdir(options.directory, { recursive: true, mode: 0o700 });
+    await pruneAbandonedHistoryCaches(options.directory, "timeline-");
+    const directory = await mkdtemp(path.join(options.directory, `timeline-${process.pid}-`));
+    try {
+      return new DiskAgentTimelineStore(directory, options.cacheBytes);
+    } catch (error) {
+      await rm(directory, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
+  private constructor(directory: string, cacheBytes?: number) {
+    this.directory = directory;
     this.database = new DatabaseSync(path.join(this.directory, "projection.sqlite"));
     this.cache = new LRUCache({
-      maxSize: options.cacheBytes ?? 32 * 1024 * 1024,
+      maxSize: cacheBytes ?? 32 * 1024 * 1024,
       // Retain serialized strings, not parsed object graphs. Account for UTF-16
       // characters, keys, and per-entry overhead; oversized rows bypass the cache.
       sizeCalculation: (value, key) => 2 * (value.length + key.length) + 256,
     });
-    this.database.exec(`
+    try {
+      this.database.exec(`
       -- This cache is rebuilt from provider transcripts after a process exit.
       -- Keep transaction rollback, without synchronously writing and unlinking
       -- a disk journal for every streamed projection update.
@@ -71,6 +92,7 @@ export class DiskAgentTimelineStore implements AgentRuntimeTimelineStore {
       CREATE TABLE rows (
         sid TEXT NOT NULL, pos INTEGER NOT NULL, seq_start INTEGER NOT NULL,
         seq_end INTEGER NOT NULL, identity TEXT, user_id TEXT, item_type TEXT NOT NULL, data_bytes INTEGER NOT NULL,
+        turn_id TEXT, turn_trigger INTEGER NOT NULL, turn_start INTEGER NOT NULL,
         PRIMARY KEY (sid, pos)
       ) WITHOUT ROWID;
       CREATE TABLE payloads (
@@ -82,27 +104,32 @@ export class DiskAgentTimelineStore implements AgentRuntimeTimelineStore {
       CREATE INDEX rows_start ON rows(sid, seq_start, pos);
       CREATE INDEX rows_end ON rows(sid, seq_end, pos);
       CREATE INDEX rows_type ON rows(sid, item_type, pos);
+      CREATE INDEX rows_turn_start ON rows(sid, turn_start, pos);
       CREATE TABLE ranges (
         sid TEXT NOT NULL, pos INTEGER NOT NULL, start_seq INTEGER NOT NULL,
         end_seq INTEGER NOT NULL, PRIMARY KEY (sid, pos, start_seq)
       ) WITHOUT ROWID;
       CREATE INDEX ranges_end ON ranges(sid, end_seq, start_seq, pos);
-    `);
+      `);
+    } catch (error) {
+      this.database.close();
+      throw error;
+    }
   }
 
   get cachedBytes(): number {
     return this.cache.calculatedSize;
   }
 
-  close(): void {
-    if (this.closed) return;
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
     this.database.close();
     this.closed = true;
     this.cache.clear();
     this.statements.clear();
     this.states.clear();
-    rmSync(this.directory, { recursive: true, force: true });
-    this.closed = true;
+    this.closePromise = rm(this.directory, { recursive: true, force: true });
+    return this.closePromise;
   }
 
   has(agentId: string): boolean {
@@ -424,16 +451,28 @@ export class DiskAgentTimelineStore implements AgentRuntimeTimelineStore {
       cursor.seq < state.minSeq - 1;
     const reset = staleCursor || gap;
     const selectedDirection = reset ? "tail" : direction;
-    const { positions, hasOlder } = this.selectPositions(
-      state,
-      selectedDirection,
-      cursor?.seq,
-      limit,
-    );
+    const whole =
+      options?.wholeTurns && selectedDirection !== "after"
+        ? this.selectWholeTurnPositions(state, selectedDirection, cursor?.seq, limit)
+        : null;
+    const selected = this.selectPositions(state, selectedDirection, cursor?.seq, limit);
+    const positions = whole?.positions ?? selected.positions;
+    const hasOlder = selected.hasOlder;
     return {
       state,
       positions,
       finish: (entries) => {
+        if (whole)
+          return {
+            epoch: state.epoch,
+            direction,
+            reset,
+            staleCursor,
+            gap,
+            window,
+            ...whole.page,
+            rows: entries,
+          };
         const page = selectProjectedEntriesPage({
           entries,
           bounds: window,
@@ -510,6 +549,69 @@ export class DiskAgentTimelineStore implements AgentRuntimeTimelineStore {
     return { positions: selected, hasOlder };
   }
 
+  private selectWholeTurnPositions(
+    state: TimelineState,
+    direction: "tail" | "before",
+    cursorSeq: number | undefined,
+    limit: number,
+  ): WholeTurnSelection | null {
+    if (state.count === 0) return null;
+    let stop = state.count;
+    if (direction === "before") {
+      const endSeq = Math.min(state.nextSeq - 1, (cursorSeq ?? state.nextSeq) - 1);
+      const last = this.statement(
+        "SELECT pos FROM rows WHERE sid = ? AND seq_start <= ? ORDER BY pos DESC LIMIT 1",
+      ).get(state.key, endSeq);
+      if (!last) return null;
+      stop = Number(last.pos) + 1;
+    }
+    const requestedStart = limit === 0 ? 0 : Math.max(0, stop - limit);
+    const start = this.wholeTurnWindowStart(state, requestedStart);
+    if (direction === "before" && stop < state.count) {
+      const nextTurn = this.statement(
+        "SELECT pos FROM rows WHERE sid = ? AND turn_start = 1 AND pos >= ? ORDER BY pos LIMIT 1",
+      ).get(state.key, stop);
+      stop = nextTurn ? Number(nextTurn.pos) : state.count;
+    }
+    const first = this.statement("SELECT seq_start FROM rows WHERE sid = ? AND pos = ?").get(
+      state.key,
+      start,
+    )!;
+    const next =
+      stop === state.count
+        ? null
+        : this.statement("SELECT seq_start FROM rows WHERE sid = ? AND pos = ?").get(
+            state.key,
+            stop,
+          )!;
+    const endSeq = next ? Number(next.seq_start) - 1 : state.nextSeq - 1;
+    return {
+      positions: this.rowPositions(start, stop),
+      page: {
+        startSeq: Number(first.seq_start),
+        endSeq,
+        hasOlder: start > 0,
+        hasNewer: endSeq < state.nextSeq - 1,
+      },
+    };
+  }
+
+  private wholeTurnWindowStart(state: TimelineState, requestedStart: number): number {
+    let start = requestedStart;
+    while (start > 0) {
+      const boundary = this.statement(
+        "SELECT pos, seq_start FROM rows WHERE sid = ? AND turn_start = 1 AND pos <= ? ORDER BY pos DESC LIMIT 1",
+      ).get(state.key, start)!;
+      start = Number(boundary.pos);
+      const overlap = this.statement(
+        "SELECT MIN(pos) AS pos FROM rows WHERE sid = ? AND pos < ? AND seq_end >= ?",
+      ).get(state.key, start, boundary.seq_start);
+      if (overlap?.pos == null) break;
+      start = Number(overlap.pos);
+    }
+    return start;
+  }
+
   private *rowPositions(start: number, count: number): Generator<number> {
     for (let pos = start; pos < count; pos++) yield pos;
   }
@@ -547,7 +649,18 @@ export class DiskAgentTimelineStore implements AgentRuntimeTimelineStore {
       "SELECT data_bytes AS bytes FROM rows WHERE sid = ? AND pos = ?",
     ).get(state.key, pos);
     state.bytes += bytes - Number(previous?.bytes ?? 0);
-    this.statement(`INSERT OR REPLACE INTO rows VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    const previousTurn =
+      pos === 0
+        ? null
+        : this.statement("SELECT turn_id FROM rows WHERE sid = ? AND pos = ?").get(
+            state.key,
+            pos - 1,
+          );
+    const previousTurnId =
+      typeof previousTurn?.turn_id === "string" ? previousTurn.turn_id : undefined;
+    const trigger = isTimelineTurnTrigger(row.item);
+    const turnStart = pos === 0 || !continuesTimelineTurn(previousTurnId, row.turnId, trigger);
+    this.statement(`INSERT OR REPLACE INTO rows VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       state.key,
       pos,
       row.seqStart,
@@ -556,7 +669,26 @@ export class DiskAgentTimelineStore implements AgentRuntimeTimelineStore {
       row.item.type === "user_message" ? (row.item.clientMessageId ?? null) : null,
       row.item.type,
       bytes,
+      row.turnId ?? null,
+      Number(trigger),
+      Number(turnStart),
     );
+    const successor = this.statement(
+      "SELECT turn_id, turn_trigger FROM rows WHERE sid = ? AND pos = ?",
+    ).get(state.key, pos + 1);
+    if (successor) {
+      const successorTurnId = typeof successor.turn_id === "string" ? successor.turn_id : undefined;
+      const successorStarts = !continuesTimelineTurn(
+        row.turnId,
+        successorTurnId,
+        successor.turn_trigger === 1,
+      );
+      this.statement("UPDATE rows SET turn_start = ? WHERE sid = ? AND pos = ?").run(
+        Number(successorStarts),
+        state.key,
+        pos + 1,
+      );
+    }
     this.statement("INSERT OR REPLACE INTO payloads VALUES (?, ?, ?)").run(state.key, pos, data);
     this.statement("DELETE FROM ranges WHERE sid = ? AND pos = ?").run(state.key, pos);
     for (const range of row.sourceSeqRanges) {

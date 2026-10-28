@@ -25,7 +25,7 @@ describe("AgentHistoryReplay", () => {
         { id: "tool", state: "completed" },
         { id: "message", state: "answer" },
       ]);
-      expect([...replay.eventsSync()]).toEqual(values);
+      expect(await Array.fromAsync(replay.events())).toEqual(values);
       const windows = await replay.readWindows({
         head: { events: 1, bytes: 100 },
         tail: { events: 1, bytes: 100 },
@@ -211,14 +211,14 @@ describe("AgentHistoryReplay", () => {
     }
   });
 
-  it("applies bounded synchronous reads without splitting Unicode across chunks", async () => {
+  it("streams Unicode records without splitting characters across chunks", async () => {
     const events = [
       { text: "x".repeat(65520) + "🧠🌍", index: 1 },
       { text: "next", index: 2 },
     ];
     const replay = await AgentHistoryReplay.create(events);
     try {
-      expect([...replay.eventsSync()]).toEqual(events);
+      expect(await Array.fromAsync(replay.events())).toEqual(events);
     } finally {
       await replay.close();
     }

@@ -117,9 +117,9 @@ function normalizeWorkspaceOrderByProject(
 ): Record<string, string[]> {
   const normalized: Record<string, string[]> = {};
   for (const [projectViewKey, order] of Object.entries(workspaceOrderByProject ?? {})) {
-    const scope = projectViewKey.trim();
-    if (!scope) continue;
-    normalized[scope] = normalizeKeys(order);
+    const scope = projectViewKey;
+    if (!scope.trim()) continue;
+    normalized[scope] = dedupeKeys(order);
   }
   return normalized;
 }

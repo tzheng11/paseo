@@ -50,6 +50,7 @@ function makeSubsystem(overrides: {
   reloadConfig?: () => DaemonConfigReloadResult;
   listVisibleAgents?: () => Promise<AgentSnapshotPayload[]>;
   listVisibleWorkspaces?: () => Promise<WorkspaceDescriptorPayload[]>;
+  reloadConfig?: () => Promise<DaemonConfigReloadResult>;
 }) {
   const emitted: SessionOutboundMessage[] = [];
   const restartIntents: Parameters<DaemonSessionHost["emitLifecycleIntent"]>[0][] = [];
@@ -75,7 +76,7 @@ function makeSubsystem(overrides: {
     hubRelationships: overrides.hubRelationships,
     reloadConfig:
       overrides.reloadConfig ??
-      (() => ({
+      (async () => ({
         appliedPaths: [],
         restartRequiredPaths: [],
         overrideControlledPaths: [],
@@ -86,16 +87,16 @@ function makeSubsystem(overrides: {
 }
 
 describe("DaemonSession", () => {
-  test("config reload returns the daemon-owned classification", () => {
+  test("config reload returns the daemon-owned classification", async () => {
     const { subsystem, emitted } = makeSubsystem({
-      reloadConfig: () => ({
+      reloadConfig: async () => ({
         appliedPaths: ["daemon.browserTools.enabled"],
         restartRequiredPaths: ["daemon.listen"],
         overrideControlledPaths: ["app.baseUrl"],
       }),
     });
 
-    subsystem.handleConfigReloadRequest({
+    await subsystem.handleConfigReloadRequest({
       type: "daemon.config.reload.request",
       requestId: "reload-1",
     });
@@ -113,14 +114,14 @@ describe("DaemonSession", () => {
     ]);
   });
 
-  test("config reload failures return a correlated RPC error", () => {
+  test("config reload failures return a correlated RPC error", async () => {
     const { subsystem, emitted } = makeSubsystem({
-      reloadConfig: () => {
+      reloadConfig: async () => {
         throw new Error("Invalid config");
       },
     });
 
-    subsystem.handleConfigReloadRequest({
+    await subsystem.handleConfigReloadRequest({
       type: "daemon.config.reload.request",
       requestId: "reload-2",
     });

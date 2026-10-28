@@ -39,6 +39,7 @@ import {
   Files,
   Smartphone,
   Sparkles,
+  Mic,
   Blocks,
   Globe,
   PanelLeft,
@@ -83,7 +84,6 @@ import { KeyboardShortcutsSection } from "@/screens/settings/keyboard-shortcuts-
 import { EditorSection } from "@/screens/settings/editor-section";
 import { FilesSection } from "@/screens/settings/files-section";
 import { Button } from "@/components/ui/button";
-import { Switch } from "@/components/ui/switch";
 import { CommunityLinks } from "@/components/community-links";
 import { SegmentedControl } from "@/components/ui/segmented-control";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem } from "@/components/ui/dropdown-menu";
@@ -121,6 +121,7 @@ import { PluginSettingsContent } from "@/plugins/settings";
 import { useInstalledPlugins } from "@/plugins/registry";
 import { HostPluginsPage } from "@/screens/settings/plugins-page";
 import { MetadataGenerationPage } from "@/screens/settings/metadata-generation-page";
+import { HostVoicePage } from "@/screens/settings/voice/voice-page";
 import ProjectsScreen from "@/screens/projects-screen";
 import ProjectSettingsScreen from "@/screens/project-settings-screen";
 import { SETTINGS_DESKTOP_SIDEBAR_WIDTH, useIsCompactFormFactor } from "@/constants/layout";
@@ -136,9 +137,13 @@ import {
   type HostSectionSlug,
   type SettingsSectionSlug,
 } from "@/utils/host-routes";
-import { useLastWorkspaceSelection } from "@/stores/navigation-active-workspace-store";
+import {
+  selectSettingsHost,
+  useSettingsHostSelection,
+  useSettingsSidebarScroll,
+} from "@/navigation/settings-presentation";
 import { returnFromSettings, type SettingsView } from "@/navigation/settings-navigation";
-import { isNative, isWeb } from "@/constants/platform";
+import { isWeb } from "@/constants/platform";
 
 // ---------------------------------------------------------------------------
 // View model
@@ -239,6 +244,7 @@ const HOST_SECTION_ITEMS: HostSectionItem[] = [
   { id: "pair-device", labelKey: "openProject.tiles.pairDevice.title", icon: Smartphone },
   { id: "agents", labelKey: "settings.hostSections.agents", icon: Bot },
   { id: "metadata", labelKey: "settings.hostSections.metadata", icon: Sparkles },
+  { id: "voice", labelKey: "settings.hostSections.voice", icon: Mic },
   { id: "workspaces", labelKey: "settings.hostSections.workspaces", icon: FolderGit2 },
   { id: "providers", labelKey: "settings.hostSections.providers", icon: Boxes },
   { id: "usage", labelKey: "settings.hostSections.usage", icon: Gauge },
@@ -261,6 +267,8 @@ function renderHostSettingsContent(
       return <HostAgentsPage serverId={view.serverId} />;
     case "metadata":
       return <MetadataGenerationPage serverId={view.serverId} />;
+    case "voice":
+      return <HostVoicePage serverId={view.serverId} />;
     case "workspaces":
       return <HostWorkspacesPage serverId={view.serverId} />;
     case "providers":
@@ -385,8 +393,6 @@ function GeneralSection({ settings, handleLanguageChange }: GeneralSectionProps)
 }
 
 interface DiagnosticsSectionProps {
-  useLegacyTerminalRenderer: boolean;
-  onUseLegacyTerminalRendererChange: (value: boolean) => void;
   voiceAudioEngine: ReturnType<typeof useVoiceAudioEngineOptional>;
   isPlaybackTestRunning: boolean;
   playbackTestResult: string | null;
@@ -394,8 +400,6 @@ interface DiagnosticsSectionProps {
 }
 
 function DiagnosticsSection({
-  useLegacyTerminalRenderer,
-  onUseLegacyTerminalRendererChange,
   voiceAudioEngine,
   isPlaybackTestRunning,
   playbackTestResult,
@@ -409,26 +413,6 @@ function DiagnosticsSection({
   return (
     <SettingsSection title={t("settings.diagnostics.title")}>
       <View style={settingsStyles.card}>
-        {isNative ? (
-          <View style={settingsStyles.row} testID="legacy-terminal-renderer-row">
-            <View style={settingsStyles.rowContent}>
-              <Text style={settingsStyles.rowTitle}>
-                {t("settings.diagnostics.legacyTerminalRenderer.label")}
-              </Text>
-              <Text style={settingsStyles.rowHint}>
-                {t("settings.diagnostics.legacyTerminalRenderer.description")}
-              </Text>
-            </View>
-            <Switch
-              value={useLegacyTerminalRenderer}
-              onValueChange={onUseLegacyTerminalRendererChange}
-              accessibilityLabel={t(
-                "settings.diagnostics.legacyTerminalRenderer.accessibilityLabel",
-              )}
-              testID="legacy-terminal-renderer-switch"
-            />
-          </View>
-        ) : null}
         <View style={settingsStyles.row} testID="app-diagnostic-row">
           <View style={settingsStyles.rowContent}>
             <Text style={settingsStyles.rowTitle}>{t("settings.diagnostics.app.rowTitle")}</Text>
@@ -973,6 +957,7 @@ function SettingsSidebar({
   const items = SIDEBAR_SECTION_ITEMS.filter((item) => isSectionAvailable(item, isDesktopApp));
   const insets = useSafeAreaInsets();
   const isDesktop = layout === "desktop";
+  const sidebarScroll = useSettingsSidebarScroll(isDesktop);
   const outerContainerStyle = useMemo(
     () => [isDesktop ? sidebarStyles.desktopContainer : sidebarStyles.mobileContainer],
     [isDesktop],
@@ -1085,6 +1070,7 @@ function SettingsSidebar({
             style={sidebarStyles.scrollBody}
             showsVerticalScrollIndicator={false}
             testID="settings-sidebar-scroll-body"
+            {...sidebarScroll}
           >
             {sidebarBody}
           </ScrollView>
@@ -1128,21 +1114,7 @@ export default function SettingsScreen({ view, openAddHostIntent = null }: Setti
   const { resolution: main } = useMainHost();
   const localServerId = useLocalDaemonServerId();
   const sortedHosts = useSortedHosts(hosts, localServerId);
-  const lastWorkspaceSelection = useLastWorkspaceSelection();
-  const routedSettingsHostServerId =
-    view.kind === "host" || view.kind === "project" || view.kind === "plugin"
-      ? view.serverId
-      : null;
-  const [selectedSettingsHostServerId, setSelectedSettingsHostServerId] = useState<string | null>(
-    routedSettingsHostServerId ?? lastWorkspaceSelection?.serverId ?? null,
-  );
-  useFocusEffect(
-    useCallback(() => {
-      setSelectedSettingsHostServerId(
-        routedSettingsHostServerId ?? lastWorkspaceSelection?.serverId ?? null,
-      );
-    }, [lastWorkspaceSelection?.serverId, routedSettingsHostServerId]),
-  );
+  const selectedSettingsHostServerId = useSettingsHostSelection();
 
   // The host the four sections scope to: the host on the active view, otherwise
   // the picker choice, otherwise the connected local daemon, otherwise the first host.
@@ -1161,13 +1133,6 @@ export default function SettingsScreen({ view, openAddHostIntent = null }: Setti
   const handleLanguageChange = useCallback(
     (language: AppLanguage) => {
       void updateSettings({ language });
-    },
-    [updateSettings],
-  );
-
-  const handleUseLegacyTerminalRendererChange = useCallback(
-    (useLegacyTerminalRenderer: boolean) => {
-      void updateSettings({ useLegacyTerminalRenderer });
     },
     [updateSettings],
   );
@@ -1270,7 +1235,7 @@ export default function SettingsScreen({ view, openAddHostIntent = null }: Setti
   // host detail route, keep that detail section and swap only the host segment.
   const handleSelectHost = useCallback(
     (serverId: string) => {
-      setSelectedSettingsHostServerId(serverId);
+      selectSettingsHost(serverId);
       if (view.kind === "project") {
         const target = buildSettingsHostSectionRoute(serverId, "projects");
         if (isCompactLayout) {
@@ -1399,8 +1364,6 @@ export default function SettingsScreen({ view, openAddHostIntent = null }: Setti
         case "diagnostics":
           return (
             <DiagnosticsSection
-              useLegacyTerminalRenderer={settings.useLegacyTerminalRenderer}
-              onUseLegacyTerminalRendererChange={handleUseLegacyTerminalRendererChange}
               voiceAudioEngine={voiceAudioEngine}
               isPlaybackTestRunning={isPlaybackTestRunning}
               playbackTestResult={playbackTestResult}
@@ -1522,6 +1485,7 @@ export default function SettingsScreen({ view, openAddHostIntent = null }: Setti
               title={detailTitle}
               titleTestID="settings-detail-header-title"
               fullWidth={isMainHostConfirmation}
+              testID="settings-detail-scroll-body"
             >
               {content}
             </PageLayout>

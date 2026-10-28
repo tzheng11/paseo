@@ -56,6 +56,7 @@ export interface SeedDaemonClient {
     expectedValue: string;
     requestId?: string;
   }): Promise<{ value: string }>;
+  setWorkspaceTitle(workspaceId: string, title: string | null): Promise<{ title: string | null }>;
   setWorkspacePinned(workspaceId: string, pinned: boolean): Promise<{ pinnedAt: string | null }>;
   setWorkspaceSuperpinned(
     workspaceId: string,
@@ -170,7 +171,12 @@ export interface SeedDaemonClient {
     predicate: (snapshot: { status: string }) => boolean,
     timeout?: number,
   ): Promise<{ status: string }>;
-  sendAgentMessage(agentId: string, text: string): Promise<void>;
+  cancelAgent(agentId: string): Promise<void>;
+  sendAgentMessage(
+    agentId: string,
+    text: string,
+    options?: { sourceAgentId?: string },
+  ): Promise<void>;
   waitForFinish(
     agentId: string,
     timeout?: number,

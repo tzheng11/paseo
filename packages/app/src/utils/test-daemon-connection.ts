@@ -192,6 +192,20 @@ export async function buildClientConfig(
     };
   }
 
+  return buildRelayClientConfig({ connection, base, serverId });
+}
+
+interface RelayClientConfigInput {
+  connection: Extract<HostConnection, { type: "relay" }>;
+  base: Omit<DaemonClientConfig, "url">;
+  serverId?: string;
+}
+
+function buildRelayClientConfig({
+  connection,
+  base,
+  serverId,
+}: RelayClientConfigInput): DaemonClientConfig {
   if (!serverId) {
     throw new Error("serverId is required to probe a relay connection");
   }
@@ -203,7 +217,11 @@ export async function buildClientConfig(
       useTls: connection.useTls ?? shouldUseTlsForDefaultHostedRelay(connection.relayEndpoint),
       serverId,
     }),
-    e2ee: { enabled: true, daemonPublicKeyB64: connection.daemonPublicKeyB64 },
+    e2ee: {
+      enabled: true,
+      daemonPublicKeyB64: connection.daemonPublicKeyB64,
+      ...(connection.minimumSecurityMode ? { minimumMode: connection.minimumSecurityMode } : {}),
+    },
   };
 }
 

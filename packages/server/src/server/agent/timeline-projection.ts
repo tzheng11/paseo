@@ -1,3 +1,4 @@
+import { continuesTimelineTurn, isTimelineTurnTrigger } from "@getpaseo/protocol/timeline-turn";
 import type { AgentTimelineItem, ToolCallDetail } from "./agent-sdk-types.js";
 import { timelineItemIdentity } from "@getpaseo/protocol/timeline-identity";
 
@@ -295,6 +296,14 @@ function mergeAssistantChunks(entries: readonly WorkingEntry[]): WorkingEntry[] 
 /** A retained item. `seq` is its latest source event, not its display anchor. */
 export type ProjectedTimelineRow = AgentTimelineRow & TimelineProjectionEntry;
 
+interface ProjectedTimelinePageOptions {
+  wholeTurns?: boolean;
+  bounds: { minSeq: number; maxSeq: number };
+  direction: TimelineLimitDirection;
+  cursorSeq?: number;
+  limit?: number;
+}
+
 /** Owns projected state; source events are consumed, never retained. */
 /** Reuse the same projection rules for memory and disk-backed rows. */
 export function mergeProjectedTimelineRow(
@@ -316,24 +325,82 @@ export function mergeProjectedTimelineRow(
 export class TimelineProjection {
   private readonly rows: ProjectedTimelineRow[] = [];
   private readonly identities = new Map<string, number>();
+  private lastAssistantRowIndex: number | null = null;
+  // Disjoint source-coverage spans in display order. A tail starting inside a
+  // span must include its first anchor to cover interleaved lifecycle updates.
+  private readonly spans: { start: number; endSeq: number }[] = [];
+
+  private readonly sourceRanges: { startSeq: number; endSeq: number; rowIndex: number }[] = [];
+
+  constructor(rows: readonly AgentTimelineRow[] = []) {
+    for (const row of rows) this.appendProjected(row);
+    for (const [rowIndex, row] of this.rows.entries()) {
+      for (const range of row.sourceSeqRanges) this.sourceRanges.push({ ...range, rowIndex });
+    }
+    this.sourceRanges.sort((a, b) => a.startSeq - b.startSeq);
+  }
 
   append(row: AgentTimelineRow): void {
+    const rowIndex = this.appendProjected(row);
+    const last = this.sourceRanges.at(-1);
+    if (last && last.rowIndex === rowIndex && last.endSeq + 1 === row.seq) {
+      last.endSeq = row.seq;
+    } else {
+      this.sourceRanges.push({ startSeq: row.seq, endSeq: row.seq, rowIndex });
+    }
+  }
+
+  private appendProjected(row: AgentTimelineRow): number {
     const entry = makeCanonicalEntries([row])[0];
     const identity = timelineItemIdentity(row.item);
     const index = identity === null ? undefined : this.identities.get(identity);
     const existing = index === undefined ? undefined : this.rows[index];
     const merged = mergeProjectedTimelineRow(existing, entry, "identity");
     if (merged && index !== undefined) {
-      this.rows[index] = merged;
-      return;
+      this.rows[index] = { ...merged, seq: merged.seqEnd };
+      this.extendSpan(index);
+      return index;
     }
     const mergedText = mergeProjectedTimelineRow(this.rows.at(-1), entry, "adjacent");
     if (mergedText) {
-      this.rows[this.rows.length - 1] = mergedText;
-      return;
+      const adjacentIndex = this.rows.length - 1;
+      this.rows[adjacentIndex] = { ...mergedText, seq: mergedText.seqEnd };
+      this.extendSpan(adjacentIndex);
+      return adjacentIndex;
     }
     if (identity !== null) this.identities.set(identity, this.rows.length);
+    if (entry.item.type === "assistant_message") this.lastAssistantRowIndex = this.rows.length;
     this.rows.push({ ...entry, seq: entry.seqEnd });
+    const last = this.spans.at(-1);
+    if (last && last.endSeq >= entry.seqStart) {
+      last.endSeq = Math.max(last.endSeq, entry.seqEnd);
+    } else {
+      this.spans.push({ start: this.rows.length - 1, endSeq: entry.seqEnd });
+    }
+    return this.rows.length - 1;
+  }
+
+  private spanIndex(rowIndex: number): number {
+    let low = 0;
+    let high = this.spans.length;
+    while (low + 1 < high) {
+      const middle = (low + high) >>> 1;
+      if (this.spans[middle].start <= rowIndex) low = middle;
+      else high = middle;
+    }
+    return low;
+  }
+
+  private extendSpan(rowIndex: number): void {
+    const index = this.spanIndex(rowIndex);
+    const span = this.spans[index];
+    span.endSeq = Math.max(span.endSeq, this.rows[rowIndex].seqEnd);
+    let end = index + 1;
+    while (end < this.spans.length && this.rows[this.spans[end].start].seqStart <= span.endSeq) {
+      span.endSeq = Math.max(span.endSeq, this.spans[end].endSeq);
+      end++;
+    }
+    this.spans.splice(index + 1, end - index - 1);
   }
 
   get count(): number {
@@ -367,10 +434,6 @@ export class TimelineProjection {
     return chunks.length ? chunks.toReversed().join("") : null;
   }
 
-  selectPage(input: Omit<Parameters<typeof selectProjectedEntriesPage>[0], "entries">) {
-    return selectProjectedEntriesPage({ ...input, entries: this.rows });
-  }
-
   getRecentItems(limit: number): AgentTimelineItem[] {
     const count = Math.max(0, Math.floor(limit));
     const rows = count === 0 ? this.rows : this.rows.slice(-count);
@@ -379,6 +442,139 @@ export class TimelineProjection {
 
   getRows(): ProjectedTimelineRow[] {
     return this.rows.map((row) => ({ ...row }));
+  }
+
+  selectPage(input: ProjectedTimelinePageOptions): ProjectedTimelinePageSelection {
+    if (this.rows.length === 0) {
+      const cursor =
+        input.cursorSeq ??
+        (input.direction === "before" ? input.bounds.maxSeq + 1 : input.bounds.minSeq - 1);
+      return {
+        entries: [],
+        startSeq: null,
+        endSeq: null,
+        hasOlder:
+          input.direction === "after"
+            ? cursor >= input.bounds.minSeq
+            : input.direction === "before" && cursor > input.bounds.minSeq,
+        hasNewer:
+          input.direction === "after"
+            ? cursor < input.bounds.maxSeq
+            : input.direction === "before" && cursor <= input.bounds.maxSeq,
+      };
+    }
+    switch (input.direction) {
+      case "tail":
+        return this.selectTail(input);
+      case "after":
+        return this.selectAfter(input);
+      case "before":
+        return this.selectBefore(input);
+    }
+  }
+
+  private selectTail(input: ProjectedTimelinePageOptions): ProjectedTimelinePageSelection {
+    const limit = Math.max(0, Math.floor(input.limit ?? 0));
+    const requestedStart = limit === 0 ? 0 : Math.max(0, this.rows.length - limit);
+    const coveredStart = this.spans[this.spanIndex(requestedStart)].start;
+    const start = input.wholeTurns ? this.wholeTurnWindowStart(coveredStart) : coveredStart;
+    return {
+      entries: this.rows.slice(start),
+      startSeq: this.rows[start].seqStart,
+      endSeq: input.bounds.maxSeq,
+      hasOlder: start > 0,
+      hasNewer: false,
+    };
+  }
+
+  private wholeTurnWindowStart(requestedStart: number): number {
+    let start = requestedStart;
+    for (;;) {
+      while (start > 0 && continuesProjectedTurn(this.rows[start - 1], this.rows[start])) start--;
+      // Source coverage can pull in an earlier tool and therefore its entire run.
+      const coveredStart = this.spans[this.spanIndex(start)].start;
+      if (coveredStart === start) return start;
+      start = coveredStart;
+    }
+  }
+
+  private selectAfter(input: ProjectedTimelinePageOptions): ProjectedTimelinePageSelection {
+    const startSeq = Math.max(
+      input.bounds.minSeq,
+      (input.cursorSeq ?? input.bounds.minSeq - 1) + 1,
+    );
+    let low = 0;
+    let high = this.sourceRanges.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (this.sourceRanges[middle].endSeq < startSeq) low = middle + 1;
+      else high = middle;
+    }
+    const indexes = new Set<number>();
+    const limit = Math.max(0, Math.floor(input.limit ?? 0));
+    for (let i = low; i < this.sourceRanges.length; i++) {
+      const range = this.sourceRanges[i];
+      if (range.startSeq > input.bounds.maxSeq) break;
+      indexes.add(range.rowIndex);
+      if (limit > 0 && indexes.size === limit) break;
+    }
+    const entries = [...indexes].sort((a, b) => a - b).map((index) => this.rows[index]);
+    const selected = selectProjectedEntriesAfter({
+      entries,
+      startSeq,
+      maxSeq: input.bounds.maxSeq,
+      limit,
+    });
+    return {
+      entries: selected.entries,
+      startSeq: selected.endSeq === null ? null : startSeq,
+      endSeq: selected.endSeq,
+      hasOlder: startSeq > input.bounds.minSeq,
+      hasNewer: selected.endSeq !== null && selected.endSeq < input.bounds.maxSeq,
+    };
+  }
+
+  private selectBefore(input: ProjectedTimelinePageOptions): ProjectedTimelinePageSelection {
+    const endSeq = Math.min(input.bounds.maxSeq, (input.cursorSeq ?? input.bounds.maxSeq + 1) - 1);
+    if (endSeq >= input.bounds.minSeq) {
+      let low = 0;
+      let high = this.rows.length;
+      while (low < high) {
+        const middle = (low + high) >>> 1;
+        if (this.rows[middle].seqStart <= endSeq) low = middle + 1;
+        else high = middle;
+      }
+      const limit = Math.max(0, Math.floor(input.limit ?? 0));
+      const requestedStart = limit === 0 ? 0 : Math.max(0, low - limit);
+      const start = input.wholeTurns ? this.wholeTurnWindowStart(requestedStart) : requestedStart;
+      // Choose the window before extending the right edge, so a prompt jump
+      // cannot lose its target when the next turn is arbitrarily large.
+      if (input.wholeTurns) {
+        while (low < this.rows.length && continuesProjectedTurn(this.rows[low - 1], this.rows[low]))
+          low++;
+      }
+      let selectedEnd = endSeq;
+      if (input.wholeTurns)
+        selectedEnd = low === this.rows.length ? input.bounds.maxSeq : this.rows[low].seqStart - 1;
+      return {
+        entries: this.rows.slice(start, low),
+        startSeq: this.rows[start]?.seqStart ?? null,
+        endSeq: selectedEnd,
+        hasOlder: start > 0,
+        hasNewer: selectedEnd < input.bounds.maxSeq,
+      };
+    }
+    return { entries: [], startSeq: null, endSeq: null, hasOlder: false, hasNewer: true };
+  }
+
+  getLastItem(seq: number): AgentTimelineItem | null {
+    const last = this.sourceRanges.at(-1);
+    return last?.endSeq === seq ? this.rows[last.rowIndex].item : null;
+  }
+
+  getLastAssistantMessage(): string | null {
+    const row = this.lastAssistantRowIndex === null ? null : this.rows[this.lastAssistantRowIndex];
+    return row?.item.type === "assistant_message" ? row.item.text : null;
   }
 
   enrichSubmittedUserMessage(
@@ -498,21 +694,6 @@ export function selectTimelineWindowByProjectedLimit(input: {
   };
 }
 
-function getTimelineBounds(
-  rows: readonly AgentTimelineRow[],
-): { minSeq: number; maxSeq: number } | null {
-  const first = rows[0];
-  const last = rows[rows.length - 1];
-  if (!first || !last) {
-    return null;
-  }
-  const entries = makeCanonicalEntries(rows);
-  return {
-    minSeq: entries.reduce((min, e) => Math.min(min, e.seqStart), Infinity),
-    maxSeq: entries.reduce((max, e) => Math.max(max, e.seqEnd), 0),
-  };
-}
-
 function firstSourceSeqInRange(
   entry: TimelineProjectionEntry,
   startSeq: number,
@@ -608,6 +789,21 @@ function selectProjectedEntriesTail(
     endSeq: bounds.maxSeq,
     hasOlder: start > 0,
     hasNewer: false,
+  };
+}
+
+function getTimelineBounds(
+  rows: readonly AgentTimelineRow[],
+): { minSeq: number; maxSeq: number } | null {
+  const first = rows[0];
+  const last = rows[rows.length - 1];
+  if (!first || !last) {
+    return null;
+  }
+  const entries = makeCanonicalEntries(rows);
+  return {
+    minSeq: entries.reduce((min, e) => Math.min(min, e.seqStart), Infinity),
+    maxSeq: entries.reduce((max, e) => Math.max(max, e.seqEnd), 0),
   };
 }
 
@@ -717,6 +913,13 @@ export function selectProjectedEntriesPage(input: {
     hasOlder: selected.hasOlder,
     hasNewer: endSeq < bounds.maxSeq,
   };
+}
+
+function continuesProjectedTurn(
+  previous: TimelineProjectionEntry,
+  next: TimelineProjectionEntry,
+): boolean {
+  return continuesTimelineTurn(previous.turnId, next.turnId, isTimelineTurnTrigger(next.item));
 }
 
 /**

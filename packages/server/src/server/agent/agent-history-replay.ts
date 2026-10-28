@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { pruneAbandonedHistoryCaches } from "./agent-history-cache-directory.js";
-import { closeSync, createReadStream, openSync, readSync } from "node:fs";
+import { createReadStream } from "node:fs";
 import { chmod, copyFile, mkdtemp, open, rm, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -21,7 +21,7 @@ export function withAgentHistoryReadMetrics<T>(
   return requestHistoryReads.run(metrics, operation);
 }
 
-let prunedAbandonedReplays = false;
+let abandonedReplayPruning: Promise<void> | undefined;
 
 export interface HistoryReadLimit {
   events: number;
@@ -99,10 +99,8 @@ export class AgentHistoryReplay<T> {
     events: AsyncIterable<T> | Iterable<T>,
     options?: { key?: (event: T) => string | null; measureSource?: boolean },
   ): Promise<AgentHistoryReplay<T>> {
-    if (!prunedAbandonedReplays) {
-      pruneAbandonedHistoryCaches(tmpdir(), "paseo-history-");
-      prunedAbandonedReplays = true;
-    }
+    abandonedReplayPruning ??= pruneAbandonedHistoryCaches(tmpdir(), "paseo-history-");
+    await abandonedReplayPruning;
     const directory = await mkdtemp(path.join(tmpdir(), `paseo-history-${process.pid}-`));
     const replay = new AgentHistoryReplay<T>(directory, null);
     const metrics = options?.measureSource === false ? undefined : requestHistoryReads.getStore();
@@ -308,30 +306,6 @@ export class AgentHistoryReplay<T> {
 
   async *events(): AsyncGenerator<T> {
     yield* this.streamAll();
-  }
-
-  *eventsSync(): Generator<T> {
-    const descriptor = openSync(path.join(this.directory, "events.jsonl"), "r");
-    try {
-      for (const record of this.records) {
-        const buffer = Buffer.allocUnsafe(record.bytes);
-        let read = 0;
-        while (read < record.bytes) {
-          const bytes = readSync(
-            descriptor,
-            buffer,
-            read,
-            record.bytes - read,
-            record.offset + read,
-          );
-          if (!bytes) throw new Error("History source was truncated during streamed read");
-          read += bytes;
-        }
-        yield JSON.parse(buffer.toString("utf8")) as T;
-      }
-    } finally {
-      closeSync(descriptor);
-    }
   }
 
   async close(): Promise<void> {

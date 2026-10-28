@@ -1,3 +1,4 @@
+import { usePanelStore } from "@/stores/panel-store";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
 import { useMainHost } from "@/hosts/use-main-host";
 import { router } from "expo-router";
@@ -482,6 +483,7 @@ export function AddProjectFlow({ request, onClose }: AddProjectFlowProps) {
   const openNewWorkspaceForProject = useCallback(
     (serverId: string, project: WorkspaceProjectDescriptorPayload) => {
       onClose();
+      usePanelStore.getState().showMobileAgent();
       router.push(
         buildNewWorkspaceRoute({
           serverId,
@@ -629,6 +631,7 @@ export function AddProjectFlow({ request, onClose }: AddProjectFlowProps) {
           testID: "add-project-flow-add-host",
           select: () => {
             onClose();
+            usePanelStore.getState().showMobileAgent();
             router.push(buildSettingsAddHostRoute(Date.now()));
           },
         });

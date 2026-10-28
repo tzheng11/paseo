@@ -29,7 +29,7 @@ import {
   type ActiveWorkspaceSelection,
 } from "@/stores/navigation-active-workspace-store";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
-import { density, densityIconBox } from "@/styles/density";
+import { density, densityIconBox, densityIconProps } from "@/styles/density";
 import type { Theme } from "@/styles/theme";
 import type { SidebarSurfaceBackdrop } from "@/styles/surface-backdrop";
 import { getSidebarRowBackdrop } from "@/components/sidebar/sidebar-row-backdrop";
@@ -119,6 +119,9 @@ import {
 import { captureVisiblePinnedOrder } from "@/components/sidebar/workspace-tree/capture-pinned-order";
 import { PinnedSectionHeader } from "@/components/sidebar/pinned-section-header";
 import { ProjectWorkspaceSortMenu } from "@/components/sidebar/workspace-sort-menu";
+import { SidebarGroupToggleRow } from "@/components/sidebar/sidebar-group-toggle-row";
+import { createWorkspaceVisibilityPolicy } from "@/components/sidebar/sidebar-group-visibility";
+import { useLimitedSidebarGroup } from "@/components/sidebar/use-limited-sidebar-group";
 import {
   SidebarWorkspaceRowFrame,
   SidebarWorkspaceRowContent,
@@ -289,7 +292,7 @@ interface WorkspaceRowInnerProps {
   shortcutNumber: number | null;
   showShortcutBadge: boolean;
   onPress: () => void;
-  drag: () => void;
+  drag?: () => void;
   isDragging: boolean;
   isArchiving: boolean;
   isCreating?: boolean;
@@ -398,8 +401,6 @@ function getProjectWorkspaceRowStyle({
   ];
 }
 
-function noop() {}
-
 const prBadgeStyles = StyleSheet.create((theme) => ({
   badge: {
     flexDirection: "row",
@@ -482,12 +483,12 @@ const openInNewWindowLeadingIcon = (
   <ThemedExternalLink size={14} uniProps={foregroundMutedColorMapping} />
 );
 
+const kebabTriggerIconProps = densityIconProps("sm", foregroundMutedColorMapping);
+const kebabTriggerIconHoveredProps = densityIconProps("sm", foregroundColorMapping);
+
 function renderKebabTriggerIcon({ hovered }: { hovered?: boolean }) {
   return (
-    <ThemedMoreVertical
-      size={14}
-      uniProps={hovered ? foregroundColorMapping : foregroundMutedColorMapping}
-    />
+    <ThemedMoreVertical uniProps={hovered ? kebabTriggerIconHoveredProps : kebabTriggerIconProps} />
   );
 }
 
@@ -1254,7 +1255,7 @@ function WorkspaceRowWithMenu({
   shortcutNumber: number | null;
   showShortcutBadge: boolean;
   onPress: () => void;
-  drag: () => void;
+  drag?: () => void;
   isDragging: boolean;
   dragHandleProps?: DraggableListDragHandleProps;
   canCopyBranchName: boolean;
@@ -1421,7 +1422,6 @@ function WorkspaceRowItem({
   isCreating = false,
   selectionEnabled,
   activeWorkspaceSelection,
-  onWorkspacePress,
   drag,
   isDragging = false,
   dragHandleProps,
@@ -1430,9 +1430,8 @@ function WorkspaceRowItem({
     if (!workspace.serverId) {
       return;
     }
-    onWorkspacePress?.();
     navigateToWorkspace({ serverId: workspace.serverId, workspaceId: workspace.workspaceId });
-  }, [onWorkspacePress, workspace.serverId, workspace.workspaceId]);
+  }, [workspace.serverId, workspace.workspaceId]);
 
   return (
     <WorkspaceRow
@@ -1454,7 +1453,7 @@ function WorkspaceRowItem({
         enabled: selectionEnabled,
       })}
       onPress={handlePress}
-      drag={drag ?? noop}
+      drag={drag}
       isDragging={isDragging}
       dragHandleProps={dragHandleProps}
     />
@@ -1483,7 +1482,7 @@ function areWorkspaceRowItemPropsEqual(
     previous.hostBadge === next.hostBadge &&
     previous.leadingProjectName === next.leadingProjectName &&
     previous.leadingProjectIconDataUri === next.leadingProjectIconDataUri &&
-    previous.shortcutNumber === next.shortcutNumber &&
+    (!next.showShortcutBadge || previous.shortcutNumber === next.shortcutNumber) &&
     previous.showShortcutBadge === next.showShortcutBadge &&
     previous.canCopyBranchName === next.canCopyBranchName &&
     previous.canPin === next.canPin &&
@@ -1525,7 +1524,7 @@ function WorkspaceRow({
   shortcutNumber: number | null;
   showShortcutBadge: boolean;
   onPress: () => void;
-  drag: () => void;
+  drag?: () => void;
   isDragging: boolean;
   dragHandleProps?: DraggableListDragHandleProps;
   canCopyBranchName: boolean;
@@ -1604,6 +1603,16 @@ function ProjectBlock({
   supportsPinningByServerId: ReadonlyMap<string, boolean>;
   onToggleWorkspacePin: ToggleSidebarWorkspacePin;
 }) {
+  const visibilityPolicy = useMemo(
+    () => createWorkspaceVisibilityPolicy<SidebarWorkspacePlacement>(workspaceEntriesByKey),
+    [workspaceEntriesByKey],
+  );
+  const {
+    visibleItems: visibleWorkspaces,
+    expanded: workspacesExpanded,
+    canToggle: canToggleWorkspaces,
+    toggleExpanded: toggleWorkspacesExpanded,
+  } = useLimitedSidebarGroup(project.workspaces, visibilityPolicy);
   const activeServerId = activeWorkspaceSelection?.serverId ?? null;
   const activeHostStatus = useHostRuntimeConnectionStatus(activeServerId ?? "");
   const preferredServerId = activeHostStatus === "online" ? activeServerId : null;
@@ -1645,6 +1654,7 @@ function ProjectBlock({
     ) => {
       return (
         <MemoWorkspaceRowItem
+          key={item.workspaceKey}
           workspace={item}
           workspaceEntry={workspaceEntriesByKey.get(item.workspaceKey) ?? null}
           hostBadge={hostBadgeByServerId.get(item.serverId) ?? null}
@@ -1758,12 +1768,21 @@ function ProjectBlock({
   if (!collapsed) {
     if (project.workspaces.length > 0) {
       projectChildren = (
-        <SidebarWorkspaceTreeList
-          testID={`sidebar-workspace-list-${project.viewKey}`}
-          data={project.workspaces}
-          sortSiblings={sortWorkspaceSiblings}
-          renderItem={renderWorkspace}
-        />
+        <>
+          <SidebarWorkspaceTreeList
+            testID={`sidebar-workspace-list-${project.viewKey}`}
+            data={visibleWorkspaces}
+            sortSiblings={sortWorkspaceSiblings}
+            renderItem={renderWorkspace}
+          />
+          {canToggleWorkspaces ? (
+            <SidebarGroupToggleRow
+              expanded={workspacesExpanded}
+              onPress={toggleWorkspacesExpanded}
+              testID={`sidebar-project-show-more-${project.viewKey}`}
+            />
+          ) : null}
+        </>
       );
     } else if (rowModel.trailingAction.kind === "new_workspace") {
       projectChildren = (
@@ -1817,13 +1836,13 @@ type ProjectBlockProps = Parameters<typeof ProjectBlock>[0];
 function areProjectBlockPropsEqual(previous: ProjectBlockProps, next: ProjectBlockProps): boolean {
   return (
     previous.project === next.project &&
-    previous.workspaceEntriesByKey === next.workspaceEntriesByKey &&
+    projectWorkspaceEntriesEqual(previous, next) &&
     previous.collapsed === next.collapsed &&
     previous.displayName === next.displayName &&
     previous.iconDataUri === next.iconDataUri &&
     previous.selectionEnabled === next.selectionEnabled &&
     previous.showShortcutBadges === next.showShortcutBadges &&
-    previous.shortcutIndexByWorkspaceKey === next.shortcutIndexByWorkspaceKey &&
+    projectShortcutBadgesEqual(previous, next) &&
     previous.hostBadgeByServerId === next.hostBadgeByServerId &&
     previous.supportsMultiplicityByServerId === next.supportsMultiplicityByServerId &&
     previous.supportsPinningByServerId === next.supportsPinningByServerId &&
@@ -1837,6 +1856,31 @@ function areProjectBlockPropsEqual(previous: ProjectBlockProps, next: ProjectBlo
     previous.creatingWorkspaceIds === next.creatingWorkspaceIds &&
     previous.activeWorkspaceSelection?.serverId === next.activeWorkspaceSelection?.serverId &&
     areProjectBlockSelectionsEqual(previous, next)
+  );
+}
+
+function projectShortcutBadgesEqual(previous: ProjectBlockProps, next: ProjectBlockProps): boolean {
+  if (
+    !next.showShortcutBadges ||
+    previous.shortcutIndexByWorkspaceKey === next.shortcutIndexByWorkspaceKey
+  )
+    return true;
+  return next.project.workspaces.every(
+    ({ workspaceKey }) =>
+      previous.shortcutIndexByWorkspaceKey.get(workspaceKey) ===
+      next.shortcutIndexByWorkspaceKey.get(workspaceKey),
+  );
+}
+
+function projectWorkspaceEntriesEqual(
+  previous: ProjectBlockProps,
+  next: ProjectBlockProps,
+): boolean {
+  if (previous.workspaceEntriesByKey === next.workspaceEntriesByKey) return true;
+  return next.project.workspaces.every(
+    ({ workspaceKey }) =>
+      previous.workspaceEntriesByKey.get(workspaceKey) ===
+      next.workspaceEntriesByKey.get(workspaceKey),
   );
 }
 
@@ -2790,8 +2834,12 @@ const styles = StyleSheet.create((theme) => ({
     marginRight: -6,
   },
   projectKebabButton: {
-    width: 24,
-    height: 24,
+    // Larger on compact so the kebab is an easy tap target. The negative margins keep its
+    // dots on the same rail as the 24px desktop box and the row at its 44px height.
+    width: { xs: 32, md: 24 },
+    height: { xs: 32, md: 24 },
+    marginRight: { xs: -4, md: 0 },
+    marginVertical: { xs: -4, md: 0 },
     borderRadius: theme.borderRadius.md,
     alignItems: "center",
     justifyContent: "center",

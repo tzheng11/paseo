@@ -21,6 +21,7 @@ import { CreationClient } from "./creation/index.js";
 import type { CreationSnapshot } from "@getpaseo/protocol/messages";
 import type { z } from "zod";
 import type { SessionEventSubscription } from "@getpaseo/protocol/messages";
+import type { LocalSpeechModel } from "@getpaseo/protocol/speech/rpc-schemas";
 import { CLIENT_CAPS, type ClientCapability } from "@getpaseo/protocol/client-capabilities";
 import type { AgentAttentionNotificationPayload } from "@getpaseo/protocol/agent-attention-notification";
 import { MAX_WEBSOCKET_MESSAGE_BYTES } from "@getpaseo/protocol/websocket-message-limit";
@@ -167,10 +168,11 @@ import {
 } from "@getpaseo/protocol/binary-frames/index";
 import {
   createRelayE2eeTransportFactory,
-  createRelayTransportFactory,
+  createRelayUpgradeTransportFactory,
   createWebSocketTransportFactory,
   decodeMessageData,
   defaultWebSocketFactory,
+  describeEndpointSecurityClose,
   describeTransportClose,
   describeTransportError,
   type DaemonTransport,
@@ -399,6 +401,9 @@ export type DaemonEventHandler = (event: DaemonEvent) => void;
 export type BrowserAutomationExecuteRequestMessage = BrowserAutomationExecuteRequest;
 export type BrowserAutomationExecuteResponseMessage = BrowserAutomationExecuteResponse;
 
+/** Endpoint security negotiated on a relay connection. See docs/relay-endpoint-security.md. */
+export type RelaySecurityMode = "legacy" | "protected";
+
 export interface DaemonClientConfig {
   /** Deliver compact bodies/hash references to a caller-owned snapshot cache.
    * The default keeps public SDK snapshot entries expanded. */
@@ -420,6 +425,10 @@ export interface DaemonClientConfig {
   e2ee?: {
     enabled?: boolean;
     daemonPublicKeyB64?: string;
+    /** Refuse connections whose negotiated endpoint security is below this mode. */
+    minimumMode?: RelaySecurityMode;
+    /** Called with the negotiated mode after each authenticated relay handshake. */
+    onSecurityMode?: (mode: RelaySecurityMode) => void;
   };
   reconnect?: {
     enabled?: boolean;
@@ -690,6 +699,8 @@ export interface FetchAgentOptions {
 }
 type LegacyFetchAgentOptions = Omit<FetchAgentOptions, "agentId">;
 export interface FetchAgentTimelineOptions {
+  /** Prefer whole-turn pages when supported; older hosts retain item-based paging. */
+  wholeTurns?: boolean;
   direction?: FetchAgentTimelineDirection;
   cursor?: FetchAgentTimelineCursor;
   limit?: number;
@@ -1360,6 +1371,12 @@ export class DaemonClient {
   private completedBinaryFileReads = new Map<string, FileReadResult>();
   private logger: Logger;
   private pendingSendQueue: PendingSend[] = [];
+  /**
+   * Lowest relay endpoint security this client accepts on its next attempt.
+   * Starts at the configured minimum and rises to "protected" once a daemon
+   * negotiates it, so a later reconnect cannot be downgraded to legacy.
+   */
+  private relaySecurityFloorValue: RelaySecurityMode | undefined;
   private readonly logConnectionPath: "direct" | "relay";
   private readonly logServerId: string | null;
   private readonly logClientIdHash: string;
@@ -1375,6 +1392,7 @@ export class DaemonClient {
 
   constructor(private config: DaemonClientConfig) {
     this.logger = config.logger ?? consoleLogger;
+    this.relaySecurityFloorValue = config.e2ee?.minimumMode;
     this.logConnectionPath = isRelayClientWebSocketUrl(this.config.url) ? "relay" : "direct";
     let parsedUrlForLog: URL | null = null;
     try {
@@ -1476,14 +1494,15 @@ export class DaemonClient {
         this.config.transportFactory ??
         createWebSocketTransportFactory(this.config.webSocketFactory ?? defaultWebSocketFactory);
       const isRelayTransport = isRelayClientWebSocketUrl(this.config.url);
-      const shouldUseRelayE2ee = this.config.e2ee?.enabled === true && isRelayTransport;
       this.assertEncryptedRelayAuth(selected.helloAuth, isRelayTransport);
 
+      // Relay upgrades are routing only: credentials never reach the relay socket.
       let transportFactory = isRelayTransport
-        ? createRelayTransportFactory(baseTransportFactory)
+        ? createRelayUpgradeTransportFactory(baseTransportFactory)
         : baseTransportFactory;
-      if (shouldUseRelayE2ee) {
-        const daemonPublicKeyB64 = this.config.e2ee?.daemonPublicKeyB64;
+      // Endpoint security is selected by configuration, never inferred from the URL.
+      if (this.config.e2ee?.enabled === true) {
+        const daemonPublicKeyB64 = this.config.e2ee.daemonPublicKeyB64;
         if (!daemonPublicKeyB64) {
           throw new Error("daemonPublicKeyB64 is required for relay E2EE");
         }
@@ -1491,6 +1510,11 @@ export class DaemonClient {
           baseFactory: transportFactory,
           daemonPublicKeyB64,
           logger: this.logger,
+          ...(this.relaySecurityFloorValue ? { minimumMode: this.relaySecurityFloorValue } : {}),
+          onSecurityMode: (mode) => {
+            if (mode === "protected") this.relaySecurityFloorValue = "protected";
+            this.config.e2ee?.onSecurityMode?.(mode);
+          },
         });
       }
       const transportUrl = this.resolveTransportUrlForAttempt();
@@ -1548,9 +1572,12 @@ export class DaemonClient {
             this.pendingGenericTransportErrorTimeout = null;
           }
           this.authFailureReasonValue ??= authFailureFromLegacyClose(event);
+          // An endpoint security policy close cannot be fixed by retrying.
+          const securityFailure = describeEndpointSecurityClose(event);
+          if (securityFailure) this.setReconnectEnabled(false);
           const reason = this.authFailureReasonValue
             ? new DaemonAuthenticationError(this.authFailureReasonValue).message
-            : describeTransportClose(event);
+            : (securityFailure ?? describeTransportClose(event));
           if (reason) {
             this.lastErrorValue = reason;
           }
@@ -1850,6 +1877,11 @@ export class DaemonClient {
 
   get isConnecting(): boolean {
     return this.connectionState.status === "connecting";
+  }
+
+  /** The relay endpoint security this client requires on its next attempt. */
+  get relaySecurityFloor(): RelaySecurityMode | undefined {
+    return this.relaySecurityFloorValue;
   }
 
   get lastError(): string | null {
@@ -3718,9 +3750,15 @@ export class DaemonClient {
     agentId: string,
     options: FetchAgentTimelineOptions = {},
   ): Promise<FetchAgentTimelinePayload> {
+    // COMPAT(wholeTurnTimeline): added after v0.13.2 (#8010); remove after 2027-04-27 once the daemon floor supports whole-turn pages.
+    // Reading history predates this capability and must keep working on older hosts.
+    const supportsWholeTurns = this.lastServerInfoMessage?.features?.wholeTurnTimeline === true;
     const resolvedRequestId = this.createRequestId(options.requestId);
     const message = SessionInboundMessageSchema.parse({
       type: "fetch_agent_timeline_request",
+      ...(supportsWholeTurns && options.wholeTurns !== undefined
+        ? { wholeTurns: options.wholeTurns }
+        : {}),
       agentId,
       requestId: resolvedRequestId,
       ...(options.direction ? { direction: options.direction } : {}),
@@ -5776,6 +5814,34 @@ export class DaemonClient {
       },
       responseType: "set_daemon_config_response",
     });
+  }
+
+  async listLocalSpeechModels(requestId?: string): Promise<LocalSpeechModel[]> {
+    const payload = await this.sendCorrelatedSessionRequest({
+      requestId,
+      message: { type: "speech.local_models.list.request" },
+      responseType: "speech.local_models.list.response",
+    });
+    if (payload.error) throw new Error(payload.error);
+    return payload.models;
+  }
+
+  async downloadLocalSpeechModel(modelId: string, requestId?: string): Promise<void> {
+    const payload = await this.sendCorrelatedSessionRequest({
+      requestId,
+      message: { type: "speech.local_models.download.request", modelId },
+      responseType: "speech.local_models.download.response",
+    });
+    if (payload.error) throw new Error(payload.error);
+  }
+
+  async deleteLocalSpeechModel(modelId: string, requestId?: string): Promise<void> {
+    const payload = await this.sendCorrelatedSessionRequest({
+      requestId,
+      message: { type: "speech.local_models.delete.request", modelId },
+      responseType: "speech.local_models.delete.response",
+    });
+    if (payload.error) throw new Error(payload.error);
   }
 
   sendBrowserAutomationExecuteResponse(response: BrowserAutomationExecuteResponse): void {

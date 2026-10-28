@@ -3,7 +3,16 @@ import type { Logger } from "pino";
 import { z } from "zod";
 
 import { terminateWithTreeKill } from "../../../../utils/tree-kill.js";
-import { JsonlFrameDecoder, JsonlFrameSizeError } from "../jsonl-frame-decoder.js";
+
+import {
+  JsonlFrameDecoder,
+  JsonlFrameSizeError,
+  ProviderStreamLimitError,
+} from "../jsonl-frame-decoder.js";
+
+// A measured long-thread resume was 19.75 MB; preserve the existing 32 MiB fixture
+// with 4x margin for longer threads. This is provider stdout, not the client protocol.
+export const CODEX_PROVIDER_LINE_BYTES = 128 * 1024 * 1024;
 
 const DEFAULT_TIMEOUT_MS = 14 * 24 * 60 * 60 * 1000;
 const APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_MS = 2_000;
@@ -169,6 +178,7 @@ function readProviderTurnId(params: unknown): string | undefined {
 
 export class CodexAppServerClient {
   private readonly frameDecoder: JsonlFrameDecoder;
+  private activeProviderRequests = 0;
   private readonly pending = new Map<number, PendingRequest>();
   private readonly requestHandlers = new Map<string, RequestHandler>();
   private notificationHandler: NotificationHandler | null = null;
@@ -187,13 +197,14 @@ export class CodexAppServerClient {
     private readonly getTraceContext: () => CodexAppServerTraceContext = () => ({}),
   ) {
     this.frameDecoder = new JsonlFrameDecoder({
+      providerLineBytes: CODEX_PROVIDER_LINE_BYTES,
       frame: (frame) => {
         void this.handleFrame(frame).catch((error) => {
           this.logger.warn({ error }, "Failed to handle Codex app-server stdout frame");
         });
       },
       problem: (problem, detail) => {
-        if (detail instanceof JsonlFrameSizeError) {
+        if (detail instanceof JsonlFrameSizeError || detail instanceof ProviderStreamLimitError) {
           this.handleUnexpectedTermination(detail);
           void this.dispose().catch((error) => {
             this.logger.error({ error }, "Failed to stop oversized Codex app-server response");
@@ -238,6 +249,10 @@ export class CodexAppServerClient {
 
   setRequestHandler(method: string, handler: RequestHandler): void {
     this.requestHandlers.set(method, handler);
+  }
+
+  hasPendingRequests(): boolean {
+    return this.pending.size > 0 || this.activeProviderRequests > 0;
   }
 
   request(method: string, params?: unknown, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<unknown> {
@@ -365,6 +380,7 @@ export class CodexAppServerClient {
         this.traceRawEvent(request);
         const handler = this.requestHandlers.get(request.method);
         try {
+          this.activeProviderRequests++;
           const result = handler ? await handler(request.params, request.id) : {};
           this.writeJsonRpcResponse({ id: request.id, result });
         } catch (error) {
@@ -372,6 +388,8 @@ export class CodexAppServerClient {
             id: request.id,
             error: { message: error instanceof Error ? error.message : String(error) },
           });
+        } finally {
+          this.activeProviderRequests--;
         }
         return;
       }

@@ -1,3 +1,4 @@
+import { type WorkspaceRuntimeStore } from "./workspace-runtime-store/index.js";
 import type pino from "pino";
 import type { SubscribeCheckoutDiffRequest, SessionOutboundMessage } from "./messages.js";
 import type { WorkspaceGitRuntimeSnapshot, WorkspaceGitService } from "./workspace-git-service.js";
@@ -68,6 +69,7 @@ export class CheckoutDiffManager {
     logger: pino.Logger;
     paseoHome: string;
     workspaceGitService: CheckoutDiffWorkspace;
+    workspaceRuntimeStore: WorkspaceRuntimeStore;
   }) {
     this.workspaceGitService = options.workspaceGitService;
     this.logger = options.logger;
