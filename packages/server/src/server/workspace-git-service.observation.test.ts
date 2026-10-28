@@ -1843,6 +1843,8 @@ describe("WorkspaceGitService checkout observation", () => {
     });
     const subscriptions = worktrees.map((cwd) => service.registerWorkspace({ cwd }, vi.fn()));
     try {
+      // The batch starts after bounded observation admission, including metadata setup.
+      await Promise.all(subscriptions.map((subscription) => subscription.ready));
       await vi.waitFor(() => {
         expect(service.getMetrics()).toMatchObject({
           repositoryTargetCount: 1,
