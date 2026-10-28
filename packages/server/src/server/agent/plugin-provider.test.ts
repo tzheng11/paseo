@@ -1288,7 +1288,7 @@ test.each([true, false, "error", "wrong-session", "missing"] as const)(
   },
 );
 
-test("plugin without a runtime safety capability uses baseline collection without a query", async () => {
+test("plugin without runtime safety proof stays resident without a query", async () => {
   const home = await mkdtemp(join(tmpdir(), "plugin-baseline-cleanup-"));
   const logger = createTestLogger();
   const storage = new AgentStorage(join(home, "agents"), logger);
@@ -1310,8 +1310,8 @@ test("plugin without a runtime safety capability uses baseline collection withou
   });
   try {
     expect(agent.session?.canStopRuntime).toBeUndefined();
-    expect((await cleanup.sweep()).collected).toHaveLength(1);
-    expect(manager.getAgent(agent.id)).toBeNull();
+    expect((await cleanup.sweep()).collected).toEqual([]);
+    expect(manager.getAgent(agent.id)).toMatchObject({ id: agent.id });
     expect(harness.inputs.filter((input) => input.type === "session.can_stop_runtime")).toEqual([]);
   } finally {
     await cleanup.close();

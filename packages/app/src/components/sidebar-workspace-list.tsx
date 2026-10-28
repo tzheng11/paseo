@@ -95,7 +95,11 @@ import { ProjectLeadingVisual } from "@/components/sidebar/project-leading-visua
 import { useToast } from "@/contexts/toast-context";
 import { getForgePresentation, normalizeForge } from "@/git/forge";
 import { toWorktreeArchiveRisk } from "@/git/worktree-archive-warning";
-import { hasVisibleOrderChanged, mergeWithRemainder } from "@/utils/sidebar-reorder";
+import {
+  captureUnmovedProjectOrders,
+  hasVisibleOrderChanged,
+  mergeWithRemainder,
+} from "@/utils/sidebar-reorder";
 import { confirmDialog } from "@/utils/confirm-dialog";
 import type { SidebarStateBucket } from "@/utils/sidebar-agent-state";
 import { SidebarStatusWorkspaceList } from "@/components/sidebar/sidebar-status-list";
@@ -2266,12 +2270,33 @@ export function SidebarWorkspaceList({
               if (drop.pinSection === "unpinned")
                 store.setWorkspaceSortMode(UNGROUPED_WORKSPACE_SORT_KEY, "manual");
               else store.setPinnedWorkspaceSortMode("manual");
-            } else store.setWorkspaceSortMode(workspace.projectViewKey, "manual");
+            } else {
+              if (useSidebarViewStore.getState().workspaceSort !== "manual") {
+                for (const update of captureUnmovedProjectOrders({
+                  projects: pinnedGroups.unpinnedProjects,
+                  movedProjectViewKey: workspace.projectViewKey,
+                  workspaceOrderByProject: store.workspaceOrderByProject,
+                  workspaceSortModeByProject: store.workspaceSortModeByProject,
+                }))
+                  store.setWorkspaceOrder(update.projectViewKey, update.order);
+              }
+              // The host now owns the successful ordinary move. Retire only
+              // this project's legacy client order; untouched projects retain
+              // their pre-beta manual order until the user moves them.
+              store.setWorkspaceOrder(workspace.projectViewKey, []);
+              store.setWorkspaceSortMode(workspace.projectViewKey, "manual");
+              useSidebarViewStore.getState().setWorkspaceSort("manual");
+            }
           },
         });
       });
     },
-    [fullHierarchyWorkspaces, hierarchyWorkspaces, pinnedWorkspaceTree],
+    [
+      fullHierarchyWorkspaces,
+      hierarchyWorkspaces,
+      pinnedWorkspaceTree,
+      pinnedGroups.unpinnedProjects,
+    ],
   );
   // One fetch, one map, every mode — project mode paints icons on its headers and status mode
   // paints them on each row, all keyed by `projectViewKey`. The targets come from the projection

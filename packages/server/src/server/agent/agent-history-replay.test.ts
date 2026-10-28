@@ -12,9 +12,11 @@ describe("AgentHistoryReplay", () => {
   it("retries abandoned cache pruning after a transient filesystem failure", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "paseo-prune-retry-test-"));
     const target = path.join(root, "temporary-root");
-    const previous = process.env.TMPDIR;
+    // Node uses TEMP on Windows and TMPDIR on POSIX.
+    const temporaryRootVariable = process.platform === "win32" ? "TEMP" : "TMPDIR";
+    const previous = process.env[temporaryRootVariable];
     await writeFile(target, "temporarily not a directory");
-    process.env.TMPDIR = target;
+    process.env[temporaryRootVariable] = target;
     try {
       await expect(AgentHistoryReplay.create([])).rejects.toMatchObject({ code: "ENOTDIR" });
       await rm(target);
@@ -26,8 +28,8 @@ describe("AgentHistoryReplay", () => {
         await replay.close();
       }
     } finally {
-      if (previous === undefined) delete process.env.TMPDIR;
-      else process.env.TMPDIR = previous;
+      if (previous === undefined) delete process.env[temporaryRootVariable];
+      else process.env[temporaryRootVariable] = previous;
       await rm(root, { recursive: true, force: true });
     }
   });

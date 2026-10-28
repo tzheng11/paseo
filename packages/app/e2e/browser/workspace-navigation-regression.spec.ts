@@ -218,7 +218,9 @@ test.describe("Workspace navigation regression", () => {
       timeout: 30_000,
     });
     await expect(page.getByTestId("agent-route-waiting-for-host")).toBeVisible();
-    await expect(page.getByText(/Notification Host/).first()).toBeVisible();
+    await expect(
+      page.getByTestId("agent-route-waiting-for-host").getByText(/Notification Host/),
+    ).toBeVisible();
   });
 
   test("cold agent targets hydrate their workspace without opening the compact sidebar", async ({

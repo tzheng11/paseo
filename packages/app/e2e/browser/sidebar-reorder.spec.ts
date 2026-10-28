@@ -62,7 +62,16 @@ async function quickDragFirstRowAfterSecond(
   await expect(rows).toHaveCount(2);
   const before = await rowTestIds(rows);
   const sourceBox = await visibleBoundingBox(rows.nth(0));
-  const targetBox = await visibleBoundingBox(rows.nth(1));
+  const targetRow = rows.nth(1);
+  const targetId = await targetRow.getAttribute("data-testid");
+  const workspaceTarget = targetId?.startsWith("sidebar-workspace-row-") ?? false;
+  // Workspace before/inside/after zones belong to the whole tree node,
+  // including its nesting controls, rather than the inner pressable row.
+  const targetBox = await visibleBoundingBox(
+    workspaceTarget
+      ? rows.page().getByTestId(targetId!.replace("sidebar-workspace-row-", "workspace-tree-node-"))
+      : targetRow,
+  );
 
   const page = rows.page();
   const source = {
@@ -71,13 +80,14 @@ async function quickDragFirstRowAfterSecond(
   };
   const target = {
     x: targetBox.x + targetBox.width / 2,
-    y: targetBox.y + targetBox.height * 0.9,
+    y: targetBox.y + (workspaceTarget ? targetBox.height - 2 : targetBox.height * 0.9),
   };
 
   await page.mouse.move(source.x, source.y);
   await pressRow(rows);
   await page.mouse.move(source.x, source.y + 7);
   await page.mouse.move(target.x, target.y, { steps: 4 });
+  if (workspaceTarget) await expect(page.getByTestId("workspace-tree-drop-after")).toBeVisible();
   await page.mouse.up();
 
   await expect.poll(() => rowTestIds(rows)).toEqual([before[1], before[0]]);
@@ -95,9 +105,7 @@ async function dragWithoutReordering(rows: Locator): Promise<void> {
   await expect.poll(() => rowTestIds(rows)).toEqual(before);
 }
 
-test("projects and pinned chats reorder while ordinary workspaces stay newest first", async ({
-  page,
-}) => {
+test("projects, pinned chats and ordinary workspaces reorder", async ({ page }) => {
   const firstProject = await seedWorkspace({
     repoPrefix: "sidebar-reorder-first-",
   });
@@ -148,7 +156,8 @@ test("projects and pinned chats reorder while ordinary workspaces stay newest fi
     );
     await expect
       .poll(() => rowTestIds(ordinaryRows))
-      .toEqual([secondWorkspaceTestId, firstWorkspaceTestId]);
+      .toEqual([firstWorkspaceTestId, secondWorkspaceTestId]);
+    // Ordinary workspaces reorder as flat siblings; dropping inside stays blocked.
     await dragWithoutReordering(ordinaryRows);
 
     await firstProject.client.setWorkspacePinned(firstProject.workspaceId, true);

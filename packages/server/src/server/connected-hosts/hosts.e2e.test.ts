@@ -1713,7 +1713,7 @@ test(
           if (config.title === "Batch parent")
             parentPrompts.push(typeof prompt === "string" ? prompt : JSON.stringify(prompt));
         },
-        // Receipts acknowledge dispatch, so keep the turn active until both writes settle.
+        // Hold the first recipient turn until its report has been observed.
         beforeTurnComplete: () => finishParent.promise,
       }),
     });
@@ -1816,6 +1816,10 @@ test(
     // Exercise each delivery across windows; delivery.test.ts owns batching with a clock.
     await expect.poll(() => parentPrompts, { timeout: 10000 }).toHaveLength(1);
     expect(parentPrompts[0]).toContain("REMOTE_REPORT &lt;ready&gt;");
+    // The fixture has no native steering capability. Finish its held turn
+    // before exercising the next delivery across a separate dispatch window.
+    finishParent.resolve();
+    await origin.client.waitForFinish(parent.id, 10000);
 
     const cli = await promisify(execFile)(
       process.execPath,
@@ -1871,12 +1875,12 @@ test(
     expect(
       messages.map((message) => [message.event, message.sender.id, message.sender.serverId]),
     ).toEqual([
-      ["message", parent.id, undefined],
       ["message", child.id, bId],
+      ["message", parent.id, undefined],
       ["finished", child.id, bId],
     ]);
-    expect(messages[0]!.text).toBe("LOCAL_CLI_REPORT");
-    expect(messages[1]!.text).toBe("REMOTE_REPORT <ready>");
+    expect(messages[0]!.text).toBe("REMOTE_REPORT <ready>");
+    expect(messages[1]!.text).toBe("LOCAL_CLI_REPORT");
     expect(timeline.entries.filter((row) => row.item.type === "user_message")).toEqual([]);
 
     const human = await aWorkspace.agents.create({

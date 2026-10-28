@@ -612,21 +612,23 @@ describe("WorkspaceGitServiceImpl", () => {
     const subscription = service.onSnapshotUpdated((snapshot) => snapshots.push(snapshot));
     try {
       const initial = await service.getSnapshot(REPO_CWD);
-      expect(snapshots).toEqual([initial]);
+      // Cold Git state publishes before optional Forge enrichment.
+      expect(snapshots.at(-1)).toBe(initial);
+      const initialPublications = [...snapshots];
       expect(service.getMetrics().workspaceListenerCount).toBe(0);
 
       await service.getSnapshot(REPO_CWD);
-      expect(snapshots).toEqual([initial]);
+      expect(snapshots).toEqual(initialPublications);
 
       const refreshed = await service.getSnapshot(REPO_CWD, {
         force: true,
         reason: "unobserved-refresh",
       });
-      expect(snapshots).toEqual([initial, refreshed]);
+      expect(snapshots).toEqual([...initialPublications, refreshed]);
 
       subscription.unsubscribe();
       await service.getSnapshot(REPO_CWD, { force: true, reason: "after-unsubscribe" });
-      expect(snapshots).toEqual([initial, refreshed]);
+      expect(snapshots).toEqual([...initialPublications, refreshed]);
     } finally {
       await service.dispose();
     }
@@ -673,12 +675,14 @@ describe("WorkspaceGitServiceImpl", () => {
       });
       expect(latest.forge.pullRequest).toMatchObject({ state: "merged", isMerged: true });
       expect(store.get(REPO_CWD)).toBe(latest);
+      expect(published.at(-1)).toBe(latest);
+      const publishedBeforeRetiredCompletion = [...published];
 
       retiredRead.resolve(createPullRequestStatusResult());
       const retired = await oldRefresh;
       expect(retired.forge.pullRequest).toMatchObject({ state: "open", isMerged: false });
       expect(store.get(REPO_CWD)).toBe(latest);
-      expect(published).toEqual([latest]);
+      expect(published).toEqual(publishedBeforeRetiredCompletion);
     } finally {
       retiredRead.resolve(createPullRequestStatusResult());
       await oldRefresh;
@@ -1781,6 +1785,8 @@ describe("WorkspaceGitServiceImpl", () => {
       { cwd: join(REPO_CWD, "packages", "server") },
       vi.fn(),
     );
+    // The initial snapshots do not prove async repository observation is ready.
+    await Promise.all([first.ready, second.ready]);
     await vi.waitFor(() => {
       expect(getCheckoutSnapshotFacts).toHaveBeenCalledTimes(2);
     });

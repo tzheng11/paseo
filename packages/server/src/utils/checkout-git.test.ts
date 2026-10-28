@@ -765,7 +765,7 @@ describe("checkout git utilities", () => {
       worktreeSlug: "owned",
       paseoHome,
     });
-    rmSync(getPaseoWorktreeMetadataPath(owned.worktreePath));
+    rmSync(await getPaseoWorktreeMetadataPath(owned.worktreePath));
     await expect(getCheckoutIdentity(owned.worktreePath, { paseoHome })).resolves.toMatchObject({
       paseoWorktree: { isPaseoOwnedWorktree: true },
       resolvedBaseRef: "main",
