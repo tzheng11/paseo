@@ -202,13 +202,30 @@ test.describe("Compact sidebar inspection", () => {
     await expect(page.getByTestId("sidebar-search")).toBeVisible();
   }
 
-  test("canceling Search retains the compact sidebar", async ({ page }) => {
-    await gotoAppShell(page);
-    await openSidebar(page);
-    await openCommandCenter(page);
-    await page.keyboard.press("Escape");
-    await expect(page.getByTestId("command-center-panel")).not.toBeVisible();
-    await expectSidebarPreserved(page);
+  test("fork Search stays closed on cancel and preserves its route", async ({ page }) => {
+    const seeded = await seedWorkspace({
+      repoPrefix: "compact-search-cancel-",
+      title: "Compact search cancellation",
+    });
+    try {
+      await page.goto(`/h/${process.env.E2E_SERVER_ID}/workspace/${seeded.workspaceId}`);
+      const routeBeforeSearch = page.url();
+      await openSidebar(page);
+      await openCommandCenter(page);
+      await expect(page.getByTestId("sidebar-sessions")).not.toBeInViewport();
+      await page.keyboard.press("Escape");
+      await expect(page.getByTestId("command-center-panel")).not.toBeVisible();
+      await expect(page).toHaveURL(routeBeforeSearch);
+      await expect(page.getByRole("button", { name: "Open menu", exact: true })).toHaveAttribute(
+        "aria-expanded",
+        "false",
+      );
+      await expect(page.getByTestId("sidebar-sessions")).not.toBeInViewport();
+      await openSidebar(page);
+      await expectSidebarPreserved(page);
+    } finally {
+      await seeded.cleanup();
+    }
   });
   test("canceling Import session retains the compact sidebar", async ({ page }) => {
     await gotoAppShell(page);

@@ -205,7 +205,7 @@ test("manual scrolling cancels a pending file-search reveal and query editing re
 
 test.describe("Compact file search context", () => {
   test.use({ viewport: { width: 390, height: 844 } });
-  test("a file result opens a sheet above the left sidebar", async ({ page }) => {
+  test("fork Search closes the compact sidebar before opening a file sheet", async ({ page }) => {
     const seeded = await seedWorkspace({
       repoPrefix: "compact-search-file-",
       title: "Compact file lookup",
@@ -213,8 +213,10 @@ test.describe("Compact file search context", () => {
     });
     try {
       await page.goto(`/h/${process.env.E2E_SERVER_ID}/workspace/${seeded.workspaceId}`);
+      const routeBeforeSearch = page.url();
       await page.getByRole("button", { name: "Open menu", exact: true }).click();
       const search = await openCommandCenter(page);
+      await expect(page.getByTestId("sidebar-sessions")).not.toBeInViewport();
       await search.getByTestId("command-center-input").fill("lookup.ts");
       await search.getByRole("button", { name: "lookup.ts", exact: true }).click();
       await expect(page.getByTestId("sheet-tab-body")).toBeVisible();
@@ -224,6 +226,13 @@ test.describe("Compact file search context", () => {
         .getByRole("button", { name: "Close", exact: true })
         .click();
       await expect(page.getByTestId("sheet-tab-body")).not.toBeVisible();
+      await expect(page).toHaveURL(routeBeforeSearch);
+      await expect(page.getByRole("button", { name: "Open menu", exact: true })).toHaveAttribute(
+        "aria-expanded",
+        "false",
+      );
+      await expect(page.getByTestId("sidebar-sessions")).not.toBeInViewport();
+      await page.getByRole("button", { name: "Open menu", exact: true }).click();
       await expect(page.getByRole("button", { name: "Close menu", exact: true })).toHaveAttribute(
         "aria-expanded",
         "true",
