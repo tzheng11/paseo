@@ -203,6 +203,50 @@ export function seedPinnedWorkspaceTree(
   return next ?? (tree as Record<string, PinnedWorkspaceTreePlacement>);
 }
 
+/** Full section membership, including collapsed/filtered rows and dormant unpinned groups. */
+export function collectPinnedWorkspaceSubtree(input: {
+  tree: PinnedWorkspaceTree;
+  workspaces: readonly PinnedWorkspaceTreeItem[];
+  workspaceKey: string;
+}): { workspaceKeys: string[]; unavailableWorkspaceKeys: string[] } {
+  const byKey = new Map(input.workspaces.map((item) => [item.workspaceKey, item]));
+  const source = byKey.get(input.workspaceKey);
+  if (!source) return { workspaceKeys: [], unavailableWorkspaceKeys: [input.workspaceKey] };
+  const resolved = resolvePinnedWorkspaceTree(input.workspaces, input.tree);
+  const children = new Map<string, string[]>();
+  const keys = new Set([...Object.keys(input.tree), ...byKey.keys()]);
+  for (const key of keys) {
+    const item = byKey.get(key);
+    if (item && item.sidebarSection !== source.sidebarSection) continue;
+    const parent = own(input.tree, key)
+      ? input.tree[key]!.parentWorkspaceKey
+      : resolved.get(key)?.parentWorkspaceKey;
+    if (!parent || parent === key) continue;
+    const siblings = children.get(parent) ?? [];
+    siblings.push(key);
+    children.set(parent, siblings);
+  }
+  const workspaceKeys: string[] = [];
+  const unavailableWorkspaceKeys: string[] = [];
+  const seen = new Set<string>();
+  const pending = [input.workspaceKey];
+  while (pending.length) {
+    const key = pending.pop()!;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (byKey.has(key)) workspaceKeys.push(key);
+    else unavailableWorkspaceKeys.push(key);
+    const descendants = children.get(key) ?? [];
+    descendants.sort((left, right) => {
+      const l = input.tree[left]?.siblingOrder ?? resolved.get(left)?.siblingOrder ?? 0;
+      const r = input.tree[right]?.siblingOrder ?? resolved.get(right)?.siblingOrder ?? 0;
+      return l - r || left.localeCompare(right);
+    });
+    pending.push(...descendants.toReversed());
+  }
+  return { workspaceKeys, unavailableWorkspaceKeys };
+}
+
 export interface MovePinnedWorkspaceTreeInput {
   tree: PinnedWorkspaceTree;
   /** Full, unfiltered catalog, with original confirmed section membership. */
@@ -281,24 +325,20 @@ function parentToPreserve(
   return resolved.get(key)!.parentWorkspaceKey;
 }
 
-/** Call after any single-workspace pin-membership mutation has been confirmed. */
+/** Call after every member's destination pin membership has been confirmed. */
 export function movePinnedWorkspaceTree(
   input: MovePinnedWorkspaceTreeInput,
 ): MovePinnedWorkspaceTreeResult {
   const byKey = new Map(input.workspaces.map((workspace) => [workspace.workspaceKey, workspace]));
   const source = byKey.get(input.workspaceKey);
   if (!source) return { ok: false, reason: "Workspace is no longer available" };
-  const beforeMove = resolvePinnedWorkspaceTree(input.workspaces, input.tree);
-  if (
-    source.sidebarSection !== input.section &&
-    [...beforeMove.values()].some(
-      (placement) => placement.parentWorkspaceKey === source.workspaceKey,
-    )
-  )
+  const subtree = collectPinnedWorkspaceSubtree(input);
+  if (source.sidebarSection !== input.section && subtree.unavailableWorkspaceKeys.length)
     return {
       ok: false,
-      reason: "Move children out before moving a group between pinned sections",
+      reason: "Some group members are unavailable. Reconnect their hosts and retry",
     };
+  const movingKeys = new Set(subtree.workspaceKeys);
   if (
     input.parentWorkspaceKey !== null &&
     byKey.get(input.parentWorkspaceKey)?.sidebarSection !== input.section
@@ -307,7 +347,7 @@ export function movePinnedWorkspaceTree(
   if (createsRawCycle(input, byKey))
     return { ok: false, reason: "A workspace cannot be moved into one of its children" };
   const destination = input.workspaces.map((workspace) =>
-    workspace.workspaceKey === source.workspaceKey
+    movingKeys.has(workspace.workspaceKey)
       ? { ...workspace, sidebarSection: input.section }
       : workspace,
   );
@@ -316,7 +356,7 @@ export function movePinnedWorkspaceTree(
   const siblings = destination
     .filter(
       (workspace) =>
-        workspace.workspaceKey !== source.workspaceKey &&
+        !movingKeys.has(workspace.workspaceKey) &&
         workspace.sidebarSection === input.section &&
         resolved.get(workspace.workspaceKey)?.parentWorkspaceKey === input.parentWorkspaceKey,
     )
