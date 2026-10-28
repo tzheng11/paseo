@@ -5,7 +5,7 @@ import {
   createCodexAppServerChildProcess,
   createFakeCodexAppServer,
 } from "./test-utils/fake-app-server.js";
-import { CodexAppServerClient } from "./app-server-transport.js";
+import { CodexAppServerClient, CODEX_PROVIDER_LINE_BYTES } from "./app-server-transport.js";
 
 describe("Codex app-server transport", () => {
   test("oversized provider output rejects all pending requests and leaves another client usable", async () => {
@@ -13,10 +13,15 @@ describe("Codex app-server transport", () => {
     const client = new CodexAppServerClient(child, createTestLogger());
     const terminated = vi.fn();
     client.setUnexpectedTerminationHandler(terminated);
-    const first = expect(client.request("thread/read", {})).rejects.toThrow("JSONL frame exceeded");
-    const second = expect(client.request("model/list", {})).rejects.toThrow("JSONL frame exceeded");
+    const first = expect(client.request("thread/read", {})).rejects.toMatchObject({
+      code: "PROVIDER_STREAM_LINE_TOO_LARGE",
+    });
+    const second = expect(client.request("model/list", {})).rejects.toMatchObject({
+      code: "PROVIDER_STREAM_LINE_TOO_LARGE",
+    });
     const block = Buffer.alloc(1024 * 1024, "x");
-    for (let index = 0; index < 64; index++) child.stdout.write(block);
+    for (let index = 0; index < CODEX_PROVIDER_LINE_BYTES / block.byteLength; index++)
+      child.stdout.write(block);
     child.stdout.write("x");
     await first;
     await second;

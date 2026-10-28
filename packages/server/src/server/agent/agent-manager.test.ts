@@ -1,6 +1,7 @@
 import { createIdleRuntimeCleanup } from "./idle-runtime-cleanup/index.js";
 import {
   prepareAgentMessage,
+  createAgentMessageDelivery,
   formatAgentMessage,
   formatSystemNotificationPrompt,
 } from "./agent-messages/index.js";
@@ -15920,4 +15921,116 @@ test("an out-of-band command racing idle cleanup waits for the resumed runtime",
   expect(await command).toEqual({ disposition: "out_of_band" });
   expect(h.commands).toEqual(["/maintenance"]);
   expect(h.prompts).toEqual([]);
+});
+
+test.each(["page", "windows"] as const)(
+  "starts a queued message after completion while a history %s is still stalled",
+  async (operation) => {
+    const { manager, agent, session, cleanup } = await createHeldHistoryFixture();
+    const initial = drainAsyncGenerator(manager.streamAgent(agent.id, "initial"));
+    await manager.waitForAgentRunStart(agent.id);
+    let readFinished = false;
+    const history = manager.readTimelineHistory(agent.id, { operation, cursor: 0 }).finally(() => {
+      readFinished = true;
+    });
+    let flush: (() => void) | undefined;
+    const errors: unknown[] = [];
+    const delivery = createAgentMessageDelivery({
+      schedule: (_delay, callback) => {
+        flush = callback;
+        return () => {};
+      },
+      dispatch: async (request) => {
+        const result = await startAgentRun(manager, request.recipientId, request.prompt, logger, {
+          replaceRunning: true,
+          activeTurnBehavior: request.activeTurnBehavior,
+          runOptions: { clientMessageId: request.messageIds[0] },
+          onDispatch: request.onDispatch,
+        });
+        return result.disposition;
+      },
+      onError: (error) => errors.push(error),
+    });
+    try {
+      await session.readStarted.promise;
+      const queued = delivery.enqueue({
+        recipientId: agent.id,
+        messageId: "queued-after-native-completion",
+        source: { kind: "agent-message", agentId: "test-sender", title: "Sender" },
+        prompt: "queued follow-up",
+      });
+      expect(queued.status).toBe("queued");
+      expect(session.startCount).toBe(1);
+      session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+      await vi.waitFor(() => {
+        const current = manager.getAgent(agent.id)!;
+        expect(current.lifecycle).toBe("idle");
+        expect(toAgentPayload(current).activeTurn).toBeNull();
+      });
+      await initial;
+      expect(readFinished).toBe(false);
+      flush!();
+      await expect(queued.dispatched).resolves.toBe("turn_started");
+      await manager.waitForAgentRunStart(agent.id);
+      expect(session.startCount).toBe(2);
+      expect(session.startPrompts[1]).toContain("queued follow-up");
+      expect(session.interruptCount).toBe(0);
+      expect(session.steerCount).toBe(0);
+      expect(readFinished).toBe(false);
+      session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-2" });
+      await vi.waitFor(() => expect(manager.getAgent(agent.id)?.lifecycle).toBe("idle"));
+      expect(errors).toEqual([]);
+    } finally {
+      session.releaseRead.resolve();
+      await Promise.allSettled([history, initial, delivery.close()]);
+      await cleanup();
+    }
+  },
+);
+
+test("finish observation waits for queued out-of-band admission and its failure event", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-finish-admission-"));
+  const session = new TestAgentSession({ provider: "codex", cwd: workdir });
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const outOfBand: AgentSession = session;
+  outOfBand.tryHandleOutOfBand = () => ({
+    async run() {
+      entered.resolve();
+      await release.promise;
+      session.pushEvent({ type: "turn_started", provider: "codex", turnId: "queued-command" });
+      session.pushEvent({
+        type: "turn_failed",
+        provider: "codex",
+        turnId: "queued-command",
+        error: "command rejected",
+      });
+    },
+  });
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, logger });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {});
+  try {
+    expect(await manager.tryRunOutOfBand(agent.id, "/follow-up")).toBe(true);
+    await entered.promise;
+    let settled = false;
+    const observing = manager
+      .waitForAgentEvent(agent.id, { waitForActive: true })
+      .then((result) => {
+        settled = true;
+        return result;
+      });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(settled).toBe(false);
+    release.resolve();
+    expect((await observing).status).toBe("error");
+  } finally {
+    release.resolve();
+    await manager.closeAgent(agent.id);
+    rmSync(workdir, { recursive: true, force: true });
+  }
 });

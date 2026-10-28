@@ -3659,6 +3659,8 @@ export class CodexAppServerAgentSession implements AgentSession {
   private readonly clientDisposals = new WeakMap<CodexAppServerClient, Promise<void>>();
   private deferredHistory = false;
   private deferredHistoryPromise: Promise<void> | null = null;
+  private readonly historyWork = new Set<Promise<unknown>>();
+  private readonly historyReaders = new Set<CodexAppServerClientLike>();
   private startupTimedOut = false;
   private readonly backgroundTasks = new CodexBackgroundTasks();
   private closed = false;
@@ -3851,7 +3853,6 @@ export class CodexAppServerAgentSession implements AgentSession {
   ): Promise<void> {
     if (this.shouldReadHistoryOnly(interactive)) {
       await this.readArchivedHistory();
-      this.connectionState = "history-ready";
       return;
     }
     const child = await this.spawnAppServer();
@@ -4226,7 +4227,9 @@ export class CodexAppServerAgentSession implements AgentSession {
   private async readArchivedHistory(): Promise<void> {
     const child = await this.spawnAppServer();
     const client = new CodexAppServerClient(child, this.logger, () => this.traceContext());
+    this.historyReaders.add(client);
     try {
+      if (this.closed) throw this.createClosedError();
       const initialized = toObjectRecord(
         await client.request("initialize", buildCodexAppServerInitializeParams()),
       );
@@ -4240,8 +4243,10 @@ export class CodexAppServerAgentSession implements AgentSession {
           CodexModelListResponseSchema.parse(await client.request("model/list", {})).data ?? [];
         this.reconcileServiceTier();
       }
+      if (this.closed) throw this.createClosedError();
+      this.connectionState = "history-ready";
     } finally {
-      await client.dispose();
+      await this.disposeHistoryReader(client);
     }
   }
 
@@ -4263,7 +4268,25 @@ export class CodexAppServerAgentSession implements AgentSession {
     );
   }
 
-  private async loadPersistedHistory(
+  private loadPersistedHistory(
+    client: CodexAppServerClientLike | null,
+    readMode?: "bounded",
+  ): Promise<void> {
+    return this.trackHistoryWork(() => this.loadPersistedHistoryInternal(client, readMode));
+  }
+
+  private trackHistoryWork<T>(operation: () => Promise<T>): Promise<T> {
+    const work = Promise.resolve().then(() => {
+      if (this.closed) throw this.createClosedError();
+      return operation();
+    });
+    this.historyWork.add(work);
+    const clear = () => this.historyWork.delete(work);
+    void work.then(clear, clear);
+    return work;
+  }
+
+  private async loadPersistedHistoryInternal(
     client: CodexAppServerClientLike | null,
     readMode?: "bounded",
   ): Promise<void> {
@@ -4282,6 +4305,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         mapItem: (entry) => mapCodexHistoryItem(entry, this.config.cwd ?? null),
       });
       const windows = await source.windows(client, DEFAULT_HISTORY_WINDOWS);
+      if (this.closed) return;
       await this.persistedHistory?.close();
       await this.persistedSubagentHistory?.close();
       this.persistedHistory = null;
@@ -4290,6 +4314,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.subAgentCallsByCallId.clear();
       this.subAgentCallIdByChildThreadId.clear();
       this.pendingSubAgentNotificationsByThreadId.clear();
+      if (this.closed) return;
       this.persistedAsyncQuestionIds = new Set(windows.asyncQuestionIds);
       this.nativeHistorySource = source;
       this.nativeHistoryWindows = windows;
@@ -4303,6 +4328,14 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (readMode === "bounded") {
       throw new Error("Codex cannot read bounded native history for this thread");
     }
+    await this.loadLegacyPersistedHistory(client, threadId, metadata);
+  }
+
+  private async loadLegacyPersistedHistory(
+    client: CodexAppServerClientLike,
+    threadId: string,
+    metadata: CodexThreadHistoryMetadata | null,
+  ): Promise<void> {
     const history = await loadCodexThreadHistoryTimeline({
       threadId,
       cwd: this.config.cwd ?? null,
@@ -4310,35 +4343,38 @@ export class CodexAppServerAgentSession implements AgentSession {
       pagedHistoryAvailable: this.pagedHistoryAvailable,
       ...(metadata ? { historyMode: metadata.mode } : {}),
     });
-    this.nativeHistorySource = null;
-    this.nativeHistoryWindows = null;
     const { timeline, subAgentRoutes } = history;
+    let subagents: AgentHistoryReplay<AgentStreamEvent> | undefined;
+    let committed = false;
     this.subAgentCallsByCallId.clear();
     this.subAgentCallIdByChildThreadId.clear();
     this.pendingSubAgentNotificationsByThreadId.clear();
     this.persistedProviderSubagentEvents = [];
     this.loadingPersistedHistory = true;
     try {
-      const subagents = await AgentHistoryReplay.create(
+      subagents = await AgentHistoryReplay.create(
         this.loadPersistedSubAgentHistories(client, subAgentRoutes),
         { measureSource: false },
       );
+      const windows = await timeline.readWindows(DEFAULT_HISTORY_WINDOWS);
+      if (this.closed) return;
+      await this.persistedHistory?.close();
       await this.persistedSubagentHistory?.close();
+      if (this.closed) return;
+      this.nativeHistorySource = null;
+      this.resetCodexUserMessageTurns();
+      this.persistedAsyncQuestionIds = history.asyncQuestionIds;
+      for (const message of history.userMessages)
+        this.rememberCodexUserMessageTurn(message.messageId, message.turnId);
       this.persistedSubagentHistory = subagents;
-    } catch (error) {
-      await timeline.close();
-      throw error;
+      this.persistedHistory = timeline;
+      this.nativeHistoryWindows = windows;
+      this.historyPending = true;
+      committed = true;
     } finally {
       this.loadingPersistedHistory = false;
+      if (!committed) await Promise.all([timeline.close(), subagents?.close()]);
     }
-    this.resetCodexUserMessageTurns();
-    this.persistedAsyncQuestionIds = history.asyncQuestionIds;
-    for (const message of history.userMessages)
-      this.rememberCodexUserMessageTurn(message.messageId, message.turnId);
-    await this.persistedHistory?.close();
-    this.persistedHistory = timeline;
-    this.nativeHistoryWindows = await timeline.readWindows(DEFAULT_HISTORY_WINDOWS);
-    this.historyPending = true;
   }
 
   private async *loadPersistedSubAgentHistories(
@@ -4979,9 +5015,10 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (this.nativeHistorySource) {
       const owned = await this.createHistoryReader();
       try {
-        yield* this.nativeHistorySource.stream(owned, options);
+        if (this.closed) throw this.createClosedError();
+        yield* this.nativeHistorySource!.stream(owned, options);
       } finally {
-        await owned.dispose();
+        await this.disposeHistoryReader(owned);
       }
       return;
     }
@@ -5043,9 +5080,10 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (this.closed) throw this.createClosedError();
     const client = await this.createHistoryReader();
     try {
+      if (this.closed) throw this.createClosedError();
       return await read(client);
     } finally {
-      await client.dispose();
+      await this.disposeHistoryReader(client);
     }
   }
 
@@ -5063,17 +5101,29 @@ export class CodexAppServerAgentSession implements AgentSession {
     await this.deferredHistoryPromise;
   }
 
-  private async createHistoryReader(): Promise<CodexAppServerClientLike> {
+  private createHistoryReader(): Promise<CodexAppServerClientLike> {
+    return this.trackHistoryWork(() => this.createHistoryReaderInternal());
+  }
+
+  private async disposeHistoryReader(client: CodexAppServerClientLike): Promise<void> {
+    await client.dispose();
+    this.historyReaders.delete(client);
+  }
+
+  private async createHistoryReaderInternal(): Promise<CodexAppServerClientLike> {
     const child = await this.spawnAppServer();
     const client =
       this.deps._createCodexClient?.(child, this.logger, () => this.traceContext()) ??
       new CodexAppServerClient(child, this.logger, () => this.traceContext());
+    this.historyReaders.add(client);
     try {
+      if (this.closed) throw this.createClosedError();
       await client.request("initialize", buildCodexAppServerInitializeParams());
       client.notify("initialized", {});
+      if (this.closed) throw this.createClosedError();
       return client;
     } catch (error) {
-      await client.dispose();
+      await this.disposeHistoryReader(client);
       throw error;
     }
   }
@@ -5569,6 +5619,8 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.pendingForegroundTurnIdentification?.resolve(null);
     this.pendingForegroundTurnIdentification = null;
     await this.disposeClient();
+    await Promise.all([...this.historyReaders].map((reader) => this.disposeHistoryReader(reader)));
+    await Promise.allSettled([this.connectionPromise, ...this.historyWork]);
     await this.persistedHistory?.close();
     this.persistedHistory = null;
     await this.persistedSubagentHistory?.close();

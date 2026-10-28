@@ -127,9 +127,9 @@ describe("JsonlRpcProcess", () => {
     const healthy = startProcess();
     const exited = nextExit(transport);
     try {
-      await expect(transport.request({ type: "read-history" })).rejects.toThrow(
-        "JSONL frame exceeded",
-      );
+      await expect(transport.request({ type: "read-history" })).rejects.toMatchObject({
+        code: "PROVIDER_STREAM_LINE_TOO_LARGE",
+      });
       await exited;
       await expect(healthy.request({ type: "echo", value: "still alive" })).resolves.toMatchObject({
         value: "still alive",

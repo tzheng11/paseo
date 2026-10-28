@@ -3830,12 +3830,12 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
   ): AsyncGenerator<AgentStreamEvent> {
+    this.invalidateQuotaRecovery(agentId);
     this.reloadOperations?.assertWriterAdmissionSync(agentId);
     if (this.idleReloads.has(agentId))
       throw new AgentIdleReloadError({ agentId, reason: "in_progress" });
     if (this.collectingRuntimes.has(agentId) || (!this.agents.has(agentId) && this.registry))
       return this.streamAfterRuntimeCollection(agentId, prompt, options);
-    this.invalidateQuotaRecovery(agentId);
     return this.streamAgentInternal(agentId, prompt, options);
   }
 
@@ -4768,10 +4768,32 @@ export class AgentManager {
     return lastLiveItem ?? (await this.durableTimelineStore?.getLastItem(agentId)) ?? null;
   }
 
+  private async waitForAdmission(operation: Promise<void>, signal?: AbortSignal): Promise<void> {
+    if (!signal) return operation;
+    let abort!: () => void;
+    const cancellation = new Promise<never>((_resolve, reject) => {
+      abort = () => reject(createAbortError(signal, "wait_for_agent aborted"));
+      if (signal.aborted) abort();
+      else signal.addEventListener("abort", abort, { once: true });
+    });
+    try {
+      await Promise.race([operation, cancellation]);
+    } finally {
+      signal.removeEventListener("abort", abort);
+    }
+  }
+
   async waitForAgentEvent(
     agentId: string,
     options?: WaitForAgentOptions,
   ): Promise<WaitForAgentResult> {
+    if (options?.waitForActive) {
+      // A queued out-of-band command may not have published its start or failure yet.
+      // Observe its admission and already queued events before classifying an idle snapshot.
+      const admission = this.foregroundMutationTails.get(agentId);
+      if (admission) await this.waitForAdmission(admission, options.signal);
+      await this.waitForAdmission(this.drainSessionEvents(agentId), options.signal);
+    }
     const snapshot = this.getAgent(agentId);
     if (!snapshot) {
       throw new Error(`Agent ${agentId} not found`);

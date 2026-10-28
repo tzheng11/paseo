@@ -1624,7 +1624,7 @@ describe("Codex app-server provider", () => {
   test("malformed native command lifecycle keeps background activity uncertain", async () => {
     const session = createSession();
     try {
-      asInternals(session).handleNotification("codex/event/exec_command_end", {
+      await asInternals(session).handleNotification("codex/event/exec_command_end", {
         id: "test-thread",
         msg: { type: "exec_command_end", call_id: "unknown-command", stdout: 123 },
       });
@@ -1637,11 +1637,11 @@ describe("Codex app-server provider", () => {
   test("native child-thread PTYs remain active after their foreground completes", async () => {
     const session = createSession();
     try {
-      asInternals(session).handleNotification("codex/event/exec_command_begin", {
+      await asInternals(session).handleNotification("codex/event/exec_command_begin", {
         id: "not-yet-registered-child-thread",
         msg: { type: "exec_command_begin", call_id: "child-exec", command: ["sleep", "30"] },
       });
-      asInternals(session).handleNotification("codex/event/exec_command_end", {
+      await asInternals(session).handleNotification("codex/event/exec_command_end", {
         id: "not-yet-registered-child-thread",
         msg: {
           type: "exec_command_end",
@@ -1650,12 +1650,12 @@ describe("Codex app-server provider", () => {
           exit_code: 0,
         },
       });
-      asInternals(session).handleNotification("turn/completed", {
+      await asInternals(session).handleNotification("turn/completed", {
         threadId: "not-yet-registered-child-thread",
         turn: { id: "child-turn", status: "completed", items: [], error: null },
       });
       expect(session.hasActiveBackgroundTasks?.()).toBe(true);
-      asInternals(session).handleNotification("item/completed", {
+      await asInternals(session).handleNotification("item/completed", {
         threadId: "not-yet-registered-child-thread",
         item: {
           type: "commandExecution",
@@ -8268,15 +8268,15 @@ test.each([
   { status: "failed", identity: "unauthorized", quota: false },
   { status: "failed", identity: undefined, quota: false },
   { status: "completed", identity: "usageLimitExceeded", quota: false },
-])("Codex typed terminal quota classification: %j", ({ status, identity, quota }) => {
+])("Codex typed terminal quota classification: %j", async ({ status, identity, quota }) => {
   const session = createSession();
   const events: AgentStreamEvent[] = [];
   session.subscribe((event) => events.push(event));
-  asInternals(session).handleNotification("turn/started", {
+  await asInternals(session).handleNotification("turn/started", {
     threadId: "test-thread",
     turn: { id: "native-turn" },
   });
-  asInternals(session).handleNotification("turn/completed", {
+  await asInternals(session).handleNotification("turn/completed", {
     threadId: "test-thread",
     turn: {
       id: "native-turn",
@@ -8325,20 +8325,20 @@ test("Codex guarded continuation checks actual turn/start dispatch after asynchr
 
 test.each(["late-A", "missing-id", "foreign-thread"])(
   "Codex quota identity refuses %s terminal evidence",
-  (scenario) => {
+  async (scenario) => {
     const session = createSession();
     const events: AgentStreamEvent[] = [];
     session.subscribe((event) => events.push(event));
     const internal = asInternals(session);
-    internal.handleNotification("turn/started", {
+    await internal.handleNotification("turn/started", {
       threadId: "test-thread",
       turn: { id: "native-A" },
     });
-    internal.handleNotification("turn/started", {
+    await internal.handleNotification("turn/started", {
       threadId: "test-thread",
       turn: { id: "native-B" },
     });
-    internal.handleNotification("turn/completed", {
+    await internal.handleNotification("turn/completed", {
       threadId: scenario === "foreign-thread" ? "unrelated-thread" : "test-thread",
       turn: {
         ...(scenario === "missing-id"
@@ -8535,4 +8535,67 @@ test("publishes a materialized image before dispatching the following turn compl
   } finally {
     await session.close();
   }
+});
+
+test("close drains a legacy history load and releases every staged replay", async () => {
+  const session = createSession();
+  const entered = deferred<void>();
+  const reply = deferred<unknown>();
+  const loading = asInternals(session).loadPersistedHistory({
+    request: async () => {
+      entered.resolve();
+      return reply.promise;
+    },
+  });
+  await entered.promise;
+  let closed = false;
+  const closing = session.close().then(() => {
+    closed = true;
+    return undefined;
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  expect(closed).toBe(false);
+  reply.resolve({ thread: { turns: [] } });
+  await loading;
+  await closing;
+  const internals = castInternals<{
+    persistedHistory: unknown;
+    persistedSubagentHistory: unknown;
+    nativeHistoryWindows: unknown;
+  }>(session);
+  expect(internals.persistedHistory).toBeNull();
+  expect(internals.persistedSubagentHistory).toBeNull();
+  expect(internals.nativeHistoryWindows).toBeNull();
+});
+
+test("close owns a read-only child whose spawn resolves after closure starts", async () => {
+  const started = deferred<void>();
+  const spawn = deferred<ChildProcessWithoutNullStreams>();
+  const appServer = createFakeCodexAppServer();
+  const reader = {
+    request: vi.fn(async () => ({})),
+    notify: vi.fn(),
+    dispose: vi.fn(async () => {}),
+  };
+  const session = new CodexAppServerAgentSession(
+    createConfig(),
+    null,
+    createTestLogger(),
+    () => {
+      started.resolve();
+      return spawn.promise;
+    },
+    { _createCodexClient: () => reader },
+  );
+  const opening = castInternals<{ createHistoryReader(): Promise<unknown> }>(
+    session,
+  ).createHistoryReader();
+  const rejected = expect(opening).rejects.toThrow("closed");
+  await started.promise;
+  const closing = session.close();
+  spawn.resolve(appServer.child);
+  await rejected;
+  await closing;
+  expect(reader.request).not.toHaveBeenCalled();
+  expect(reader.dispose).toHaveBeenCalledTimes(1);
 });

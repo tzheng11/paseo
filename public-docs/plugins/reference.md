@@ -964,23 +964,24 @@ plans, and mode changes; requesting permission does not end the turn.
 
 ### Events
 
-| Name                         | Event fields                                            | Trigger                                            |
-| ---------------------------- | ------------------------------------------------------- | -------------------------------------------------- |
-| `agent.created`              | `agent`                                                 | Ordinary creation finishes; excludes import/resume |
-| `agent.closed`               | `agent`                                                 | A live agent runtime closes                        |
-| `agent.turn_started`         | `agent`, `turnId`                                       | Live turn starts                                   |
-| `agent.turn_ended`           | `agent`, `turnId`, `outcome`, deprecated `timeline: []` | Live turn completes, fails, or is canceled         |
-| `agent.permission_requested` | `agent`, `request`                                      | Permission or question becomes pending             |
-| `agent.permission_resolved`  | `agent`, `requestId`, `resolution`                      | Pending request is answered or cleared             |
-| `agent.archived`             | `agent`, `archivedAt`                                   | Archive state is saved                             |
-| `workspace.created`          | `workspace`                                             | Record created; directory available                |
-| `workspace.archived`         | `workspace`                                             | Archive state is saved                             |
+| Name                         | Event fields                                                            | Trigger                                            |
+| ---------------------------- | ----------------------------------------------------------------------- | -------------------------------------------------- |
+| `agent.created`              | `agent`                                                                 | Ordinary creation finishes; excludes import/resume |
+| `agent.closed`               | `agent`                                                                 | A live agent runtime closes                        |
+| `agent.turn_started`         | `agent`, `turnId`                                                       | Live turn starts                                   |
+| `agent.turn_ended`           | `agent`, `turnId`, `outcome`, deprecated bounded `timeline`, gap fields | Live turn completes, fails, or is canceled         |
+| `agent.permission_requested` | `agent`, `request`                                                      | Permission or question becomes pending             |
+| `agent.permission_resolved`  | `agent`, `requestId`, `resolution`                                      | Pending request is answered or cleared             |
+| `agent.archived`             | `agent`, `archivedAt`                                                   | Archive state is saved                             |
+| `workspace.created`          | `workspace`                                                             | Record created; directory available                |
+| `workspace.archived`         | `workspace`                                                             | Archive state is saved                             |
 
 Agent events exclude the daemon's private disposable helpers. Public background workspaces and
 their ordinary agents run the same lifecycle hooks as other workspaces. Archive events can precede
 runtime/worktree cleanup; observe lifecycle completion separately when cleanup matters.
 
-`agent.turn_ended.timeline` is deprecated and always empty. Fetch history on demand with
+`agent.turn_ended.timeline` is a deprecated bounded head/tail snapshot in this fork.
+Inspect `timelineGap` and `providerHistoryGap` before treating it as complete. Fetch history on demand with
 `context.paseo.agents.ref(event.agent.id).timeline.refetch({ direction: "tail", limit: 20 })`.
 The hook payload size does not grow with conversation history.
 
@@ -1010,13 +1011,13 @@ type PluginTurnOutcome =
   | { kind: "canceled"; reason: string };
 ```
 
-| Field        | Shape / meaning                                                                                       |
-| ------------ | ----------------------------------------------------------------------------------------------------- |
-| `turnId`     | Provider-reported `string` or `null`; can repeat after a session reopens                              |
-| `timeline`   | `readonly AgentTimelineItem[]`; complete snapshot including earlier conversation; text may span items |
-| `request`    | SDK `AgentPermissionRequest`; `kind` is `tool`, `plan`, `question`, `mode`, or `other`                |
-| `resolution` | SDK `AgentPermissionResponse`                                                                         |
-| `archivedAt` | Timestamp string                                                                                      |
+| Field        | Shape / meaning                                                                                               |
+| ------------ | ------------------------------------------------------------------------------------------------------------- |
+| `turnId`     | Provider-reported `string` or `null`; can repeat after a session reopens                                      |
+| `timeline`   | `readonly AgentTimelineItem[]`; bounded head/tail compatibility snapshot; gap fields describe omitted history |
+| `request`    | SDK `AgentPermissionRequest`; `kind` is `tool`, `plan`, `question`, `mode`, or `other`                        |
+| `resolution` | SDK `AgentPermissionResponse`                                                                                 |
+| `archivedAt` | Timestamp string                                                                                              |
 
 ### Before hooks
 

@@ -66,6 +66,7 @@ function createPendingManager() {
     resolve(): void;
   }> = [];
   const workspaceGitService = {
+    peekSnapshot: () => null,
     getCheckoutDiff: async () => ({ diff: "", structured: [] }),
     getSnapshot: async () => createWorkspaceSnapshot(),
 
@@ -126,6 +127,7 @@ describe("CheckoutDiffManager", () => {
     });
 
     const workspaceGitService = {
+      peekSnapshot: () => null,
       subscribe: vi.fn(),
 
       registerWorkspace: vi.fn(
@@ -256,9 +258,11 @@ describe("CheckoutDiffManager", () => {
       () => {},
     );
 
-    expect(mockRequestWorkingTreeWatch).toHaveBeenCalledWith(
-      "/tmp/repo/packages/server",
-      expect.any(Function),
+    await vi.waitFor(() =>
+      expect(mockRequestWorkingTreeWatch).toHaveBeenCalledWith(
+        "/tmp/repo/packages/server",
+        expect.any(Function),
+      ),
     );
   });
 

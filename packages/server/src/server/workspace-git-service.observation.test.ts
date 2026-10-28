@@ -654,6 +654,7 @@ describe("WorkspaceGitService checkout observation", () => {
     );
     try {
       await service.getSnapshot(REPO_CWD);
+      await summary.ready;
       await vi.advanceTimersByTimeAsync(0);
       expect(getWatcherSubscribeCallCount(watcher, REPO_CWD)).toBe(0);
       expect(getWatcherSubscribeCallCount(watcher, GIT_DIR)).toBe(1);
@@ -2865,7 +2866,9 @@ describe("WorkspaceGitService checkout observation", () => {
         expect(getWatcherSubscribeCallCount(watcher, failedDirectory)).toBe(1);
       });
       await vi.advanceTimersByTimeAsync(45_000);
-      expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
+      await vi.waitFor(() =>
+        expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0),
+      );
       expect(getWatcherSubscribeCallCount(watcher, failedDirectory)).toBe(1);
 
       openedSubscription.resolve({

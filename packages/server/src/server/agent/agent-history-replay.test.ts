@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -9,6 +9,28 @@ import {
 } from "./agent-history-replay.js";
 
 describe("AgentHistoryReplay", () => {
+  it("retries abandoned cache pruning after a transient filesystem failure", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "paseo-prune-retry-test-"));
+    const target = path.join(root, "temporary-root");
+    const previous = process.env.TMPDIR;
+    await writeFile(target, "temporarily not a directory");
+    process.env.TMPDIR = target;
+    try {
+      await expect(AgentHistoryReplay.create([])).rejects.toMatchObject({ code: "ENOTDIR" });
+      await rm(target);
+      await mkdir(target);
+      const replay = await AgentHistoryReplay.create(["recovered"]);
+      try {
+        expect(await Array.fromAsync(replay.events())).toEqual(["recovered"]);
+      } finally {
+        await replay.close();
+      }
+    } finally {
+      if (previous === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = previous;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
   it("replaces keyed payloads on disk without moving their original history position", async () => {
     const replay = await AgentHistoryReplay.create(
       [

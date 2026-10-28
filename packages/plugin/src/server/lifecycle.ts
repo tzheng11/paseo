@@ -63,7 +63,8 @@ export interface PluginLifecycleEvents {
     turnId: string | null;
     outcome: PluginTurnOutcome;
     /**
-     * @deprecated Always empty. Fetch history on demand with
+     * @deprecated Bounded compatibility snapshot; inspect timelineGap and providerHistoryGap.
+     * Fetch history on demand with
      * context.paseo.agents.ref(agent.id).timeline.refetch({ direction: "tail", limit: 20 }).
      */
     timeline: readonly AgentTimelineItem[];

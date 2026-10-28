@@ -823,21 +823,21 @@ export default function contribute(server: PluginServerContext) {
 
 ### 事件 {#events}
 
-| 名称                         | 事件字段                                              | 触发时机                      |
-| ---------------------------- | ----------------------------------------------------- | ----------------------------- |
-| `agent.created`              | `agent`                                               | 普通创建完成；不包括导入/恢复 |
-| `agent.closed`               | `agent`                                               | 一个运行中的 Agent 运行时关闭 |
-| `agent.turn_started`         | `agent`, `turnId`                                     | 实时轮次开始                  |
-| `agent.turn_ended`           | `agent`, `turnId`, `outcome`, 已弃用的 `timeline: []` | 实时轮次完成、失败或被取消    |
-| `agent.permission_requested` | `agent`, `request`                                    | 权限请求或问题进入待处理状态  |
-| `agent.permission_resolved`  | `agent`, `requestId`, `resolution`                    | 待处理的请求得到回应或被清除  |
-| `agent.archived`             | `agent`, `archivedAt`                                 | 归档状态已保存                |
-| `workspace.created`          | `workspace`                                           | 记录已创建；目录可用          |
-| `workspace.archived`         | `workspace`                                           | 归档状态已保存                |
+| 名称                         | 事件字段                                                         | 触发时机                      |
+| ---------------------------- | ---------------------------------------------------------------- | ----------------------------- |
+| `agent.created`              | `agent`                                                          | 普通创建完成；不包括导入/恢复 |
+| `agent.closed`               | `agent`                                                          | 一个运行中的 Agent 运行时关闭 |
+| `agent.turn_started`         | `agent`, `turnId`                                                | 实时轮次开始                  |
+| `agent.turn_ended`           | `agent`, `turnId`, `outcome`, 已弃用的有界 `timeline` 和缺口字段 | 实时轮次完成、失败或被取消    |
+| `agent.permission_requested` | `agent`, `request`                                               | 权限请求或问题进入待处理状态  |
+| `agent.permission_resolved`  | `agent`, `requestId`, `resolution`                               | 待处理的请求得到回应或被清除  |
+| `agent.archived`             | `agent`, `archivedAt`                                            | 归档状态已保存                |
+| `workspace.created`          | `workspace`                                                      | 记录已创建；目录可用          |
+| `workspace.archived`         | `workspace`                                                      | 归档状态已保存                |
 
 Agent 事件不包括 daemon 私有的一次性辅助 Agent。公开的后台工作区及其普通 Agent 与其他工作区运行相同的生命周期钩子。归档事件可能早于运行时/worktree 清理；当清理很重要时，请单独观察生命周期何时完成。
 
-`agent.turn_ended.timeline` 已弃用，并且始终为空。需要历史时，请用 `context.paseo.agents.ref(event.agent.id).timeline.refetch({ direction: "tail", limit: 20 })` 按需获取。钩子负载的大小不会随对话历史增长。
+本分支的 `agent.turn_ended.timeline` 是已弃用的有界头尾快照。判断历史是否完整前，请检查 `timelineGap` 和 `providerHistoryGap`。需要历史时，请用 `context.paseo.agents.ref(event.agent.id).timeline.refetch({ direction: "tail", limit: 20 })` 按需获取。钩子负载的大小不会随对话历史增长。
 
 **共享的负载结构**（`@getpaseo/plugin/server`）：
 
@@ -868,7 +868,7 @@ type PluginTurnOutcome =
 | 字段         | 结构 / 含义                                                                              |
 | ------------ | ---------------------------------------------------------------------------------------- |
 | `turnId`     | Provider 报告的 `string` 或 `null`；会话重新打开后可能重复                               |
-| `timeline`   | `readonly AgentTimelineItem[]`；包含之前对话的完整快照；文本可能跨越多个条目             |
+| `timeline`   | `readonly AgentTimelineItem[]`；有界头尾兼容快照；缺口字段说明省略的历史                 |
 | `request`    | SDK 的 `AgentPermissionRequest`；`kind` 为 `tool`、`plan`、`question`、`mode` 或 `other` |
 | `resolution` | SDK 的 `AgentPermissionResponse`                                                         |
 | `archivedAt` | 时间戳字符串                                                                             |

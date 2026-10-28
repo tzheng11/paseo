@@ -93,6 +93,8 @@ const entries = [
 // Files read at runtime via fs APIs rather than `require`. nft only
 // traces the module graph; data files have to be listed explicitly.
 const additionalInputs = [
+  // This Worker URL is a separate runtime entry; nft does not follow it.
+  "packages/server/dist/server/server/agent/providers/codex/history-index-worker.mjs",
   // Agent orchestration skill catalog loaded through filesystem paths
   "packages/server/dist/server/skills/**",
   "packages/server/dist/server/builtin-plugins/**",

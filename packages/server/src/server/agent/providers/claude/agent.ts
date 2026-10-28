@@ -2309,6 +2309,7 @@ class ClaudeAgentSession implements AgentSession {
   private readonly harnessEnvironment: Record<string, string>;
   private readonly usageSessionKey = randomUUID();
   private childProcess: ChildProcess | null = null;
+  private readonly retiringChildren = new Set<ChildProcess>();
   private input: AsyncMessageInput<SDKUserMessage> | null = null;
   /** The exact SDK query/input pair that owns the current foreground turn. */
   private activeForegroundQuery: ClaudeQuery | null = null;
@@ -3118,7 +3119,15 @@ class ClaudeAgentSession implements AgentSession {
     );
     this.closed = true;
     this.historyAbort?.abort();
-    await this.historyLoad;
+    const historyResults = await Promise.allSettled([
+      this.historyLoad,
+      this.historyTransition,
+      this.missingResumeRecovery,
+    ]);
+    for (const result of historyResults) {
+      if (result.status === "rejected")
+        this.logger.warn({ err: result.reason }, "Claude history cleanup did not settle cleanly");
+    }
     this.rejectAllPendingPermissions(new Error("Claude session closed"));
     this.cancelCurrentTurn?.();
     this.subscribers.clear();
@@ -3146,28 +3155,12 @@ class ClaudeAgentSession implements AgentSession {
     // Terminate the entire process tree (claude + MCP children) to prevent
     // orphan accumulation. The SDK's internal cleanup may only kill the
     // direct child process.
-    if (this.childProcess) {
-      try {
-        const result = await withTimeout(
-          this.terminateProcess(this.childProcess, {
-            gracefulTimeoutMs: 2_000,
-            forceTimeoutMs: 2_000,
-          }),
-          5_000,
-          "Claude process cleanup exceeded 5000ms",
-        );
-        if (result === "kill-timeout")
-          throw new Error("Claude process did not report exit after SIGKILL");
-        this.childProcess = null;
-      } catch (error) {
-        throw Object.assign(
-          new Error("Claude child cleanup could not be confirmed", { cause: error }),
-          {
-            code: "reload_cleanup_unconfirmed",
-          },
-        );
-      }
-    }
+    if (this.childProcess) this.retiringChildren.add(this.childProcess);
+    const cleanup = await Promise.allSettled(
+      [...this.retiringChildren].map((child) => this.terminateOwnedChild(child)),
+    );
+    const failed = cleanup.find((result) => result.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
     if (this.persistSession === false && this.claudeSessionId) {
       // Claude Code currently ignores --no-session-persistence outside --print mode
       // (see `claude --help`), so the SDK's persistSession=false is silently dropped
@@ -3603,24 +3596,43 @@ class ClaudeAgentSession implements AgentSession {
     const retiredChild = this.childProcess;
     this.childProcess = null;
     if (retiredChild) this.failRunningRuntimeTasks();
-    oldInput?.end();
-    oldAbortController?.abort();
-    oldQuery.close?.();
+    if (retiredChild) this.retiringChildren.add(retiredChild);
     try {
-      await oldQuery.return?.();
-    } catch {
-      /* ignore */
+      oldInput?.end();
+      oldAbortController?.abort();
+      oldQuery.close?.();
+      try {
+        await withTimeout(
+          Promise.resolve(oldQuery.return?.()),
+          5_000,
+          "Claude query return timed out",
+        );
+      } catch (error) {
+        this.logger.warn({ err: error }, "Retired Claude query return did not settle cleanly");
+      }
+    } finally {
+      if (retiredChild) await this.terminateOwnedChild(retiredChild);
     }
-    // Tree-kill the old process tree now that the SDK has cleaned up.
-    // If we skip this, MCP children of the previous claude process can
-    // survive as orphans when the session spawns a replacement query.
-    if (retiredChild) {
-      await this.terminateProcess(retiredChild, {
-        gracefulTimeoutMs: 2_000,
-        forceTimeoutMs: 2_000,
-      }).catch(() => {
-        /* process may already be dead */
-      });
+  }
+
+  private async terminateOwnedChild(child: ChildProcess): Promise<void> {
+    try {
+      const result = await withTimeout(
+        this.terminateProcess(child, { gracefulTimeoutMs: 2_000, forceTimeoutMs: 2_000 }),
+        5_000,
+        "Claude process cleanup exceeded 5000ms",
+      );
+      if (result === "kill-timeout")
+        throw new Error("Claude process did not report exit after SIGKILL");
+      this.retiringChildren.delete(child);
+      if (this.childProcess === child) this.childProcess = null;
+    } catch (error) {
+      throw Object.assign(
+        new Error("Claude child cleanup could not be confirmed", { cause: error }),
+        {
+          code: "reload_cleanup_unconfirmed",
+        },
+      );
     }
   }
 
@@ -4586,29 +4598,7 @@ class ClaudeAgentSession implements AgentSession {
     this.deferredHistorySessionId = null;
     this.historyAbort?.abort();
     await this.historyLoad;
-    // Ending the input retires the process on purpose. Detach first so its exit
-    // is not reported as a crash.
-    const retiredChild = this.childProcess;
-    this.childProcess = null;
-    this.input?.end();
-    await this.awaitWithTimeout(
-      activeQuery.return?.(),
-      "query pump return on missing resumed conversation",
-    );
-    // Tree-kill for the same reason the restart path does: MCP children of the
-    // retired claude process outlive it otherwise.
-    if (retiredChild) {
-      await this.terminateProcess(retiredChild, {
-        gracefulTimeoutMs: 2_000,
-        forceTimeoutMs: 2_000,
-      }).catch(() => {
-        /* process may already be dead */
-      });
-    }
-    if (this.query === activeQuery) {
-      this.query = null;
-      this.input = null;
-    }
+    if (this.query === activeQuery) await this.retireQuery();
     this.persistence = null;
     this.persistedHistory = [];
     this.persistedProviderSubagentEvents = [];

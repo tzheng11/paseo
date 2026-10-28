@@ -236,6 +236,41 @@ describe("Claude credential maintenance", () => {
     );
   }
 
+  test("history cleanup failure cannot bypass query and child shutdown", async () => {
+    const h = harness();
+    const session = await h.resume();
+    const internals = session as unknown as { historyLoad: Promise<void> };
+    internals.historyLoad = Promise.reject(new Error("disposable cache removal failed"));
+    await expect(session.close()).resolves.toBeUndefined();
+    expect(h.query.closeCalls).toBe(1);
+    expect(h.terminations).toContain(h.child);
+  });
+
+  test("retirement closes its owned child even when query close throws", async () => {
+    const h = harness();
+    const session = await h.resume();
+    const internals = session as unknown as { retireQuery(): Promise<void> };
+    vi.spyOn(h.query, "close").mockImplementation(() => {
+      throw new Error("query retirement failed");
+    });
+    await expect(internals.retireQuery()).rejects.toThrow("query retirement failed");
+    expect(h.terminations).toContain(h.child);
+    await session.close();
+  });
+
+  test("close retains and retries a retiring child with unconfirmed termination", async () => {
+    const h = harness();
+    const session = await h.resume();
+    h.cleanupResult = "kill-timeout";
+    const internals = session as unknown as { retireQuery(): Promise<void> };
+    await expect(internals.retireQuery()).rejects.toMatchObject({
+      code: "reload_cleanup_unconfirmed",
+    });
+    h.cleanupResult = "terminated";
+    await expect(session.close()).resolves.toBeUndefined();
+    expect(h.terminations).toEqual([h.child, h.child]);
+  });
+
   test("warms a fresh control-ready query without sending a model prompt", async () => {
     const h = harness();
     const session = await h.resume();

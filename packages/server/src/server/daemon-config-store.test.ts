@@ -1328,7 +1328,7 @@ describe("DaemonConfigStore reload", () => {
   });
 });
 
-test("idle unload period patches persist under agents and notify the runtime", () => {
+test("idle unload period patches persist under agents and notify the runtime", async () => {
   const paseoHome = mkdtempSync(path.join(tmpdir(), "paseo-idle-config-"));
   try {
     const store = new DaemonConfigStore(paseoHome, {
@@ -1345,10 +1345,10 @@ test("idle unload period patches persist under agents and notify the runtime", (
     store.onFieldChange("idleUnloadAfterMinutes", (minutes) => {
       observed.push(minutes);
     });
-    store.patch({ idleUnloadAfterMinutes: 0 });
+    await store.patch({ idleUnloadAfterMinutes: 0 });
     expect(loadPersistedConfig(paseoHome).agents?.idleUnloadAfterMinutes).toBe(0);
     expect(observed).toEqual([0]);
-    expect(() => store.patch({ idleUnloadAfterMinutes: -1 })).toThrow();
+    await expect(store.patch({ idleUnloadAfterMinutes: -1 })).rejects.toThrow();
   } finally {
     rmSync(paseoHome, { recursive: true, force: true });
   }

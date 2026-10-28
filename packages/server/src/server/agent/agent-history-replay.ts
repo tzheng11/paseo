@@ -99,7 +99,12 @@ export class AgentHistoryReplay<T> {
     events: AsyncIterable<T> | Iterable<T>,
     options?: { key?: (event: T) => string | null; measureSource?: boolean },
   ): Promise<AgentHistoryReplay<T>> {
-    abandonedReplayPruning ??= pruneAbandonedHistoryCaches(tmpdir(), "paseo-history-");
+    abandonedReplayPruning ??= pruneAbandonedHistoryCaches(tmpdir(), "paseo-history-").catch(
+      (error) => {
+        abandonedReplayPruning = undefined;
+        throw error;
+      },
+    );
     await abandonedReplayPruning;
     const directory = await mkdtemp(path.join(tmpdir(), `paseo-history-${process.pid}-`));
     const replay = new AgentHistoryReplay<T>(directory, null);
