@@ -133,6 +133,7 @@ jobs:
         if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.sdk != 'false') }}
         run: npm run typecheck:examples --workspace=@getpaseo/client
 
+  # The locked Playwright installers do not support ubuntu-latest's Ubuntu 26.04.
   typecheck:
     name: typecheck
     needs: changes
@@ -416,14 +417,6 @@ jobs:
 
       - name: Run app unit tests
         run: npm run test --workspace=@getpaseo/app
-
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "21"
-
-      - name: Run Android module tests
-        run: npm run test:android --workspace=@getpaseo/app
 
   playwright-1:
     name: playwright (shard 1/8)

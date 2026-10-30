@@ -203,6 +203,47 @@ test("received messages show their sender and open that agent", async ({ page })
   }
 });
 
+test("long sender attribution stays on one line in compact chat", async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.addInitScript(() =>
+    localStorage.setItem("@paseo:app-settings", JSON.stringify({ theme: "dark" })),
+  );
+  const recipient = await seedMockAgentWorkspace({
+    repoPrefix: "compact-attribution-",
+    title: "Implementation",
+  });
+  try {
+    const title = "Reviewer checking the compact chat timeline and sender attribution";
+    const sender = await recipient.client.createAgent({
+      provider: "codex",
+      cwd: recipient.cwd,
+      workspaceId: recipient.workspaceId,
+      title,
+      model: "gpt-6.1-sol",
+      modeId: "full-access",
+    });
+    await recipient.client.sendAgentMessage(
+      recipient.agentId,
+      "The sender label stays on one line, even when the agent has a long name.",
+      { sourceAgentId: sender.id },
+    );
+    await openAgentRoute(page, recipient);
+    await expectComposerVisible(page);
+    const attribution = page.getByRole("button", { name: `Sent by ${title}`, exact: true });
+    await expect(attribution).toBeVisible();
+    await expectSenderTruncatedWithinMessage(attribution, title);
+    await expectSenderAlignedWithBubble(attribution);
+    await attribution.scrollIntoViewIfNeeded();
+    await page.screenshot({ path: testInfo.outputPath("sender-compact-390.png") });
+    await page.setViewportSize({ width: 320, height: 740 });
+    await expectSenderTruncatedWithinMessage(attribution, title);
+    await expectSenderAlignedWithBubble(attribution);
+    await page.screenshot({ path: testInfo.outputPath("sender-compact-320.png") });
+  } finally {
+    await recipient.cleanup();
+  }
+});
+
 interface MessagePreviewWatch {
   /** Frames after the watch started on which the fade or "Show more" control was missing. */
   framesWithoutClip: number[];
@@ -315,6 +356,20 @@ test("opening a turn keeps the received message above it clipped on every frame"
     await recipient.cleanup();
   }
 });
+
+async function expectSenderTruncatedWithinMessage(attribution: Locator, title: string) {
+  const label = attribution.getByText(`Sent by ${title}`, { exact: true });
+  await expect(label).toHaveCSS("white-space", "nowrap");
+  await expect(label).toHaveCSS("text-overflow", "ellipsis");
+  const bounds = await label.evaluate((element) => ({
+    textWidth: element.scrollWidth,
+    visibleWidth: element.clientWidth,
+    right: element.getBoundingClientRect().right,
+    viewportWidth: document.documentElement.clientWidth,
+  }));
+  expect(bounds.textWidth).toBeGreaterThan(bounds.visibleWidth);
+  expect(bounds.right).toBeLessThanOrEqual(bounds.viewportWidth);
+}
 
 async function expectSenderAlignedWithBubble(attribution: Locator) {
   const edges = await attribution.evaluate((button) => {
@@ -475,7 +530,20 @@ async function expectThinkingPresentation(page: Page, autoExpandReasoning: boole
     await expect(group).toContainText(/read 1 file/i);
     await expect(group.getByRole("button").first()).not.toContainText(/thought/i);
     await group.getByRole("button").first().click();
-    await expect(reasoning).toBeVisible();
+    // Expand thinking is off: the group opens its rows, but the thought row stays closed
+    // until the reader opens it.
+    const thought = group
+      .getByTestId("tool-call-badge")
+      .filter({ hasText: /^Thinking/ })
+      .first();
+    await expect(thought).toBeVisible();
+    await expect(reasoning).toHaveCount(0);
+    // A press right after the group opens occasionally does not register; retry until the
+    // thought row opens.
+    await expect(async () => {
+      await thought.getByRole("button").first().click();
+      await expect(reasoning).toBeVisible({ timeout: 2_000 });
+    }).toPass();
   }
 }
 
