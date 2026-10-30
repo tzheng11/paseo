@@ -23,6 +23,8 @@ import {
   type AppUpdateCheckIntent,
 } from "./app-update-rollout.js";
 
+import { desktopUpdatesEnabled } from "./update-policy.js";
+
 export {
   bucketFromStagingUserId,
   rolloutManifestSchema,
@@ -32,16 +34,6 @@ export {
   type AppUpdateCheckResult,
   type AppUpdateInstallResult,
 };
-
-import { desktopUpdatesEnabled } from "./update-policy.js";
-
-// Custom distributions must not download or install upstream replacements,
-// including a cached update when the application quits.
-if (!desktopUpdatesEnabled) {
-  autoUpdater.autoDownload = false;
-  autoUpdater.autoInstallOnAppQuit = false;
-  autoUpdater.autoRunAppAfterInstall = false;
-}
 
 let cachedStagingUserIdPromise: Promise<string> | null = null;
 

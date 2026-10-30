@@ -9,9 +9,6 @@ const { autoUpdaterMock, updatePolicyMock } = vi.hoisted(() => {
   return {
     updatePolicyMock: { enabled: true },
     autoUpdaterMock: {
-      autoDownload: true,
-      autoInstallOnAppQuit: true,
-      autoRunAppAfterInstall: true,
       handlers,
       logger: {
         debug: vi.fn(),
@@ -340,9 +337,6 @@ describe("custom distribution update policy", () => {
     const beforeQuit = vi.fn();
     try {
       const managed = await import("./auto-updater.js");
-      expect(autoUpdaterMock.autoDownload).toBe(false);
-      expect(autoUpdaterMock.autoInstallOnAppQuit).toBe(false);
-      expect(autoUpdaterMock.autoRunAppAfterInstall).toBe(false);
       const check = await managed.checkForAppUpdate({
         currentVersion: "0.14.0",
         releaseChannel: "stable",
@@ -354,8 +348,6 @@ describe("custom distribution update policy", () => {
         beforeQuit,
       );
       expect(install.installed).toBe(false);
-      // A stale updater notification must not make the manual adapter install on quit.
-      autoUpdaterMock.handlers.get("update-downloaded")?.({ version: "0.14.1" });
       expect(
         await managed.installAppUpdateOnQuit({
           currentVersion: "0.14.0",
