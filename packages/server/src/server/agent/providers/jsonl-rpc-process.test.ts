@@ -127,9 +127,9 @@ describe("JsonlRpcProcess", () => {
     const healthy = startProcess();
     const exited = nextExit(transport);
     try {
-      await expect(transport.request({ type: "read-history" })).rejects.toThrow(
-        "JSONL frame exceeded",
-      );
+      await expect(transport.request({ type: "read-history" })).rejects.toMatchObject({
+        code: "PROVIDER_STREAM_LINE_TOO_LARGE",
+      });
       await exited;
       await expect(healthy.request({ type: "echo", value: "still alive" })).resolves.toMatchObject({
         value: "still alive",
@@ -495,5 +495,27 @@ describe("JsonlRpcProcess", () => {
     } finally {
       await transport.close();
     }
+  });
+});
+
+describe("JSONL stdout byte admission", () => {
+  test("fails pending requests and publishes the typed failure to live-turn consumers", async () => {
+    const child = createInMemoryChildProcess();
+    const process = startProcess({ child });
+    const exit = new Promise<JsonlRpcExit>((resolve) => process.onExit(resolve));
+    const request = process.request({ type: "hang" }, 1000).catch((error: Error) => error);
+    const chunk = Buffer.alloc(64 * 1024, "x");
+    child.stdout.write('{"type":"notice","text":"');
+    for (let index = 0; index < 1024; index++) child.stdout.write(chunk);
+    const error = await request;
+    expect(error).toMatchObject({
+      name: "ProviderStreamLimitError",
+      code: "PROVIDER_STREAM_LINE_TOO_LARGE",
+      limitBytes: 64 * 1024 * 1024,
+    });
+    expect((await exit).error).toBe(error);
+    await process.close();
+    child.stdout.end();
+    child.stderr.end();
   });
 });

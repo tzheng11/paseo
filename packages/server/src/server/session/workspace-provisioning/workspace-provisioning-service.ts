@@ -1,3 +1,7 @@
+import {
+  initialWorkspaceSidebarFields,
+  type WorkspaceSidebarPlacement,
+} from "../../workspace-pin-placement.js";
 import type { PluginLifecycle } from "../../plugins/lifecycle/index.js";
 import { describeHookWorkspace } from "../../plugins/lifecycle/index.js";
 import { basename, resolve } from "node:path";
@@ -28,6 +32,7 @@ export interface ResolveOrCreateWorkspaceIdInput {
   initialTitle: string | null;
   background?: boolean;
   callerWorkspaceId?: string;
+  sidebarPlacement?: WorkspaceSidebarPlacement;
 }
 
 export interface ImportWorkspaceInput {
@@ -56,6 +61,7 @@ export interface CreateWorktreeWorkspaceInput {
   siblingOrder?: number;
   background?: boolean;
   callerWorkspaceId?: string;
+  sidebarPlacement?: WorkspaceSidebarPlacement;
 }
 
 export interface WorkspaceProvisioningService {
@@ -76,6 +82,7 @@ export interface WorkspaceProvisioningService {
       siblingOrder?: number;
       background?: boolean;
       callerWorkspaceId?: string;
+      sidebarPlacement?: WorkspaceSidebarPlacement;
     },
   ): Promise<PersistedWorkspaceRecord>;
   createWorkspaceForWorktree(
@@ -107,7 +114,7 @@ export function createWorkspaceProvisioningService(deps: {
   serverId?: string;
   workspaceRegistry: WorkspaceRegistry;
   projectRegistry: ProjectRegistry;
-  workspaceGitService: Pick<WorkspaceGitService, "getCheckout" | "getSnapshot" | "peekSnapshot">;
+  workspaceGitService: Pick<WorkspaceGitService, "getCheckout" | "getSnapshot">;
   isDirectory: (path: string) => Promise<boolean>;
   logger: Logger;
   lifecycle?: PluginLifecycle;
@@ -231,6 +238,7 @@ export function createWorkspaceProvisioningService(deps: {
   async function resolveBackground(input?: {
     background?: boolean;
     callerWorkspaceId?: string;
+    sidebarPlacement?: WorkspaceSidebarPlacement;
   }): Promise<boolean> {
     if (input?.background !== undefined) return input.background;
     if (!input?.callerWorkspaceId) return false;
@@ -250,6 +258,7 @@ export function createWorkspaceProvisioningService(deps: {
       siblingOrder?: number;
       background?: boolean;
       callerWorkspaceId?: string;
+      sidebarPlacement?: WorkspaceSidebarPlacement;
     },
   ): Promise<PersistedWorkspaceRecord> {
     const normalizedCwd = resolve(cwd);
@@ -272,6 +281,7 @@ export function createWorkspaceProvisioningService(deps: {
       createdAt: timestamp,
       updatedAt: timestamp,
       background: await resolveBackground(context),
+      ...(await initialWorkspaceSidebarFields(workspaceRegistry, serverId, context)),
       parentWorkspaceId: context?.parentWorkspaceId,
       siblingOrder: context?.siblingOrder,
     });
@@ -316,6 +326,7 @@ export function createWorkspaceProvisioningService(deps: {
       updatedAt: timestamp,
       ...(input.untrustedSource ? { untrustedSource: input.untrustedSource } : {}),
       background: await resolveBackground(input),
+      ...(await initialWorkspaceSidebarFields(workspaceRegistry, serverId, input)),
       parentWorkspaceId: input.parentWorkspaceId,
       siblingOrder: input.siblingOrder,
     });

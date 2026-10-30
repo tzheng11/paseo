@@ -63,6 +63,7 @@ export const en = {
       daemonClientUnavailable: "Daemon client unavailable",
       daemonClientDisconnected: "Daemon client is disconnected",
       noFileFound: "No file found for {{token}}",
+      folderOutsideWorkspace: "{{path}} is outside this workspace",
       unexpectedDictationError: "An unexpected error occurred while handling dictation.",
     },
     connectionStatus: {
@@ -95,6 +96,7 @@ export const en = {
       addProject: "Add project",
       home: "Home",
       groupByProject: "Group by project",
+      groupByNone: "Show workspace hierarchy",
       groupByStatus: "Group by status",
       modelGroupLabel: "Model",
       modelSearchKeywords: "switch model change model set model select model",
@@ -129,6 +131,8 @@ export const en = {
       sendAndInterrupt: "Send and interrupt",
       sendAndSteer: "Send and steer",
       sendMessage: "Send message",
+      longPressToQueue: "Long press to queue",
+      longPressToSendNow: "Long press to send now",
       queue: "Queue",
       send: "Send",
     },
@@ -612,6 +616,9 @@ export const en = {
       hostDisconnected: "Host is not connected",
       updateHost: "Update the host to use the native terminal renderer.",
       unableToSubscribe: "Unable to subscribe to terminal",
+      fileUploaded: "File uploaded",
+      pasteFileFailed: "Failed to paste file: {{reason}}",
+      uploadingFile: "Uploading file…",
     },
     sheet: {
       openAsTab: "Open as tab",
@@ -1171,7 +1178,15 @@ export const en = {
       showBackground: "Show background",
       trigger: "Display preferences",
       heading: "Display",
+      sort: {
+        label: "Sort",
+        created: "Created",
+        manual: "Manual",
+        lastPrompt: "Last prompt",
+        updateHost: "Update hosts to sort workspaces",
+      },
       grouping: {
+        none: "None",
         label: "Grouping",
         project: "Project",
         status: "Status",
@@ -1323,6 +1338,7 @@ export const en = {
         copyPath: "Copy path",
         copyBranchName: "Copy branch name",
         rename: "Rename workspace",
+        addChild: "Add child workspace",
         pin: "Pin to top",
         unpin: "Unpin",
         archive: "Archive",
@@ -1354,6 +1370,13 @@ export const en = {
     },
   },
   newWorkspace: {
+    parent: {
+      label: "Make this child of",
+      none: "No parent",
+      searchPlaceholder: "Search workspaces",
+      empty: "No workspaces available.",
+      unavailable: "Workspace unavailable",
+    },
     title: "New workspace",
     create: "Create",
     isolation: {
@@ -1978,6 +2001,12 @@ export const en = {
     backdrop: "Menu backdrop",
   },
   subagents: {
+    parent: {
+      backToParent: "Back to parent",
+      backTo: "Back to {{label}}",
+      parentAgent: "Parent agent",
+      openParent: "Open parent",
+    },
     title: "Subagents",
     pillLabelOne: "1 subagent",
     pillLabelMany: "{{count}} subagents",
@@ -2023,7 +2052,6 @@ export const en = {
         alwaysUseExtension: "Always use for .{{extension}}",
         alwaysUseFilename: "Always use for {{filename}}",
         option: "{{title}} — {{owner}}",
-        actions: "File actions",
         builtin: {
           owner: "Paseo",
           markdown: "Markdown",
@@ -2042,6 +2070,8 @@ export const en = {
       notFound: "File not found",
       failedToLoadPreview: "Failed to load file preview",
       editor: {
+        preview: "Preview",
+        source: "Source",
         fileSize: "File size {{size}}",
         lines: "{{count}} lines",
         editorStatus: "Editor status {{status}}",
@@ -2092,7 +2122,14 @@ export const en = {
     input: "Input",
     output: "Output",
   },
+  turnSummary: {
+    details: "View turn details",
+    sentBy: "Sent by {{name}}",
+    showMore: "Show more",
+    showLess: "Show less",
+  },
   toolCallGroup: {
+    thought: "Thought",
     editedFiles: {
       one: "edited {{count}} file",
       other: "edited {{count}} files",
@@ -2331,6 +2368,7 @@ export const en = {
       connections: "Connections",
       agents: "Agents",
       metadata: "Metadata",
+      voice: "Voice",
       workspaces: "Workspaces",
       providers: "Providers",
       usage: "Usage",
@@ -2411,9 +2449,72 @@ export const en = {
       automaticHint: "Paseo picks a fast available model",
       preferredHint: "Choose the model Paseo uses",
       model: "Model",
-      fallbackHint: "If it is unavailable, Paseo falls back to another available model",
+      modelHint: "Only this model is used. If it fails, Paseo does not try another model",
       docs: "Docs",
       saveError: "Unable to update metadata generation",
+    },
+    voice: {
+      offline: "Connect to this host to configure voice.",
+      updateHost: "Update the host to configure voice.",
+      saveError: "Unable to update voice settings",
+      provider: "Provider",
+      providers: {
+        local: "Local",
+        openai: "OpenAI",
+      },
+      voice: "Voice",
+      save: "Save",
+      retry: "Retry",
+      cancel: "Cancel",
+      model: "Model",
+      language: "Language",
+      languagePlaceholder: "Auto-detect",
+      setBy: "Set by {{name}}",
+      unknownProvider: "Update the app to configure {{provider}}",
+      sites: {
+        dictationStt: "Speech-to-text",
+        voiceModeStt: "Listening",
+        voiceModeTts: "Speaking",
+      },
+      dictation: {
+        title: "Dictation",
+        enabled: "Dictation",
+        enabledHint: "Speak into the message box instead of typing",
+      },
+      voiceMode: {
+        title: "Voice mode",
+        info: "Voice mode transcribes what you say and reads agent replies aloud.",
+        enabled: "Voice mode",
+        enabledHint: "Talk with your agents hands-free",
+      },
+      openai: {
+        apiKey: "API key",
+        apiKeyHint: "Saved on the host and never shown again.",
+        keyPlaceholder: "sk-...",
+        savedKeyPlaceholder: "Saved",
+        missingKey: "API key missing",
+        baseUrl: "Base URL",
+        baseUrlHint: "For OpenAI-compatible servers. Leave empty to use OpenAI.",
+      },
+      models: {
+        loading: "Loading models...",
+        loadError: "Couldn't load local models",
+        none: "No models available",
+        downloaded: "Downloaded",
+        inUse: "In use",
+        recommended: "Recommended",
+        download: "Download",
+        downloadAction: "Download {{label}}",
+        downloading: "Downloading...",
+        downloadingPercent: "Downloading {{percent}}%",
+        extracting: "Extracting...",
+        delete: "Delete",
+        deleteAction: "Delete {{label}}",
+        deleteTitle: "Delete {{label}}?",
+        deleteMessage: "This frees {{size}}. You can download it again later.",
+        languages: "{{label}} languages",
+        moreLanguages: "{{languages}} and {{count}} more",
+      },
     },
     general: {
       title: "General",
@@ -2437,10 +2538,24 @@ export const en = {
             "When the agent is running, Enter steers the active turn. Command/Ctrl+Enter queues.",
           queue: "When the agent is running, Enter queues. Command/Ctrl+Enter submits.",
         },
+        commandEnterDescriptions: {
+          interrupt:
+            "When the agent is running, {{modifier}}+Enter interrupts. Enter inserts a new line.",
+          steer:
+            "When the agent is running, {{modifier}}+Enter steers the active turn. Enter inserts a new line.",
+          queue: "When the agent is running, {{modifier}}+Enter queues. Enter inserts a new line.",
+        },
         options: {
           interrupt: "Interrupt",
           steer: "Steer",
           queue: "Queue",
+        },
+      },
+      sendShortcut: {
+        label: "Send shortcut",
+        options: {
+          enter: "Enter",
+          "mod-enter": "{{modifier}}+Enter",
         },
       },
       serviceUrls: {
@@ -2459,12 +2574,13 @@ export const en = {
         label: "Always expand reasoning",
         description: "Show agent thinking and chain-of-thought blocks fully expanded by default",
       },
-      toolCallDetail: {
-        label: "Tool call display",
-        description: "How tool calls appear in the timeline",
+      chatDisplay: {
+        label: "Chat display",
+        description: "How much of an agent's work the chat shows",
         options: {
-          overview: "Summary",
-          detailed: "Full detail",
+          full: "Full",
+          collapseToolCalls: "Collapse tool calls",
+          collapseTurns: "Collapse turns",
         },
       },
       language: {
@@ -2486,11 +2602,6 @@ export const en = {
     },
     diagnostics: {
       title: "Diagnostics",
-      legacyTerminalRenderer: {
-        label: "Use legacy terminal renderer",
-        description: "Use the previous WebView terminal after reopening a terminal",
-        accessibilityLabel: "Use legacy terminal renderer",
-      },
       testAudio: "Test audio",
       playTest: "Play test",
       playing: "Playing...",
@@ -2839,6 +2950,11 @@ export const en = {
       },
       agents: {
         unavailable: "Connect to this host to manage agents",
+        idleRuntimeCleanup: {
+          title: "Release idle agents",
+          hint: "Free up memory after an hour of inactivity.",
+          info: "Stops the agent's process while keeping its conversation. Send a message to resume.\n\nActive work, pending notifications, and provider safety checks prevent cleanup.",
+        },
       },
       workspaces: {
         unavailable: "Connect to this host to manage workspaces",

@@ -5,6 +5,7 @@ import {
   withAgentHistoryReadMetrics,
   type AgentHistoryReadMetrics,
 } from "./agent/agent-history-replay.js";
+import { type WorkspaceRuntimeStore } from "./workspace-runtime-store/index.js";
 import {
   createAgentMessageDelivery,
   type AgentMessageDelivery,
@@ -118,6 +119,7 @@ import {
 } from "./lifecycle-reasons.js";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 
+import type { SecurityMode } from "@getpaseo/relay/e2ee";
 import type { BrowserToolsBroker } from "./browser-tools/broker.js";
 import type { DaemonRuntimeConfig } from "./session/daemon/daemon-session.js";
 import { DirectorySyncService } from "./directory-sync/index.js";
@@ -139,6 +141,8 @@ export interface ExternalSocketMetadata {
   transport: "relay" | "hub";
   externalSessionKey?: string;
   relayConnectionId?: string;
+  /** Negotiated endpoint security for relay-carried sockets. */
+  securityMode?: SecurityMode;
   hubDaemonId?: string;
 }
 
@@ -166,6 +170,7 @@ interface WebSocketConnectionIdentity {
   userAgent?: string;
   remoteAddress?: string;
   relayConnectionId?: string;
+  securityMode?: SecurityMode;
   hubDaemonId?: string;
   clientId?: string;
   sessionId?: string;
@@ -243,13 +248,13 @@ function createFallbackWorkspaceGitSnapshot(cwd: string): WorkspaceGitRuntimeSna
 
 function createFallbackWorkspaceGitService(): WorkspaceGitService {
   return {
+    peekSnapshot: () => null,
     registerWorkspace: () => ({
       unsubscribe: () => {},
     }),
     onSnapshotUpdated: () => ({
       unsubscribe: () => {},
     }),
-    peekSnapshot: () => null,
     getCheckout: async (cwd: string) => ({
       cwd,
       isGit: false,
@@ -369,7 +374,7 @@ function createNoopWorkspaceRegistry(): WorkspaceRegistry {
     },
     update: async () => null,
     upsert: async () => {},
-    archive: async () => {},
+    archive: async () => false,
     remove: async () => {},
   };
 }
@@ -668,6 +673,7 @@ export class VoiceAssistantWebSocketServer {
     mcpBaseUrl: string | null,
     wsConfig: WebSocketServerConfig,
     workspaceAutoName: WorkspaceAutoName,
+    private readonly workspaceRuntimeStore: WorkspaceRuntimeStore,
     auth?: DaemonAuthConfig,
     speech?: SpeechService | null,
     terminalManager?: TerminalManager | null,
@@ -1640,6 +1646,7 @@ export class VoiceAssistantWebSocketServer {
       checkoutDiffManager: this.checkoutDiffManager,
       github: this.github,
       workspaceGitService: this.workspaceGitService,
+      workspaceRuntimeStore: this.workspaceRuntimeStore,
       workspaceAutoName: this.workspaceAutoName,
       daemonConfigStore: this.daemonConfigStore,
       pluginRuntime: this.pluginRuntime,
@@ -1648,6 +1655,7 @@ export class VoiceAssistantWebSocketServer {
       stt: () => this.speech?.resolveStt() ?? null,
       sttLanguage: this.speech?.resolveSttLanguage() ?? "en",
       tts: () => this.speech?.resolveTts() ?? null,
+      speechModels: this.speech,
       terminalManager: this.terminalManager,
       providerSnapshotManager: this.providerSnapshotManager,
       hubExecutionAgents: options.hubExecutionAgents,
@@ -1845,7 +1853,6 @@ export class VoiceAssistantWebSocketServer {
         credential: message.auth,
         passwordHash: this.passwordHash,
         localCredential: this.credentialSource?.localCredential?.() ?? null,
-        transport: pending.identity.transport === "relay" ? "relay" : "direct",
       });
       if (this.pendingConnections.get(ws) !== pending) return false;
       if ("rejection" in resolved) {
@@ -1980,6 +1987,8 @@ export class VoiceAssistantWebSocketServer {
         mainHost: this.mainHostStore !== undefined,
         connectedHosts: true,
         hostMultiplexing: true,
+        // COMPAT(relayProtectedSecurity): added in v0.13.0, remove gate after 2027-04-21.
+        relayProtectedSecurity: true,
         usageSources: true,
         workspaceFields: true,
         ownedSubscriptions: true,
@@ -1992,6 +2001,8 @@ export class VoiceAssistantWebSocketServer {
         hubAgentRpc: true,
         backgroundWorkspaces: true,
         workspaceHierarchy: true,
+        workspacePinPlacement: true,
+        workspaceSidebarPlacement: true,
         // COMPAT(directorySync): added in v0.3.x, remove gate after 2027-02-12.
         directorySync: true,
         // COMPAT(workspaceLabels): added in v0.5.0, remove after 2027-08-14.
@@ -1999,6 +2010,7 @@ export class VoiceAssistantWebSocketServer {
         // COMPAT(workspaceSetupRun): added in v0.7.3, remove gate after 2027-09-02.
         workspaceSetupRun: true,
         workspaceSetupObservation: true,
+        workspaceSortTimes: true,
         // COMPAT(providersSnapshot): keep optional until all clients rely on snapshot flow.
         providersSnapshot: true,
         // COMPAT(providersSnapshotCwd): added in v0.3.2, remove gate after 2027-02-10.
@@ -2029,6 +2041,8 @@ export class VoiceAssistantWebSocketServer {
         hostStats: true,
         // COMPAT(daemonConfigReload): added in v0.4.0, remove gate after 2027-02-14.
         daemonConfigReload: true,
+        // COMPAT(speechSettings): added in v0.12.0, remove gate after 2027-04-18.
+        speechSettings: true,
         // COMPAT(relayConfig): added in v0.2.6, remove gate after 2027-01-31.
         ...(this.advertiseRelayConfig ? { relayConfig: true } : {}),
         // COMPAT(pushTokenRevocation): added in v0.3.2, remove gate after 2027-02-10.
@@ -2046,6 +2060,8 @@ export class VoiceAssistantWebSocketServer {
         pluginTimelineItems: true,
         // COMPAT(skillManagement): added in v0.4.0, remove gate after 2027-08-16.
         skillManagement: true,
+        // COMPAT(idleRuntimeCleanupSetting): added in v0.13.0, remove gate after 2027-04-26.
+        idleRuntimeCleanupSetting: true,
         // COMPAT(terminalRestoreModes): added in v0.1.81, remove gate after 2026-11-23.
         "terminal-restore-modes": true,
         // COMPAT(terminalInputModeReplay): added in v0.2.6, remove gate after 2027-02-02.
@@ -2096,6 +2112,7 @@ export class VoiceAssistantWebSocketServer {
         // COMPAT(projectedSubagentTimeline): added after v0.8.0, remove gates after 2027-03-14; retain advertisement.
         projectedSubagentTimeline: true,
         boundedTimelineHistory: true,
+        wholeTurnTimeline: true,
         // COMPAT(providerSubagentNesting): added in v0.7, remove gate after 2027-03-04.
         providerSubagentNesting: true,
         // COMPAT(workspacePinning): added in v0.1.107, remove gate after 2027-01-12.
@@ -3054,6 +3071,7 @@ function createWebSocketConnectionIdentity(
     ...(requestMetadata.userAgent ? { userAgent: requestMetadata.userAgent } : {}),
     ...(requestMetadata.remoteAddress ? { remoteAddress: requestMetadata.remoteAddress } : {}),
     ...(metadata?.relayConnectionId ? { relayConnectionId: metadata.relayConnectionId } : {}),
+    ...(metadata?.securityMode ? { securityMode: metadata.securityMode } : {}),
     ...(metadata?.hubDaemonId ? { hubDaemonId: metadata.hubDaemonId } : {}),
   };
 }
@@ -3072,6 +3090,7 @@ function toConnectionLogFields(identity: WebSocketConnectionIdentity): Record<st
     ...(identity.userAgent ? { userAgent: identity.userAgent } : {}),
     ...(identity.remoteAddress ? { remoteAddress: identity.remoteAddress } : {}),
     ...(identity.relayConnectionId ? { relayConnectionId: identity.relayConnectionId } : {}),
+    ...(identity.securityMode ? { securityMode: identity.securityMode } : {}),
     ...(identity.hubDaemonId ? { hubDaemonId: identity.hubDaemonId } : {}),
     ...(identity.clientId ? { clientId: identity.clientId } : {}),
     ...(identity.sessionId ? { sessionId: identity.sessionId } : {}),

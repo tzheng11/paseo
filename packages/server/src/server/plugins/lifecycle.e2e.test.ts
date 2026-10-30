@@ -146,7 +146,18 @@ export default function contribute(server) {
         { hook: "agent.permission_resolved", event: { resolution: { behavior: "deny" } } },
         {
           hook: "agent.turn_ended",
-          event: { outcome: { kind: "completed" }, timeline: [] },
+          event: {
+            outcome: { kind: "completed" },
+            timeline: [
+              { type: "user_message", text: "Run rm -f permission.txt" },
+              {
+                type: "tool_call",
+                name: "Bash",
+                detail: { input: { command: "rm -f permission.txt" } },
+              },
+            ],
+            timelineGap: null,
+          },
         },
         { hook: "agent.turn_started", event: { agent: { id: agent.id } } },
       ]);

@@ -29,7 +29,7 @@ import {
   type ActiveWorkspaceSelection,
 } from "@/stores/navigation-active-workspace-store";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
-import { density, densityIconBox } from "@/styles/density";
+import { density, densityIconBox, densityIconProps } from "@/styles/density";
 import type { Theme } from "@/styles/theme";
 import type { SidebarSurfaceBackdrop } from "@/styles/surface-backdrop";
 import { getSidebarRowBackdrop } from "@/components/sidebar/sidebar-row-backdrop";
@@ -46,6 +46,8 @@ import {
 } from "@/runtime/host-runtime";
 import {
   splitPinnedSidebarGroups,
+  sharedPinnedWorkspaceTree,
+  projectWorkspaceTree,
   usePinnedSidebarKeys,
   type PinnedSidebarGroups,
 } from "@/hooks/use-sidebar-pins";
@@ -53,7 +55,8 @@ import {
   useSidebarWorkspacePinController,
   confirmWorkspacePinChange,
   markWorkspacePinOutcomeUnknown,
-  runWorkspacePinChange,
+  runWorkspacePinChanges,
+  reconcileWorkspacePin,
   type ToggleSidebarWorkspacePin,
 } from "@/hooks/use-sidebar-workspace-pin";
 import { useSidebarCollapsedSectionsStore } from "@/stores/sidebar-collapsed-sections-store";
@@ -92,7 +95,11 @@ import { ProjectLeadingVisual } from "@/components/sidebar/project-leading-visua
 import { useToast } from "@/contexts/toast-context";
 import { getForgePresentation, normalizeForge } from "@/git/forge";
 import { toWorktreeArchiveRisk } from "@/git/worktree-archive-warning";
-import { hasVisibleOrderChanged, mergeWithRemainder } from "@/utils/sidebar-reorder";
+import {
+  captureUnmovedProjectOrders,
+  hasVisibleOrderChanged,
+  mergeWithRemainder,
+} from "@/utils/sidebar-reorder";
 import { confirmDialog } from "@/utils/confirm-dialog";
 import type { SidebarStateBucket } from "@/utils/sidebar-agent-state";
 import { SidebarStatusWorkspaceList } from "@/components/sidebar/sidebar-status-list";
@@ -109,16 +116,26 @@ import {
   type WorkspaceTreeDrop,
 } from "@/components/sidebar/workspace-tree";
 import { useSessionStore } from "@/stores/session-store";
-import { applyWorkspaceTreeMove } from "@/components/sidebar/workspace-tree/pin-placement";
+import {
+  changedPinPlacements,
+  requireSharedPinClients,
+  saveSharedPinPlacements,
+  acceptSharedPinPlacement,
+} from "@/components/sidebar/workspace-tree/shared-pin-placement";
+import { applyWorkspacePinGroupChange } from "@/components/sidebar/workspace-tree/pin-placement";
 import { useSidebarModel } from "@/components/sidebar/sidebar-model";
 import { SidebarWorkspaceTreeList } from "@/components/sidebar/workspace-tree/list";
 import {
   movePinnedWorkspaceTree,
-  resolvePinnedWorkspaceTree,
+  collectPinnedWorkspaceSubtree,
 } from "@/components/sidebar/workspace-tree/pinned-layout";
 import { captureVisiblePinnedOrder } from "@/components/sidebar/workspace-tree/capture-pinned-order";
 import { PinnedSectionHeader } from "@/components/sidebar/pinned-section-header";
 import { ProjectWorkspaceSortMenu } from "@/components/sidebar/workspace-sort-menu";
+import { SidebarGroupToggleRow } from "@/components/sidebar/sidebar-group-toggle-row";
+import { createWorkspaceVisibilityPolicy } from "@/components/sidebar/sidebar-group-visibility";
+import { useLimitedSidebarGroup } from "@/components/sidebar/use-limited-sidebar-group";
+import { UNGROUPED_WORKSPACE_SORT_KEY } from "@/components/sidebar/workspace-sort";
 import {
   SidebarWorkspaceRowFrame,
   SidebarWorkspaceRowContent,
@@ -289,7 +306,7 @@ interface WorkspaceRowInnerProps {
   shortcutNumber: number | null;
   showShortcutBadge: boolean;
   onPress: () => void;
-  drag: () => void;
+  drag?: () => void;
   isDragging: boolean;
   isArchiving: boolean;
   isCreating?: boolean;
@@ -398,8 +415,6 @@ function getProjectWorkspaceRowStyle({
   ];
 }
 
-function noop() {}
-
 const prBadgeStyles = StyleSheet.create((theme) => ({
   badge: {
     flexDirection: "row",
@@ -482,12 +497,12 @@ const openInNewWindowLeadingIcon = (
   <ThemedExternalLink size={14} uniProps={foregroundMutedColorMapping} />
 );
 
+const kebabTriggerIconProps = densityIconProps("sm", foregroundMutedColorMapping);
+const kebabTriggerIconHoveredProps = densityIconProps("sm", foregroundColorMapping);
+
 function renderKebabTriggerIcon({ hovered }: { hovered?: boolean }) {
   return (
-    <ThemedMoreVertical
-      size={14}
-      uniProps={hovered ? foregroundColorMapping : foregroundMutedColorMapping}
-    />
+    <ThemedMoreVertical uniProps={hovered ? kebabTriggerIconHoveredProps : kebabTriggerIconProps} />
   );
 }
 
@@ -1254,7 +1269,7 @@ function WorkspaceRowWithMenu({
   shortcutNumber: number | null;
   showShortcutBadge: boolean;
   onPress: () => void;
-  drag: () => void;
+  drag?: () => void;
   isDragging: boolean;
   dragHandleProps?: DraggableListDragHandleProps;
   canCopyBranchName: boolean;
@@ -1421,7 +1436,6 @@ function WorkspaceRowItem({
   isCreating = false,
   selectionEnabled,
   activeWorkspaceSelection,
-  onWorkspacePress,
   drag,
   isDragging = false,
   dragHandleProps,
@@ -1430,9 +1444,8 @@ function WorkspaceRowItem({
     if (!workspace.serverId) {
       return;
     }
-    onWorkspacePress?.();
     navigateToWorkspace({ serverId: workspace.serverId, workspaceId: workspace.workspaceId });
-  }, [onWorkspacePress, workspace.serverId, workspace.workspaceId]);
+  }, [workspace.serverId, workspace.workspaceId]);
 
   return (
     <WorkspaceRow
@@ -1454,7 +1467,7 @@ function WorkspaceRowItem({
         enabled: selectionEnabled,
       })}
       onPress={handlePress}
-      drag={drag ?? noop}
+      drag={drag}
       isDragging={isDragging}
       dragHandleProps={dragHandleProps}
     />
@@ -1483,7 +1496,7 @@ function areWorkspaceRowItemPropsEqual(
     previous.hostBadge === next.hostBadge &&
     previous.leadingProjectName === next.leadingProjectName &&
     previous.leadingProjectIconDataUri === next.leadingProjectIconDataUri &&
-    previous.shortcutNumber === next.shortcutNumber &&
+    (!next.showShortcutBadge || previous.shortcutNumber === next.shortcutNumber) &&
     previous.showShortcutBadge === next.showShortcutBadge &&
     previous.canCopyBranchName === next.canCopyBranchName &&
     previous.canPin === next.canPin &&
@@ -1525,7 +1538,7 @@ function WorkspaceRow({
   shortcutNumber: number | null;
   showShortcutBadge: boolean;
   onPress: () => void;
-  drag: () => void;
+  drag?: () => void;
   isDragging: boolean;
   dragHandleProps?: DraggableListDragHandleProps;
   canCopyBranchName: boolean;
@@ -1604,6 +1617,16 @@ function ProjectBlock({
   supportsPinningByServerId: ReadonlyMap<string, boolean>;
   onToggleWorkspacePin: ToggleSidebarWorkspacePin;
 }) {
+  const visibilityPolicy = useMemo(
+    () => createWorkspaceVisibilityPolicy<SidebarWorkspacePlacement>(workspaceEntriesByKey),
+    [workspaceEntriesByKey],
+  );
+  const {
+    visibleItems: visibleWorkspaces,
+    expanded: workspacesExpanded,
+    canToggle: canToggleWorkspaces,
+    toggleExpanded: toggleWorkspacesExpanded,
+  } = useLimitedSidebarGroup(project.workspaces, visibilityPolicy);
   const activeServerId = activeWorkspaceSelection?.serverId ?? null;
   const activeHostStatus = useHostRuntimeConnectionStatus(activeServerId ?? "");
   const preferredServerId = activeHostStatus === "online" ? activeServerId : null;
@@ -1645,6 +1668,7 @@ function ProjectBlock({
     ) => {
       return (
         <MemoWorkspaceRowItem
+          key={item.workspaceKey}
           workspace={item}
           workspaceEntry={workspaceEntriesByKey.get(item.workspaceKey) ?? null}
           hostBadge={hostBadgeByServerId.get(item.serverId) ?? null}
@@ -1758,12 +1782,21 @@ function ProjectBlock({
   if (!collapsed) {
     if (project.workspaces.length > 0) {
       projectChildren = (
-        <SidebarWorkspaceTreeList
-          testID={`sidebar-workspace-list-${project.viewKey}`}
-          data={project.workspaces}
-          sortSiblings={sortWorkspaceSiblings}
-          renderItem={renderWorkspace}
-        />
+        <>
+          <SidebarWorkspaceTreeList
+            testID={`sidebar-workspace-list-${project.viewKey}`}
+            data={visibleWorkspaces}
+            sortSiblings={sortWorkspaceSiblings}
+            renderItem={renderWorkspace}
+          />
+          {canToggleWorkspaces ? (
+            <SidebarGroupToggleRow
+              expanded={workspacesExpanded}
+              onPress={toggleWorkspacesExpanded}
+              testID={`sidebar-project-show-more-${project.viewKey}`}
+            />
+          ) : null}
+        </>
       );
     } else if (rowModel.trailingAction.kind === "new_workspace") {
       projectChildren = (
@@ -1817,13 +1850,13 @@ type ProjectBlockProps = Parameters<typeof ProjectBlock>[0];
 function areProjectBlockPropsEqual(previous: ProjectBlockProps, next: ProjectBlockProps): boolean {
   return (
     previous.project === next.project &&
-    previous.workspaceEntriesByKey === next.workspaceEntriesByKey &&
+    projectWorkspaceEntriesEqual(previous, next) &&
     previous.collapsed === next.collapsed &&
     previous.displayName === next.displayName &&
     previous.iconDataUri === next.iconDataUri &&
     previous.selectionEnabled === next.selectionEnabled &&
     previous.showShortcutBadges === next.showShortcutBadges &&
-    previous.shortcutIndexByWorkspaceKey === next.shortcutIndexByWorkspaceKey &&
+    projectShortcutBadgesEqual(previous, next) &&
     previous.hostBadgeByServerId === next.hostBadgeByServerId &&
     previous.supportsMultiplicityByServerId === next.supportsMultiplicityByServerId &&
     previous.supportsPinningByServerId === next.supportsPinningByServerId &&
@@ -1837,6 +1870,31 @@ function areProjectBlockPropsEqual(previous: ProjectBlockProps, next: ProjectBlo
     previous.creatingWorkspaceIds === next.creatingWorkspaceIds &&
     previous.activeWorkspaceSelection?.serverId === next.activeWorkspaceSelection?.serverId &&
     areProjectBlockSelectionsEqual(previous, next)
+  );
+}
+
+function projectShortcutBadgesEqual(previous: ProjectBlockProps, next: ProjectBlockProps): boolean {
+  if (
+    !next.showShortcutBadges ||
+    previous.shortcutIndexByWorkspaceKey === next.shortcutIndexByWorkspaceKey
+  )
+    return true;
+  return next.project.workspaces.every(
+    ({ workspaceKey }) =>
+      previous.shortcutIndexByWorkspaceKey.get(workspaceKey) ===
+      next.shortcutIndexByWorkspaceKey.get(workspaceKey),
+  );
+}
+
+function projectWorkspaceEntriesEqual(
+  previous: ProjectBlockProps,
+  next: ProjectBlockProps,
+): boolean {
+  if (previous.workspaceEntriesByKey === next.workspaceEntriesByKey) return true;
+  return next.project.workspaces.every(
+    ({ workspaceKey }) =>
+      previous.workspaceEntriesByKey.get(workspaceKey) ===
+      next.workspaceEntriesByKey.get(workspaceKey),
   );
 }
 
@@ -1867,6 +1925,14 @@ function areProjectBlockSelectionsEqual(
 }
 
 const MemoProjectBlock = memo(ProjectBlock, areProjectBlockPropsEqual);
+
+function workspacePinSection(
+  fields: { pinnedAt?: string | null; superpinnedAt?: string | null } | undefined,
+) {
+  if (fields?.superpinnedAt) return "superpinned" as const;
+  if (fields?.pinnedAt) return "pinned" as const;
+  return undefined;
+}
 
 export function SidebarWorkspaceList({
   workspaceGroups,
@@ -1904,13 +1970,12 @@ export function SidebarWorkspaceList({
   const supportsMultiplicityByServerId = useHostFeatureMap(serverIds, "workspaceMultiplicity");
   const supportsPinningByServerId = useHostFeatureMap(serverIds, "workspacePinning");
   const supportsHierarchyByServerId = useHostFeatureMap(serverIds, "workspaceHierarchy");
+  const supportsPinPlacementByServerId = useHostFeatureMap(serverIds, "workspacePinPlacement");
   const { allProjects } = useSidebarModel();
-  const pinnedWorkspaceTree = useSidebarOrderStore((state) => state.pinnedWorkspaceTree);
+  const pinnedWorkspaceTree = useMemo(() => sharedPinnedWorkspaceTree(allProjects), [allProjects]);
   const fullPinnedKeys = usePinnedSidebarKeys(allProjects);
-  const pinnedWorkspaceOrder = useSidebarOrderStore((state) => state.pinnedWorkspaceOrder);
-  const superpinnedWorkspaceOrder = useSidebarOrderStore(
-    (state) => state.superpinnedWorkspaceOrder,
-  );
+  const pinnedWorkspaceOrder = useMemo<string[]>(() => [], []);
+  const superpinnedWorkspaceOrder = pinnedWorkspaceOrder;
   const fullPinnedGroups = useMemo(() => {
     return splitPinnedSidebarGroups({
       projects: allProjects,
@@ -1927,31 +1992,46 @@ export function SidebarWorkspaceList({
     superpinnedWorkspaceOrder,
   ]);
   const navigationWorkspaces = useCallback(
-    (sourceProjects: readonly SidebarProjectEntry[], pins: PinnedSidebarGroups) => {
+    (
+      sourceProjects: readonly SidebarProjectEntry[],
+      pins: PinnedSidebarGroups,
+      visibleUnpinned?: SidebarWorkspacePlacement[],
+    ) => {
       const pinned = [...pins.superpinnedChats, ...pins.pinnedChats];
       const covered = new Set(pinned.map((workspace) => workspace.workspaceKey));
-      return [
-        ...sourceProjects
-          .flatMap((project) => project.workspaces)
-          .filter((workspace) => !covered.has(workspace.workspaceKey))
-          .map((workspace) =>
-            Object.assign({}, workspace, {
-              sidebarParentWorkspaceKey: null,
-              sidebarSection: undefined,
-            }),
-          ),
-        ...pinned,
-      ].map((workspace) =>
+      const ordinary = sourceProjects
+        .flatMap((project) => project.workspaces)
+        .filter((workspace) => !covered.has(workspace.workspaceKey));
+      const unpinned =
+        groupMode === "none"
+          ? (visibleUnpinned ??
+            projectWorkspaceTree({
+              workspaces: ordinary,
+              section: "unpinned",
+              tree: pinnedWorkspaceTree,
+            }))
+          : ordinary.map((workspace) =>
+              Object.assign({}, workspace, {
+                sidebarParentWorkspaceKey: null,
+                sidebarSection: undefined,
+              }),
+            );
+      return [...unpinned, ...pinned].map((workspace) =>
         Object.assign({}, workspace, {
           name: workspaceEntriesByKey.get(workspace.workspaceKey)?.name ?? workspace.name,
         }),
       );
     },
-    [workspaceEntriesByKey],
+    [groupMode, pinnedWorkspaceTree, workspaceEntriesByKey],
   );
   const hierarchyWorkspaces = useMemo(
-    () => navigationWorkspaces(projects, pinnedGroups),
-    [navigationWorkspaces, projects, pinnedGroups],
+    () =>
+      navigationWorkspaces(
+        projects,
+        pinnedGroups,
+        workspaceGroups.find((group) => group.leading.kind === "workspaces")?.rows,
+      ),
+    [navigationWorkspaces, projects, pinnedGroups, workspaceGroups],
   );
   const fullHierarchyWorkspaces = useMemo(
     () => navigationWorkspaces(allProjects, fullPinnedGroups),
@@ -1994,92 +2074,229 @@ export function SidebarWorkspaceList({
         (item) => item.workspaceKey === drop.workspaceKey,
       );
       if (!workspace) throw new Error("Workspace is no longer available");
-      const shouldPin = drop.pinSection !== undefined;
+      const shouldPin = drop.pinSection === "pinned" || drop.pinSection === "superpinned";
       const shouldSuperpin = drop.pinSection === "superpinned";
-      const orderStore = useSidebarOrderStore.getState();
-      const treeForDrop = (store: ReturnType<typeof useSidebarOrderStore.getState>) =>
-        drop.pinSection === "pinned" && store.pinnedWorkspaceSortMode !== "manual"
-          ? captureVisiblePinnedOrder({
-              tree: store.pinnedWorkspaceTree,
-              workspaces: fullHierarchyWorkspaces,
-              visibleWorkspaces: hierarchyWorkspaces,
-              section: "pinned",
-            })
-          : store.pinnedWorkspaceTree;
-      const layoutInput = drop.pinSection
-        ? {
-            tree: treeForDrop(orderStore),
+      const treeForDrop = (store: ReturnType<typeof useSidebarOrderStore.getState>) => {
+        let tree = pinnedWorkspaceTree;
+        if (
+          store.pinnedWorkspaceSortMode !== "manual" &&
+          (workspace.sidebarSection === "pinned" || drop.pinSection === "pinned")
+        )
+          tree = captureVisiblePinnedOrder({
+            tree,
             workspaces: fullHierarchyWorkspaces,
-            workspaceKey: workspace.workspaceKey,
-            parentWorkspaceKey: drop.parentWorkspaceKey ?? null,
-            beforeWorkspaceKey: drop.beforeWorkspaceKey ?? null,
-            section: drop.pinSection,
+            visibleWorkspaces: hierarchyWorkspaces,
+            section: "pinned",
+          });
+        if (
+          (store.workspaceSortModeByProject[UNGROUPED_WORKSPACE_SORT_KEY] ?? "manual") !==
+            "manual" &&
+          (workspace.sidebarSection === "unpinned" || drop.pinSection === "unpinned")
+        )
+          tree = captureVisiblePinnedOrder({
+            tree,
+            workspaces: fullHierarchyWorkspaces,
+            visibleWorkspaces: hierarchyWorkspaces,
+            section: "unpinned",
+          });
+        return tree;
+      };
+      const initialTree = treeForDrop(useSidebarOrderStore.getState());
+      const subtree = collectPinnedWorkspaceSubtree({
+        tree: initialTree,
+        workspaces: fullHierarchyWorkspaces,
+        workspaceKey: workspace.workspaceKey,
+      });
+      const changingSection = workspace.sidebarSection !== drop.pinSection;
+      if (changingSection && subtree.unavailableWorkspaceKeys.length)
+        throw new Error("Some group members are unavailable. Reconnect their hosts and retry");
+      const movingKeys = new Set(
+        changingSection ? subtree.workspaceKeys : [workspace.workspaceKey],
+      );
+      const byKey = new Map(fullHierarchyWorkspaces.map((item) => [item.workspaceKey, item]));
+      const moving = [...movingKeys].map((key) => byKey.get(key)!);
+      const target = fullHierarchyWorkspaces.find(
+        (item) => item.workspaceKey === drop.targetWorkspaceKey,
+      );
+      await runWorkspacePinChanges(target ? [...moving, target] : moving, async () => {
+        const runtime = getHostRuntimeStore();
+        const changedHosts = new Map<
+          string,
+          { client: NonNullable<ReturnType<typeof runtime.getClient>>; epoch: number }
+        >();
+        const members = moving.map((item) => {
+          const currentFields = () =>
+            useSessionStore.getState().sessions[item.serverId]?.workspaces.get(item.workspaceId);
+          const current = currentFields();
+          if (!current)
+            throw new Error("Workspace is no longer available. Refresh its host and retry");
+          const pinned = current.pinnedAt != null || current.superpinnedAt != null;
+          const superpinned = current.superpinnedAt != null;
+          const currentSection = workspacePinSection(current);
+          const expectedSection =
+            item.sidebarSection === "unpinned" ? undefined : item.sidebarSection;
+          if (currentSection !== expectedSection)
+            throw new Error("Workspace pin status changed. Refresh the group and retry");
+          const snapshot = runtime.getSnapshot(item.serverId);
+          const client = runtime.getClient(item.serverId);
+          const changed = pinned !== shouldPin || superpinned !== shouldSuperpin;
+          if (changed) {
+            const info = client?.getLastServerInfoMessage();
+            if (!client || snapshot?.connectionStatus !== "online" || !info)
+              throw new Error("A group member's host is disconnected. Reconnect it and retry");
+            if (!info.permissions?.includes("workspace.manage"))
+              throw new Error(
+                "A group member is read-only. Workspace management permission is required",
+              );
+            if (
+              info.features?.workspacePinning !== true ||
+              (superpinned !== shouldSuperpin && info.features?.workspaceSuperpinning !== true)
+            )
+              throw new Error(
+                "A group member's host does not support this pin change. Update that host",
+              );
+            changedHosts.set(item.serverId, { client, epoch: snapshot.connectionEpoch });
           }
-        : null;
-      if (layoutInput) {
-        const checked = movePinnedWorkspaceTree(layoutInput);
-        if (!checked.ok) throw new Error(checked.reason);
-      }
-      const currentFields = () =>
-        useSessionStore
-          .getState()
-          .sessions[workspace.serverId]?.workspaces.get(workspace.workspaceId);
-      await runWorkspacePinChange(workspace, async () => {
-        const current = currentFields();
-        await applyWorkspaceTreeMove({
-          client: getHostRuntimeStore().getClient(workspace.serverId),
-          workspaceId: workspace.workspaceId,
-          drop,
-          pinned: current?.pinnedAt != null || current?.superpinnedAt != null,
-          superpinned: current?.superpinnedAt != null,
+          const readPinState = () => {
+            const live = runtime.getSnapshot(item.serverId);
+            if (
+              changed &&
+              (live?.connectionStatus !== "online" ||
+                live.client !== client ||
+                live.connectionEpoch !== snapshot?.connectionEpoch)
+            )
+              return null;
+            const fields = currentFields();
+            return fields
+              ? {
+                  pinned: fields.pinnedAt != null || fields.superpinnedAt != null,
+                  superpinned: fields.superpinnedAt != null,
+                }
+              : null;
+          };
+          return {
+            workspaceKey: item.workspaceKey,
+            workspaceId: item.workspaceId,
+            serverId: item.serverId,
+            client,
+            pinned,
+            superpinned,
+            readPinState,
+            confirmPinState: async () => {
+              markWorkspacePinOutcomeUnknown(item.workspaceKey);
+              await confirmWorkspacePinChange(item);
+              // A new connection can authoritatively settle a lost ACK, even though
+              // it invalidates the original connection used to start the group.
+              const fields = currentFields();
+              return fields
+                ? {
+                    pinned: fields.pinnedAt != null || fields.superpinnedAt != null,
+                    superpinned: fields.superpinnedAt != null,
+                  }
+                : null;
+            },
+          };
+        });
+        const layoutInput = drop.pinSection
+          ? {
+              tree: initialTree,
+              workspaces: fullHierarchyWorkspaces,
+              workspaceKey: workspace.workspaceKey,
+              parentWorkspaceKey: drop.parentWorkspaceKey ?? null,
+              beforeWorkspaceKey: drop.beforeWorkspaceKey ?? null,
+              section: drop.pinSection,
+            }
+          : null;
+        const next = layoutInput ? movePinnedWorkspaceTree(layoutInput) : null;
+        if (next && !next.ok) throw new Error(next.reason);
+        const updates = next?.ok
+          ? changedPinPlacements({
+              previous: pinnedWorkspaceTree,
+              next: next.tree,
+              workspaces: fullHierarchyWorkspaces,
+            })
+          : [];
+        const getClient = (serverId: string) => getHostRuntimeStore().getClient(serverId);
+        requireSharedPinClients(updates, getClient);
+        if (!layoutInput) {
+          const client = runtime.getClient(workspace.serverId);
+          if (!client) throw new Error("Host disconnected. Reconnect and retry");
+          // Ordinary lists are flat. Only the dragged root is reordered in its
+          // existing project; descendants return to their own projects and hosts.
+          await client.moveWorkspace(workspace.workspaceId, {
+            parentWorkspaceId: null,
+            beforeWorkspaceId: drop.beforeWorkspaceId,
+          });
+        }
+        await applyWorkspacePinGroupChange({
+          members,
           shouldPin,
           shouldSuperpin,
-          confirmPinState: async () => {
-            markWorkspacePinOutcomeUnknown(workspace.workspaceKey);
-            await confirmWorkspacePinChange(workspace);
-            const confirmed = currentFields();
-            return {
-              pinned: confirmed?.pinnedAt != null || confirmed?.superpinnedAt != null,
-              superpinned: confirmed?.superpinnedAt != null,
-            };
+          commit: async () => {
+            // Confirm the complete group once per owning host before saving its
+            // shared layout. RPC ACKs can precede the directory replica update.
+            for (const serverId of changedHosts.keys()) await reconcileWorkspacePin(serverId);
+            for (const [serverId, before] of changedHosts) {
+              const after = runtime.getSnapshot(serverId);
+              if (
+                after?.connectionStatus !== "online" ||
+                after.client !== before.client ||
+                after.connectionEpoch !== before.epoch
+              )
+                throw new Error("A group host reconnected. Check its current pin status and retry");
+            }
+            for (const member of members) {
+              const state = member.readPinState();
+              if (!state || state.pinned !== shouldPin || state.superpinned !== shouldSuperpin)
+                throw new Error("Group pin status changed before saving. Refresh and retry");
+            }
+            if (drop.pinSection && target) {
+              const fields = useSessionStore
+                .getState()
+                .sessions[target.serverId]?.workspaces.get(target.workspaceId);
+              const section = workspacePinSection(fields);
+              const targetSection = drop.pinSection === "unpinned" ? undefined : drop.pinSection;
+              if (section !== targetSection)
+                throw new Error("The destination pin section changed. Retry the move");
+            }
+            const store = useSidebarOrderStore.getState();
+            if (layoutInput) {
+              await saveSharedPinPlacements({
+                updates,
+                sourceWorkspaceKey: workspace.workspaceKey,
+                getClient,
+                accepted: acceptSharedPinPlacement,
+              });
+              if (drop.pinSection === "unpinned")
+                store.setWorkspaceSortMode(UNGROUPED_WORKSPACE_SORT_KEY, "manual");
+              else store.setPinnedWorkspaceSortMode("manual");
+            } else {
+              if (useSidebarViewStore.getState().workspaceSort !== "manual") {
+                for (const update of captureUnmovedProjectOrders({
+                  projects: pinnedGroups.unpinnedProjects,
+                  movedProjectViewKey: workspace.projectViewKey,
+                  workspaceOrderByProject: store.workspaceOrderByProject,
+                  workspaceSortModeByProject: store.workspaceSortModeByProject,
+                }))
+                  store.setWorkspaceOrder(update.projectViewKey, update.order);
+              }
+              // The host now owns the successful ordinary move. Retire only
+              // this project's legacy client order; untouched projects retain
+              // their pre-beta manual order until the user moves them.
+              store.setWorkspaceOrder(workspace.projectViewKey, []);
+              store.setWorkspaceSortMode(workspace.projectViewKey, "manual");
+              useSidebarViewStore.getState().setWorkspaceSort("manual");
+            }
           },
         });
-        if (layoutInput) {
-          const store = useSidebarOrderStore.getState();
-          const next = movePinnedWorkspaceTree({ ...layoutInput, tree: treeForDrop(store) });
-          if (!next.ok) throw new Error(next.reason);
-          const destination = fullHierarchyWorkspaces.map((item) =>
-            item.workspaceKey === workspace.workspaceKey
-              ? { ...item, sidebarSection: drop.pinSection }
-              : item,
-          );
-          const resolved = resolvePinnedWorkspaceTree(destination, next.tree);
-          const roots = destination
-            .filter(
-              (item) =>
-                item.sidebarSection === drop.pinSection &&
-                resolved.get(item.workspaceKey)?.parentWorkspaceKey === null,
-            )
-            .sort(
-              (left, right) =>
-                resolved.get(left.workspaceKey)!.siblingOrder -
-                resolved.get(right.workspaceKey)!.siblingOrder,
-            )
-            .map((item) => item.workspaceKey);
-          await store.setPinnedWorkspaceTree(next.tree, {
-            section: layoutInput.section,
-            keys: mergeWithRemainder({
-              currentOrder:
-                layoutInput.section === "superpinned"
-                  ? store.superpinnedWorkspaceOrder
-                  : store.pinnedWorkspaceOrder,
-              reorderedVisibleKeys: roots,
-            }),
-          });
-        } else orderStore.setWorkspaceSortMode(workspace.projectViewKey, "manual");
       });
     },
-    [fullHierarchyWorkspaces, hierarchyWorkspaces],
+    [
+      fullHierarchyWorkspaces,
+      hierarchyWorkspaces,
+      pinnedWorkspaceTree,
+      pinnedGroups.unpinnedProjects,
+    ],
   );
   // One fetch, one map, every mode — project mode paints icons on its headers and status mode
   // paints them on each row, all keyed by `projectViewKey`. The targets come from the projection
@@ -2148,6 +2365,7 @@ export function SidebarWorkspaceList({
       workspaces={hierarchyWorkspaces}
       allWorkspaces={fullHierarchyWorkspaces}
       supportedServerIds={supportsHierarchyByServerId}
+      supportedPinnedServerIds={supportsPinPlacementByServerId}
       onMove={handleWorkspaceMove}
     >
       {content}
@@ -2790,8 +3008,12 @@ const styles = StyleSheet.create((theme) => ({
     marginRight: -6,
   },
   projectKebabButton: {
-    width: 24,
-    height: 24,
+    // Larger on compact so the kebab is an easy tap target. The negative margins keep its
+    // dots on the same rail as the 24px desktop box and the row at its 44px height.
+    width: { xs: 32, md: 24 },
+    height: { xs: 32, md: 24 },
+    marginRight: { xs: -4, md: 0 },
+    marginVertical: { xs: -4, md: 0 },
     borderRadius: theme.borderRadius.md,
     alignItems: "center",
     justifyContent: "center",

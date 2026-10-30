@@ -7,7 +7,7 @@ import {
 import { migrateSidebarOrderState, useSidebarOrderStore } from "./sidebar-order-store";
 
 describe("migrateSidebarOrderState", () => {
-  it("prefixes legacy per-server workspace order with the source server id", () => {
+  it("preserves legacy workspace ordering across hosts", () => {
     const migrated = migrateSidebarOrderState({
       projectOrderByServerId: {
         "host-a": ["project-a"],
@@ -64,7 +64,7 @@ describe("migrateSidebarOrderState", () => {
 
   it("normalizes pinned workspace order", () => {
     const migrated = migrateSidebarOrderState({
-      pinnedWorkspaceOrder: [" host-a:one ", "host-a:one", "", "host-b:two"],
+      pinnedWorkspaceOrder: ["host-a:one", "host-a:one", "", "host-b:two"],
     });
 
     expect(migrated.pinnedWorkspaceOrder).toEqual(["host-a:one", "host-b:two"]);
@@ -169,12 +169,19 @@ describe("migrateSidebarOrderState", () => {
       release();
       await pending;
       expect(complete).toBe(true);
+      const beforeFailure = useSidebarOrderStore.getState();
       spy.mockRejectedValueOnce(new Error("Storage unavailable"));
       await expect(
         useSidebarOrderStore
           .getState()
           .setPinnedWorkspaceTree({}, { section: "superpinned", keys: ["two:b"] }),
       ).rejects.toThrow("Storage unavailable");
+      expect(useSidebarOrderStore.getState().pinnedWorkspaceTree).toBe(
+        beforeFailure.pinnedWorkspaceTree,
+      );
+      expect(useSidebarOrderStore.getState().superpinnedWorkspaceOrder).toBe(
+        beforeFailure.superpinnedWorkspaceOrder,
+      );
     } finally {
       spy.mockRestore();
     }
@@ -357,7 +364,6 @@ describe("sidebar order keys that end in whitespace", () => {
       computeSidebarOrderUpdates({
         projects,
         persistedProjectOrder: useSidebarOrderStore.getState().projectOrder,
-        getWorkspaceOrder: (key) => useSidebarOrderStore.getState().getWorkspaceOrder(key),
       });
 
     // First pass adds the newly visible project.
@@ -370,9 +376,9 @@ describe("sidebar order keys that end in whitespace", () => {
     expect(runPass().projectOrder).toBeNull();
   });
 
-  it("still trims keys when migrating persisted state", () => {
+  it("still trims legacy keys when migrating per-host persisted state", () => {
     const migrated = migrateSidebarOrderState({
-      projectOrder: [" host-a:one ", "host-a:one"],
+      projectOrderByServerId: { host: [" host-a:one ", "host-a:one"] },
     });
 
     expect(migrated.projectOrder).toEqual(["host-a:one"]);
@@ -417,4 +423,65 @@ describe("sidebar order keys that end in whitespace", () => {
     await useSidebarOrderStore.persist.rehydrate();
     expect(useSidebarOrderStore.getState()).toMatchObject(expectedState);
   });
+});
+
+it("preserves project, pinned and ordinary workspace order", () => {
+  expect(
+    migrateSidebarOrderState({
+      projectOrder: ["b", "a"],
+      pinnedWorkspaceOrder: ["h:y", "h:x"],
+      workspaceOrderByProject: { a: ["h:old", "h:new"] },
+    }),
+  ).toMatchObject({
+    projectOrder: ["b", "a"],
+    pinnedWorkspaceOrder: ["h:y", "h:x"],
+    workspaceOrderByProject: { a: ["h:old", "h:new"] },
+  });
+});
+
+it("preserves whitespace in current project and pin identities during upgrade", () => {
+  expect(
+    migrateSidebarOrderState(
+      {
+        projectOrder: ["project "],
+        pinnedWorkspaceOrder: ["host:workspace "],
+        workspaceOrderByProject: {},
+      },
+      2,
+    ),
+  ).toMatchObject({
+    projectOrder: ["project "],
+    pinnedWorkspaceOrder: ["host:workspace "],
+    workspaceOrderByProject: {},
+  });
+});
+
+it("retains a pre-beta manual order when upgrading", () => {
+  expect(
+    migrateSidebarOrderState({
+      projectOrder: ["project"],
+      pinnedWorkspaceOrder: [],
+      workspaceOrderByProject: { project: ["host:b", "host:a"] },
+    }),
+  ).toMatchObject({
+    projectOrder: ["project"],
+    pinnedWorkspaceOrder: [],
+    workspaceOrderByProject: { project: ["host:b", "host:a"] },
+  });
+});
+
+it("starts with an empty manual order for beta users whose order was discarded", () => {
+  expect(
+    migrateSidebarOrderState({ projectOrder: ["p"], pinnedWorkspaceOrder: ["h:a"] }),
+  ).toMatchObject({
+    projectOrder: ["p"],
+    pinnedWorkspaceOrder: ["h:a"],
+    workspaceOrderByProject: {},
+  });
+});
+it("preserves spaces in saved workspace scopes and identities", () => {
+  expect(
+    migrateSidebarOrderState({ workspaceOrderByProject: { "project ": ["host:b ", "host:a "] } })
+      .workspaceOrderByProject,
+  ).toEqual({ "project ": ["host:b ", "host:a "] });
 });

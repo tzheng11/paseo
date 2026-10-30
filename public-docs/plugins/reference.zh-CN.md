@@ -529,9 +529,12 @@ export default function contribute(server: PluginServerContext) {
 
 只要插件处于启用状态，钩子就会在 daemon 上运行，即使没有应用连接。
 
-### 修改配置并注入 MCP 服务器 {#change-configuration-and-inject-an-mcp-server}
+`agent.create` 修改 Agent 的已保存配置。对 `config` 的修改会被持久化，在插件停用或移除后仍然保留。
+`agent.session_open` 提供仅用于启动的 `env`、`tools` 和 `mcpServers`；每次创建、恢复、刷新和导入时都会重新计算，随插件的生命周期变化，不会写入 Agent 记录。
 
-在 `contribute(server)` 中添加这个回调。把占位 URL 替换为你的 MCP 端点。
+### 修改已保存的配置 {#change-saved-configuration}
+
+在 `contribute(server)` 中添加这个回调，为新的 Codex Agent 设置已保存的选项：
 
 ```ts
 server.before("agent.create", ({ request }) => {
@@ -548,13 +551,6 @@ server.before("agent.create", ({ request }) => {
         sandbox_mode: "workspace-write",
         approval_policy: "on-request",
       },
-      mcpServers: {
-        ...request.config.mcpServers,
-        company: {
-          type: "http",
-          url: "https://tools.example.com/mcp",
-        },
-      },
     },
   };
 });
@@ -564,10 +560,37 @@ server.before("agent.create", ({ request }) => {
 | ------------------------------------------- | ------------------- |
 | `providerOptions.sandbox_mode: "read-only"` | `"workspace-write"` |
 | `providerOptions.web_search: "disabled"`    | 由展开运算保留      |
-| 已有的 `mcpServers.search`                  | 由展开运算保留      |
-| 已有的 `mcpServers.company`                 | 被替换为上面的条目  |
 
-所选的 Provider 会校验 `providerOptions`，并且必须支持配置的 MCP 服务器。显式的 Codex 沙盒和批准选项会覆盖它的模式预设。
+所选的 Provider 会校验 `providerOptions`。显式的 Codex 沙盒和批准选项会覆盖它的模式预设。
+
+### 注入 MCP 服务器 {#inject-mcp-servers}
+
+需要将服务器保存为 Agent 配置的一部分时，使用 `agent.create.config.mcpServers`。
+插件拥有的服务器使用下面的回调，在 `contribute(server)` 中添加，并把占位 URL 替换为你的 MCP 端点：
+
+```ts
+server.before("agent.session_open", ({ request }) => {
+  if (request.provider !== "codex") return;
+
+  return {
+    ...request,
+    mcpServers: {
+      ...request.mcpServers,
+      company: { type: "http", url: "https://tools.example.com/mcp" },
+    },
+  };
+});
+```
+
+`request.mcpServers` 使用与 `AgentSessionConfig.mcpServers` 相同的服务器配置。
+每个插件的映射从空开始，只在该插件自己的回调之间累积，不包含 Agent 已保存的服务器或其他插件的服务器。
+替换映射即可添加、替换或移除本插件的条目；返回 `undefined` 会保持不变。
+Paseo 按插件 ID 顺序合并各插件的最终映射。
+
+名称与已保存的服务器、Paseo 内部的 `paseo` 服务器或其他插件的服务器冲突时，会话打开失败，错误会指出服务器名称及双方来源。
+不支持 MCP 的 Provider 会报 `does not support MCP servers` 错误，并指出插件名称。
+`purpose: "history"` 的会话打开会忽略这些服务器。安装、停用和重新加载插件后，现有 Agent
+通过[会话重新打开行为](#attach-tools-to-agents)获取变化。
 
 ### 在每次打开会话时注入环境变量 {#inject-environment-variables-on-every-session-opening}
 
@@ -583,7 +606,118 @@ server.before("agent.session_open", ({ request }) => {
 });
 ```
 
-它会在创建、恢复、刷新和导入时运行。如果只想在创建时注入，请改为在 `agent.create` 回调中设置 `env`。
+会话打开时的环境变量覆盖项会在每次打开时重新计算。`agent.create.env` 只作用于首次启动，不会写入 Agent 的已保存配置。
+
+### 为 Agent 附加工具 {#attach-tools-to-agents}
+
+在 `index.server.ts` 中定义工具，并在 `before("agent.session_open")` 中附加它。
+此示例只向带有 `notes/enabled: "true"` 标签的 Agent 提供 `append_workspace_note`：
+
+```ts
+import { writeFile } from "node:fs/promises";
+import path from "node:path";
+import { z } from "zod";
+import { defineAgentTool, type PluginServerContext } from "@getpaseo/plugin/server";
+
+const appendWorkspaceNote = defineAgentTool({
+  name: "append_workspace_note",
+  description: "Append a note to AGENT_NOTES.md in this agent's working directory.",
+  input: z.object({ note: z.string().min(1).describe("Note to append") }),
+  async execute({ note }, { agent, signal }) {
+    const notePath = path.join(agent.cwd, "AGENT_NOTES.md");
+    await writeFile(notePath, `${note}\n`, { encoding: "utf8", flag: "a", signal });
+    return {
+      text: `Saved note to ${notePath}`,
+      structuredContent: { path: notePath },
+    };
+  },
+});
+
+export default function contribute(server: PluginServerContext) {
+  server.before("agent.session_open", ({ request }) => {
+    if (request.labels["notes/enabled"] !== "true") return;
+    return { ...request, tools: [...request.tools, appendWorkspaceNote] };
+  });
+  return () => {};
+}
+```
+
+通过 SDK 创建 Agent 时设置标签：
+
+```ts
+const agent = await paseo.agents.create({
+  config: { provider: "codex/gpt-5.4" },
+  cwd: "/projects/shop",
+  labels: { "notes/enabled": "true" },
+});
+```
+
+使用会话打开请求中的字段选择 Agent：
+
+| 选择依据   | 回调中的条件                                 |
+| ---------- | -------------------------------------------- |
+| 标签       | `request.labels["notes/enabled"] === "true"` |
+| Provider   | `request.provider === "codex"`               |
+| 工作区     | `request.workspaceId === "workspace-456"`    |
+| 单个 Agent | `request.agentId === chosenAgentId`          |
+
+每个插件的 `request.tools` 都从空数组开始。同一插件中的后续回调会看到前面回调返回的工具；
+替换数组即可添加或移除工具。返回 `undefined` 会保留请求。`purpose: "history"` 时会忽略工具。
+
+从 `@getpaseo/plugin/server` 导入 `defineAgentTool`、`AgentToolDefinition`、`AgentToolContext`
+和 `AgentToolResult`。辅助函数会根据 Zod schema 推断验证后的输入类型：
+
+```ts
+declare function defineAgentTool<Input extends z.ZodType>(tool: {
+  name: string;
+  title?: string;
+  description: string;
+  input: Input;
+  execute(
+    input: z.output<Input>,
+    context: AgentToolContext,
+  ): AgentToolResult | Promise<AgentToolResult>;
+}): AgentToolDefinition;
+
+interface AgentToolResult {
+  text?: string;
+  structuredContent?: unknown;
+  isError?: boolean;
+}
+```
+
+| 执行 context | 值                                                                                                  |
+| ------------ | --------------------------------------------------------------------------------------------------- |
+| `agent`      | 发起调用的 Agent，以 `PluginHookAgent` 表示，包括 `id`、`workspaceId`、`provider`、`cwd` 和 `title` |
+| `paseo`      | 已连接到此 daemon 的 SDK                                                                            |
+| `signal`     | 此次工具调用的中止信号；请把它传给文件操作或外部请求                                                |
+
+`execute` 在插件进程中运行。闭包和原始 Zod schema 保留在该进程中；只有工具元数据和调用的
+输入、结果会跨进程传递。Paseo 在调用 `execute` 前验证输入。无效输入会将 schema 问题返回给
+Agent。抛出的错误会转换为 `{ isError: true, text: message }`，插件继续运行。取消调用或关闭
+其传输连接会中止 `signal` 并丢弃结果。工具调用最长运行 10 分钟，与钩子的 30 秒超时分开。
+关闭或重新打开 Agent 会话会移除旧定义。
+
+在 `text` 中返回模型可见的文本。`structuredContent` 必须可序列化为 JSON；省略 `text` 时，
+Paseo 会将该值格式化为供模型读取的文本。设置 `isError: true` 可报告工具错误。
+
+Paseo 通过 Agent 工具传输提供附加的工具，按 Provider 的支持情况使用 MCP 或原生注册。
+同一份定义和回调适用于这两种方式。附加的工具遵循[与 Paseo 工具相同的限制](/docs/mcp#limit-paseo-tools-by-provider)。
+只有该 Agent 能看到这些工具。
+
+名称必须匹配 `/^[a-z][a-z0-9_]*$/`，且不超过 64 个字符。如果名称与同一 Agent 的 Paseo
+工具或另一插件的工具冲突，会话打开会失败，并指出双方。一个插件内的重复名称也会导致
+会话打开失败。回调未选中的 Agent 不受影响。
+
+| 变更                                                   | Agent 何时收到变更                                                                                                                                                                 |
+| ------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 启动、停止或重新加载声明了 `agent.session_open` 的插件 | 已打开的会话会标记为过期。每个会话在下一次空闲提示词前重新打开；正在运行的轮次会继续，不会被中断。重新打开后的下一条提示词复用该会话。                                             |
+| 修改回调选择的 Agent                                   | 编辑此示例后运行 `paseo plugin reload agent-tools`，然后在 Agent 空闲时发送提示词。                                                                                                |
+| 立即应用                                               | 调用 `await paseo.agents.ref(id).reload({ requestId: "reload-notes" })`。`requestId` 可选。这会重新打开 Provider 会话，以 `reason: "refresh"` 再次运行钩子，并中断正在运行的轮次。 |
+| 读取当前快照                                           | 调用 `await paseo.agents.ref(id).refresh()`。这只读取状态，不会重新打开会话。                                                                                                      |
+
+如果自动重新打开失败，触发它的提示词会返回该错误。参阅
+[完整 agent-tools 示例](https://github.com/getpaseo/paseo/tree/main/plugin-examples/agent-tools)。
 
 ### 选择工作区隔离方式 {#choose-workspace-isolation}
 
@@ -689,21 +823,21 @@ export default function contribute(server: PluginServerContext) {
 
 ### 事件 {#events}
 
-| 名称                         | 事件字段                                              | 触发时机                      |
-| ---------------------------- | ----------------------------------------------------- | ----------------------------- |
-| `agent.created`              | `agent`                                               | 普通创建完成；不包括导入/恢复 |
-| `agent.closed`               | `agent`                                               | 一个运行中的 Agent 运行时关闭 |
-| `agent.turn_started`         | `agent`, `turnId`                                     | 实时轮次开始                  |
-| `agent.turn_ended`           | `agent`, `turnId`, `outcome`, 已弃用的 `timeline: []` | 实时轮次完成、失败或被取消    |
-| `agent.permission_requested` | `agent`, `request`                                    | 权限请求或问题进入待处理状态  |
-| `agent.permission_resolved`  | `agent`, `requestId`, `resolution`                    | 待处理的请求得到回应或被清除  |
-| `agent.archived`             | `agent`, `archivedAt`                                 | 归档状态已保存                |
-| `workspace.created`          | `workspace`                                           | 记录已创建；目录可用          |
-| `workspace.archived`         | `workspace`                                           | 归档状态已保存                |
+| 名称                         | 事件字段                                                         | 触发时机                      |
+| ---------------------------- | ---------------------------------------------------------------- | ----------------------------- |
+| `agent.created`              | `agent`                                                          | 普通创建完成；不包括导入/恢复 |
+| `agent.closed`               | `agent`                                                          | 一个运行中的 Agent 运行时关闭 |
+| `agent.turn_started`         | `agent`, `turnId`                                                | 实时轮次开始                  |
+| `agent.turn_ended`           | `agent`, `turnId`, `outcome`, 已弃用的有界 `timeline` 和缺口字段 | 实时轮次完成、失败或被取消    |
+| `agent.permission_requested` | `agent`, `request`                                               | 权限请求或问题进入待处理状态  |
+| `agent.permission_resolved`  | `agent`, `requestId`, `resolution`                               | 待处理的请求得到回应或被清除  |
+| `agent.archived`             | `agent`, `archivedAt`                                            | 归档状态已保存                |
+| `workspace.created`          | `workspace`                                                      | 记录已创建；目录可用          |
+| `workspace.archived`         | `workspace`                                                      | 归档状态已保存                |
 
 Agent 事件不包括 daemon 私有的一次性辅助 Agent。公开的后台工作区及其普通 Agent 与其他工作区运行相同的生命周期钩子。归档事件可能早于运行时/worktree 清理；当清理很重要时，请单独观察生命周期何时完成。
 
-`agent.turn_ended.timeline` 已弃用，并且始终为空。需要历史时，请用 `context.paseo.agents.ref(event.agent.id).timeline.refetch({ direction: "tail", limit: 20 })` 按需获取。钩子负载的大小不会随对话历史增长。
+本分支的 `agent.turn_ended.timeline` 是已弃用的有界头尾快照。判断历史是否完整前，请检查 `timelineGap` 和 `providerHistoryGap`。需要历史时，请用 `context.paseo.agents.ref(event.agent.id).timeline.refetch({ direction: "tail", limit: 20 })` 按需获取。钩子负载的大小不会随对话历史增长。
 
 **共享的负载结构**（`@getpaseo/plugin/server`）：
 
@@ -734,18 +868,18 @@ type PluginTurnOutcome =
 | 字段         | 结构 / 含义                                                                              |
 | ------------ | ---------------------------------------------------------------------------------------- |
 | `turnId`     | Provider 报告的 `string` 或 `null`；会话重新打开后可能重复                               |
-| `timeline`   | `readonly AgentTimelineItem[]`；包含之前对话的完整快照；文本可能跨越多个条目             |
+| `timeline`   | `readonly AgentTimelineItem[]`；有界头尾兼容快照；缺口字段说明省略的历史                 |
 | `request`    | SDK 的 `AgentPermissionRequest`；`kind` 为 `tool`、`plan`、`question`、`mode` 或 `other` |
 | `resolution` | SDK 的 `AgentPermissionResponse`                                                         |
 | `archivedAt` | 时间戳字符串                                                                             |
 
 ### before 钩子 {#before-hooks}
 
-| 名称                 | 请求字段                                                                | 可编辑                              |
-| -------------------- | ----------------------------------------------------------------------- | ----------------------------------- |
-| `agent.create`       | `config`，可选的 `env`                                                  | 除 `cwd` 外的公开 Agent 配置；`env` |
-| `agent.session_open` | `agentId`, `workspaceId`, `provider`, `cwd`, `reason`, `purpose`, `env` | 仅 `env`                            |
-| `workspace.create`   | `source`，可选的 `title`，`firstAgentContext`                           | 整个显式创建请求                    |
+| 名称                 | 请求字段                                                                                                                   | 可编辑                                    |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
+| `agent.create`       | `config`，可选的 `env`                                                                                                     | 除 `cwd` 外的公开 Agent 配置；`env`       |
+| `agent.session_open` | `agentId`, `workspaceId`, `provider`, `cwd`，只读的 `title` 和 `labels`，`reason`, `purpose`, `env`, `tools`, `mcpServers` | 仅用于启动的 `env`、`tools`、`mcpServers` |
+| `workspace.create`   | `source`，可选的 `title`，`firstAgentContext`                                                                              | 整个显式创建请求                          |
 
 **`agent.create.config`** 使用 `AgentSessionConfig`：
 
@@ -766,18 +900,26 @@ type PluginTurnOutcome =
   "workspaceId": "workspace-456",
   "provider": "codex",
   "cwd": "/projects/shop",
+  "title": "Workspace notes",
+  "labels": { "notes/enabled": "true" },
+  "tools": [],
+  "mcpServers": {},
   "reason": "resume",
   "purpose": "interactive",
   "env": { "COMPANY_ENV": "development" }
 }
 ```
 
-| 字段          | 取值                                                                                 |
-| ------------- | ------------------------------------------------------------------------------------ |
-| `workspaceId` | 字符串或 `null`                                                                      |
-| `reason`      | `create`、`resume`、`refresh`、`import`                                              |
-| `purpose`     | `interactive`、`history`                                                             |
-| `env`         | 启动覆盖映射；不包括 daemon 继承的环境变量。替换整个映射即可添加、替换或移除覆盖项。 |
+| 字段          | 取值                                                                                                     |
+| ------------- | -------------------------------------------------------------------------------------------------------- |
+| `workspaceId` | 字符串或 `null`                                                                                          |
+| `title`       | 只读字符串或 `null`；创建时使用创建请求的标题，恢复时使用已保存的标题。                                  |
+| `labels`      | 只读的字符串映射；创建时使用创建请求的标签，恢复时使用已保存的标签。                                     |
+| `tools`       | 可编辑的 `AgentToolDefinition[]`，仅包含此插件的工具。参阅[为 Agent 附加工具](#attach-tools-to-agents)。 |
+| `mcpServers`  | 可编辑的服务器映射，仅用于启动且仅包含本插件的条目。参阅[注入 MCP 服务器](#inject-mcp-servers)。         |
+| `reason`      | `create`、`resume`、`refresh`、`import`                                                                  |
+| `purpose`     | `interactive`、`history`                                                                                 |
+| `env`         | 启动覆盖映射；不包括 daemon 继承的环境变量。替换整个映射即可添加、替换或移除覆盖项。                     |
 
 ### 顺序与返回值 {#ordering-and-returned-values}
 
@@ -786,7 +928,7 @@ Creation request
   → agent.create hooks (plugin-ID order; registration order within each plugin)
   → resolve defaults and validate provider configuration
   → derive launch configuration with Paseo runtime tools and daemon prompt
-  → agent.session_open hooks (same ordering; env only)
+  → agent.session_open hooks (same ordering; env and plugin-local tools and MCP servers)
   → set PASEO_AGENT_ID and PASEO_AGENT_CWD
   → open provider session and save agent configuration
 ```
@@ -798,7 +940,8 @@ Creation request
 | `undefined`                                             | 未改变的请求                      |
 | 抛出错误或返回无效数据                                  | 操作失败；后面的回调不会运行      |
 
-没有自动的深度合并。后面的回调可以覆盖前面的值。Agent 配置会被保存；环境变量覆盖项不会随之持久化。
+没有自动的深度合并。`env` 在插件之间累积；`tools` 和 `mcpServers` 只在同一插件的回调之间累积。
+返回替换的映射或数组会替换该范围内之前的值。
 
 ### context 与清理 {#context-and-cleanup}
 
@@ -822,6 +965,7 @@ Creation request
 | [lifecycle-logger](https://github.com/getpaseo/paseo/tree/main/plugin-examples/lifecycle-logger)       | 全部十一个钩子；隐去环境变量值的 JSON 日志             |
 | [lifecycle-actions](https://github.com/getpaseo/paseo/tree/main/plugin-examples/lifecycle-actions)     | 后续消息、权限、环境变量、切换 Provider、选择 worktree |
 | [agent-configuration](https://github.com/getpaseo/paseo/tree/main/plugin-examples/agent-configuration) | MCP 注入以及 Codex 沙盒/批准选项                       |
+| [agent-tools](https://github.com/getpaseo/paseo/tree/main/plugin-examples/agent-tools)                 | 按标签选择 Agent，并在插件进程中执行文件操作的工具     |
 
 用 `paseo plugin logs lifecycle-logger` 或主机的 `daemon.log` 读取 logger 的输出。
 
@@ -1069,7 +1213,7 @@ export function IssueActions({ theme }: PluginSurfaceProps) {
 ```tsx
 import { Markdown } from "@getpaseo/plugin/client/ui";
 
-<Markdown>{"## 审查\n\n检查**通过**。"}</Markdown>;
+<Markdown>{"## Review\n\nThe checks **passed**."}</Markdown>;
 ```
 
 `children` 是唯一的属性，必须为字符串。更新它会立即渲染新内容；空字符串不渲染任何内容。
@@ -1525,7 +1669,8 @@ if (current.status === "ready") {
 
 ## 工作区面板 {#workspace-panels}
 
-为工作区或 Agent 上下文注册一个面板：
+使用 `addWorkspacePanel` 注册工作区面板，使用 `addAgentPanel` 注册 Agent 面板。
+两者与[文件面板](#file-panels)使用相同的面板契约。
 
 `client/review.tsx`：
 
@@ -1534,9 +1679,9 @@ import { type PluginAgentPanelProps, useAgent, useWorkspace } from "@getpaseo/pl
 import { useMemo } from "react";
 import { Text, View } from "react-native";
 
-export function ReviewPanel({ theme, layout, workspaceId, agentId }: PluginAgentPanelProps) {
+export function ReviewPanel({ theme, layout, workspaceId, params }: PluginAgentPanelProps) {
   const workspaceName = useWorkspace(workspaceId, (workspace) => workspace.name);
-  const agent = useAgent(agentId, ({ id, title }) => ({ id, title }));
+  const agent = useAgent(params.agentId, ({ id, title }) => ({ id, title }));
   const styles = useMemo(
     () => ({
       screen: {
@@ -1565,11 +1710,10 @@ import type { PluginClientContext } from "@getpaseo/plugin/client";
 import { ReviewPanel } from "./client/review";
 
 export default function contribute(client: PluginClientContext) {
-  client.addWorkspacePanel({
+  client.addAgentPanel({
     id: "review",
     title: "Review",
     icon: "Scan",
-    context: "agent",
     locations: ["workspace", "explorer"],
     Component: ReviewPanel,
   });
@@ -1577,20 +1721,42 @@ export default function contribute(client: PluginClientContext) {
 }
 ```
 
-`addWorkspacePanel` 的字段：
+`addWorkspacePanel` 和 `addAgentPanel` 的字段：
 
 | 字段        | 是否必填 | 含义                                                |
 | ----------- | -------- | --------------------------------------------------- |
 | `id`        | 是       | 插件内部的面板 ID。                                 |
 | `title`     | 是       | 工作区标签页的标题。                                |
 | `icon`      | 是       | Lucide 名称、`{ svg }` 或组件。参见[图标](#icons)。 |
-| `context`   | 是       | `workspace` 或 `agent`。                            |
 | `locations` | 否       | `workspace` 和/或 `explorer`。默认为 `workspace`。  |
 | `Component` | 是       | 与所选上下文的属性相匹配的 React Native 组件。      |
 
-工作区面板接收 `PluginWorkspacePanelProps`：`context: "workspace"`、`theme`、`host`、`layout` 和 `workspaceId`。Agent 面板接收 `PluginAgentPanelProps`：`context: "agent"`、相同的通用字段和 `workspaceId`，外加 `agentId`。
+每个面板都接收 `PluginPanelProps<Params>`，包含 `theme`、`host`、`layout`、`navigation`、
+`workspaceId`、只读的 `params`、`revision` 和 `tab`。工作区面板使用空的
+`PluginWorkspacePanelParams`；Agent 面板的 `PluginAgentPanelParams` 包含 `agentId`。
+每次向同一标签页重新发送 params 时，`revision` 都会递增，即使请求与上次相同。
 
-用 `useWorkspace(workspaceId, selector)` 和 `useAgent(agentId, selector)` 读取缓存的状态。selector 是必填的。Paseo 对它的结果做浅比较，因此选择 `{ name, status }` 时，无关字段的变化不会触发重新渲染。在一次调用中选择组件渲染的所有字段；不要选择整个快照。
+`tab.setModified(boolean)` 标记未保存的更改，并在关闭前询问。`tab.state` 是由面板定义的持久化
+JSON，初始为 `undefined`；`tab.setState(value)` 替换整个值。每个标签页拥有独立状态。
+Paseo 只保存状态，不解释其内容。用 `useTabState(tab, schema, defaultState)` 验证它：
+
+```tsx
+const schema = z.object({ view: z.enum(["preview", "source"]) });
+const [state, setState] = useTabState(tab, schema, { view: "preview" });
+// Missing or invalid persisted state returns the default.
+// In an event handler, call setState({ view: "source" }).
+```
+
+从 `@getpaseo/plugin/client` 导入 `useTabState`，从 `zod` 导入 `z`。setter 替换整个 JSON 值。
+标签页恢复和应用重新加载后，状态仍然保留。
+
+统一属性、`addAgentPanel` 和 `useTabState` 需要 Paseo 0.13.0 或更高版本。
+
+**已弃用，将在 2027-04-23 之后移除**：0.12 面板的 `context` 和顶层 `agentId` 属性、
+`addWorkspacePanel({ context: "workspace" })` 以及 `addWorkspacePanel({ context: "agent" })`
+仍然有效。省略工作区的 `context`，用 `addAgentPanel` 注册 Agent 面板，并读取 `params.agentId`。
+
+用 `useWorkspace(workspaceId, selector)` 和 `useAgent(params.agentId, selector)` 读取缓存的状态。selector 是必填的。Paseo 对它的结果做浅比较，因此选择 `{ name, status }` 时，无关字段的变化不会触发重新渲染。在一次调用中选择组件渲染的所有字段；不要选择整个快照。
 
 当记录不可用时，两个 hook 都返回 `null`。否则它们会针对规范化的客户端状态同步运行。快照 DTO 及其嵌套值都是深度只读的，并在运行时被冻结。不要调用插件 RPC 来获取当前的工作区或 Agent。可选的或特定于厂商的补充数据，请在组件渲染之后再获取。
 
@@ -1637,7 +1803,7 @@ Agent 快照字段：
 
 ## 文件面板 {#file-panels}
 
-注册一个组件，把文件渲染为文件标签页的主体。组件会收到所选主机上该文件的句柄，远程主机也一样。由组件读取文件、显示自己的加载状态，并在用户编辑时写回文件。标签页栏会显示面板切换器、溢出菜单，以及在面板报告有未保存更改时显示一个圆点。
+注册一个组件，把文件渲染为文件标签页的主体。组件会收到所选主机上该文件的句柄，远程主机也一样。由组件读取文件、显示自己的加载状态，并在用户编辑时写回文件。面板报告有未保存更改时，标签页会显示一个圆点。
 
 ```tsx
 import type { PluginClientContext } from "@getpaseo/plugin/client";
@@ -1659,7 +1825,7 @@ export default function contribute(client: PluginClientContext) {
 | 字段        | 必填 | 含义                                                                 |
 | ----------- | ---- | -------------------------------------------------------------------- |
 | `id`        | 是   | 插件内唯一的 ID，匹配 `^[a-z][a-z0-9-]*$`。                          |
-| `title`     | 是   | 显示在面板切换器、选择器和 **打开方式…** 菜单中的非空标签。          |
+| `title`     | 是   | 显示在选择器、**打开方式…** 菜单和 **设置 > 文件** 中的非空标签。    |
 | `icon`      | 是   | Lucide 名称、`{ svg }` 或组件。参见[图标](#icons)。                  |
 | `files`     | 是   | `{ extensions: readonly string[]; filenames?: readonly string[] }`。 |
 | `Component` | 是   | 接收 `PluginFilePanelProps` 的组件。                                 |
@@ -1670,12 +1836,13 @@ export default function contribute(client: PluginClientContext) {
 
 `PluginFilePanelProps` 包含[主题和布局](#theme-and-layout)中介绍的通用属性 `theme`、`host`、`layout` 和可选的 `navigation`，另外还有：
 
-| 属性          | 类型                 | 含义                                                               |
-| ------------- | -------------------- | ------------------------------------------------------------------ |
-| `workspaceId` | `string`             | 包含该文件标签页的工作区。                                         |
-| `file`        | `PluginFile`         | 文件的句柄。标签页显示该文件期间保持不变。                         |
-| `tab`         | `PluginFileTab`      | `setModified(modified)` 会显示标签页的未保存圆点，并在关闭前确认。 |
-| `location`    | `PluginFileLocation` | `lineStart?`、`lineEnd?` 和 `revision`，后者在每次导航时递增。     |
+| 属性          | 类型                    | 含义                                                                                       |
+| ------------- | ----------------------- | ------------------------------------------------------------------------------------------ |
+| `workspaceId` | `string`                | 包含该文件标签页的工作区。                                                                 |
+| `params`      | `PluginFilePanelParams` | 打开请求提供的只读 `path`、`lineStart?` 和 `lineEnd?`。                                    |
+| `revision`    | `number`                | 每次向该标签页重新发送 params 时递增，即使是同一行。                                       |
+| `file`        | `PluginFile`            | 从 `params.path` 解析的文件能力；标签页显示该文件期间保持不变。                            |
+| `tab`         | `PluginTab`             | `setModified`、持久化的自定义 `state` 和 `setState`。参见[工作区面板](#workspace-panels)。 |
 
 Paseo 在知道文件存在及其大小后就会挂载你的面板，不会先读取文件。`file` 对象保持不变，它的 stat 字段保存 Paseo 已知的最新版本。请在渲染时读取这些字段；它们变化时不会重新渲染你的面板。面板要通过 `watch` 监听器，或 `useFileText`、`useFileBytes`、`useFileUrl` 引起的重新渲染，得知它们已变化：
 
@@ -1732,17 +1899,17 @@ hook 的重新读取会采用磁盘上的版本，因此下一次写入会覆盖
 5. 遇到 `PluginFileConflictError` 时，显示同样的冲突。
 6. 收到 `{ type: "deleted" }` 或遇到 `PluginFileDeletedError` 时，告诉用户文件已不存在。
 
-请在组件卸载之前写入待保存的编辑：切换面板或关闭标签页都会卸载它。如果面板报告有未保存的更改，Paseo 会在关闭标签页之前询问。[Markdown 面板](https://github.com/getpaseo/paseo/tree/main/plugin-examples/markdown-panel)示例实现了这些步骤。
+请在组件卸载之前写入待保存的编辑：用其他面板打开标签页或关闭标签页都会卸载它。如果面板报告有未保存的更改，Paseo 会在关闭标签页之前询问。[Markdown 面板](https://github.com/getpaseo/paseo/tree/main/plugin-examples/markdown-panel)示例实现了这些步骤。
 
 ### 选择与打开方式 {#selection-and-open-with}
 
-插件面板是其选择器匹配的每个文件的候选面板，无论是文本还是二进制文件。内置面板要求主机报告的文件类型：Markdown、HTML 和 **源代码** 打开文本文件，**图片** 打开图片。候选面板的顺序是：内置的 Markdown、HTML 和图片面板，然后按主机目录顺序排列的插件面板，最后是每个文本文件都有的 **源代码**。只有没有其他面板认领文件时，源代码才会默认打开它。
+插件面板是其选择器匹配的每个文件的候选面板，无论是文本还是二进制文件。内置面板要求主机报告的文件类型：Markdown、HTML 和 **源代码** 打开文本文件，**图片** 打开图片。Markdown 和 HTML 面板各自有文件的预览视图和源代码视图，在面板的工具栏中切换。**源代码** 是 Paseo 的编辑器，是没有其他内置面板认领的文本文件的内置面板；它从不与其他内置面板一起提供。候选面板的顺序是：认领该文件的内置面板，然后按主机目录顺序排列的插件面板，最后是没有其他内置面板认领该文件时的源代码。
 
-记住的关联在其面板于当前主机上可用时选择该面板。否则 Paseo 打开第一个候选面板。当插件面板是多个候选面板之一且没有适用的关联时，Paseo 每次打开标签页时询问一次，询问显示在它已经打开的面板上方。只有内置面板时从不询问：Markdown 文件用 Markdown 打开，并在切换器中提供源代码。安装了一个 Markdown 插件后，选择器会提供 **Markdown — Paseo**、**Rich Markdown — markdown-panel** 和 **源代码 — Paseo**。认领文本扩展名的插件会与源代码竞争，所以第一次打开时会询问；单独认领某个二进制文件的插件会直接打开，不询问。
+记住的关联在其面板于当前主机上可用时选择该面板。否则 Paseo 打开第一个候选面板。当插件面板是多个候选面板之一且没有适用的关联时，Paseo 每次打开标签页时询问一次，询问显示在它已经打开的面板上方。只有一个候选面板的文件从不询问。安装了一个 Markdown 插件后，选择器会提供 **Markdown — Paseo** 和 **Rich Markdown — markdown-panel**。认领某个没有内置面板认领的文本扩展名的插件会与源代码竞争，所以第一次打开时会询问；单独认领某个二进制文件的插件会直接打开，不询问。
 
 **不再询问** 会在此设备上为该扩展名记住这个选择。当某个候选面板匹配了确切的文件名时，该选择改为应用于那个 basename。不可用的关联在该主机上会被忽略，并为安装了其面板的主机保留。
 
-用户可以用栏中的面板切换器切换当前标签页：它并排显示最多三个面板（手机上为两个），更多的面板放在菜单中；也可以用标签页菜单中的 **打开方式…**。对于这个标签页，该选择优先于记住的关联，直到标签页被重新定向。栏的溢出菜单和打开方式中的 **始终用于** 会记住当前显示的面板。从链接或搜索结果在某一行打开文件时，标签页会切换到源代码。没有候选面板的文件显示 **二进制预览不可用**；二进制文件没有源代码面板。
+用户有三种方式选择面板：第一次打开时的选择器、标签页菜单中的 **打开方式…**，以及 **设置 > 文件**。打开方式会切换当前标签页，并且对于这个标签页优先于记住的关联，直到标签页被重新定向；其中的 **始终用于** 会记住当前显示的面板。从链接或搜索结果在某一行打开文件时，标签页会切换到它的内置面板，并在源代码视图中显示该行。没有候选面板的文件显示 **二进制预览不可用**；二进制文件没有源代码面板。
 
 ### DocumentFrame {#documentframe}
 
@@ -1888,8 +2055,9 @@ review.update({ visible: true });
 review.remove();
 ```
 
-省略 `label` 即为只有图标的标题栏按钮。在宽布局中，菜单和弹出框会显示一个 V 形箭头。紧凑布局中的标题栏
-按钮只使用图标，没有标签和箭头。Paseo 会把多出来的贡献移入一个共享的溢出菜单。位置和溢出由宿主决定。
+省略 `label` 即为只有图标的标题栏按钮。在宽布局中，菜单和弹出框会显示一个 V 形箭头。Paseo 会把多出来的
+贡献移入一个共享的溢出菜单。在手机和较窄的窗口中，标题栏没有空间放置插件按钮，因此每个按钮都会成为工作区
+菜单（`···`）中的一行，显示它的图标和标题；它的菜单和弹出框以该底部面板中的页面打开。位置和溢出由宿主决定。
 
 ## Composer 胶囊 {#composer-pills}
 

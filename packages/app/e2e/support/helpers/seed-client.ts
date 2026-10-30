@@ -1,6 +1,7 @@
 import path from "node:path";
 import { readFileSync } from "node:fs";
 import type { TerminalActivity } from "@getpaseo/protocol/terminal-activity";
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { connectDaemonClient } from "./daemon-client-loader";
 import { withProjectOwnership } from "./project-ownership";
 import { createTempDirectory, createTempGitRepo } from "./workspace";
@@ -19,6 +20,7 @@ export interface SeedWorkspaceDescriptor {
   fieldValues?: Record<string, string>;
   pinnedAt?: string | null;
   superpinnedAt?: string | null;
+  pinPlacement?: { parentWorkspaceKey: string | null; siblingOrder: number; revision: number };
 }
 
 interface SeedProjectDescriptor {
@@ -33,6 +35,7 @@ interface SeedProjectDescriptor {
  * prefer those wrappers over reaching for this client directly.
  */
 export interface SeedDaemonClient {
+  setWorkspacePinPlacement: DaemonClient["setWorkspacePinPlacement"];
   connect(): Promise<void>;
   close(): Promise<void>;
   addProject(cwd: string): Promise<{
@@ -56,6 +59,7 @@ export interface SeedDaemonClient {
     expectedValue: string;
     requestId?: string;
   }): Promise<{ value: string }>;
+  setWorkspaceTitle(workspaceId: string, title: string | null): Promise<{ title: string | null }>;
   setWorkspacePinned(workspaceId: string, pinned: boolean): Promise<{ pinnedAt: string | null }>;
   setWorkspaceSuperpinned(
     workspaceId: string,
@@ -89,6 +93,11 @@ export interface SeedDaemonClient {
     title?: string;
     parentWorkspaceId?: string | null;
     siblingOrder?: number;
+    sidebarPlacement?: {
+      parentWorkspaceKey: string | null;
+      siblingOrder?: number;
+      section: "unpinned" | "pinned" | "superpinned";
+    };
     background?: boolean;
   }): Promise<{
     workspace: SeedWorkspaceDescriptor | null;
@@ -170,7 +179,12 @@ export interface SeedDaemonClient {
     predicate: (snapshot: { status: string }) => boolean,
     timeout?: number,
   ): Promise<{ status: string }>;
-  sendAgentMessage(agentId: string, text: string): Promise<void>;
+  cancelAgent(agentId: string): Promise<void>;
+  sendAgentMessage(
+    agentId: string,
+    text: string,
+    options?: { sourceAgentId?: string },
+  ): Promise<void>;
   waitForFinish(
     agentId: string,
     timeout?: number,

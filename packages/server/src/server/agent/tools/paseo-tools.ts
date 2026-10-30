@@ -1,7 +1,20 @@
+import {
+  resolveSidebarAutomationPlacement,
+  resolveSidebarAutomationCatalog,
+  sidebarAutomationSubtree,
+  type SidebarAutomationWorkspace,
+} from "../../workspace-sidebar-automation.js";
+import {
+  workspaceSidebarSection,
+  type WorkspaceSidebarPlacement,
+} from "../../workspace-pin-placement.js";
+import { registerPluginTools } from "./plugin-tools.js";
+import type { FinishSubscriptions, FinishRegistration } from "../finish-subscriptions/index.js";
 import type { AgentMessageDelivery } from "../agent-messages/index.js";
 import {
   createHostResolver,
-  waitForPermissionChange,
+  fetchAllAutomationWorkspaces,
+  HostOperationRejectedError,
   type HostOperation,
   type HostOperations,
   type ToolHosts,
@@ -15,7 +28,12 @@ import { AsyncLocalStorage } from "node:async_hooks";
 
 import type { AgentMode, AgentProvider, AgentSessionConfig } from "../agent-sdk-types.js";
 import type { AgentManager, ManagedAgent } from "../agent-manager.js";
-import { ActiveTurnBehaviorSchema, AgentProfileSchema } from "@getpaseo/protocol/messages";
+import {
+  ActiveTurnBehaviorSchema,
+  AgentProfileSchema,
+  WorkspacePinPlacementSchema,
+  WorkspaceSidebarSectionSchema,
+} from "@getpaseo/protocol/messages";
 import {
   WORKSPACE_FIELDS,
   WORKSPACE_FIELD_CATALOG_VERSION,
@@ -84,8 +102,6 @@ import {
 import {
   type PromptDispatchDisposition,
   sendPromptToAgent,
-  setupFinishNotification,
-  setupFinishWait,
   waitForAgentRunStartWithTimeout,
 } from "../agent-prompt.js";
 import { respondToAgentPermission } from "../permission-response.js";
@@ -131,6 +147,7 @@ const callerSnapshots = new AsyncLocalStorage<CallerSnapshot | null>();
 
 export interface PaseoToolHostDependencies {
   agentMessages?: () => AgentMessageDelivery;
+  finishSubscriptions?: () => FinishSubscriptions;
   serverId?: string;
   hosts?: () => ToolHosts;
   agentManager: AgentManager;
@@ -153,6 +170,13 @@ export interface PaseoToolHostDependencies {
   setWorkspaceFieldValue?: (
     input: Parameters<typeof setWorkspaceFieldValueTransaction>[1],
   ) => Promise<string>;
+  setWorkspacePinPlacement?: (input: {
+    workspaceId: string;
+    placement: { parentWorkspaceKey: string | null; siblingOrder: number };
+    section?: WorkspaceSidebarPlacement["section"];
+    sectionState?: { pinnedAt: string | null; superpinnedAt: string | null };
+    expectedRevision: number;
+  }) => Promise<NonNullable<PersistedWorkspaceRecord["pinPlacement"]>>;
   projectRegistry?: Pick<ProjectRegistry, "get" | "list">;
   createDirectoryWorkspace?: (
     cwd: string,
@@ -161,6 +185,7 @@ export interface PaseoToolHostDependencies {
     context?: {
       background?: boolean;
       callerWorkspaceId?: string;
+      sidebarPlacement?: WorkspaceSidebarPlacement;
       parentWorkspaceId?: string | null;
       siblingOrder?: number;
     },
@@ -196,10 +221,6 @@ export interface PaseoToolHostDependencies {
   logger: Logger;
 }
 
-function settledStatus(status: string): "error" | "idle" {
-  return status === "error" ? "error" : "idle";
-}
-
 interface ProviderSummary {
   id: AgentProvider;
   label: string;
@@ -220,11 +241,17 @@ const WorkspaceAutomationSummarySchema = z.object({
   background: z.boolean().optional(),
   parentWorkspaceId: z.string().nullable(),
   siblingOrder: z.number().finite(),
+  workspaceKey: z.string().optional(),
+  section: WorkspaceSidebarSectionSchema.optional(),
+  pinPlacement: WorkspacePinPlacementSchema.optional(),
 });
 
-function toWorkspaceAutomationSummary(workspace: PersistedWorkspaceRecord) {
+function toWorkspaceAutomationSummary(workspace: PersistedWorkspaceRecord, serverId?: string) {
   return {
     workspaceId: workspace.workspaceId,
+    ...(serverId ? { workspaceKey: `${serverId}:${workspace.workspaceId}` } : {}),
+    section: workspaceSidebarSection(workspace),
+    ...(workspace.pinPlacement ? { pinPlacement: workspace.pinPlacement } : {}),
     projectId: workspace.projectId,
     cwd: workspace.cwd,
     isolation: workspace.kind === "worktree" ? ("worktree" as const) : ("local" as const),
@@ -688,11 +715,56 @@ function createToolCatalog(
     if (!options.agentMessages) throw new Error("Agent message delivery is not configured");
     return options.agentMessages();
   }
+  function finishSubscriptions(): FinishSubscriptions {
+    if (!options.finishSubscriptions) throw new Error("Finish subscriptions are not configured");
+    return options.finishSubscriptions();
+  }
+  async function prepareRemoteNotification(
+    name: string,
+    destination: string | undefined,
+    input: Record<string, unknown>,
+  ): Promise<FinishRegistration | undefined> {
+    if (
+      name !== "send_agent_prompt" ||
+      destination === options.serverId ||
+      !callerAgentId ||
+      input.notifyOnFinish === false
+    )
+      return undefined;
+    return finishSubscriptions().register(
+      { childAgentId: input.agentId as string, callerAgentId, serverId: destination },
+      true,
+    );
+  }
+  async function registerRemoteCreation(
+    name: string,
+    destination: string | undefined,
+    input: Record<string, unknown>,
+    response: PaseoToolResult,
+  ): Promise<void> {
+    if (
+      name !== "create_agent" ||
+      destination === options.serverId ||
+      !callerAgentId ||
+      input.notifyOnFinish === false ||
+      response.isError
+    )
+      return;
+    const childAgentId = (response.structuredContent as { agentId: string }).agentId;
+    await finishSubscriptions().register({
+      childAgentId,
+      callerAgentId,
+      serverId: destination,
+      requireParentOwnership: true,
+    });
+  }
   const localHostOperations = new Map<string, HostOperation>();
   const tools = new Map<string, PaseoToolDefinition>();
+  const builtinNames = new Set<string>();
   const hostTools = new Map([
     ["create_agent", "createAgent"],
     ["create_workspace", "createWorkspace"],
+    ["move_workspace", "moveWorkspace"],
     ["list_workspaces", "listWorkspaces"],
     ["send_agent_prompt", "sendPrompt"],
     ["get_agent_status", "getStatus"],
@@ -711,49 +783,258 @@ function createToolCatalog(
       createAgent: (args, context) => localHostOperations.get("create_agent")!(args, context),
       createWorkspace: (args, context) =>
         localHostOperations.get("create_workspace")!(args, context),
+      moveWorkspace: (args, context) => localHostOperations.get("move_workspace")!(args, context),
       listWorkspaces: (args, context) => localHostOperations.get("list_workspaces")!(args, context),
       sendPrompt: (args, context) => localHostOperations.get("send_agent_prompt")!(args, context),
       getStatus: (args, context) => localHostOperations.get("get_agent_status")!(args, context),
       getActivity: (args, context) => localHostOperations.get("get_agent_activity")!(args, context),
       listAgents: (args, context) => localHostOperations.get("list_agents")!(args, context),
-      async observe(agentId, handler, signal) {
-        const unsubscribe = agentManager.subscribe(
-          (event) => {
-            if (event.type === "agent_state") handler(toAgentPayload(event.agent));
-          },
-          { agentId, replayState: true },
-        );
-        const stop = () => unsubscribe();
-        signal.addEventListener("abort", stop, { once: true });
-        return async () => {
-          signal.removeEventListener("abort", stop);
-          unsubscribe();
-        };
-      },
-      async wait(agentId, signal) {
-        const settled = await agentManager.waitForAgentEvent(agentId, {
-          signal,
-          waitForActive: true,
-        });
-        const snapshot = agentManager.getAgent(agentId);
-        const final = snapshot
-          ? await serializeSnapshotWithMetadata(agentStorage, snapshot, childLogger)
-          : null;
-        return {
-          status: settled.permission ? "permission" : settledStatus(settled.status),
-          final,
-          lastMessage: settled.lastMessage,
-          error: final?.lastError ?? null,
-        };
-      },
     },
   });
+  async function loadSidebarCatalog(requireComplete = true): Promise<SidebarAutomationWorkspace[]> {
+    const local = ((await options.workspaceRegistry?.list()) ?? [])
+      .filter((row) => !row.archivedAt)
+      .map((row) => ({
+        workspaceKey: `${options.serverId ?? "self"}:${row.workspaceId}`,
+        workspaceId: row.workspaceId,
+        projectId: row.projectId,
+        parentWorkspaceId: row.parentWorkspaceId,
+        siblingOrder: row.siblingOrder,
+        section: workspaceSidebarSection(row),
+        pinnedAt: row.pinnedAt,
+        superpinnedAt: row.superpinnedAt,
+        pinPlacement: row.pinPlacement,
+      }));
+    if (!options.hosts) return resolveSidebarAutomationCatalog(local);
+    const hosts = options.hosts();
+    const directory = await hosts.directory();
+    const destinations = directory.hosts.filter(
+      (host) => host.enabled && host.serverId && host.serverId !== options.serverId,
+    );
+    if (requireComplete && destinations.some((host) => host.status !== "online"))
+      throw new PaseoToolInputError(
+        "Reconnect all registered hosts before moving the shared workspace hierarchy.",
+      );
+    const remote = await Promise.all(
+      destinations
+        .filter((host) => host.status === "online")
+        .map((host) =>
+          hosts.use(host.serverId!, async (client) => {
+            const rows = await fetchAllAutomationWorkspaces(client);
+            return rows.map((row) => ({
+              workspaceKey: `${host.serverId}:${row.id}`,
+              workspaceId: row.id,
+              projectId: row.projectId,
+              parentWorkspaceId: row.parentWorkspaceId,
+              siblingOrder: row.siblingOrder,
+              section: workspaceSidebarSection(row),
+              pinnedAt: row.pinnedAt,
+              superpinnedAt: row.superpinnedAt,
+              pinPlacement: row.pinPlacement,
+            }));
+          }),
+        ),
+    );
+    return resolveSidebarAutomationCatalog([...local, ...remote.flat()]);
+  }
+
+  async function prepareSidebarCreation(input: Record<string, unknown>) {
+    const callerWorkspaceId = resolveCallerAgent()?.workspaceId;
+    let parent: string | null | undefined;
+    if (input.parentWorkspaceKey !== undefined) parent = input.parentWorkspaceKey as string | null;
+    else if (input.parentWorkspaceId === undefined && callerWorkspaceId)
+      parent = `${options.serverId ?? "self"}:${callerWorkspaceId}`;
+    if (parent === undefined && input.section === undefined)
+      return { ...input, sidebarPlacement: undefined };
+    const explicitSnapshot = input.section !== undefined && input.siblingOrder !== undefined;
+    const rows = explicitSnapshot
+      ? ((await options.workspaceRegistry?.list()) ?? [])
+          .filter((row) => !row.archivedAt)
+          .map((row) => ({
+            workspaceKey: `${options.serverId ?? "self"}:${row.workspaceId}`,
+            workspaceId: row.workspaceId,
+            projectId: row.projectId,
+            parentWorkspaceId: row.parentWorkspaceId,
+            siblingOrder: row.siblingOrder,
+            section: workspaceSidebarSection(row),
+            pinPlacement: row.pinPlacement,
+          }))
+      : // Creation adds a fresh leaf, so unrelated offline owners cannot hide a descendant being moved.
+        // Resolve its parent from reachable owners and append after their known siblings.
+        await loadSidebarCatalog(false);
+    const sidebarPlacement = resolveSidebarAutomationPlacement({
+      workspaces: rows,
+      parentWorkspaceKey: parent ?? null,
+      section: input.section as WorkspaceSidebarPlacement["section"] | undefined,
+      siblingOrder: input.siblingOrder as number | undefined,
+    });
+    return { ...input, sidebarPlacement };
+  }
+
+  async function executeSidebarMove(
+    input: Record<string, unknown>,
+    destination: string | undefined,
+    context: PaseoToolExecutionContext,
+  ) {
+    const rows = await loadSidebarCatalog();
+    const sourceKey = `${destination ?? options.serverId ?? "self"}:${input.workspaceId}`;
+    const source = rows.find((row) => row.workspaceKey === sourceKey);
+    if (!source)
+      throw new PaseoToolInputError("Workspace not found in the connected host catalog.");
+    const parentWorkspaceKey =
+      input.parentWorkspaceKey === undefined
+        ? (source.pinPlacement?.parentWorkspaceKey ?? null)
+        : (input.parentWorkspaceKey as string | null);
+    let section = input.section as WorkspaceSidebarPlacement["section"] | undefined;
+    if (section === undefined && parentWorkspaceKey === null) section = source.section;
+    const placement = resolveSidebarAutomationPlacement({
+      workspaces: rows,
+      movingWorkspaceKey: sourceKey,
+      parentWorkspaceKey,
+      section,
+      siblingOrder: input.siblingOrder as number | undefined,
+      beforeWorkspaceKey: input.beforeWorkspaceKey as string | null | undefined,
+    });
+    const changed =
+      source.section === placement.section
+        ? []
+        : sidebarAutomationSubtree(rows, sourceKey).filter((row) => row.workspaceKey !== sourceKey);
+    const updates = [
+      ...changed.map((row) => ({
+        row,
+        placement: {
+          parentWorkspaceKey: row.pinPlacement?.parentWorkspaceKey ?? null,
+          siblingOrder: row.pinPlacement?.siblingOrder ?? 0,
+          section: placement.section,
+        },
+      })),
+      { row: source, placement },
+    ];
+    // Check every affected owner before the first mutation. Cross-host writes use CAS and roll back only their own revisions.
+    const owners = [
+      ...new Set(
+        updates.map(({ row }) => row.workspaceKey.slice(0, row.workspaceKey.indexOf(":"))),
+      ),
+    ];
+    for (const owner of owners) {
+      if (owner === (options.serverId ?? "self")) {
+        if (!options.setWorkspacePinPlacement)
+          throw new Error("Workspace sidebar placement is not configured");
+      } else {
+        await options.hosts!().use(owner, async (client) => {
+          if (client.getLastServerInfoMessage()?.features?.workspaceSidebarPlacement !== true)
+            throw new Error(`Update host ${owner} to move child workspaces.`);
+        });
+      }
+    }
+    return commitSidebarMoves(updates, context);
+  }
+
+  async function commitSidebarMoves(
+    updates: {
+      row: SidebarAutomationWorkspace;
+      placement: WorkspaceSidebarPlacement & { siblingOrder: number };
+    }[],
+    context: PaseoToolExecutionContext,
+  ) {
+    const committed: typeof updates = [];
+    let result: PaseoToolResult | undefined;
+    let pendingWorkspaceKey: string | undefined;
+    try {
+      for (const update of updates) {
+        const owner = update.row.workspaceKey.slice(0, update.row.workspaceKey.indexOf(":"));
+        pendingWorkspaceKey = update.row.workspaceKey;
+        result = await hostResolver.use(owner, (host) =>
+          host.moveWorkspace(
+            {
+              workspaceId: update.row.workspaceId,
+              sidebarPlacement: update.placement,
+              expectedRevision: update.row.pinPlacement?.revision ?? 0,
+            },
+            context,
+          ),
+        );
+        committed.push(update);
+        pendingWorkspaceKey = undefined;
+      }
+      return result!;
+    } catch (error) {
+      const failedRollbacks: string[] =
+        error instanceof Error &&
+        "outcome" in error &&
+        error.outcome === "unknown" &&
+        pendingWorkspaceKey
+          ? [pendingWorkspaceKey]
+          : [];
+      for (const update of committed.toReversed()) {
+        const owner = update.row.workspaceKey.slice(0, update.row.workspaceKey.indexOf(":"));
+        try {
+          await hostResolver.use(owner, (host) =>
+            host.moveWorkspace(
+              {
+                workspaceId: update.row.workspaceId,
+                sidebarPlacement: {
+                  parentWorkspaceKey: update.row.pinPlacement?.parentWorkspaceKey ?? null,
+                  siblingOrder: update.row.pinPlacement?.siblingOrder ?? 0,
+                  section: update.row.section,
+                },
+                sectionState: {
+                  pinnedAt: update.row.pinnedAt ?? null,
+                  superpinnedAt: update.row.superpinnedAt ?? null,
+                },
+                expectedRevision: (update.row.pinPlacement?.revision ?? 0) + 1,
+              },
+              context,
+            ),
+          );
+        } catch {
+          failedRollbacks.push(update.row.workspaceKey);
+        }
+      }
+      if (failedRollbacks.length)
+        throw new Error(
+          `Workspace move failed; inspect these workspaces before retrying: ${failedRollbacks.join(", ")}. ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
+        );
+      throw error;
+    }
+  }
+
+  async function invokeHostTool(
+    name: string,
+    operation: keyof Pick<
+      HostOperations,
+      | "createAgent"
+      | "createWorkspace"
+      | "moveWorkspace"
+      | "listWorkspaces"
+      | "sendPrompt"
+      | "getStatus"
+      | "getActivity"
+      | "listAgents"
+    >,
+    input: Record<string, unknown>,
+    serverId: string | undefined,
+    context: PaseoToolExecutionContext,
+  ) {
+    const sharedMove =
+      name === "move_workspace" &&
+      (input.parentWorkspaceId === undefined ||
+        ["parentWorkspaceKey", "section", "siblingOrder", "beforeWorkspaceKey"].some(
+          (key) => input[key] !== undefined,
+        ));
+    if (sharedMove) return executeSidebarMove(input, serverId ?? options.serverId, context);
+    const prepared = name === "create_workspace" ? await prepareSidebarCreation(input) : input;
+    return hostResolver.use(serverId, (host) => host[operation](prepared, context));
+  }
+
   const registerTool = (
     name: string,
     config: PaseoToolConfig,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Tool handlers are schema-validated at registration boundaries.
     handler: (input: any, context: PaseoToolExecutionContext) => Promise<PaseoToolResult>,
   ) => {
+    builtinNames.add(name);
     if (!isPaseoToolEnabled(options.paseoToolPolicy, name)) {
       return;
     }
@@ -777,34 +1058,12 @@ function createToolCatalog(
       };
       handler = async ({ serverId, ...input }, context) => {
         const destination = serverId ?? options.serverId;
+        const remoteNotification = await prepareRemoteNotification(name, destination, input);
         try {
-          const response = await hostResolver.use(serverId, (host) =>
-            host[operation](input, context),
-          );
-          let childAgentId: string | undefined;
-          if (name === "create_agent") {
-            childAgentId = (response.structuredContent as { agentId: string }).agentId;
-          } else if (name === "send_agent_prompt" && destination !== options.serverId) {
-            childAgentId = input.agentId as string;
-          }
-          if (childAgentId && callerAgentId && input.notifyOnFinish !== false) {
-            setupFinishWait({
-              agentMessages: agentMessages(),
-              agentManager,
-              agentStorage,
-              originServerId: options.serverId,
-              childServerId: destination,
-              childAgentId,
-              callerAgentId,
-              logger: childLogger,
-              wait: (signal) =>
-                hostResolver.use(destination, (host) => host.wait(childAgentId, signal)),
-              afterPermission: (requestId, signal) =>
-                hostResolver.use(destination, (host) =>
-                  waitForPermissionChange(host, childAgentId, requestId, signal),
-                ),
-            });
-          }
+          const response = await invokeHostTool(name, operation, input, serverId, context);
+          if (response.isError) await remoteNotification?.reject();
+          else remoteNotification?.accept();
+          await registerRemoteCreation(name, destination, input, response);
           return {
             ...response,
             structuredContent: {
@@ -813,6 +1072,11 @@ function createToolCatalog(
             },
           };
         } catch (error) {
+          // A lost response does not establish whether the remote daemon admitted the prompt.
+          // Reconcile the child rather than silently dropping notification intent.
+          if (error instanceof PaseoToolInputError || error instanceof HostOperationRejectedError)
+            await remoteNotification?.reject();
+          else remoteNotification?.accept();
           if (!options.serverId) throw error;
           const failure = {
             serverId: destination,
@@ -1458,7 +1722,25 @@ function createToolCatalog(
           .describe(
             "Parent workspace id within the same project. Omit or use null for the project root.",
           ),
-        siblingOrder: z.number().finite().optional().describe("Order among sibling workspaces."),
+        siblingOrder: z
+          .number()
+          .finite()
+          .optional()
+          .describe(
+            "Order among siblings; applies to universal sidebar placement when parentWorkspaceKey or section is supplied.",
+          ),
+        parentWorkspaceKey: z
+          .string()
+          .min(1)
+          .max(512)
+          .nullable()
+          .optional()
+          .describe(
+            "Universal parent key (serverId:workspaceId), across hosts. Omit to create below your calling workspace; null creates a root.",
+          ),
+        section: WorkspaceSidebarSectionSchema.optional().describe(
+          "Sidebar section. Children inherit their parent; needed with siblingOrder if a remote parent cannot be resolved.",
+        ),
         background: z
           .boolean()
           .optional()
@@ -1505,6 +1787,7 @@ function createToolCatalog(
       title,
       parentWorkspaceId,
       siblingOrder,
+      sidebarPlacement,
       background,
       mode,
       worktreeSlug,
@@ -1538,6 +1821,7 @@ function createToolCatalog(
         workspace = await options.createDirectoryWorkspace(cwd, title, projectId, {
           background,
           callerWorkspaceId: resolveCallerAgent()?.workspaceId,
+          sidebarPlacement,
           parentWorkspaceId,
           siblingOrder,
         });
@@ -1573,6 +1857,7 @@ function createToolCatalog(
             ...(title ? { title } : {}),
             background,
             callerWorkspaceId: resolveCallerAgent()?.workspaceId,
+            sidebarPlacement,
             parentWorkspaceId,
             siblingOrder,
           },
@@ -1585,7 +1870,9 @@ function createToolCatalog(
 
       return {
         content: [],
-        structuredContent: ensureValidJson(toWorkspaceAutomationSummary(workspace)),
+        structuredContent: ensureValidJson(
+          toWorkspaceAutomationSummary(workspace, options.serverId),
+        ),
       };
     },
   );
@@ -1606,7 +1893,7 @@ function createToolCatalog(
         .filter(
           (workspace) => !workspace.archivedAt && (includeBackground || !workspace.background),
         )
-        .map(toWorkspaceAutomationSummary);
+        .map((workspace) => toWorkspaceAutomationSummary(workspace, options.serverId));
       return {
         content: [],
         structuredContent: ensureValidJson({ workspaces }),
@@ -1718,7 +2005,7 @@ function createToolCatalog(
     {
       title: "Move workspace",
       description:
-        "Move a workspace under a parent or to the project root, optionally before a sibling.",
+        "Move or reorder a workspace in the universal sidebar hierarchy, including across hosts. Section changes include its complete subtree. Legacy parentWorkspaceId moves within a project.",
       inputSchema: {
         workspaceId: z.string().trim().min(1),
         parentWorkspaceId: z
@@ -1726,7 +2013,32 @@ function createToolCatalog(
           .trim()
           .min(1)
           .nullable()
-          .describe("Destination parent workspace id, or null for the project root."),
+          .optional()
+          .describe("Legacy same-project parent id, or null for its root."),
+        parentWorkspaceKey: z
+          .string()
+          .min(1)
+          .max(512)
+          .nullable()
+          .optional()
+          .describe(
+            "Universal destination parent key. Omit to retain the parent; null moves to the sidebar root.",
+          ),
+        siblingOrder: z
+          .number()
+          .finite()
+          .optional()
+          .describe("Explicit sidebar sibling rank; omit to append."),
+        section: WorkspaceSidebarSectionSchema.optional().describe(
+          "Destination root section; a child inherits its parent section.",
+        ),
+        beforeWorkspaceKey: z
+          .string()
+          .min(1)
+          .max(512)
+          .nullable()
+          .optional()
+          .describe("Place before this universal sibling key; omit or null to append."),
         beforeWorkspaceId: z
           .string()
           .trim()
@@ -1737,17 +2049,49 @@ function createToolCatalog(
       },
       outputSchema: WorkspaceAutomationSummarySchema.shape,
     },
-    async ({ workspaceId, parentWorkspaceId, beforeWorkspaceId }) => {
+    async ({
+      workspaceId,
+      parentWorkspaceId,
+      beforeWorkspaceId,
+      sidebarPlacement,
+      expectedRevision,
+      sectionState,
+    }) => {
       if (!options.workspaceRegistry) {
         throw new Error("Workspace registry is not configured");
       }
-      const workspace = await options.workspaceRegistry.move(workspaceId, {
-        parentWorkspaceId,
-        beforeWorkspaceId,
-      });
+      let workspace: PersistedWorkspaceRecord;
+      if (sidebarPlacement) {
+        if (!options.setWorkspacePinPlacement)
+          throw new Error("Workspace sidebar placement is not configured");
+        await options.setWorkspacePinPlacement({
+          workspaceId,
+          placement: {
+            parentWorkspaceKey: sidebarPlacement.parentWorkspaceKey,
+            siblingOrder: sidebarPlacement.siblingOrder,
+          },
+          section: sidebarPlacement.section,
+          sectionState,
+          expectedRevision,
+        });
+        const updated = await options.workspaceRegistry.get(workspaceId);
+        if (!updated) throw new Error("Workspace not found");
+        workspace = updated;
+      } else {
+        if (parentWorkspaceId === undefined)
+          throw new PaseoToolInputError(
+            "Specify parentWorkspaceKey, section, siblingOrder, beforeWorkspaceKey, or legacy parentWorkspaceId.",
+          );
+        workspace = await options.workspaceRegistry.move(workspaceId, {
+          parentWorkspaceId,
+          beforeWorkspaceId,
+        });
+      }
       return {
         content: [],
-        structuredContent: ensureValidJson(toWorkspaceAutomationSummary(workspace)),
+        structuredContent: ensureValidJson(
+          toWorkspaceAutomationSummary(workspace, options.serverId),
+        ),
       };
     },
   );
@@ -1828,6 +2172,7 @@ function createToolCatalog(
         {
           agentManager,
           agentStorage,
+          finishSubscriptions: options.finishSubscriptions?.(),
           logger: childLogger,
           paseoHome: options.paseoHome,
           worktreesRoot: options.worktreesRoot,
@@ -1856,7 +2201,7 @@ function createToolCatalog(
           },
           mode: parsedArgs.settings?.modeId,
           promptFailure: "throw",
-          notifyOnFinish: false,
+          notifyOnFinish,
           detached: resolvedArgs.detached,
           callerAgentId,
           callerContext,
@@ -2173,68 +2518,56 @@ function createToolCatalog(
       notifyOnFinish = Boolean(callerAgentId),
       activeTurnBehavior = callerAgentId ? "steer" : "interrupt",
     }) => {
-      let stopNotification: (() => void) | undefined;
-      let acceptDispatch!: (result: PromptDispatchDisposition | false) => void;
-      const dispatchResult = new Promise<PromptDispatchDisposition | false>((resolve) => {
-        acceptDispatch = resolve;
-      });
-      const notifying = Boolean(callerAgentId && notifyOnFinish);
-      function prepareDispatch(): void {
-        if (!callerAgentId || !notifyOnFinish) return;
-        stopNotification = setupFinishNotification({
-          agentMessages: agentMessages(),
-          agentManager,
-          agentStorage,
-          childAgentId: agentId,
-          childServerId: options.serverId,
-          callerAgentId,
-          waitForTurnStart: false,
-          dispatchResult,
-          logger: childLogger,
-        });
+      if (callerAgentId && !agentManager.getAgent(agentId) && !(await agentStorage.get(agentId))) {
+        throw new PaseoToolInputError(`Agent ${agentId} not found`);
       }
-      function confirmDispatch(disposition: PromptDispatchDisposition): void {
-        // A new turn must ignore outcomes from the displaced turn. Its iterator
-        // has not started yet, so rearm here; steering keeps the early observer.
-        if (disposition !== "turn_started") {
-          acceptDispatch(disposition);
-          return;
-        }
-        acceptDispatch(disposition);
-        if (!callerAgentId || !notifyOnFinish) return;
-        stopNotification?.();
-        stopNotification = setupFinishNotification({
-          agentMessages: agentMessages(),
-          agentManager,
-          agentStorage,
-          childAgentId: agentId,
-          childServerId: options.serverId,
-          callerAgentId,
-          waitForTurnStart: true,
-          logger: childLogger,
-        });
+      const notifying = Boolean(callerAgentId && notifyOnFinish);
+      const notification =
+        notifying && callerAgentId
+          ? await (() => {
+              if (!options.finishSubscriptions)
+                throw new Error("Finish subscriptions are not configured");
+              return options
+                .finishSubscriptions()
+                .register({ childAgentId: agentId, callerAgentId }, true);
+            })()
+          : undefined;
+      function confirmDispatch(_disposition: PromptDispatchDisposition): void {
+        notification?.accept();
+      }
+      function rejectNotification(): void {
+        void notification
+          ?.reject()
+          .catch((error) =>
+            childLogger.error(
+              { err: error, agentId },
+              "Failed to remove rejected finish subscription",
+            ),
+          );
       }
 
       if (callerAgentId) {
-        if (!agentManager.getAgent(agentId) && !(await agentStorage.get(agentId))) {
-          throw new PaseoToolInputError(`Agent ${agentId} not found`);
-        }
-        const receipt = agentMessages().enqueue({
-          recipientId: agentId,
-          prompt,
-          source: {
-            kind: "agent-message",
-            agentId: callerAgentId,
-            title: resolveCallerAgent()?.config.title ?? undefined,
-          },
-          sessionMode,
-          activeTurnBehavior,
-          beforeDispatch: prepareDispatch,
-          onDispatch: confirmDispatch,
-        });
+        const receipt = (() => {
+          try {
+            return agentMessages().enqueue({
+              recipientId: agentId,
+              prompt,
+              source: {
+                kind: "agent-message",
+                agentId: callerAgentId,
+                title: resolveCallerAgent()?.config.title ?? undefined,
+              },
+              sessionMode,
+              activeTurnBehavior,
+              onDispatch: confirmDispatch,
+            });
+          } catch (error) {
+            rejectNotification();
+            throw error;
+          }
+        })();
         void receipt.dispatched.catch(() => {
-          acceptDispatch(false);
-          stopNotification?.();
+          rejectNotification();
         });
         return {
           content: [],
@@ -2261,8 +2594,7 @@ function createToolCatalog(
         onDispatch: confirmDispatch,
         logger: childLogger,
       }).catch((error) => {
-        acceptDispatch(false);
-        stopNotification?.();
+        rejectNotification();
         if (error instanceof AgentNotFoundError) {
           throw new PaseoToolInputError(error.message);
         }
@@ -2272,7 +2604,7 @@ function createToolCatalog(
       // Return once the provider has accepted the turn, so the status reports it running.
       if (disposition === "turn_started") {
         await waitForAgentRunStartWithTimeout(agentManager, agentId).catch((error) => {
-          stopNotification?.();
+          rejectNotification();
           throw error;
         });
       }
@@ -3509,6 +3841,14 @@ function createToolCatalog(
     },
   );
 
+  registerPluginTools({
+    agentManager,
+    callerAgentId,
+    scope,
+    tools,
+    builtinNames,
+    policy: options.paseoToolPolicy,
+  });
   return toCatalog();
 }
 

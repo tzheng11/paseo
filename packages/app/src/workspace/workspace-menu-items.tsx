@@ -7,7 +7,18 @@ import {
 } from "react";
 import { useTranslation } from "react-i18next";
 import { withUnistyles } from "react-native-unistyles";
-import { Archive, Circle, CircleCheck, Copy, Pencil, Pin, PinOff, Tag } from "lucide-react-native";
+import {
+  Archive,
+  Circle,
+  CircleCheck,
+  Copy,
+  CornerDownRight,
+  Pencil,
+  Pin,
+  PinOff,
+  Tag,
+} from "lucide-react-native";
+import { router } from "expo-router";
 import type { Theme } from "@/styles/theme";
 import type { ShortcutKey } from "@/utils/format-shortcut";
 import { DropdownMenuItem, DropdownMenuSubTrigger } from "@/components/ui/dropdown-menu";
@@ -23,6 +34,8 @@ import {
 import { useHostFeatureAvailability } from "@/runtime/host-features";
 import { useHostRuntimeIsConnected } from "@/runtime/host-runtime";
 import { useWorkspaceFields } from "@/stores/session-store-hooks";
+import { buildNewWorkspaceRoute } from "@/utils/host-routes";
+import { generateDraftId } from "@/stores/draft-keys";
 
 const foregroundMutedColorMapping = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
 const ThemedCopy = withUnistyles(Copy);
@@ -33,6 +46,7 @@ const ThemedCircleCheck = withUnistyles(CircleCheck);
 const ThemedPin = withUnistyles(Pin);
 const ThemedPinOff = withUnistyles(PinOff);
 const ThemedTag = withUnistyles(Tag);
+const ThemedChild = withUnistyles(CornerDownRight);
 
 const copyLeadingIcon = <ThemedCopy size={14} uniProps={foregroundMutedColorMapping} />;
 const renameLeadingIcon = <ThemedPencil size={14} uniProps={foregroundMutedColorMapping} />;
@@ -43,6 +57,7 @@ const markAsUnreadLeadingIcon = <ThemedCircle size={14} uniProps={foregroundMute
 const archiveLeadingIcon = <ThemedArchive size={14} uniProps={foregroundMutedColorMapping} />;
 const pinLeadingIcon = <ThemedPin size={14} uniProps={foregroundMutedColorMapping} />;
 const unpinLeadingIcon = <ThemedPinOff size={14} uniProps={foregroundMutedColorMapping} />;
+const childLeadingIcon = <ThemedChild size={14} uniProps={foregroundMutedColorMapping} />;
 
 export interface WorkspaceMenuItemsProps {
   workspaceKey: string;
@@ -143,6 +158,15 @@ export function WorkspaceMenuItems({
           {t("sidebar.workspace.actions.rename")}
         </WorkspaceMenuItem>
       ) : null}
+      {serverId && workspaceId ? (
+        <WorkspaceAddChildMenuItem
+          surface={surface}
+          serverId={serverId}
+          workspaceId={workspaceId}
+          workspaceKey={workspaceKey}
+          testIDPrefix={testIDPrefix}
+        />
+      ) : null}
       {onMarkAsRead ? (
         <WorkspaceMenuItem
           surface={surface}
@@ -212,6 +236,53 @@ export function WorkspaceMenuItems({
         </WorkspaceMenuItem>
       ) : null}
     </>
+  );
+}
+
+function WorkspaceAddChildMenuItem({
+  surface,
+  serverId,
+  workspaceId,
+  workspaceKey,
+  testIDPrefix,
+}: {
+  surface: MenuSurface;
+  serverId: string;
+  workspaceId: string;
+  workspaceKey: string;
+  testIDPrefix: string;
+}) {
+  const { t } = useTranslation();
+  const workspace = useWorkspaceFields(serverId, workspaceId, (value) => ({
+    projectId: value.projectId,
+    projectRootPath: value.projectRootPath,
+    projectDisplayName: value.projectDisplayName,
+    background: value.background,
+    archivingAt: value.archivingAt,
+  }));
+  const addChild = useCallback(() => {
+    if (!workspace) return;
+    router.push(
+      buildNewWorkspaceRoute({
+        serverId,
+        sourceDirectory: workspace.projectRootPath,
+        projectId: workspace.projectId,
+        displayName: workspace.projectDisplayName,
+        parentWorkspaceKey: workspaceKey,
+        draftId: generateDraftId(),
+      }),
+    );
+  }, [serverId, workspace, workspaceKey]);
+  if (!workspace || workspace.background || workspace.archivingAt) return null;
+  return (
+    <WorkspaceMenuItem
+      surface={surface}
+      leading={childLeadingIcon}
+      testID={`${testIDPrefix}-add-child-${workspaceKey}`}
+      onSelect={addChild}
+    >
+      {t("sidebar.workspace.actions.addChild")}
+    </WorkspaceMenuItem>
   );
 }
 

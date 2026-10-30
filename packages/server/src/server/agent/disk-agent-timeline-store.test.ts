@@ -9,13 +9,13 @@ import type { AgentTimelineItem } from "./agent-sdk-types.js";
 import type { ProjectedTimelineRow } from "./timeline-projection.js";
 import { streamTimelinePromptIndex } from "./timeline-prompt-index.js";
 
-const cleanups: Array<() => void> = [];
-afterEach(() => {
-  for (const cleanup of cleanups.splice(0).toReversed()) cleanup();
+const cleanups: Array<() => void | Promise<void>> = [];
+afterEach(async () => {
+  for (const cleanup of cleanups.splice(0).toReversed()) await cleanup();
 });
-function createStore(cacheBytes = 1024) {
+async function createStore(cacheBytes = 1024) {
   const directory = mkdtempSync(path.join(tmpdir(), "paseo-timeline-test-"));
-  const store = new DiskAgentTimelineStore({ directory, cacheBytes });
+  const store = await DiskAgentTimelineStore.create({ directory, cacheBytes });
   cleanups.push(
     () => rmSync(directory, { recursive: true, force: true }),
     () => store.close(),
@@ -38,7 +38,7 @@ const tool = (callId: string, status: "running" | "completed"): AgentTimelineIte
 
 describe("DiskAgentTimelineStore", () => {
   it("indexes cached prompts without reading interleaved nonuser payloads", async () => {
-    const store = createStore();
+    const store = await createStore();
     const memory = new InMemoryAgentTimelineStore();
     const items: AgentTimelineItem[] = [
       { type: "user_message", text: "  café 🧪\0\n first  ", clientMessageId: "first" },
@@ -92,7 +92,7 @@ describe("DiskAgentTimelineStore", () => {
   });
 
   it("pages cached prompt metadata, yields, and rejects a changed projection", async () => {
-    const store = createStore();
+    const store = await createStore();
     store.initialize("prompts", {
       epoch: "before",
       items: Array.from({ length: 300 }, (_, index) => ({
@@ -118,7 +118,7 @@ describe("DiskAgentTimelineStore", () => {
   });
 
   it("serves other event-loop work while reading a tail expanded by an old tool", async () => {
-    const store = createStore();
+    const store = await createStore();
     store.initialize("busy", { epoch: "epoch" });
     store.append("busy", tool("old", "running"));
     for (let index = 0; index < 300; index++) {
@@ -138,7 +138,7 @@ describe("DiskAgentTimelineStore", () => {
   });
 
   it("rejects a page invalidated between read batches instead of mixing epochs", async () => {
-    const store = createStore();
+    const store = await createStore();
     store.initialize("changing", { epoch: "before" });
     for (let index = 0; index < 100; index++)
       store.append("changing", { type: "user_message", text: String(index) });
@@ -149,8 +149,8 @@ describe("DiskAgentTimelineStore", () => {
     expect((await store.fetchAsync("changing")).epoch).toBe("after");
   });
 
-  it("rolls back a failed batch and keeps the prior projection and sequence", () => {
-    const store = createStore();
+  it("rolls back a failed batch and keeps the prior projection and sequence", async () => {
+    const store = await createStore();
     store.initialize("rollback", { epoch: "epoch" });
     store.append("rollback", { type: "assistant_message", messageId: "reply", text: "before" });
     const before = store.fetch("rollback");
@@ -177,8 +177,8 @@ describe("DiskAgentTimelineStore", () => {
     ]);
   });
 
-  it("reads only the final assistant segment and identifies a durable-history join", () => {
-    const store = createStore();
+  it("reads only the final assistant segment and identifies a durable-history join", async () => {
+    const store = await createStore();
     store.initialize("segment");
     store.append("segment", { type: "assistant_message", messageId: "first", text: "A" });
     expect(store.getLastAssistantMessageSegmentInfo("segment")).toEqual({
@@ -194,7 +194,7 @@ describe("DiskAgentTimelineStore", () => {
     expect(store.getLastAssistantMessageSegment("segment")).toBe("B");
   });
   it("streams projected history without collecting payloads and rejects a changing epoch", async () => {
-    const store = createStore();
+    const store = await createStore();
     store.initialize("stream", { epoch: "before" });
     for (let index = 0; index < 1000; index++)
       store.append("stream", {
@@ -214,21 +214,21 @@ describe("DiskAgentTimelineStore", () => {
     store.initialize("stream", { epoch: "after" });
     await expect(iterator.next()).rejects.toThrow("History changed");
   });
-  it("cleans caches left by a dead process without touching live or unrelated directories", () => {
+  it("cleans caches left by a dead process without touching live or unrelated directories", async () => {
     const directory = mkdtempSync(path.join(tmpdir(), "paseo-timeline-owner-test-"));
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
     mkdirSync(path.join(directory, "timeline-2147483647-dead"));
     mkdirSync(path.join(directory, `timeline-${process.pid}-live`));
     mkdirSync(path.join(directory, "timeline-unrelated"));
-    const store = new DiskAgentTimelineStore({ directory });
+    const store = await DiskAgentTimelineStore.create({ directory });
     cleanups.push(() => store.close());
     expect(readdirSync(directory)).not.toContain("timeline-2147483647-dead");
     expect(readdirSync(directory)).toContain(`timeline-${process.pid}-live`);
     expect(readdirSync(directory)).toContain("timeline-unrelated");
   });
 
-  it("preserves empty-window cursor semantics", () => {
-    const disk = createStore();
+  it("preserves empty-window cursor semantics", async () => {
+    const disk = await createStore();
     const memory = new InMemoryAgentTimelineStore();
     disk.initialize("a", { epoch: "epoch" });
     memory.initialize("a", { epoch: "epoch" });
@@ -236,8 +236,19 @@ describe("DiskAgentTimelineStore", () => {
       expect(disk.fetch("a", { direction })).toEqual(memory.fetch("a", { direction }));
   });
 
-  it("appends batches with exactly the same projection as individual source events", () => {
-    const disk = createStore();
+  it("waits for cache removal on every concurrent close", async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "paseo-timeline-close-test-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const store = await DiskAgentTimelineStore.create({ directory });
+    const first = store.close();
+    const second = store.close();
+    expect(second).toBe(first);
+    await second;
+    expect(readdirSync(directory)).toEqual([]);
+  });
+
+  it("appends batches with exactly the same projection as individual source events", async () => {
+    const disk = await createStore();
     const memory = new InMemoryAgentTimelineStore();
     disk.initialize("a", { epoch: "epoch" });
     memory.initialize("a", { epoch: "epoch" });
@@ -251,7 +262,7 @@ describe("DiskAgentTimelineStore", () => {
     expect(disk.fetch("a")).toEqual(memory.fetch("a"));
   });
   it("matches memory-store paging with interleaved lifecycle updates and evicted rows", async () => {
-    const disk = createStore();
+    const disk = await createStore();
     const memory = new InMemoryAgentTimelineStore();
     for (const store of [disk, memory]) {
       store.initialize("a", { epoch: "epoch" });
@@ -293,8 +304,8 @@ describe("DiskAgentTimelineStore", () => {
     expect(disk.getRecentItems("a", 0)).toEqual(memory.getItems("a"));
   });
 
-  it("shares a bounded cache across agents while preserving complete older history", () => {
-    const disk = createStore(4096);
+  it("shares a bounded cache across agents while preserving complete older history", async () => {
+    const disk = await createStore(4096);
     for (const agent of ["a", "b", "c"]) {
       disk.initialize(agent);
       for (let index = 0; index < 200; index++) {
@@ -322,8 +333,8 @@ describe("DiskAgentTimelineStore", () => {
     expect(disk.cachedBytes).toBeLessThanOrEqual(4096);
   });
 
-  it("keeps seeded coverage, merges chunks, and isolates deletion and reinitialization", () => {
-    const disk = createStore();
+  it("keeps seeded coverage, merges chunks, and isolates deletion and reinitialization", async () => {
+    const disk = await createStore();
     disk.initialize("a", {
       nextSeq: 5,
       rows: [
@@ -351,8 +362,8 @@ describe("DiskAgentTimelineStore", () => {
   });
 });
 
-it("decodes bounded projection edges and accounts for a huge unloaded middle", () => {
-  const store = createStore(1024);
+it("decodes bounded projection edges and accounts for a huge unloaded middle", async () => {
+  const store = await createStore(1024);
   store.initialize("windows");
   for (let index = 0; index < 10; index++)
     store.append("windows", {

@@ -2,6 +2,7 @@ import type { TFunction } from "i18next";
 import { buildStatusGroups } from "@/hooks/sidebar-status-view-model";
 import {
   splitPinnedSidebarGroups,
+  projectWorkspaceTree,
   type PinnedSidebarGroups,
   type PinnedSidebarKeys,
 } from "@/hooks/use-sidebar-pins";
@@ -12,7 +13,11 @@ import type {
 import type { SidebarGroupMode } from "@/stores/sidebar-view-store";
 import type { PinnedWorkspaceSortMode } from "@/stores/sidebar-order-store";
 import type { WorkspaceTitleSource } from "@/hooks/use-settings";
-import { sortSidebarWorkspaces, type SidebarWorkspaceSortMode } from "./workspace-sort";
+import {
+  sortSidebarWorkspaces,
+  UNGROUPED_WORKSPACE_SORT_KEY,
+  type SidebarWorkspaceSortMode,
+} from "./workspace-sort";
 import {
   resolveSidebarProjectIconTargets,
   type SidebarProjectIconTarget,
@@ -129,7 +134,15 @@ export function buildSidebarProjection(input: SidebarProjectionInput): SidebarPr
   } else {
     sections.push(
       ...workspaceGroups.map((group) => ({
-        workspaces: group.rows,
+        workspaces:
+          group.leading.kind === "workspaces"
+            ? flattenWorkspaceTree(
+                group.rows,
+                collapsedWorkspaces,
+                (input.workspaceSortModeByProject?.[UNGROUPED_WORKSPACE_SORT_KEY] ?? "manual") ===
+                  "manual",
+              ).map((row) => row.workspace)
+            : group.rows,
         collapsed: input.collapsedWorkspaceGroupKeys.has(group.key),
       })),
     );
@@ -143,12 +156,35 @@ export function buildSidebarProjection(input: SidebarProjectionInput): SidebarPr
   };
 }
 
-/** Project mode keeps its project headers and groups nothing; status mode groups the rows. */
 function buildWorkspaceGroups(
   input: SidebarProjectionInput,
   unpinnedWorkspaces: SidebarWorkspaceEntry[],
 ): SidebarWorkspaceGroup[] {
   switch (input.groupMode) {
+    case "none": {
+      const projected = projectWorkspaceTree({
+        workspaces: unpinnedWorkspaces,
+        section: "unpinned",
+        tree: input.pinnedWorkspaceTree,
+      });
+      const mode = input.workspaceSortModeByProject?.[UNGROUPED_WORKSPACE_SORT_KEY] ?? "manual";
+      const sorted = sortSidebarWorkspaces({
+        workspaces: projected,
+        mode,
+        workspaceTitleSource: input.workspaceTitleSource ?? "title",
+        workspaceEntriesByKey: input.workspaceEntriesByKey,
+      });
+      const entries = sorted.map((workspace) =>
+        Object.assign({}, input.workspaceEntriesByKey.get(workspace.workspaceKey)!, {
+          sidebarSection: workspace.sidebarSection,
+          sidebarParentWorkspaceKey: workspace.sidebarParentWorkspaceKey,
+          siblingOrder: workspace.siblingOrder,
+        }),
+      );
+      return [
+        { key: "section:workspaces", label: "", rows: entries, leading: { kind: "workspaces" } },
+      ];
+    }
     case "project":
       return [];
     case "status":

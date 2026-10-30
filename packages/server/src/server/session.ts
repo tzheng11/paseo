@@ -1,5 +1,7 @@
 import { WorkspaceFieldError } from "@getpaseo/protocol/workspace-fields";
 import { setWorkspaceFieldValue } from "./workspace-fields.js";
+import { type WorkspaceRuntimeStore } from "./workspace-runtime-store/index.js";
+import { setWorkspacePinPlacement } from "./workspace-pin-placement.js";
 import type { AgentMessageDelivery } from "./agent/agent-messages/index.js";
 import { AgentDirectory } from "./agent/directory.js";
 import { ConnectedHostSession } from "./connected-hosts/index.js";
@@ -85,7 +87,6 @@ import {
   type WorkspaceScriptsService,
 } from "./session/workspace-scripts/workspace-scripts-service.js";
 import type { DaemonConfigStore } from "./daemon-config-store.js";
-import { loadPersistedConfig } from "./persisted-config.js";
 import { releaseWorkspaceServicePortPlan } from "./workspace-service-port-registry.js";
 import { getErrorMessage, getErrorMessageOr } from "@getpaseo/protocol/error-utils";
 import { getAgentStatusPriority } from "@getpaseo/protocol/agent-state-bucket";
@@ -190,6 +191,10 @@ import {
 import { ScheduleSession } from "./session/schedule/schedule-session.js";
 import { ProviderCatalogSession } from "./session/provider/provider-catalog-session.js";
 import { UsageSession } from "./session/usage/usage-session.js";
+import {
+  SpeechModelsSession,
+  type SpeechModelsSessionOptions,
+} from "./session/speech/speech-models-session.js";
 import { WorkspaceFilesSession } from "./session/files/workspace-files-session.js";
 import { AgentConfigSession } from "./session/agent-config/agent-config-session.js";
 import { ProjectConfigSession } from "./session/project-config/project-config-session.js";
@@ -489,6 +494,7 @@ export interface SessionOptions {
   // defaults to the real checkout-git implementation.
   renameCurrentBranch?: typeof renameCurrentBranchDefault;
   workspaceGitService: WorkspaceGitService;
+  workspaceRuntimeStore: WorkspaceRuntimeStore;
   workspaceAutoName: WorkspaceAutoName;
   daemonConfigStore: DaemonConfigStore;
   pluginRuntime?: {
@@ -538,6 +544,7 @@ export interface SessionOptions {
   stt: Resolvable<SpeechToTextProvider | null>;
   sttLanguage?: string;
   tts: Resolvable<TextToSpeechProvider | null>;
+  speechModels?: SpeechModelsSessionOptions["runtime"];
   terminalManager: TerminalManager | null;
   providerSnapshotManager: ProviderSnapshotManager;
   hubExecutionAgents?: HubExecutionAgents;
@@ -759,6 +766,7 @@ export class Session {
   private readonly github: ForgeService;
   private readonly renameCurrentBranch: typeof renameCurrentBranchDefault;
   private readonly workspaceGitService: WorkspaceGitService;
+  private readonly workspaceRuntimeStore: WorkspaceRuntimeStore;
   private readonly workspaceAutoName: WorkspaceAutoName;
   private readonly gitMutation: GitMutationService;
   private readonly workspaceProvisioning: WorkspaceProvisioningService;
@@ -821,12 +829,14 @@ export class Session {
   private readonly scheduleSession: ScheduleSession;
   private readonly providerCatalogSession: ProviderCatalogSession;
   private readonly usageSession: UsageSession;
+  private readonly speechModelsSession: SpeechModelsSession;
   private readonly workspaceFilesSession: WorkspaceFilesSession;
   private readonly agentConfigSession: AgentConfigSession;
   private readonly projectConfigSession: ProjectConfigSession;
   private readonly daemonSession: DaemonSession;
   private readonly fleetSession: FleetSession;
   private readonly hubExecutionController: HubExecutionController | null;
+  private readonly pinServerId: string | undefined;
   private readonly workspaceScripts: WorkspaceScriptsService;
   private readonly messageReceipts: Pick<MessageReceipts, "send">;
   private readonly agentMessages: AgentMessageDelivery;
@@ -864,6 +874,7 @@ export class Session {
       github,
       renameCurrentBranch,
       workspaceGitService,
+      workspaceRuntimeStore,
       workspaceAutoName,
       daemonConfigStore,
       pluginRuntime,
@@ -871,6 +882,7 @@ export class Session {
       stt,
       sttLanguage,
       tts,
+      speechModels,
       terminalManager,
       providerSnapshotManager,
       serviceProxy,
@@ -890,6 +902,7 @@ export class Session {
       daemonRuntimeConfig,
       getWebSocketRuntimeMetrics,
     } = options;
+    this.pinServerId = serverId;
     this.browserToolsBroker = options.browserToolsBroker;
     this.clientId = clientId;
     this.authorization = new SessionAuthorization(permissions);
@@ -945,6 +958,7 @@ export class Session {
     this.github = github ?? createGitHubService();
     this.renameCurrentBranch = renameCurrentBranch ?? renameCurrentBranchDefault;
     this.workspaceGitService = workspaceGitService;
+    this.workspaceRuntimeStore = workspaceRuntimeStore;
     this.gitMutation = createGitMutationService({
       workspaceGitService: this.workspaceGitService,
       logger: this.sessionLogger,
@@ -988,7 +1002,9 @@ export class Session {
           providerSnapshotManager,
           readDaemonConfig: () => this.readStructuredGenerationDaemonConfig(),
           getFocusedSelection: (cwd) => this.getFocusedAgentSelectionForCwd(cwd),
+          logger: this.sessionLogger,
         }),
+        logger: this.sessionLogger,
       }),
       paseoHome: this.paseoHome,
       worktreesRoot: this.worktreesRoot,
@@ -1044,6 +1060,10 @@ export class Session {
       emit: (msg) => this.emit(msg),
       runtime: pluginRuntime,
       logger: this.sessionLogger,
+    });
+    this.speechModelsSession = new SpeechModelsSession({
+      emit: (msg) => this.emit(msg),
+      runtime: speechModels,
     });
     this.agentConfigSession = new AgentConfigSession({
       host: {
@@ -1220,7 +1240,7 @@ export class Session {
       terminalManager: this.terminalManager,
       workspaceRegistry: this.workspaceRegistry,
       projectRegistry: this.projectRegistry,
-      workspaceGitService: this.workspaceGitService,
+      workspaceRuntimeStore: this.workspaceRuntimeStore,
       getDaemonTcpPort: this.getDaemonTcpPort,
       getDaemonTcpHost: this.getDaemonTcpHost,
       serviceProxyPublicBaseUrl: this.serviceProxyPublicBaseUrl,
@@ -1234,13 +1254,14 @@ export class Session {
       spawnWorkspaceScript,
       assertAutomationAllowed: (workspaceId) =>
         assertWorkspaceAutomationAllowedForWorkspace(this.workspaceRegistry, workspaceId),
-      globalServicePorts: loadPersistedConfig(this.paseoHome).worktrees?.servicePorts,
+      getGlobalServicePorts: () => this.daemonConfigStore.readServicePorts(),
     });
     this.workspaceDirectory = new WorkspaceDirectory({
       logger: this.sessionLogger,
       projectRegistry: this.projectRegistry,
       workspaceRegistry: this.workspaceRegistry,
       listAgentPayloads: () => this.listAgentPayloads({ includeBackground: true }),
+      workspaceLastUserMessageTimes: () => this.agentDirectory.workspaceLastUserMessageTimes(),
       listProviderSubagentActivity: async () => this.agentManager.listProviderSubagentActivity(),
       listTerminalActivityContributions: () => this.listTerminalActivityContributions(),
       isProviderVisibleToClient: (provider) => this.isProviderVisibleToClient(provider),
@@ -2162,7 +2183,7 @@ export class Session {
     if (!project) {
       throw new Error(`Project not found for workspace ${workspace.workspaceId}`);
     }
-    const snapshot = this.workspaceGitService.peekSnapshot(workspace.cwd);
+    const snapshot = this.workspaceRuntimeStore.get(workspace.cwd);
     const checkout = checkoutFromPersistedWorkspacePlacement({
       workspace,
       // COMPAT(workspacePlacementBackfill): added in v0.1.107, remove after 2027-01-15.
@@ -2453,8 +2474,7 @@ export class Session {
       this.dispatchOrchestrationSkillsMessage(msg) ??
       this.dispatchPluginDirectoryMessage(msg) ??
       this.dispatchPluginMessage(msg) ??
-      this.dispatchTerminalMessage(msg) ??
-      this.dispatchScheduleMessage(msg) ??
+      this.dispatchHostServiceMessage(msg) ??
       this.dispatchMiscMessage(msg);
     if (promise) await promise;
   }
@@ -2467,6 +2487,14 @@ export class Session {
       this.dispatchAgentRestoreMessage(msg, source) ??
       this.dispatchAgentRelationshipMessage(msg) ??
       this.dispatchAgentTimelineMessage(msg, source)
+    );
+  }
+
+  private dispatchHostServiceMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+    return (
+      this.dispatchTerminalMessage(msg) ??
+      this.dispatchScheduleMessage(msg) ??
+      this.speechModelsSession.dispatch(msg)
     );
   }
 
@@ -2951,8 +2979,7 @@ export class Session {
       case "daemon.get_host_stats.request":
         return this.daemonSession.handleGetHostStatsRequest(msg);
       case "daemon.config.reload.request":
-        this.daemonSession.handleConfigReloadRequest(msg);
-        return undefined;
+        return this.daemonSession.handleConfigReloadRequest(msg);
       case "hub.management.daemon.connect.request":
       case "hub.management.daemon.get_status.request":
       case "hub.management.daemon.disconnect.request":
@@ -2963,14 +2990,15 @@ export class Session {
       case "daemon.update.request":
         return this.daemonSession.handleUpdateRequest(msg);
       case "set_daemon_config_request":
-        this.emit({
-          type: "set_daemon_config_response",
-          payload: {
-            requestId: msg.requestId,
-            config: this.daemonConfigStore.patch(msg.config),
-          },
+        return this.daemonConfigStore.patch(msg.config).then((config) => {
+          return this.emit({
+            type: "set_daemon_config_response",
+            payload: {
+              requestId: msg.requestId,
+              config,
+            },
+          });
         });
-        return undefined;
       case "read_project_config_request":
         return this.projectConfigSession.handleReadProjectConfigRequest(msg);
       case "write_project_config_request":
@@ -2988,7 +3016,7 @@ export class Session {
       case "checkout.commits.list.request":
         return this.checkoutSession.handleCommitsListRequest(msg);
       case "checkout.commits.file_diff.request":
-        return this.checkoutSession.handleCommitFileDiffRequest(msg);
+        return this.checkoutSession.handleCommitFileDiffRequest(msg, this.delivery.requestSignal);
       case "validate_branch_request":
         return this.checkoutSession.handleValidateBranchRequest(msg);
       case "branch_suggestions_request":
@@ -3084,6 +3112,15 @@ export class Session {
         return this.handleWorkspaceFieldValueSetRequest(msg);
       case "workspace.move.request":
         return this.handleWorkspaceMoveRequest(msg);
+      default:
+        return this.dispatchWorkspacePinMessage(msg);
+    }
+  }
+
+  private dispatchWorkspacePinMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+    switch (msg.type) {
+      case "workspace.pin.placement.set.request":
+        return this.handleWorkspacePinPlacementSetRequest(msg);
       case "workspace.title.set.request":
         return this.handleWorkspaceTitleSetRequest(msg.workspaceId, msg.title, msg.requestId);
       case "workspace.superpin.set.request":
@@ -3855,6 +3892,35 @@ export class Session {
           accepted: false,
           removedWorkspaceIds: [],
           error: getErrorMessageOr(error, "Failed to remove project"),
+        },
+      });
+    }
+  }
+
+  private async handleWorkspacePinPlacementSetRequest(
+    request: Extract<SessionInboundMessage, { type: "workspace.pin.placement.set.request" }>,
+  ): Promise<void> {
+    const { requestId, workspaceId } = request;
+    try {
+      const placement = await setWorkspacePinPlacement(
+        this.workspaceRegistry,
+        request,
+        this.pinServerId,
+      );
+      this.emit({
+        type: "workspace.pin.placement.set.response",
+        payload: { requestId, workspaceId, accepted: true, placement, error: null },
+      });
+      await this.emitWorkspaceUpdatesForWorkspaceIds([workspaceId]);
+    } catch (error) {
+      this.emit({
+        type: "workspace.pin.placement.set.response",
+        payload: {
+          requestId,
+          workspaceId,
+          accepted: false,
+          placement: null,
+          error: getErrorMessageOr(error, "Unable to save pin layout"),
         },
       });
     }
@@ -5637,7 +5703,7 @@ export class Session {
     if (!record || record.internal) {
       return null;
     }
-    return { record, lastMessage: null };
+    return { record, lastMessage: await this.agentManager.getLastAssistantMessage(agentId) };
   }
 
   private async getAgentPayloadById(agentId: string): Promise<AgentSnapshotPayload | null> {
@@ -5894,7 +5960,7 @@ export class Session {
       projectRecord ?? (await this.projectRegistry.get(workspace.projectId));
 
     let diffStat: { additions: number; deletions: number } | null = null;
-    const snapshot = this.workspaceGitService.peekSnapshot(workspace.cwd);
+    const snapshot = this.workspaceRuntimeStore.get(workspace.cwd);
     if (snapshot?.git.diffStat) {
       diffStat = snapshot.git.diffStat;
     }
@@ -5907,6 +5973,7 @@ export class Session {
     return {
       id: workspace.workspaceId,
       parentWorkspaceId: workspace.parentWorkspaceId,
+      pinPlacement: workspace.pinPlacement,
       siblingOrder: workspace.siblingOrder,
       projectId: workspace.projectId,
       projectDisplayName: resolvedProjectRecord
@@ -5931,8 +5998,9 @@ export class Session {
       status: "done",
       statusEnteredAt: null,
       activityAt: null,
+      createdAt: workspace.createdAt,
       diffStat,
-      scripts: this.buildWorkspaceScriptPayloadSnapshot(workspace, resolvedProjectRecord),
+      scripts: await this.buildWorkspaceScriptPayloadSnapshot(workspace, resolvedProjectRecord),
       ...(resolvedProjectRecord
         ? {
             project: await this.buildProjectPlacementForWorkspace(workspace, resolvedProjectRecord),
@@ -5974,7 +6042,7 @@ export class Session {
     projectRecord?: PersistedProjectRecord | null,
   ): Promise<WorkspaceDescriptorPayload> {
     const base = await this.describeWorkspaceRecord(workspace, projectRecord);
-    const snapshot = this.workspaceGitService.peekSnapshot(workspace.cwd);
+    const snapshot = this.workspaceRuntimeStore.get(workspace.cwd);
     if (!snapshot) {
       return base;
     }
@@ -6002,6 +6070,7 @@ export class Session {
     return {
       id: result.workspace.workspaceId,
       parentWorkspaceId: result.workspace.parentWorkspaceId,
+      pinPlacement: result.workspace.pinPlacement,
       siblingOrder: result.workspace.siblingOrder,
       projectId: result.workspace.projectId,
       projectDisplayName: projectRecord
@@ -6030,6 +6099,8 @@ export class Session {
       status: "done",
       statusEnteredAt: result.workspace.createdAt,
       activityAt: null,
+      createdAt: result.workspace.createdAt,
+      lastUserMessageAt: null,
       diffStat: { additions: 0, deletions: 0 },
       scripts: [],
       gitRuntime: {
@@ -7090,6 +7161,7 @@ export class Session {
         background: request.background,
         parentWorkspaceId: request.parentWorkspaceId,
         siblingOrder: request.siblingOrder,
+        sidebarPlacement: request.sidebarPlacement,
         callerWorkspaceId: await this.getCallerWorkspaceId(request.callerAgentId),
       },
     );
@@ -7156,6 +7228,7 @@ export class Session {
         background: request.background,
         parentWorkspaceId: request.parentWorkspaceId,
         siblingOrder: request.siblingOrder,
+        sidebarPlacement: request.sidebarPlacement,
         callerWorkspaceId: await this.getCallerWorkspaceId(request.callerAgentId),
       },
       source.baseBranch
@@ -7532,7 +7605,7 @@ export class Session {
   private buildWorkspaceScriptPayloadSnapshot(
     workspace: PersistedWorkspaceRecord,
     project: PersistedProjectRecord | null,
-  ): WorkspaceDescriptorPayload["scripts"] {
+  ): Promise<WorkspaceDescriptorPayload["scripts"]> {
     return this.workspaceScripts.buildSnapshot(workspace, project);
   }
 
@@ -8122,8 +8195,6 @@ export class Session {
   ): Promise<void> {
     const direction: AgentTimelineFetchDirection = msg.direction ?? (msg.cursor ? "after" : "tail");
     const projection = "projected" as const;
-    const requestedLimit = msg.limit;
-    const pageLimit = requestedLimit ?? (direction === "after" ? 0 : 200);
     const cursor: AgentTimelineCursor | undefined = msg.cursor
       ? {
           epoch: msg.cursor.epoch,
@@ -8142,7 +8213,8 @@ export class Session {
       const fetchedControlTimeline = await this.agentManager.fetchTimelineAsync(msg.agentId, {
         direction,
         cursor,
-        limit: pageLimit,
+        limit: msg.limit,
+        wholeTurns: msg.wholeTurns,
       });
       const selectedTimeline = {
         timeline: fetchedControlTimeline,

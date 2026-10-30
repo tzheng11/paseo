@@ -22,6 +22,7 @@ export interface AgentTimelineStreamOptions {
 export type AgentTimelineFetchDirection = "tail" | "before" | "after";
 
 export interface AgentTimelineFetchOptions {
+  wholeTurns?: boolean;
   direction?: AgentTimelineFetchDirection;
   cursor?: AgentTimelineCursor;
   /**

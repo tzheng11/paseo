@@ -5,7 +5,7 @@ import {
   createCodexAppServerChildProcess,
   createFakeCodexAppServer,
 } from "./test-utils/fake-app-server.js";
-import { CodexAppServerClient } from "./app-server-transport.js";
+import { CodexAppServerClient, CODEX_PROVIDER_LINE_BYTES } from "./app-server-transport.js";
 
 describe("Codex app-server transport", () => {
   test("oversized provider output rejects all pending requests and leaves another client usable", async () => {
@@ -13,10 +13,15 @@ describe("Codex app-server transport", () => {
     const client = new CodexAppServerClient(child, createTestLogger());
     const terminated = vi.fn();
     client.setUnexpectedTerminationHandler(terminated);
-    const first = expect(client.request("thread/read", {})).rejects.toThrow("JSONL frame exceeded");
-    const second = expect(client.request("model/list", {})).rejects.toThrow("JSONL frame exceeded");
+    const first = expect(client.request("thread/read", {})).rejects.toMatchObject({
+      code: "PROVIDER_STREAM_LINE_TOO_LARGE",
+    });
+    const second = expect(client.request("model/list", {})).rejects.toMatchObject({
+      code: "PROVIDER_STREAM_LINE_TOO_LARGE",
+    });
     const block = Buffer.alloc(1024 * 1024, "x");
-    for (let index = 0; index < 64; index++) child.stdout.write(block);
+    for (let index = 0; index < CODEX_PROVIDER_LINE_BYTES / block.byteLength; index++)
+      child.stdout.write(block);
     child.stdout.write("x");
     await first;
     await second;
@@ -222,5 +227,31 @@ describe("Codex app-server transport", () => {
     codex.child.stdout.end();
     codex.child.stderr.end();
     codex.child.stdin.end();
+  });
+});
+
+describe("Codex stdout byte admission", () => {
+  test("fails pending requests and the session before joining an oversized line", async () => {
+    const child = createCodexAppServerChildProcess();
+    const client = new CodexAppServerClient(child, createTestLogger());
+    const terminations: Error[] = [];
+    client.setUnexpectedTerminationHandler((error) => terminations.push(error));
+    const request = client.request("thread/resume", {}, 1000).catch((error: Error) => error);
+    const chunk = Buffer.alloc(64 * 1024, "x");
+    child.stdout.write('{"id":1,"result":"');
+    for (let index = 0; index < 2048; index++) child.stdout.write(chunk);
+    const error = await request;
+    expect(error).toMatchObject({
+      name: "ProviderStreamLimitError",
+      code: "PROVIDER_STREAM_LINE_TOO_LARGE",
+      limitBytes: 128 * 1024 * 1024,
+    });
+    expect(terminations).toEqual([error]);
+    expect(client.hasPendingRequests()).toBe(false);
+    child.stdout.write('"}\n{"id":1,"result":"late"}\n');
+    await expect(client.request("model/list")).rejects.toThrow("closed");
+    await client.dispose();
+    child.stdout.end();
+    child.stderr.end();
   });
 });

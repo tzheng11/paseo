@@ -67,6 +67,7 @@ export const ko: TranslationResources = {
       daemonClientUnavailable: "데몬 클라이언트를 사용할 수 없습니다",
       daemonClientDisconnected: "데몬 클라이언트 연결이 끊어졌습니다",
       noFileFound: "{{token}}에 해당하는 파일을 찾을 수 없습니다",
+      folderOutsideWorkspace: "{{path}}은(는) 이 워크스페이스 밖에 있습니다",
       unexpectedDictationError: "받아쓰기를 처리하는 중 예기치 않은 오류가 발생했습니다.",
     },
     connectionStatus: {
@@ -99,6 +100,7 @@ export const ko: TranslationResources = {
       addProject: "프로젝트 추가",
       home: "홈",
       groupByProject: "프로젝트별 그룹화",
+      groupByNone: "워크스페이스 계층 표시",
       groupByStatus: "상태별 그룹화",
       modelGroupLabel: "모델",
       modelSearchKeywords: "모델 전환 모델 변경 모델 설정 모델 선택",
@@ -133,6 +135,8 @@ export const ko: TranslationResources = {
       sendAndInterrupt: "보내고 중단",
       sendAndSteer: "보내고 지시 추가",
       sendMessage: "메시지 보내기",
+      longPressToQueue: "길게 눌러 대기열에 추가",
+      longPressToSendNow: "길게 눌러 지금 보내기",
       queue: "대기열",
       send: "보내기",
     },
@@ -616,6 +620,9 @@ export const ko: TranslationResources = {
       hostDisconnected: "호스트가 연결되어 있지 않습니다",
       updateHost: "기본 터미널 렌더러를 사용하도록 호스트를 업데이트합니다.",
       unableToSubscribe: "터미널을 구독할 수 없습니다",
+      fileUploaded: "파일을 업로드했습니다",
+      pasteFileFailed: "파일을 붙여넣지 못했습니다: {{reason}}",
+      uploadingFile: "파일 업로드 중…",
     },
     sheet: {
       openAsTab: "탭으로 열기",
@@ -1170,7 +1177,15 @@ export const ko: TranslationResources = {
       showBackground: "백그라운드 표시",
       trigger: "표시 설정",
       heading: "표시",
+      sort: {
+        label: "정렬",
+        created: "생성일",
+        manual: "수동",
+        lastPrompt: "마지막 프롬프트",
+        updateHost: "작업 공간을 정렬하려면 호스트를 업데이트하세요",
+      },
       grouping: {
+        none: "없음",
         label: "그룹화",
         project: "프로젝트",
         status: "상태",
@@ -1314,6 +1329,7 @@ export const ko: TranslationResources = {
         pending: "대기 중: {{count}}개",
       },
       actions: {
+        addChild: "하위 워크스페이스 추가",
         menu: "워크스페이스 작업",
         newWorkspace: "새 워크스페이스",
         showMore: "더 보기",
@@ -1353,6 +1369,13 @@ export const ko: TranslationResources = {
     },
   },
   newWorkspace: {
+    parent: {
+      label: "상위 워크스페이스",
+      none: "상위 없음",
+      searchPlaceholder: "워크스페이스 검색",
+      empty: "사용 가능한 워크스페이스가 없습니다.",
+      unavailable: "워크스페이스를 사용할 수 없습니다",
+    },
     title: "새 워크스페이스",
     create: "생성",
     isolation: {
@@ -1963,6 +1986,12 @@ export const ko: TranslationResources = {
     backdrop: "메뉴 배경",
   },
   subagents: {
+    parent: {
+      backToParent: "상위 에이전트로 돌아가기",
+      backTo: "{{label}}(으)로 돌아가기",
+      parentAgent: "상위 에이전트",
+      openParent: "상위 에이전트 열기",
+    },
     title: "하위 에이전트",
     pillLabelOne: "하위 에이전트 1개",
     pillLabelMany: "하위 에이전트 {{count}}개",
@@ -2008,7 +2037,6 @@ export const ko: TranslationResources = {
         alwaysUseExtension: ".{{extension}}에 항상 사용",
         alwaysUseFilename: "{{filename}}에 항상 사용",
         option: "{{title}} — {{owner}}",
-        actions: "파일 작업",
         builtin: {
           owner: "Paseo",
           markdown: "Markdown",
@@ -2027,6 +2055,8 @@ export const ko: TranslationResources = {
       notFound: "파일을 찾을 수 없습니다",
       failedToLoadPreview: "파일 미리보기를 불러오지 못했습니다",
       editor: {
+        preview: "미리보기",
+        source: "소스",
         fileSize: "파일 크기 {{size}}",
         lines: "{{count}} 라인",
         editorStatus: "편집기 상태 {{status}}",
@@ -2077,7 +2107,14 @@ export const ko: TranslationResources = {
     input: "입력",
     output: "출력",
   },
+  turnSummary: {
+    details: "턴 세부 정보 보기",
+    sentBy: "{{name}}이(가) 보냄",
+    showMore: "더 보기",
+    showLess: "접기",
+  },
   toolCallGroup: {
+    thought: "생각함",
     editedFiles: {
       one: "{{count}} 파일을 편집했습니다.",
       other: "{{count}} 파일을 편집했습니다.",
@@ -2278,6 +2315,7 @@ export const ko: TranslationResources = {
       connections: "연결",
       agents: "에이전트",
       metadata: "메타데이터",
+      voice: "음성",
       workspaces: "워크스페이스",
       providers: "프로바이더",
       usage: "사용량",
@@ -2296,9 +2334,72 @@ export const ko: TranslationResources = {
       automaticHint: "Paseo가 사용 가능한 빠른 모델을 선택합니다",
       preferredHint: "Paseo에서 사용할 모델을 선택하세요",
       model: "모델",
-      fallbackHint: "사용할 수 없으면 Paseo가 다른 사용 가능한 모델을 사용합니다",
+      modelHint: "이 모델만 사용합니다. 실패해도 Paseo는 다른 모델을 시도하지 않습니다",
       docs: "문서",
       saveError: "메타데이터 생성을 업데이트할 수 없습니다",
+    },
+    voice: {
+      offline: "음성을 설정하려면 이 호스트에 연결하세요.",
+      updateHost: "음성을 설정하려면 호스트를 업데이트하세요.",
+      saveError: "음성 설정을 업데이트할 수 없습니다",
+      provider: "제공자",
+      providers: {
+        local: "로컬",
+        openai: "OpenAI",
+      },
+      voice: "목소리",
+      save: "저장",
+      retry: "다시 시도",
+      cancel: "취소",
+      model: "모델",
+      language: "언어",
+      languagePlaceholder: "자동 감지",
+      setBy: "{{name}}에서 설정됨",
+      unknownProvider: "{{provider}}을(를) 설정하려면 앱을 업데이트하세요",
+      sites: {
+        dictationStt: "음성 텍스트 변환",
+        voiceModeStt: "듣기",
+        voiceModeTts: "말하기",
+      },
+      dictation: {
+        title: "받아쓰기",
+        enabled: "받아쓰기",
+        enabledHint: "입력하는 대신 메시지 상자에 말하세요",
+      },
+      voiceMode: {
+        title: "음성 모드",
+        info: "음성 모드는 말한 내용을 텍스트로 옮기고 에이전트의 답변을 소리 내어 읽어 줍니다.",
+        enabled: "음성 모드",
+        enabledHint: "손을 쓰지 않고 에이전트와 대화하세요",
+      },
+      openai: {
+        apiKey: "API 키",
+        apiKeyHint: "호스트에 저장되며 다시 표시되지 않습니다.",
+        keyPlaceholder: "sk-...",
+        savedKeyPlaceholder: "저장됨",
+        missingKey: "API 키 없음",
+        baseUrl: "기본 URL",
+        baseUrlHint: "OpenAI 호환 서버용입니다. OpenAI를 사용하려면 비워 두세요.",
+      },
+      models: {
+        loading: "모델을 불러오는 중...",
+        loadError: "로컬 모델을 불러올 수 없습니다",
+        none: "사용 가능한 모델 없음",
+        downloaded: "다운로드됨",
+        inUse: "사용 중",
+        recommended: "추천",
+        download: "다운로드",
+        downloadAction: "{{label}} 다운로드",
+        downloading: "다운로드 중...",
+        downloadingPercent: "다운로드 중 {{percent}}%",
+        extracting: "압축 해제 중...",
+        delete: "삭제",
+        deleteAction: "{{label}} 삭제",
+        deleteTitle: "{{label}}을(를) 삭제할까요?",
+        deleteMessage: "{{size}}가 확보됩니다. 나중에 다시 다운로드할 수 있습니다.",
+        languages: "{{label}} 지원 언어",
+        moreLanguages: "{{languages}} 외 {{count}}개",
+      },
     },
     general: {
       title: "일반",
@@ -2324,10 +2425,25 @@ export const ko: TranslationResources = {
           queue:
             "에이전트가 실행 중일 때 Enter는 대기열에 추가합니다. Command/Ctrl+Enter는 제출합니다.",
         },
+        commandEnterDescriptions: {
+          interrupt:
+            "에이전트가 실행 중일 때 {{modifier}}+Enter는 중단합니다. Enter는 줄바꿈합니다.",
+          steer:
+            "에이전트가 실행 중일 때 {{modifier}}+Enter는 현재 턴에 지시합니다. Enter는 줄바꿈합니다.",
+          queue:
+            "에이전트가 실행 중일 때 {{modifier}}+Enter는 대기열에 추가합니다. Enter는 줄바꿈합니다.",
+        },
         options: {
           interrupt: "중단",
           steer: "지시",
           queue: "대기열",
+        },
+      },
+      sendShortcut: {
+        label: "전송 단축키",
+        options: {
+          enter: "Enter",
+          "mod-enter": "{{modifier}}+Enter",
         },
       },
       serviceUrls: {
@@ -2346,12 +2462,13 @@ export const ko: TranslationResources = {
         label: "추론 항상 펼치기",
         description: "에이전트의 사고 및 추론 블록을 기본적으로 모두 펼쳐 표시합니다.",
       },
-      toolCallDetail: {
-        label: "도구 호출 표시",
-        description: "타임라인에 도구 호출이 표시되는 방식",
+      chatDisplay: {
+        label: "채팅 표시",
+        description: "채팅에 표시할 에이전트 작업의 양",
         options: {
-          overview: "요약",
-          detailed: "전체 세부정보",
+          full: "전체",
+          collapseToolCalls: "도구 호출 접기",
+          collapseTurns: "턴 접기",
         },
       },
       language: {
@@ -2373,11 +2490,6 @@ export const ko: TranslationResources = {
     },
     diagnostics: {
       title: "진단",
-      legacyTerminalRenderer: {
-        label: "레거시 터미널 렌더러 사용",
-        description: "터미널을 다시 열 때 이전 WebView 터미널을 사용합니다.",
-        accessibilityLabel: "레거시 터미널 렌더러 사용",
-      },
       testAudio: "오디오 테스트",
       playTest: "테스트 재생",
       playing: "재생 중...",
@@ -2723,6 +2835,11 @@ export const ko: TranslationResources = {
       },
       agents: {
         unavailable: "에이전트를 관리하려면 이 호스트에 연결하세요",
+        idleRuntimeCleanup: {
+          title: "유휴 에이전트 해제",
+          hint: "1시간 동안 활동이 없으면 메모리를 확보합니다.",
+          info: "대화를 유지하면서 에이전트 프로세스를 중지합니다. 메시지를 보내면 다시 이어집니다.\n\n진행 중인 작업, 대기 중인 알림, 프로바이더 안전 검사가 있으면 정리하지 않습니다.",
+        },
       },
       workspaces: {
         unavailable: "워크스페이스를 관리하려면 이 호스트에 연결하세요",

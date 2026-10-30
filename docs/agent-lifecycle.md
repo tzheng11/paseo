@@ -146,45 +146,59 @@ Reload releases the old runtime before resuming its durable session: an idle pro
 still own an exclusive writer. A close failure retains that runtime for cleanup and blocks the
 replacement. Once closure succeeds, a failed resume leaves the durable agent closed and retryable.
 
-The daemon also unloads long-idle runtimes while preserving the user-visible `idle` status.
-Configure the [idle unload period](../public-docs/configuration.md#idle-agent-runtimes) in
-`config.json`; changes apply through daemon config reload. The sweep runs
-once a minute and measures inactivity from the latest work event or runtime demand, including
-send preparation and timeline access. Credential maintenance and provider configuration metadata
-do not renew that clock. Unloading does not mark the chat read or change its
-last-activity timestamp. `paseo inspect --json` exposes `RuntimeLoaded`; the snapshot field is
-`runtimeLoaded`.
+The daemon collects resumable idle runtimes after one hour without activity, checking once a
+minute through one `idle-runtime-cleanup/` collector. Existing explicit
+`agents.idleUnloadAfterMinutes` values remain effective; zero or `agents.idleRuntimeCleanup: false`
+disables collection. See [idle runtimes](../public-docs/configuration.md#idle-agent-runtimes).
+Unloading preserves the visible `idle` status, agent identity, relationships and provider session.
+The next send, timeline read or attach resumes that session through `ensureAgentLoaded()`.
 
-Unloading requires an idle persistent public agent, no active or queued turn, no replacement,
-no send or message receipt in flight, no permission or permission response pending, and no
-running provider subagent, Workflow or background Agent. The provider must confirm that no
-background work is active, identify its runtime process and confirm durable native history.
-A newly allocated Codex thread id has no resumable rollout until its history is persisted. A shell directly parented by that
-process prevents unloading. Failed process observation, unknown provider ownership or missing
-background-work signals keep the runtime resident. Claude and Codex expose these signals;
-providers without them and Windows hosts retain their runtimes until observation is supported.
+Foreground work, queued deliveries and receipts, permissions, maintenance claims, lifecycle
+operations, working descendants and pending finish notifications prevent collection. Runtime demand,
+including history reads and send preparation, renews the idle clock. A provider safety veto, error
+or timeout retains ownership; a positive probe never overrides the daemon's guards. Once protected
+work finishes, a fresh idle period starts. The collector revalidates after asynchronous probes and
+event draining in the existing close/load lane. Prompts admitted before closure prevent collection;
+prompts arriving after closure starts wait and resume the saved session.
 
-Pending quota checkpoints remain resident so a later confirmed credential switch can continue the
-failed turn. Hub-owned executions also remain resident: reconnect replay currently reads the live
-execution map. Voice mode keeps its runtime until its owner restores the system prompt, including
-socket cleanup; listening without speech still needs that cleanup path.
+The fork also retains quota-recovery checkpoints, Hub-owned executions and active voice-mode
+cleanup. Claude scheduler creation remains protected until confirmed failure or deletion; an
+interruption or an unrecognized result cannot prove that background work ended. Providers exposing
+native persistence and process signals must confirm durable history and no directly owned shell.
+A newly allocated Codex thread ID alone does not establish resumable history. Providers without a
+safety capability or complete legacy signals remain resident.
 
-A Claude `CronCreate`, `ScheduleWakeup` or `Monitor` call also prevents unloading until its
-rejected creation or a matching confirmed deletion proves it ended. Interrupted creation stays held. A tool result that
-acknowledges scheduler creation does not prove expiration. Unrecognized scheduler results retain
-the runtime. Lifecycle mutations serialize with unloading, and admission is checked again after
-process observation before runtime closure. Sends, timeline reads and attaches resume through
-`ensureAgentLoaded()` using the same provider session and committed Paseo history.
-Runtime setting changes and rewind acquire demand before loading. Background timeline producers
-write to the retained timeline of an idle-unloaded agent without starting a provider. Setup output
-and plugin writes still refuse closed, deleted and archived agents. A later load retains those rows;
-a cold projection stages them after native history when that history is first read. Metadata,
-attention and archive operations classify residency inside the lifecycle lane and update the stored
-identity when the runtime is absent. A workspace archive cannot report success after an agent
-archive fails.
-Stored-state broadcasts are projections of records already committed to storage. Persistence
-listeners skip snapshots without a provider session so those projections cannot erase private
-runtime metadata or credential recovery state.
+Background timeline producers may append to retained idle identities without starting a provider.
+Closed, deleted and archived agents still reject those writes. Metadata, attention and archive
+operations classify residency inside the lifecycle lane. A workspace archive cannot succeed after
+an agent archive failure. Stored-state broadcasts preserve private runtime and credential metadata.
+
+Settings changes apply immediately, and config-file edits apply on reload. Disabling invalidates
+pending collection admission; a close already started finishes. Re-enabling retains idle timestamps.
+`paseo inspect --json` exposes `RuntimeLoaded`, independently of the user-visible status.
+
+Provider checks follow the signals their runtimes expose:
+
+- Claude uses its process-local background roster and pending completion notifications. A fresh
+  process starts empty. CLI 2.1.292 or newer is known to support the roster; older binaries must
+  demonstrate support by emitting one. Unknown versions stay resident until then.
+- Codex queries background terminals for loaded threads, including native children, and protects
+  pending provider requests. App servers without the terminal-list RPC stay resident.
+- OpenCode checks active executions and descendants. V1 checks PTYs; v2 also checks shell and
+  inbox inventories. The shared server remains leased while a session vetoes collection.
+- Pi checks streaming, compaction, pending replies, and adapter-owned operations. Known native
+  subagent signals also protect their parent through the daemon's subagent store.
+- OMP additionally requires `get_state.isSettled: true` and `hasPendingAsyncWork: false`.
+  These protect jobs with unsuppressed completion delivery, pending deliveries, queued result
+  injection, and admitted or scheduled continuations that can re-wake the session. Older OMP
+  runtimes without either field stay resident. These signals are not an inventory of arbitrary
+  processes.
+- ACP checks adapter-owned foreground turns, permissions, buffered user messages, and running
+  ACP terminals, including quiet terminals. Exited or failed-to-spawn terminal records do not
+  prevent collection. This does not inspect processes launched internally by the provider.
+
+These checks do not discover arbitrary detached processes or work hidden by third-party
+extensions. A provider plugin adds its own veto through the [runtime safety contract](../public-docs/plugins/providers.md#permit-idle-runtime-cleanup).
 
 A provider runtime can still die on its own — crash, OOM kill, host suspend. Work the agent parked
 inside that process dies with it: Claude Code's background Bash shells, `Monitor` watches, and
@@ -244,6 +258,26 @@ outcome remains pending and is not replayed, while later independent messages ca
 events still settle the turn, and a delayed start for a known finalized turn cannot reopen it.
 
 The pending window is in memory. Clean shutdown flushes it before closing agents; an abrupt crash can lose it. A durable send receipt remains pending until actual dispatch acknowledgment, so a lost window never becomes a completed receipt. Completion waits cover queued admission within their original timeout and cancellation scope.
+
+Finish notification intent has a separate daemon-owned lifetime. The finish-subscriptions module
+persists caller, child, host, and ownership policy through an injectable store; its JSON adapter uses
+`$PASEO_HOME/finish-subscriptions.json`. Registration must commit before creation or queued-prompt
+acknowledgment promises a notification. A pending replacement retains its predecessor until dispatch
+accepts; rejected dispatch removes only the candidate. Recovery coalesces registrations for the same
+caller, child, and host into one watch.
+
+Bootstrap restores these watches after repairing stale running records to `closed` and before opening
+ingress. Reading a closed child's result does not load its provider. A finish notification reports that
+the child's run has settled; the parent decides whether its task is complete. Recovery never resumes
+child work. Archived or deleted parents suppress delivery; parent-owned creation watches also stop
+reporting after detachment.
+
+Intent remains stored until the parent's notification dispatch is acknowledged. Dispatch failure
+retries the captured notification; it does not change the child's reported outcome. Remote host loss
+follows the [connected-host observation policy](connected-hosts.md#delegating-agents). Shutdown stops observation before flushing message delivery, retaining
+outstanding intent. A crash after successful dispatch but before removal commits can repeat the
+notification. Clean shutdown can also flush an already queued callback while retaining its intent,
+so that callback can repeat after restart. This is an at-least-once wakeup, without turn attribution or exactly-once delivery.
 
 Permission requests are notification checkpoints, not the end of that subscription. The caller is notified again after a permission response when the child finishes, errors, or requests another permission.
 The permission notification includes the normalized request plus the child and request IDs, so the caller can inspect it and respond without fetching agent status.
@@ -383,7 +417,7 @@ parentAgentId === thisAgent.id  AND  !archivedAt
 
 - **Provider subagents** are child executions owned by Claude, Codex, or OpenCode. They are not inserted into `AgentManager` as managed agents. Providers emit a separate descriptor and timeline stream through `agent.provider_subagents.*`; the client keeps that state outside the normal agent store and merges only the presentation rows into the track. A descriptor's optional `parentSubagentId` identifies its direct provider-subagent parent; an absent value identifies a direct child of the managed agent.
 
-Clicking either kind opens a workspace tab. On compact layouts it opens in a [sheet](explorer-sidebar.md#sheets) over the subagents list instead; the sheet hides the composer and shows the agent's model and thinking as one line in its place (`PaneSubtitle`, the row provider subagents already use), and a Paseo subagent's sheet offers **Open as tab** (the full-screen glyph in the header) to get the composer back. A Paseo subagent tab is a normal interactive agent pane. A provider subagent tab is a read-only timeline pane with no composer, archive, detach, rewind, or fork actions. It shows its own direct children in a subagents track. Both panes use `AgentStreamView`, so message, reasoning, tool-call, and layout rendering stay identical.
+Clicking either kind opens a workspace tab. On compact layouts it opens in a [sheet](explorer-sidebar.md#sheets) instead, replacing the subagents list in place (Back returns to the list); the sheet hides the composer and shows the agent's model and thinking as one line in its place (`PaneSubtitle`, the row provider subagents already use), and a Paseo subagent's sheet offers **Open as tab** (the full-screen glyph in the header) to get the composer back. A Paseo subagent tab is a normal interactive agent pane. A provider subagent tab is a read-only timeline pane with no composer, archive, detach, rewind, or fork actions. It shows its own direct children in a subagents track. Every subagent pane links back to its parent (`packages/app/src/subagents/parent/`): a pill above the composer when there is one, a parent box in the composer's place when there is not. Both panes use `AgentStreamView`, so message, reasoning, tool-call, and layout rendering stay identical.
 
 Provider timelines use the same structural timeline item format but deliberately have a separate lifecycle and transport. A provider thread/session identifier is not a Paseo agent identifier, and closing its tab is always layout-only.
 

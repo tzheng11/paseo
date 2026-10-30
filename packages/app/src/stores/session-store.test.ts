@@ -5,6 +5,7 @@ import type { WorkspaceDescriptorPayload } from "@getpaseo/protocol/messages";
 
 import {
   normalizeWorkspaceDescriptor,
+  selectAgentSentMessages,
   selectAgentTurnPresentation,
   selectAgentTimelineState,
   useSessionStore,
@@ -64,6 +65,8 @@ function createWorkspace(
   input: Partial<WorkspaceDescriptor> & Pick<WorkspaceDescriptor, "id">,
 ): WorkspaceDescriptor {
   return {
+    createdAt: null,
+    lastUserMessageAt: null,
     id: input.id,
     projectId: input.projectId ?? "project-1",
     projectDisplayName: input.projectDisplayName ?? "Project 1",
@@ -231,6 +234,25 @@ describe("agent timeline state", () => {
     expect(
       selectAgentTimelineState(useSessionStore.getState().sessions["test-server"], "agent-1"),
     ).toEqual({ status: "synced", items: [], range: null, older: "none", newer: "none" });
+  });
+
+  it("lists sent messages newest first, including the live head", () => {
+    initializeTestSession();
+    const sent = (id: string, text: string) => ({ ...submittedMessage(id), text });
+    useSessionStore.getState().applyAgentTimelineResponseState("test-server", "agent-1", {
+      items: [sent("m1", "fix the auth bug"), sent("m2", "add tests"), sent("m3", "add tests")],
+      head: [sent("m4", "  "), sent("m5", "refactor the wrong module")],
+      range: { epoch: "epoch-1", startSeq: 1, endSeq: 5 },
+      older: "none",
+      newer: false,
+      synchronized: true,
+      acknowledgedClientMessageIds: [],
+    });
+
+    expect(
+      selectAgentSentMessages(useSessionStore.getState().sessions["test-server"], "agent-1"),
+    ).toEqual(["refactor the wrong module", "add tests", "fix the auth bug"]);
+    expect(selectAgentSentMessages(undefined, "agent-1")).toEqual([]);
   });
 
   it("preserves older availability when an applied response leaves it unchanged", () => {
@@ -721,6 +743,31 @@ describe("normalizeWorkspaceDescriptor", () => {
 });
 
 describe("mergeWorkspaces", () => {
+  it("keeps acknowledged shared pin revisions across delayed directory snapshots", () => {
+    const store = useSessionStore.getState();
+    store.initializeSession("test-server", null as unknown as DaemonClient);
+    const acknowledged = createWorkspace({
+      id: "pin",
+      pinPlacement: { parentWorkspaceKey: "remote:parent", siblingOrder: 512, revision: 3 },
+    });
+    store.mergeWorkspaces("test-server", [acknowledged]);
+    const delayed = createWorkspace({
+      id: "pin",
+      pinPlacement: { parentWorkspaceKey: null, siblingOrder: 0, revision: 2 },
+    });
+    store.mergeWorkspaces("test-server", [delayed]);
+    store.setWorkspaces("test-server", new Map([["pin", delayed]]));
+    expect(
+      useSessionStore.getState().sessions["test-server"].workspaces.get("pin")?.pinPlacement,
+    ).toEqual(acknowledged.pinPlacement);
+    store.mergeWorkspaces("test-server", [
+      { ...delayed, pinPlacement: { ...delayed.pinPlacement!, revision: 4 } },
+    ]);
+    expect(
+      useSessionStore.getState().sessions["test-server"].workspaces.get("pin")?.pinPlacement
+        ?.revision,
+    ).toBe(4);
+  });
   it("preserves scripts on merged workspace entries", () => {
     const store = useSessionStore.getState();
     store.initializeSession("test-server", null as unknown as DaemonClient);

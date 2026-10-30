@@ -222,12 +222,6 @@ snapshot so a mixed edit can apply its live subset and still name the paths that
     }
   },
   providers: {
-    openai: {
-      apiKey?: string,
-      baseUrl?: string,
-      stt?: { apiKey?: string, baseUrl?: string },
-      tts?: { apiKey?: string, baseUrl?: string }
-    },
     local: { modelsDir: string }
   },
   agents: {
@@ -245,8 +239,8 @@ snapshot so a mixed edit can apply its live subset and still name the paths that
   pluginsEnabled: boolean,
   plugins: Record<pluginId, { source: "directory", path: string, enabled?: boolean }>,
   features: {
-    dictation: { enabled, stt: { provider, model, language, confidenceThreshold } },
-    voiceMode: { enabled, llm, stt: { provider, model, language }, turnDetection, tts: { provider, model, voice, speakerId, speed } }
+    dictation: { enabled, stt: SpeechSttConfig },
+    voiceMode: { enabled, llm, stt: SpeechSttConfig, turnDetection, tts: SpeechTtsConfig }
   },
   log: {
     level, format,
@@ -318,7 +312,7 @@ Paseo tools; otherwise the provider policy applies. Provider and global policy a
 session is created, resumed, imported, or reloaded, so configuration changes affect the next
 session rather than an already-running one.
 
-`agents.metadataGeneration.providers` controls the preferred structured-generation fallback order for daemon-side metadata tasks such as commit messages, PR text, branch names, and generated agent titles. Entries are tried first in the configured order, then Paseo falls through to dynamically discovered defaults and finally the current selection when available.
+`agents.metadataGeneration.providers` selects the models for daemon-side metadata tasks: commit messages, PR text, branch names, and generated titles. An empty list is Automatic; a non-empty list is Manual and only those models are tried. See [public-docs/metadata-generation.md](../public-docs/metadata-generation.md#how-a-model-is-chosen).
 
 ### Git process limits
 
@@ -354,44 +348,27 @@ Environment variables override `config.json`:
 after changing `config.json`. Environment changes require a daemon restart; the launch environment
 remains authoritative during reload.
 
-`agents.metadataGeneration.providers` controls the preferred structured-generation fallback order for daemon-side metadata tasks such as commit messages, PR text, branch names, and generated agent titles. Entries are tried first in the configured order, then Paseo falls through to dynamically discovered defaults and finally the current selection when available.
+### Speech configuration
 
-Local speech model ids are intentionally narrow: STT uses `parakeet-tdt-0.6b-v2-int8`, TTS uses `kokoro-en-v0_19`, and turn detection uses the bundled Silero VAD model.
+Each use site owns its provider settings: `features.dictation.stt`,
+`features.voiceMode.stt`, and `features.voiceMode.tts`. `provider` selects a strict
+`local` or `openai` variant. Both STT variants carry `language`; normalization preserves
+it regardless of provider. `providers.local.modelsDir` remains shared storage.
+See [Voice configuration](../public-docs/voice.md) for fields, examples and env precedence.
 
-Set these to select OpenAI instead of local speech:
+On load, `persisted-config.ts` folds legacy `providers.openai` credentials and URLs
+into OpenAI sites that lack their own values, using endpoint settings before shared
+settings. A provider-less site becomes local; provider names are lower-cased, and
+fields ignored by the selected speech provider are discarded. The next save writes only the
+inline shape. A legacy key with no site to receive it is discarded with a warning
+that names its path, without logging its value.
 
-| Env var                        | Applies to                      |
-| ------------------------------ | ------------------------------- |
-| `PASEO_VOICE_STT_PROVIDER`     | Voice mode STT provider         |
-| `PASEO_DICTATION_STT_PROVIDER` | Composer dictation STT provider |
-| `PASEO_VOICE_TTS_PROVIDER`     | Voice mode TTS provider         |
-
-OpenAI speech can be configured under `providers.openai`. STT and TTS resolve independently, so they can point at different endpoints:
-
-```json
-{
-  "providers": {
-    "openai": {
-      "stt": {
-        "apiKey": "sk-...",
-        "baseUrl": "https://stt.example.com/v1"
-      },
-      "tts": {
-        "apiKey": "sk-...",
-        "baseUrl": "https://api.openai.com/v1"
-      }
-    }
-  }
-}
-```
-
-`providers.openai.stt` is used for both composer dictation and voice mode speech-to-text; `providers.openai.tts` is used for voice mode text-to-speech. The equivalent env vars are `OPENAI_STT_API_KEY`/`OPENAI_STT_BASE_URL` and `OPENAI_TTS_API_KEY`/`OPENAI_TTS_BASE_URL`. Each feature falls back to `providers.openai.apiKey`/`providers.openai.baseUrl`, then `OPENAI_API_KEY`/`OPENAI_BASE_URL`, when its own fields are unset. These settings apply only to Paseo OpenAI speech features, not to Codex or other OpenAI-backed tools.
-
-Paseo uses these paths under the configured OpenAI base URL:
-
-- dictation STT: `/v1/audio/transcriptions`
-- voice mode STT: `/v1/audio/transcriptions`
-- voice mode TTS: `/v1/audio/speech`
+`speech-settings.ts` owns mutable config reads and patches. The wire uses the same
+`features` structure. Reads replace OpenAI keys with `hasApiKey` (saved in config)
+and report effective env sources in `envOverrides`. A site patch that changes
+`provider` replaces the entire object. The same or omitted `provider` merges fields
+into the current variant, preserving the write-only key when a form re-saves it. `null` clears a value. Switching providers discards credentials and
+options from the previous variant.
 
 ---
 
@@ -503,15 +480,29 @@ Sibling ranks are finite floating-point numbers shared by clients. A move insert
 the registry renumbers that sibling group atomically when the gap no longer has a representable
 midpoint. Expanded and collapsed workspace preferences stay on the client.
 
-The sidebar renders independent navigation trees only in Pinned and SuperPinned. Their layout
-is persisted with this app/browser's existing sidebar ordering preferences, using full
-`serverId:workspaceId` parent keys and finite fractional sibling ranks. A pin tree can span
-projects and hosts without changing workspace ownership, directory paths, or registry parent
-fields. Explicit pin priority determines section membership. Missing, filtered, or unpinned
-parents leave their children visible as roots, while stored edges remain available if the parent
-returns. Legacy registry parents are used only when both workspaces are explicitly in the same
-pin section and the client has no saved layout override. Pin membership changes still use the
-workspace's own host; rearranging an existing pin tree is a client-local operation.
+The sidebar renders navigation trees in Pinned, Superpinned, and the ordinary Workspaces list
+when **Group by → None** is selected. Each workspace's owning
+host persists its `pinPlacement`: a full `serverId:workspaceId` parent key, finite fractional
+sibling rank, and revision. Every connected client reads these placements through directory
+sync. Cross-host nesting changes navigation without moving directories, agents, or project
+membership. Explicit pin priority determines section membership. Missing, filtered, or off-section
+parents leave children visible as roots; their stored edges remain available when the parent
+returns. Concurrent cross-host cycles are rendered as roots so no workspace disappears.
+
+Pin writes require `features.workspacePinPlacement` and compare the captured revision before
+saving. Rebalance writes precede the source move; failed writes stay visible as errors and are
+not stored as a private layout. Legacy client layouts require an explicit **Share saved layout**
+import, which only fills placements that have never been shared. Old clients cannot silently
+replace shared nesting with stale browser preferences. Expansion and sort-mode preferences
+remain local.
+
+New Workspace's parent selection and MCP workspace placement use this same navigation
+relationship. Child creation inherits the parent's section and appends to its children;
+agent-scoped creation defaults to the caller's workspace, while an explicit null parent creates
+a root. This organization never changes agent parentage or worktree ownership. The creation
+request commits placement and pin priority before publishing the workspace, so a newly created
+IC workspace does not first appear as an unrelated root. These operations require
+`features.workspaceSidebarPlacement`.
 
 Client directory replicas persist parent IDs and ranks alongside their sync checkpoint. The
 checkpoint format changes when older cached projections cannot represent hierarchy; retaining

@@ -117,9 +117,9 @@ function normalizeWorkspaceOrderByProject(
 ): Record<string, string[]> {
   const normalized: Record<string, string[]> = {};
   for (const [projectViewKey, order] of Object.entries(workspaceOrderByProject ?? {})) {
-    const scope = projectViewKey.trim();
-    if (!scope) continue;
-    normalized[scope] = normalizeKeys(order);
+    const scope = projectViewKey;
+    if (!scope.trim()) continue;
+    normalized[scope] = dedupeKeys(order);
   }
   return normalized;
 }
@@ -227,6 +227,7 @@ export const useSidebarOrderStore = create<SidebarOrderStoreState>()(
       superpinnedWorkspaceOrder: [],
       pinnedWorkspaceTree: {},
       setPinnedWorkspaceTree: async (tree, rootOrder) => {
+        const previous = get();
         const update: Partial<SidebarOrderStoreState> = {
           pinnedWorkspaceTree: PinnedWorkspaceTreeSchema.parse(tree),
         };
@@ -238,7 +239,34 @@ export const useSidebarOrderStore = create<SidebarOrderStoreState>()(
         }
         // persist's wrapped set returns the storage promise at runtime. Await it
         // so a failed durable write cannot be reported as a successful drop.
-        await Promise.resolve(set(update));
+        try {
+          await Promise.resolve(set(update));
+        } catch (error) {
+          // Validation clones the tree. Compare the actual object installed by set,
+          // and restore only fields that no intervening update has replaced.
+          const current = get();
+          const restore: Partial<SidebarOrderStoreState> = {};
+          if (current.pinnedWorkspaceTree === update.pinnedWorkspaceTree)
+            restore.pinnedWorkspaceTree = previous.pinnedWorkspaceTree;
+          if (
+            update.pinnedWorkspaceOrder &&
+            current.pinnedWorkspaceOrder === update.pinnedWorkspaceOrder
+          )
+            restore.pinnedWorkspaceOrder = previous.pinnedWorkspaceOrder;
+          if (
+            update.superpinnedWorkspaceOrder &&
+            current.superpinnedWorkspaceOrder === update.superpinnedWorkspaceOrder
+          )
+            restore.superpinnedWorkspaceOrder = previous.superpinnedWorkspaceOrder;
+          if (
+            update.pinnedWorkspaceSortMode &&
+            current.pinnedWorkspaceSortMode === update.pinnedWorkspaceSortMode
+          )
+            restore.pinnedWorkspaceSortMode = previous.pinnedWorkspaceSortMode;
+          if (Object.keys(restore).length)
+            await Promise.resolve(set(restore)).catch(() => undefined);
+          throw error;
+        }
       },
       setSuperpinnedWorkspaceOrder: (keys) => set({ superpinnedWorkspaceOrder: dedupeKeys(keys) }),
       pinnedWorkspaceSortMode: "manual",

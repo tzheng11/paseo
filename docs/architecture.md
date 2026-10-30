@@ -66,6 +66,18 @@ WebSocket message schemas. Shared configuration schemas belong in protocol leaf 
 retaining the daemon's runtime and wire-schema allocations. The server export tests guard
 these dependency trees with tree-shaking disabled to match unbundled production imports.
 
+The daemon, CLI entry point and plugin worker explicitly select the server's pinned Undici
+transport once per process before running user work. Electron's embedded parser can crash when
+FIN arrives while a response body is paused; importing a newer Undici alone leaves a warmed
+embedded dispatcher in place. The public dispatcher bridge preserves native `fetch`, `Request`
+and `Response`, including references captured before initialization. The default Agent lives until
+process exit and is not closed with one embedded daemon. Existing in-flight responses and external
+provider processes keep their original transport. The model downloader retains its separate owned
+Agent. Both dispatcher owners preserve Node's explicitly enabled HTTP(S)\_PROXY/NO_PROXY policy
+using the resolved proxy configuration in the supported Node22/24 global HTTP Agent. Merely
+setting a proxy URL does not enable it. Embedders that configure a custom default transport must
+do so after Paseo initialization.
+
 Project identity is daemon-global rather than session-owned. After registry bootstrap, the daemon's
 project Git observer keeps one non-recursive watch on each lexically equivalent active project root
 and listens only for the root `.git` entry, with a slow rescan as a missed-event fallback. It runs
@@ -73,6 +85,13 @@ for empty projects and without connected clients, then fans metadata changes thr
 server to capability-aware sessions. It deliberately does not use the broad recursive working-tree
 watcher or the per-session Git observer: those are checkout/status mechanisms and intentionally do
 not retain non-Git directories.
+
+Workspace git and forge runtime data belongs to one daemon-level, directory-keyed store.
+Workspace descriptors, checkout diff subscriptions, and script metadata read the last known
+snapshot from that store, so reconnecting clients receive it before refresh completes.
+Refcounted git watches feed the store through snapshot-updated events; their lifetime controls
+refresh only. Session cleanup and workspace archive retain the data. Removing the final active
+workspace for a directory clears it. The store lives in memory and resets on daemon restart.
 
 **Key modules:**
 
@@ -184,9 +203,9 @@ Communicates with the daemon via the same WebSocket protocol as the app.
 
 Enables remote access when the daemon is behind a firewall.
 
-- Curve25519 establishes the relay-session secret; NaCl `box` protects each payload with XSalsa20-Poly1305
+- Updated peers negotiate a Noise `NK` session with per-record counters; peers on either side that predate it fall back to the legacy NaCl `box` construction. [docs/relay-endpoint-security.md](relay-endpoint-security.md) owns the mapping, negotiation, and the `daemon.relay.requireProtectedSecurity` flag
 - The relay is zero-knowledge — it routes encrypted bytes and cannot read content
-- Client and daemon channels with identical API (`createClientChannel`, `createDaemonChannel`)
+- Client and daemon channels with identical API (`openClientSecureChannel`, `openDaemonSecureChannel`)
 - Pairing via QR code transfers the daemon's public key to the client
 - New homes keep relay disabled until pairing consent. `DaemonConfigStore` persists the desired state, while the relay runtime starts or stops the outbound transport live; pairing reads that current state instead of a startup snapshot.
 - Optional E2EE capability negotiation preserves application frame kind: text plaintext uses base64 ciphertext text frames, while binary plaintext uses raw ciphertext binary frames; mixed-version peers remain base64-only

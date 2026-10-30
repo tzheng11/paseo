@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -9,6 +9,30 @@ import {
 } from "./agent-history-replay.js";
 
 describe("AgentHistoryReplay", () => {
+  it("retries abandoned cache pruning after a transient filesystem failure", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "paseo-prune-retry-test-"));
+    const target = path.join(root, "temporary-root");
+    // Node uses TEMP on Windows and TMPDIR on POSIX.
+    const temporaryRootVariable = process.platform === "win32" ? "TEMP" : "TMPDIR";
+    const previous = process.env[temporaryRootVariable];
+    await writeFile(target, "temporarily not a directory");
+    process.env[temporaryRootVariable] = target;
+    try {
+      await expect(AgentHistoryReplay.create([])).rejects.toMatchObject({ code: "ENOTDIR" });
+      await rm(target);
+      await mkdir(target);
+      const replay = await AgentHistoryReplay.create(["recovered"]);
+      try {
+        expect(await Array.fromAsync(replay.events())).toEqual(["recovered"]);
+      } finally {
+        await replay.close();
+      }
+    } finally {
+      if (previous === undefined) delete process.env[temporaryRootVariable];
+      else process.env[temporaryRootVariable] = previous;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
   it("replaces keyed payloads on disk without moving their original history position", async () => {
     const replay = await AgentHistoryReplay.create(
       [
@@ -25,7 +49,7 @@ describe("AgentHistoryReplay", () => {
         { id: "tool", state: "completed" },
         { id: "message", state: "answer" },
       ]);
-      expect([...replay.eventsSync()]).toEqual(values);
+      expect(await Array.fromAsync(replay.events())).toEqual(values);
       const windows = await replay.readWindows({
         head: { events: 1, bytes: 100 },
         tail: { events: 1, bytes: 100 },
@@ -211,14 +235,14 @@ describe("AgentHistoryReplay", () => {
     }
   });
 
-  it("applies bounded synchronous reads without splitting Unicode across chunks", async () => {
+  it("streams Unicode records without splitting characters across chunks", async () => {
     const events = [
       { text: "x".repeat(65520) + "🧠🌍", index: 1 },
       { text: "next", index: 2 },
     ];
     const replay = await AgentHistoryReplay.create(events);
     try {
-      expect([...replay.eventsSync()]).toEqual(events);
+      expect(await Array.fromAsync(replay.events())).toEqual(events);
     } finally {
       await replay.close();
     }

@@ -1,3 +1,4 @@
+import { findMountedWindowStart } from "@/agent-stream/history-window";
 import { z } from "zod";
 import {
   AgentStatusSchema,
@@ -296,9 +297,19 @@ const WorkspaceGitRuntimeSchema = z
   .optional();
 
 const StoredWorkspaceSchema = z.strictObject({
+  // Require both keys: a cursor without these values would preserve the wrong sort on reconnect.
+  createdAt: IsoDateSchema.nullable(),
+  lastUserMessageAt: IsoDateSchema.nullable(),
   id: z.string(),
   // COMPAT(workspaceHierarchyCache): added in v0.11.2; remove optional parsing after 2027-04-21.
   parentWorkspaceId: z.string().nullable().optional(),
+  pinPlacement: z
+    .object({
+      parentWorkspaceKey: z.string().nullable(),
+      siblingOrder: z.number().finite(),
+      revision: z.number().int().nonnegative(),
+    })
+    .optional(),
   siblingOrder: z.number().finite().optional(),
   projectId: z.string(),
   projectDisplayName: z.string(),
@@ -390,22 +401,23 @@ const DirectoryCheckpointSchema = z.strictObject({
 // Revalidate those directories once without evicting cached rows or timelines.
 const StoredDirectoryCheckpointSchema = z.strictObject({
   version: z.union([z.literal(1), z.literal(2)]),
-  workspaceFieldsVersion: z.union([z.literal(1), z.literal(2)]).optional(),
+  workspaceFieldsVersion: z.union([z.literal(1), z.literal(2), z.literal(3)]).optional(),
   cursors: DirectoryCheckpointSchema,
 });
 
 function serializeDirectoryCheckpoint(cursors: DirectoryCheckpoint) {
-  return { version: 2 as const, workspaceFieldsVersion: 2 as const, cursors };
+  return { version: 2 as const, workspaceFieldsVersion: 3 as const, cursors };
 }
 
 function deserializeDirectoryCheckpoint(payload: string): DirectoryCheckpoint {
   const stored = parseStoredPayload(StoredDirectoryCheckpointSchema, payload);
   const cursors = { ...stored.cursors };
   // COMPAT(workspaceFieldCache): added in v0.11.3; remove after 2027-04-15.
-  // Earlier workspace rows omitted Info values. Refresh that baseline even when
+  // COMPAT(shared-pin-cache): added in v0.13.0-beta.1; remove after 2027-04-22.
+  // Earlier workspace rows omitted shared pin placements. Refresh even when
   // its cursor is current, preserving other cached directories and timelines.
   // COMPAT(workspaceSuperpinCache): older rows omitted superpinnedAt while their cursor stayed current.
-  const refreshWorkspaces = stored.version < 2 || stored.workspaceFieldsVersion !== 2;
+  const refreshWorkspaces = stored.version < 2 || stored.workspaceFieldsVersion !== 3;
   if (refreshWorkspaces) delete cursors.workspaces;
   if (refreshWorkspaces && stored.cursors.workspaces && Object.keys(cursors).length === 0) {
     throw new Error("Cached workspace directory requires refresh");
@@ -706,10 +718,17 @@ function deserializeAgent(serverId: string, stored: StoredAgent): Agent {
   };
 }
 
+function restoreWorkspace(stored: StoredWorkspace): WorkspaceDescriptor {
+  return normalizeWorkspaceDescriptor({ ...stored, createdAt: stored.createdAt ?? undefined });
+}
+
 function serializeWorkspace(workspace: WorkspaceDescriptor): StoredWorkspace {
   return {
+    createdAt: workspace.createdAt?.toISOString() ?? null,
+    lastUserMessageAt: workspace.lastUserMessageAt?.toISOString() ?? null,
     id: workspace.id,
     parentWorkspaceId: workspace.parentWorkspaceId,
+    pinPlacement: workspace.pinPlacement,
     siblingOrder: workspace.siblingOrder,
     projectId: workspace.projectId,
     projectDisplayName: workspace.projectDisplayName,
@@ -779,7 +798,14 @@ function serializeTimeline(timeline: CachedTimeline): StoredTimeline | null {
   const canonicalItems = timeline.items.filter(
     (item) => item.kind !== "user_message" || !isUnreconciledLocalUserMessage(item),
   );
-  const items = canonicalItems.map(serializeTimelineItem).filter((item) => item !== null);
+  const start = findMountedWindowStart({
+    items: canonicalItems,
+    minMountedCount: MAX_TIMELINE_ITEMS,
+  });
+  const items = canonicalItems
+    .slice(start)
+    .map(serializeTimelineItem)
+    .filter((item) => item !== null);
   const range = timeline.range;
   const canPersistCoverage =
     range !== null &&
@@ -796,7 +822,7 @@ function serializeTimeline(timeline: CachedTimeline): StoredTimeline | null {
     canonicalItems.some((item) => item.timelineCursor?.seq === range.endSeq);
   return {
     agentId: timeline.agentId,
-    items: items.slice(-MAX_TIMELINE_ITEMS),
+    items,
     range: canPersistCoverage
       ? { epoch: range.epoch, startSeq: range.startSeq, endSeq: range.endSeq }
       : null,
@@ -878,7 +904,7 @@ function applyDirectoryRow(
     case "workspace": {
       const stored = parseStoredPayload(StoredWorkspaceSchema, row.payload);
       if (stored.id !== row.id) throw new Error("Replica workspace row id mismatch");
-      result.workspaces.set(row.id, normalizeWorkspaceDescriptor(stored));
+      result.workspaces.set(row.id, restoreWorkspace(stored));
       return;
     }
     case "project": {
@@ -968,7 +994,7 @@ export class ReplicaCache {
     try {
       const stored = parseStoredPayload(StoredWorkspaceSchema, workspaceRow.payload);
       if (stored.id !== workspaceRow.id) throw new Error("Replica workspace row id mismatch");
-      workspace = normalizeWorkspaceDescriptor(stored);
+      workspace = restoreWorkspace(stored);
     } catch {
       await this.deleteInvalidRow(workspaceRow);
       return undefined;

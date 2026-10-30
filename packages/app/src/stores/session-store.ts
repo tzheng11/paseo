@@ -103,9 +103,12 @@ export interface Agent {
 }
 
 export interface WorkspaceDescriptor {
+  createdAt: Date | null;
+  lastUserMessageAt: Date | null;
   id: string;
   parentWorkspaceId?: string | null;
   siblingOrder?: number;
+  pinPlacement?: WorkspaceDescriptorPayload["pinPlacement"];
   projectId: string;
   projectDisplayName: string;
   projectCustomName?: string | null;
@@ -143,9 +146,13 @@ export function normalizeWorkspaceDescriptor(
       ? new Date(statusEnteredAtRaw)
       : null;
   return {
+    // COMPAT(workspaceSortTimes): added in v0.13.0, remove after 2027-04-22.
+    createdAt: payload.createdAt ? new Date(payload.createdAt) : null,
+    lastUserMessageAt: payload.lastUserMessageAt ? new Date(payload.lastUserMessageAt) : null,
     id: normalizeWorkspaceOpaqueId(payload.id) ?? payload.id,
     // COMPAT(workspaceHierarchy): added in v0.11.2, remove after 2027-04-21 once daemon floor supports hierarchy.
     parentWorkspaceId: payload.parentWorkspaceId ?? null,
+    pinPlacement: payload.pinPlacement,
     siblingOrder: payload.siblingOrder,
     projectId: payload.projectId,
     projectDisplayName: payload.projectDisplayName,
@@ -213,9 +220,14 @@ function preserveWorkspaceDescriptorIdentity(
   incoming: WorkspaceDescriptor,
   existing?: WorkspaceDescriptor | null,
 ): WorkspaceDescriptor {
-  if (existing && equal(existing, incoming)) {
-    return existing;
+  // An RPC acknowledgement may arrive before an older directory snapshot.
+  if (
+    existing?.pinPlacement &&
+    existing.pinPlacement.revision > (incoming.pinPlacement?.revision ?? 0)
+  ) {
+    incoming = { ...incoming, pinPlacement: existing.pinPlacement };
   }
+  if (existing && equal(existing, incoming)) return existing;
   return incoming;
 }
 
@@ -340,6 +352,26 @@ export function selectAgentTimelineState(
     };
   }
   return items.length > 0 ? { status: "painted", items } : { status: "cold" };
+}
+
+/** Text of the loaded user messages, newest first, with back-to-back repeats collapsed. */
+export function selectAgentSentMessages(
+  session: SessionState | undefined,
+  agentId: string,
+): string[] {
+  if (!session) return [];
+  const items = [
+    ...(session.agentStreamTail.get(agentId) ?? []),
+    ...(session.agentStreamHead.get(agentId) ?? []),
+  ];
+  const messages: string[] = [];
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (item.kind !== "user_message" || item.text.trim().length === 0) continue;
+    if (messages[messages.length - 1] === item.text) continue;
+    messages.push(item.text);
+  }
+  return messages;
 }
 
 export function selectAgentTurnPresentation(
@@ -1546,7 +1578,13 @@ export const useSessionStore = create<SessionStore>()(
           }
           const nextWorkspaces =
             typeof workspaces === "function" ? workspaces(session.workspaces) : workspaces;
-          const preservedWorkspaces = preserveMapIdentity(session.workspaces, nextWorkspaces);
+          const reconciledWorkspaces = new Map(
+            Array.from(nextWorkspaces, ([id, workspace]) => [
+              id,
+              preserveWorkspaceDescriptorIdentity(workspace, session.workspaces.get(id)),
+            ]),
+          );
+          const preservedWorkspaces = preserveMapIdentity(session.workspaces, reconciledWorkspaces);
           if (session.workspaces === preservedWorkspaces) {
             return prev;
           }

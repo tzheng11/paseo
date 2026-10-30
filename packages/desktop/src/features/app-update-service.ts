@@ -77,12 +77,15 @@ export interface AppUpdateService {
 export interface AppUpdateServiceDeps {
   runtime: AppUpdateRuntime;
   isPackaged(): boolean;
+  updatesEnabled?: boolean;
   now(): number;
   bucket(): Promise<number>;
   reportCheckError?(error: unknown): void;
   reportRuntimeError?(error: unknown): void;
   reportInstallError?(message: string): void;
 }
+
+const MANAGED_UPDATES_MESSAGE = "Updates for this custom build are managed separately.";
 
 function buildCheckResult(input: {
   currentVersion: string;
@@ -254,6 +257,15 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
       });
     }
 
+    if (deps.updatesEnabled === false) {
+      return buildCheckResult({
+        currentVersion,
+        hasUpdate: false,
+        readyToInstall: false,
+        errorMessage: intent === "manual" ? MANAGED_UPDATES_MESSAGE : null,
+      });
+    }
+
     return runCheckExclusively(async () => {
       configureRuntime(releaseChannel, intent);
 
@@ -339,6 +351,10 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
         version: currentVersion,
         message: "Auto-update is not available in development mode.",
       };
+    }
+
+    if (deps.updatesEnabled === false) {
+      return { installed: false, version: currentVersion, message: MANAGED_UPDATES_MESSAGE };
     }
 
     const check = await checkForAppUpdate({
@@ -473,7 +489,7 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
     releaseChannel: AppReleaseChannel;
     signal: AbortSignal;
   }): Promise<boolean> {
-    if (!deps.isPackaged() || !downloadedUpdateVersion) {
+    if (!deps.isPackaged() || deps.updatesEnabled === false || !downloadedUpdateVersion) {
       return false;
     }
 

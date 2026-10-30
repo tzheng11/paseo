@@ -305,8 +305,8 @@ macOS 13 maps to Darwin 22. The two values use different version domains; do not
 
 iOS and Android store builds are not in `.github/workflows`. They are triggered by the EAS GitHub app the moment the `v*` tag is pushed:
 
-- **Android (Play Store)** — EAS builds with profile `production` and auto-submits to the Play Store via `eas submit` (EAS-managed credentials, no Fastlane).
-- **iOS (TestFlight + App Store)** — EAS builds with profile `production`, uploads once through a `testflight` job, distributes the build to the `Paseo Beta` external group with Beta App Review submission, and a Fastlane lane submits that same build for App Store review.
+- **Android (Play Store)** — EAS builds with profile `production` and auto-submits to the Play Store via `eas submit` (EAS-managed credentials). A Fastlane lane then replaces the store screenshots.
+- **iOS (TestFlight + App Store)** — EAS builds with profile `production`, uploads once through a `testflight` job, distributes the build to the `Paseo Beta` external group with Beta App Review submission, and a Fastlane lane uploads the store screenshots and submits that same build for App Store review.
 - **Android APK (GitHub Release asset)** — separate, via `.github/workflows/android-apk-release.yml`. This is the only Android-related workflow that lives in this repo.
 
 EAS uses the local app version source. `packages/app/app.config.js` derives the native version from the package version. Android `versionCode` is `major * 1_000_000 + minor * 1_000 + patch`. iOS reserves 1,000 build slots per app version: beta `N` uses slot `N`, and stable uses slot `999`. For example, `0.2.6-beta.2` appears in App Store Connect as version `0.2.6` build `2006002`; stable uses build `2006999`. Rebuilding the same tag produces the same native build number; if a store has already accepted a binary and you need a different binary, cut the next beta or patch instead of relying on EAS remote auto-increment.
@@ -316,6 +316,16 @@ Stable tags run `Release Mobile`; beta tags run `Release iOS Beta`. Both distrib
 Stable iOS releases use one binary for two Apple review paths: Beta App Review for external TestFlight distribution and App Store review. [Apple says](https://developer.apple.com/help/app-store-connect/test-a-beta-version/invite-external-testers) the first submitted build requires a full TestFlight review; later builds for the same version might not. Do not assume a stable patch skips review.
 
 There is no mobile-release workflow under `.github/workflows`. The EAS GitHub app reads the workflows under `packages/app/.eas/workflows` and handles tag triggering directly.
+
+### Store screenshots
+
+Each stable release publishes the screenshots committed under `assets/store-screenshots/output/` (see [its README](../assets/store-screenshots/README.md) for how they are made). To change the store screenshots, re-render and commit them before you tag.
+
+- **App Store:** `submit_review` uploads `output/apple/` and `output/apple-ipad/` to the version it submits, replacing that version's `en-US` screenshots. Apple ties screenshots to an app version, so a version that is already live keeps the ones it shipped with. `Resubmit iOS for App Store review` uploads them again.
+- **Google Play:** `upload_android_screenshots` runs `fastlane android upload_screenshots` after `submit_android`. It replaces only the phone and 10-inch tablet screenshots, never the listing text or changelogs, and skips images whose checksum already matches.
+- **F-Droid:** reads the same files as Google Play. `fastlane/metadata/android/en-US/images/phoneScreenshots/` and `tenInchScreenshots/` hold symlinks to the Google renders. `render.mjs` rewrites them on every render, so added or renamed panels reach Google Play and F-Droid as well.
+
+Fastlane cannot use the Play key Expo stores for `eas submit`. The Play lane reads its own copy of the same service-account key from the `GOOGLE_PLAY_JSON_KEY` file secret in the EAS `production` environment, and that service account needs the Play Console permission **Manage store presence**.
 
 ### Watching mobile builds from the terminal
 
@@ -359,6 +369,7 @@ For the `Release Mobile` EAS workflow, these jobs must pass:
 - `submit_ios_for_review` — iOS build submitted for App Store review via Fastlane
 - `build_android` — Android store binary built
 - `submit_android` — Android binary submitted to the Play Store
+- `upload_android_screenshots` — Google Play screenshots replaced from the repo
 
 Do not treat `build_ios: SUCCESS` or `distribute_ios: SUCCESS` as a completed iOS release. `submit_ios_for_review: FAILURE` means the iOS release is blocked even if the build is visible in TestFlight.
 
@@ -538,8 +549,8 @@ Older prerelease bodies on GitHub keep the notes they were synced with; `Release
 
 `CHANGELOG.zh-CN.md` holds the Chinese notes for `paseo.sh/zh-CN/changelog`. Only the website reads it; the app's **What's new** sheet, GitHub release bodies and F-Droid read `CHANGELOG.md`.
 
-- Translations never gate a release. Translate a new entry in a follow-up PR, or in the changelog commit when you can.
-- A translated entry uses the English heading unchanged: `## X.Y.Z - YYYY-MM-DD`. The website uses it only while the version and date both match the English entry. Otherwise it shows that release whole in English under a notice, so a beta rewritten in place drops its old translation until the new notes are translated. Delete Chinese entries whose English entry was renamed.
+- The release agent writes the Chinese entry in the changelog commit, after the English entry is approved. Every beta that rewrites the English entry rewrites the Chinese one too, and promotion renames both. `packages/website/e2e/i18n.spec.ts` fails CI on the release commit when any entry has no current translation.
+- A translated entry uses the English heading unchanged: `## X.Y.Z - YYYY-MM-DD`. The website uses it only while the version and date both match the English entry. Otherwise it shows that release whole in English under a notice. Delete Chinese entries whose English entry was renamed.
 - Keep the English sections, bullets and links one to one. Section titles: Added 新增, Improved 改进, Changed 变更, Fixed 修复, Security 安全, Breaking 破坏性变更, Plugins 插件, Notes 说明. Wording follows [website-i18n.md](website-i18n.md#chinese-style).
 
 ## Changelog ownership
@@ -654,7 +665,7 @@ Every entry covers `previous stable release → release source`: first beta, lat
 
 - [ ] The resolved release source is the intended commit (default `origin/main`) and its existing CI is green
 - [ ] Every PR in the release range has been opened, and its full description and every linked issue have been read before drafting the changelog
-- [ ] Fold this beta into the series' single `CHANGELOG.md` entry (heading `## X.Y.Z-beta.N - YYYY-MM-DD`, previous stable → release source), review it against the changelog policy, get approval, and commit it before cutting the release
+- [ ] Fold this beta into the series' single `CHANGELOG.md` entry (heading `## X.Y.Z-beta.N - YYYY-MM-DD`, previous stable → release source), review it against the changelog policy, get approval, and commit it with its [`CHANGELOG.zh-CN.md` translation](#changelog-translations) before cutting the release
 - [ ] The diff from the previous stable to the resolved release source is classified as patch or minor, with the target version and rationale approved
 - [ ] Release preparation stayed local until the approved release command pushed the complete branch and tag
 - [ ] `npm run release:beta:patch`, `npm run release:beta:minor`, or `npm run release:beta:next` completes successfully
@@ -677,7 +688,7 @@ Every entry covers `previous stable release → release source`: first beta, lat
 - [ ] Every PR in the release range has been opened, and its full description and every linked issue have been read before drafting the changelog
 - [ ] Ensure the approved release inputs are committed locally and the git worktree is clean before running any release command
 - [ ] Ensure local `npm run typecheck` passes on that exact commit before running any release command
-- [ ] Update `CHANGELOG.md` with user-facing release notes (features, fixes — not refactors). Promotion renames the series' `## X.Y.Z-beta.N` entry to `## X.Y.Z - YYYY-MM-DD` and re-checks it covers the full release
+- [ ] Update `CHANGELOG.md` with user-facing release notes (features, fixes — not refactors). Promotion renames the series' `## X.Y.Z-beta.N` entry to `## X.Y.Z - YYYY-MM-DD` and re-checks it covers the full release. Commit the matching [`CHANGELOG.zh-CN.md` entry](#changelog-translations) with it
 - [ ] Verify the changelog heading follows strict `## X.Y.Z - YYYY-MM-DD` format
 - [ ] Release preparation stayed local until the approved release command pushed the complete branch and tag
 - [ ] `npm run release:patch`, `npm run release:minor`, or `npm run release:promote` completes successfully
@@ -697,3 +708,9 @@ Every entry covers `previous stable release → release source`: first beta, lat
 - [ ] EAS Android `build_android` completes for the same tag
 - [ ] EAS Android `submit_android` succeeds, putting the build on its Play Store track
 - [ ] The release heartbeat was created after the tag push and deleted only after every item above passed
+
+## Impower custom distribution
+
+The Impower Desktop package sets `paseoDistribution.updates` to `manual`. Its update adapter does not check or download the upstream feed, and neither the manual install entry point nor quit-time installation may install a cached upstream update. Missing distribution policy also leaves automatic updates disabled; an upstream feed requires an explicit build-time `upstream` policy. This prevents an official update from replacing the custom fixes and rewriting fork-only state. Updates use the separately verified fleet rollout.
+
+Both the official and custom stable packages report `0.14.0`. Desktop only restarts its daemon for a version-string mismatch, so a custom rollout must explicitly stop the old daemon, prove it is down, and verify the started runtime against the custom artifact/source digests. A matching version or App filename does not prove that the custom server is running. This release rule grants no live action or waiver.

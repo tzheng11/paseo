@@ -1,4 +1,70 @@
-import { StringDecoder } from "node:string_decoder";
+// Provider-process stdout only; these are not app/daemon wire limits.
+export const JSONL_PROVIDER_LINE_BYTES = 64 * 1024 * 1024;
+
+export class ProviderStreamLimitError extends Error {
+  readonly code = "PROVIDER_STREAM_LINE_TOO_LARGE";
+
+  constructor(readonly limitBytes: number) {
+    super(
+      `Provider stdout line exceeds ${limitBytes} bytes. Start a new thread or reduce the provider response size.`,
+    );
+    this.name = "ProviderStreamLimitError";
+  }
+}
+
+/** Admits raw UTF-8 bytes before retaining, decoding or joining a complete line. */
+export class ProviderLineReader {
+  private parts: Buffer[] = [];
+  private bytes = 0;
+  private stopped = false;
+
+  constructor(
+    private readonly limitBytes: number,
+    private readonly onLine: (line: string) => void,
+    private readonly onLimit: (error: ProviderStreamLimitError) => void,
+  ) {}
+
+  write(chunk: Buffer | string): void {
+    if (this.stopped) return;
+    const buffer = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
+    let start = 0;
+    while (start < buffer.byteLength && !this.stopped) {
+      const newline = buffer.indexOf(10, start);
+      const end = newline === -1 ? buffer.byteLength : newline;
+      const length = end - start;
+      if (length > this.limitBytes - this.bytes) {
+        this.close();
+        this.onLimit(new ProviderStreamLimitError(this.limitBytes));
+        return;
+      }
+      if (length) this.parts.push(buffer.subarray(start, end));
+      this.bytes += length;
+      if (newline === -1) return;
+      const line = Buffer.concat(this.parts, this.bytes).toString("utf8");
+      this.parts = [];
+      this.bytes = 0;
+      this.onLine(line.endsWith("\r") ? line.slice(0, -1) : line);
+      start = newline + 1;
+    }
+  }
+
+  end(): void {
+    if (this.stopped) return;
+    if (this.bytes) {
+      const line = Buffer.concat(this.parts, this.bytes).toString("utf8");
+      this.parts = [];
+      this.bytes = 0;
+      this.onLine(line.endsWith("\r") ? line.slice(0, -1) : line);
+    }
+    this.close();
+  }
+
+  close(): void {
+    this.stopped = true;
+    this.parts = [];
+    this.bytes = 0;
+  }
+}
 
 const V2_FRAME_BYTES = 1024 * 1024;
 const V2_REASSEMBLED_BYTES = 64 * 1024 * 1024;
@@ -8,6 +74,7 @@ const V2_MAX_CHUNKS = Math.ceil(V2_REASSEMBLED_BYTES / V2_CHUNK_BYTES);
 
 export type JsonlFrameProblem =
   | "frame-too-large"
+  | "line-too-large"
   | "invalid-json"
   | "invalid-chunk"
   | "invalid-base64"
@@ -26,6 +93,7 @@ interface JsonlFrameReceiver {
   frame(message: Record<string, unknown>): void;
   problem(problem: JsonlFrameProblem, detail?: unknown): void;
   maxFrameBytes?: number;
+  providerLineBytes?: number;
 }
 
 interface ChunkHeader {
@@ -94,60 +162,36 @@ function chunkBytes(data: string): Buffer | null {
 }
 
 export class JsonlFrameDecoder {
-  private lineBuffer = "";
-  private lineBytes = 0;
-  private decoder = new StringDecoder("utf8");
-  private closed = false;
-  private readonly maxFrameBytes: number;
+  private readonly lines: ProviderLineReader;
   private assembly: ChunkAssembly | null = null;
 
   constructor(private readonly receiver: JsonlFrameReceiver) {
-    this.maxFrameBytes = receiver.maxFrameBytes ?? V2_REASSEMBLED_BYTES;
-    if (!Number.isSafeInteger(this.maxFrameBytes) || this.maxFrameBytes <= 0)
-      throw new Error("Invalid JSONL frame byte limit");
+    this.lines = new ProviderLineReader(
+      receiver.maxFrameBytes ?? receiver.providerLineBytes ?? JSONL_PROVIDER_LINE_BYTES,
+      (line) => {
+        if (line.trim()) this.consumeLine(line);
+      },
+      (error) => {
+        this.assembly = null;
+        if (receiver.maxFrameBytes !== undefined)
+          this.receiver.problem("frame-too-large", new JsonlFrameSizeError(receiver.maxFrameBytes));
+        else this.receiver.problem("line-too-large", error);
+      },
+    );
   }
 
   write(chunk: Buffer | string): void {
-    if (this.closed) return;
-    const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
-    let offset = 0;
-    while (offset < bytes.length && !this.closed) {
-      const newline = bytes.indexOf(10, offset);
-      const end = newline < 0 ? bytes.length : newline;
-      const part = bytes.subarray(offset, end);
-      if (this.lineBytes + part.length > this.maxFrameBytes) {
-        this.close();
-        this.receiver.problem("frame-too-large", new JsonlFrameSizeError(this.maxFrameBytes));
-        return;
-      }
-      this.lineBytes += part.length;
-      this.lineBuffer += this.decoder.write(part);
-      if (newline < 0) return;
-      this.finishLine();
-      offset = newline + 1;
-    }
+    this.lines.write(chunk);
   }
 
   end(): void {
-    if (this.closed) return;
-    this.finishLine();
-    this.close();
-  }
-
-  close(): void {
-    this.closed = true;
-    this.lineBuffer = "";
-    this.lineBytes = 0;
-    this.decoder = new StringDecoder("utf8");
+    this.lines.end();
     this.assembly = null;
   }
 
-  private finishLine(): void {
-    const line = (this.lineBuffer + this.decoder.end()).replace(/\r$/, "");
-    this.lineBuffer = "";
-    this.lineBytes = 0;
-    this.decoder = new StringDecoder("utf8");
-    if (line.trim()) this.consumeLine(line);
+  close(): void {
+    this.lines.close();
+    this.assembly = null;
   }
 
   private consumeLine(line: string): void {

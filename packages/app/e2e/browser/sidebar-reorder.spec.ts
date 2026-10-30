@@ -34,6 +34,12 @@ async function visibleBoundingBox(row: Locator) {
   return box;
 }
 
+interface DirectoryHydration {
+  epoch: number;
+  projects: boolean;
+  workspaces: boolean;
+}
+
 async function pressProjectRow(rows: Locator) {
   await rows.page().mouse.down();
 }
@@ -56,7 +62,16 @@ async function quickDragFirstRowAfterSecond(
   await expect(rows).toHaveCount(2);
   const before = await rowTestIds(rows);
   const sourceBox = await visibleBoundingBox(rows.nth(0));
-  const targetBox = await visibleBoundingBox(rows.nth(1));
+  const targetRow = rows.nth(1);
+  const targetId = await targetRow.getAttribute("data-testid");
+  const workspaceTarget = targetId?.startsWith("sidebar-workspace-row-") ?? false;
+  // Workspace before/inside/after zones belong to the whole tree node,
+  // including its nesting controls, rather than the inner pressable row.
+  const targetBox = await visibleBoundingBox(
+    workspaceTarget
+      ? rows.page().getByTestId(targetId!.replace("sidebar-workspace-row-", "workspace-tree-node-"))
+      : targetRow,
+  );
 
   const page = rows.page();
   const source = {
@@ -65,21 +80,32 @@ async function quickDragFirstRowAfterSecond(
   };
   const target = {
     x: targetBox.x + targetBox.width / 2,
-    y: targetBox.y + targetBox.height * 0.9,
+    y: targetBox.y + (workspaceTarget ? targetBox.height - 2 : targetBox.height * 0.9),
   };
 
   await page.mouse.move(source.x, source.y);
   await pressRow(rows);
   await page.mouse.move(source.x, source.y + 7);
   await page.mouse.move(target.x, target.y, { steps: 4 });
+  if (workspaceTarget) await expect(page.getByTestId("workspace-tree-drop-after")).toBeVisible();
   await page.mouse.up();
 
   await expect.poll(() => rowTestIds(rows)).toEqual([before[1], before[0]]);
 }
 
-test("projects, workspaces, and pinned chats reorder with an immediate mouse drag", async ({
-  page,
-}) => {
+async function dragWithoutReordering(rows: Locator): Promise<void> {
+  const before = await rowTestIds(rows);
+  const source = await visibleBoundingBox(rows.nth(0));
+  const target = await visibleBoundingBox(rows.nth(1));
+  const page = rows.page();
+  await page.mouse.move(source.x + source.width / 2, source.y + source.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(target.x + target.width / 2, target.y + target.height / 2, { steps: 5 });
+  await page.mouse.up();
+  await expect.poll(() => rowTestIds(rows)).toEqual(before);
+}
+
+test("projects, pinned chats and ordinary workspaces reorder", async ({ page }) => {
   const firstProject = await seedWorkspace({
     repoPrefix: "sidebar-reorder-first-",
   });
@@ -119,12 +145,20 @@ test("projects, workspaces, and pinned chats reorder with an immediate mouse dra
     const secondWorkspaceTestId = `sidebar-workspace-row-${getServerId()}:${
       secondWorkspace.workspace.id
     }`;
+    const ordinaryRows = page.locator(
+      `[data-testid="${firstWorkspaceTestId}"], [data-testid="${secondWorkspaceTestId}"]`,
+    );
     await quickDragFirstRowAfterSecond(
       page.locator(
         `[data-testid="${firstWorkspaceTestId}"], [data-testid="${secondWorkspaceTestId}"]`,
       ),
       pressWorkspaceRow,
     );
+    await expect
+      .poll(() => rowTestIds(ordinaryRows))
+      .toEqual([firstWorkspaceTestId, secondWorkspaceTestId]);
+    // Ordinary workspaces reorder as flat siblings; dropping inside stays blocked.
+    await dragWithoutReordering(ordinaryRows);
 
     await firstProject.client.setWorkspacePinned(firstProject.workspaceId, true);
     await secondProject.client.setWorkspacePinned(secondProject.workspaceId, true);
@@ -214,6 +248,19 @@ async function backendHierarchy(seeded: SeededWorkspace) {
     .sort((left, right) => left.id.localeCompare(right.id));
 }
 
+async function readGroupPinMember({ seeded, id }: { seeded: SeededWorkspace; id: string }) {
+  const workspace = (await seeded.client.fetchWorkspaces()).entries.find(
+    (entry) => entry.id === id,
+  );
+  return workspace
+    ? {
+        id,
+        pinned: workspace.pinnedAt != null,
+        superpinned: workspace.superpinnedAt != null,
+      }
+    : null;
+}
+
 async function observeWorkspaceMoves(page: Page, ports = [getE2EDaemonPort()]) {
   const observed = { moves: [] as string[], connectedPorts: new Set<string>() };
   await page.routeWebSocket(new RegExp(`:(?:${ports.join("|")})\\b`), (browser) => {
@@ -290,6 +337,60 @@ async function rowMenuAction(page: Page, workspaceKey: string, action: "pin" | "
     .click();
   await page.getByTestId(`sidebar-workspace-menu-${action}-${workspaceKey}`).click();
 }
+
+test("None grouping nests and reorders ordinary workspaces across projects with shared placement", async ({
+  page,
+}, testInfo) => {
+  const parent = await seedWorkspace({ repoPrefix: "ungrouped-manager-", title: "Manager" });
+  const child = await seedWorkspace({ repoPrefix: "ungrouped-ic-", title: "IC" });
+  const parentKey = `${getServerId()}:${parent.workspaceId}`;
+  const childKey = `${getServerId()}:${child.workspaceId}`;
+  try {
+    await gotoAppShell(page);
+    await waitForSidebarHydration(page);
+    await openSidebarDisplayPage(page, "sidebar-display-grouping");
+    await page.getByTestId("sidebar-grouping-none").click();
+    const list = page.getByTestId("sidebar-ungrouped-list");
+    const childNode = list.getByTestId(`workspace-tree-node-${childKey}`);
+    const parentNode = list.getByTestId(`workspace-tree-node-${parentKey}`);
+    await expect(childNode).toBeVisible();
+    await dragWorkspace(page, childKey, parentKey, "inside");
+    await expect
+      .poll(async () => {
+        const row = (await child.client.fetchWorkspaces()).entries.find(
+          (entry) => entry.id === child.workspaceId,
+        );
+        return row?.pinPlacement?.parentWorkspaceKey;
+      })
+      .toBe(parentKey);
+    expect((await visibleBoundingBox(childNode)).x - (await visibleBoundingBox(parentNode)).x).toBe(
+      16,
+    );
+    const nested = (await child.client.fetchWorkspaces()).entries.find(
+      (entry) => entry.id === child.workspaceId,
+    )!;
+    expect(nested.parentWorkspaceId).toBeNull();
+    expect(nested.projectId).toBe(child.projectId);
+    await reloadPreservingHostRegistry(page);
+    await expect(childNode).toBeVisible({ timeout: 30_000 });
+    await dragWorkspace(page, childKey, parentKey, "before");
+    await expect
+      .poll(async () => {
+        const row = (await child.client.fetchWorkspaces()).entries.find(
+          (entry) => entry.id === child.workspaceId,
+        );
+        return row?.pinPlacement?.parentWorkspaceKey;
+      })
+      .toBeNull();
+    expect((await visibleBoundingBox(childNode)).y).toBeLessThan(
+      (await visibleBoundingBox(parentNode)).y,
+    );
+    await page.screenshot({ path: testInfo.outputPath("ungrouped-shared-reorder.png") });
+  } finally {
+    await parent.cleanup();
+    await child.cleanup();
+  }
+});
 
 test("pinned trees span hosts and projects, order siblings and subtrees, and survive reload while ordinary lists stay flat", async ({
   page,
@@ -501,6 +602,14 @@ test("pinned nesting names its cross-project target, confirms local persistence,
   }
 });
 
+async function beginKeyboardWorkspaceDrag(page: Page, handle: Locator) {
+  await expect(handle).toBeEnabled();
+  await handle.focus();
+  await expect(handle).toBeFocused();
+  await page.keyboard.press("Space");
+  await expect(page.getByTestId("workspace-tree-drag-preview")).toBeVisible();
+}
+
 test("keyboard pinned dragging uses full host keys to reorder, nest Right, and lift Left", async ({
   page,
 }) => {
@@ -540,23 +649,20 @@ test("keyboard pinned dragging uses full host keys to reorder, nest Right, and l
     await expect(treeNode(page, secondKey)).toBeVisible();
     await dragWorkspace(page, firstKey, secondKey, "before");
     await expectTreeOrder(page, [firstKey, secondKey]);
-    await handle().focus();
-    await page.keyboard.press("Space");
+    await beginKeyboardWorkspaceDrag(page, handle());
     await page.keyboard.press("ArrowDown");
     await expect(page.getByTestId("workspace-tree-drop-after")).toBeVisible();
     await page.keyboard.press("Space");
     await expectTreeOrder(page, [secondKey, firstKey]);
     await expect.poll(() => treeIndent(page, firstKey, secondKey)).toBe(0);
-    await handle().focus();
-    await page.keyboard.press("Space");
+    await beginKeyboardWorkspaceDrag(page, handle());
     await page.keyboard.press("ArrowRight");
     await expect(page.getByTestId("workspace-tree-drop-inside")).toBeVisible();
     await page.keyboard.press("Space");
     await expect.poll(() => treeIndent(page, firstKey, secondKey)).toBe(16);
     await reloadPreservingHostRegistry(page);
     await expect.poll(() => treeIndent(page, firstKey, secondKey)).toBe(16);
-    await handle().focus();
-    await page.keyboard.press("Space");
+    await beginKeyboardWorkspaceDrag(page, handle());
     await page.keyboard.press("ArrowLeft");
     await expect(page.getByTestId("workspace-tree-drop-after")).toBeVisible();
     await page.keyboard.press("Space");
@@ -570,10 +676,10 @@ test("keyboard pinned dragging uses full host keys to reorder, nest Right, and l
   }
 });
 
-test("cross-section leaves wait for their source host pin ACK, retry refusals, and guard subtrees", async ({
+test("cross-section leaves wait for ACKs and whole cross-host subtrees move hidden children with recovery", async ({
   page,
-}) => {
-  test.setTimeout(240_000);
+}, testInfo) => {
+  test.setTimeout(300_000);
   const secondary = await startIsolatedHostDaemon(
     `srv_pins_${randomUUID().replaceAll("-", "").slice(0, 12)}`,
   );
@@ -594,22 +700,33 @@ test("cross-section leaves wait for their source host pin ACK, retry refusals, a
     seededWorkspaces.push(remote);
     const landing = await createWorkspace(remote, "Pinned landing");
     const child = await createWorkspace(target, "Child on first host");
+    const sibling = await createWorkspace(target, "Second child on first host");
+    const grandchild = await createWorkspace(remote, "Grandchild on remote host");
     const remoteSuperpinned = await createWorkspace(remote, "Remote SuperPinned anchor");
+    const ordinaryAnchor = await createWorkspace(remote, "Ordinary remote anchor");
     await target.client.setWorkspaceSuperpinned(target.workspaceId, true);
     await remote.client.setWorkspacePinned(remote.workspaceId, true);
     await remote.client.setWorkspacePinned(landing, true);
     await target.client.setWorkspacePinned(child, true);
+    await target.client.setWorkspacePinned(sibling, true);
+    await remote.client.setWorkspacePinned(grandchild, true);
     await remote.client.setWorkspaceSuperpinned(remoteSuperpinned, true);
     const before = await Promise.all([backendHierarchy(target), backendHierarchy(remote)]);
     const targetKey = `${getServerId()}:${target.workspaceId}`;
     const movingKey = `${secondary.serverId}:${remote.workspaceId}`;
     const landingKey = `${secondary.serverId}:${landing}`;
     const childKey = `${getServerId()}:${child}`;
+    const siblingKey = `${getServerId()}:${sibling}`;
+    const grandchildKey = `${secondary.serverId}:${grandchild}`;
     const remoteSuperpinnedKey = `${secondary.serverId}:${remoteSuperpinned}`;
+    const ordinaryAnchorKey = `${secondary.serverId}:${ordinaryAnchor}`;
     const moves: string[] = [];
     const pinRequests: string[] = [];
     let rejectFirst = true;
+    let rejectGroupChild = false;
     let heldAcceptedResponse = false;
+    const directoryConnections = new Map<string, DirectoryHydration>();
+    let directoryEpoch = 0;
     const request = z
       .object({
         message: z.object({ type: z.string(), workspaceId: z.string().optional() }).passthrough(),
@@ -619,7 +736,10 @@ test("cross-section leaves wait for their source host pin ACK, retry refusals, a
       new RegExp(`:(?:${getE2EDaemonPort()}|${secondary.port})\\b`),
       (browser) => {
         if (tearingDown) return;
-        const sourceHost = new URL(browser.url()).port === String(secondary.port);
+        const port = new URL(browser.url()).port;
+        const sourceHost = port === String(secondary.port);
+        const directory = { epoch: ++directoryEpoch, projects: false, workspaces: false };
+        directoryConnections.set(port, directory);
         const server = browser.connectToServer();
         const buffered: Array<string | Buffer> = [];
         let gate = false;
@@ -631,6 +751,21 @@ test("cross-section leaves wait for their source host pin ACK, retry refusals, a
             pinRequests.push(sourceHost ? "source" : "target");
           if (parsed.success && parsed.data.message.type === "workspace.superpin.set.request") {
             pinRequests.push(sourceHost ? "source" : "target");
+            if (!sourceHost && parsed.data.message.workspaceId === child && rejectGroupChild) {
+              rejectGroupChild = false;
+              // The parent ACK succeeds first; the child's actual host rejects
+              // this request, so the UI must restore that confirmed parent pin.
+              server.send(
+                JSON.stringify({
+                  ...parsed.data,
+                  message: {
+                    ...parsed.data.message,
+                    workspaceId: "wks_0000000000000000",
+                  },
+                }),
+              );
+              return;
+            }
             if (sourceHost && rejectFirst) {
               rejectFirst = false;
               // A real source-host refusal, followed by a retry of the unchanged UI intent.
@@ -653,6 +788,8 @@ test("cross-section leaves wait for their source host pin ACK, retry refusals, a
         });
         server.onMessage((message) => {
           const envelope = JSON.parse(message.toString());
+          if (envelope.message?.type === "project.list.response") directory.projects = true;
+          if (envelope.message?.type === "fetch_workspaces_response") directory.workspaces = true;
           if (
             sourceHost &&
             !heldAcceptedResponse &&
@@ -672,6 +809,26 @@ test("cross-section leaves wait for their source host pin ACK, retry refusals, a
         });
       },
     );
+    async function reloadWithDirectoryHydration() {
+      const beforeReload = directoryEpoch;
+      await reloadPreservingHostRegistry(page);
+      // Cached rows can paint before either live directory settles. A drag
+      // needs the new connection's authoritative catalog on both owners.
+      await expect
+        .poll(() =>
+          [getE2EDaemonPort(), secondary.port].every((hostPort) => {
+            const directory = directoryConnections.get(String(hostPort));
+            return (
+              directory !== undefined &&
+              directory.epoch > beforeReload &&
+              directory.projects &&
+              directory.workspaces
+            );
+          }),
+        )
+        .toBe(true);
+    }
+    await page.setViewportSize({ width: 1440, height: 1100 });
     await gotoAppShell(page);
     await addConnectedHostAndReload(page, {
       serverId: secondary.serverId,
@@ -705,30 +862,141 @@ test("cross-section leaves wait for their source host pin ACK, retry refusals, a
     await expect(treeNode(page, movingKey, "superpinned")).toHaveCount(0);
     await dragWorkspace(page, childKey, movingKey, "inside");
     await expect.poll(() => treeIndent(page, childKey, landingKey)).toBe(32);
-    const requestsBeforeGuard = pinRequests.length;
-    await beginWorkspaceDrag(page, movingKey, targetKey, "inside");
-    const blocked = "Move children out first before moving this workspace to another pin section";
-    await expect(page.getByTestId("workspace-tree-drop-blocked")).toContainText(blocked);
-    await page.mouse.up();
-    await expect(page.getByTestId("workspace-tree-move-blocked")).toContainText(blocked);
-    expect(pinRequests).toHaveLength(requestsBeforeGuard);
-    await expect.poll(() => treeIndent(page, childKey, landingKey)).toBe(32);
+    await dragWorkspace(page, siblingKey, movingKey, "inside");
+    await dragWorkspace(page, grandchildKey, childKey, "inside");
+    await expectTreeOrder(page, [landingKey, movingKey, childKey, grandchildKey, siblingKey]);
+    await expect.poll(() => treeIndent(page, grandchildKey, landingKey)).toBe(48);
+    const groupMembers = [
+      { seeded: remote, id: remote.workspaceId },
+      { seeded: target, id: child },
+      { seeded: remote, id: grandchild },
+      { seeded: target, id: sibling },
+    ];
+    const expectGroupPins = async (superpinned: boolean, pinned = true) => {
+      await expect
+        .poll(() => Promise.all(groupMembers.map(readGroupPinMember)))
+        .toEqual(groupMembers.map(({ id }) => ({ id, pinned, superpinned })));
+    };
+    await pinSection(page).getByTestId(`workspace-tree-toggle-${movingKey}`).click();
+    await expect(treeNode(page, childKey)).toHaveCount(0);
     await openSidebarHostFilter(page);
     await toggleHostFilter(page, secondary.serverId);
     await closeSidebarDisplayPreferences(page);
     await expect(treeNode(page, childKey)).toHaveCount(0);
     await expect(treeNode(page, movingKey)).toBeVisible();
-    await beginWorkspaceDrag(page, movingKey, remoteSuperpinnedKey, "inside");
-    await expect(page.getByTestId("workspace-tree-drop-blocked")).toContainText(blocked);
-    await page.mouse.up();
-    await expect(page.getByTestId("workspace-tree-move-blocked")).toContainText(blocked);
-    expect(pinRequests).toHaveLength(requestsBeforeGuard);
+    const beforeGroupRequests = pinRequests.length;
+    await dragWorkspace(page, movingKey, remoteSuperpinnedKey, "inside");
+    await expectGroupPins(true);
+    expect(pinRequests.slice(beforeGroupRequests).sort()).toEqual([
+      "source",
+      "source",
+      "target",
+      "target",
+    ]);
+    await expect(treeNode(page, movingKey)).toHaveCount(0);
+    await expect(treeNode(page, movingKey, "superpinned")).toBeVisible();
     await openSidebarHostFilter(page);
     await selectAllHostsFilter(page);
     await closeSidebarDisplayPreferences(page);
+    await expect(treeNode(page, childKey, "superpinned")).toHaveCount(0);
+    await pinSection(page, "superpinned").getByTestId(`workspace-tree-toggle-${movingKey}`).click();
+    await expectTreeOrder(
+      page,
+      [remoteSuperpinnedKey, movingKey, childKey, grandchildKey, siblingKey],
+      "superpinned",
+    );
+    await expect.poll(() => treeIndent(page, childKey, movingKey, "superpinned")).toBe(16);
+    await expect.poll(() => treeIndent(page, siblingKey, movingKey, "superpinned")).toBe(16);
+    await expect.poll(() => treeIndent(page, grandchildKey, movingKey, "superpinned")).toBe(32);
+    await reloadWithDirectoryHydration();
+    await expectTreeOrder(
+      page,
+      [remoteSuperpinnedKey, movingKey, childKey, grandchildKey, siblingKey],
+      "superpinned",
+    );
+    await expect.poll(() => treeIndent(page, grandchildKey, movingKey, "superpinned")).toBe(32);
+    await page.mouse.move(1000, 800);
+    await page.screenshot({
+      path: testInfo.outputPath("cross-section-subtree.png"),
+      animations: "disabled",
+    });
+    await dragWorkspace(page, movingKey, landingKey, "inside");
+    await expectGroupPins(false);
+    await expectTreeOrder(page, [landingKey, movingKey, childKey, grandchildKey, siblingKey]);
     await expect.poll(() => treeIndent(page, childKey, landingKey)).toBe(32);
+    await expect.poll(() => treeIndent(page, grandchildKey, landingKey)).toBe(48);
+    // A later host refusal must compensate the already-acknowledged parent and
+    // leave every member, local edge, and sibling order ready for a real retry.
+    rejectGroupChild = true;
+    await dragWorkspace(page, movingKey, targetKey, "inside");
+    await expect(error).toContainText("Confirmed pin changes were restored");
+    await expect(error).toContainText("Workspace not found");
+    await expectGroupPins(false);
+    await expect(treeNode(page, movingKey, "superpinned")).toHaveCount(0);
+    await expectTreeOrder(page, [landingKey, movingKey, childKey, grandchildKey, siblingKey]);
+    await expect.poll(() => treeIndent(page, grandchildKey, landingKey)).toBe(48);
+    await error.getByRole("button", { name: "Retry", exact: true }).click();
+    await expectGroupPins(true);
+    await expectTreeOrder(
+      page,
+      [targetKey, movingKey, childKey, grandchildKey, siblingKey],
+      "superpinned",
+    );
+    await dragWorkspace(page, movingKey, landingKey, "inside");
+    await expectGroupPins(false);
+    await expect.poll(() => treeIndent(page, grandchildKey, landingKey)).toBe(48);
+    // Crossing only between pin sections changes no backend hierarchy. Dropping
+    // the group into an ordinary list reorders just its root on the owning host;
+    // descendants unpin into their own original project lists without host moves.
+    expect(await Promise.all([backendHierarchy(target), backendHierarchy(remote)])).toEqual(before);
+    expect(moves).toEqual([]);
+    await expect(treeNode(page, movingKey)).toBeInViewport();
+    await expect(page.getByTestId(`workspace-tree-node-${ordinaryAnchorKey}`)).toBeInViewport();
+    await dragWorkspace(page, movingKey, ordinaryAnchorKey, "before");
+    await expectGroupPins(false, false);
+    const ordinaryRow = (key: string) =>
+      page.getByTestId(`sidebar-workspace-row-${key}`).filter({ visible: true }).first();
+    for (const key of [movingKey, childKey, grandchildKey, siblingKey]) {
+      await expect(treeNode(page, key)).toHaveCount(0);
+      await expect(treeNode(page, key, "superpinned")).toHaveCount(0);
+      await expect(ordinaryRow(key)).toBeVisible();
+      await expect(page.getByTestId(`workspace-tree-toggle-${key}`)).toHaveCount(0);
+    }
+    expect((await visibleBoundingBox(ordinaryRow(movingKey))).x).toBe(
+      (await visibleBoundingBox(ordinaryRow(grandchildKey))).x,
+    );
+    expect((await visibleBoundingBox(ordinaryRow(childKey))).x).toBe(
+      (await visibleBoundingBox(ordinaryRow(siblingKey))).x,
+    );
+    const afterOrdinary = await Promise.all([backendHierarchy(target), backendHierarchy(remote)]);
+    expect(afterOrdinary[0]).toEqual(before[0]);
+    expect(afterOrdinary[1].filter((workspace) => workspace.id !== remote.workspaceId)).toEqual(
+      before[1].filter((workspace) => workspace.id !== remote.workspaceId),
+    );
+    expect(moves).toHaveLength(1);
+    expect(JSON.parse(moves[0]).message).toEqual({
+      type: "workspace.move.request",
+      requestId: expect.stringMatching(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+      ),
+      workspaceId: remote.workspaceId,
+      parentWorkspaceId: null,
+      beforeWorkspaceId: ordinaryAnchor,
+    });
+    await reloadWithDirectoryHydration();
+    await expect(ordinaryRow(movingKey)).toBeVisible();
+    await dragWorkspace(page, movingKey, landingKey, "inside");
+    await expectGroupPins(false);
+    await expectTreeOrder(page, [landingKey, movingKey, childKey, grandchildKey, siblingKey]);
+    await expect.poll(() => treeIndent(page, childKey, landingKey)).toBe(32);
+    await expect.poll(() => treeIndent(page, siblingKey, landingKey)).toBe(32);
+    await expect.poll(() => treeIndent(page, grandchildKey, landingKey)).toBe(48);
+    await reloadWithDirectoryHydration();
+    await expectTreeOrder(page, [landingKey, movingKey, childKey, grandchildKey, siblingKey]);
+    await expect.poll(() => treeIndent(page, grandchildKey, landingKey)).toBe(48);
     // Menu changes can move one parent: its children become roots while their
     // saved edges remain dormant, then reappear when the parent returns.
+    const menuRequestsStart = pinRequests.length;
     await rowMenuAction(page, movingKey, "superpin");
     await expect(treeNode(page, movingKey, "superpinned")).toBeVisible();
     await expect.poll(() => treeIndent(page, childKey, landingKey)).toBe(0);
@@ -741,11 +1009,13 @@ test("cross-section leaves wait for their source host pin ACK, retry refusals, a
     await rowMenuAction(page, movingKey, "pin");
     await expect.poll(() => treeIndent(page, movingKey, landingKey)).toBe(16);
     await expect.poll(() => treeIndent(page, childKey, landingKey)).toBe(32);
-    await reloadPreservingHostRegistry(page);
+    await reloadWithDirectoryHydration();
     await expect.poll(() => treeIndent(page, childKey, landingKey)).toBe(32);
-    expect(pinRequests.every((host) => host === "source")).toBe(true);
-    expect(await Promise.all([backendHierarchy(target), backendHierarchy(remote)])).toEqual(before);
-    expect(moves).toEqual([]);
+    expect(pinRequests.slice(menuRequestsStart).every((host) => host === "source")).toBe(true);
+    expect(await Promise.all([backendHierarchy(target), backendHierarchy(remote)])).toEqual(
+      afterOrdinary,
+    );
+    expect(moves).toHaveLength(1);
   } finally {
     tearingDown = true;
     held.release?.();
@@ -814,8 +1084,14 @@ test("pinned A–Z sorting yields to a persisted three-row drag and follows rena
   page,
 }) => {
   test.setTimeout(120_000);
-  const zeta = await seedWorkspace({ title: "Zeta pinned", repoPrefix: "pinned-sort-zeta-" });
-  const alpha = await seedWorkspace({ title: "Alpha pinned", repoPrefix: "pinned-sort-alpha-" });
+  const zeta = await seedWorkspace({
+    title: "Zeta pinned",
+    repoPrefix: "pinned-sort-zeta-",
+  });
+  const alpha = await seedWorkspace({
+    title: "Alpha pinned",
+    repoPrefix: "pinned-sort-alpha-",
+  });
   try {
     const beta = await createWorkspace(alpha, "Beta pinned");
     await alpha.client.setWorkspacePinned(alpha.workspaceId, true);
@@ -1129,5 +1405,302 @@ test("Last Activity matches the displayed workspace ages despite fresh agent met
     });
   } finally {
     await project.cleanup();
+  }
+});
+
+async function selectWorkspaceSort(page: Page, name: "Manual" | "Created" | "Last prompt") {
+  await page.getByLabel("Display preferences", { exact: true }).click();
+  await page.getByRole("menuitem", { name: /^Sort/ }).click();
+  await page.getByRole("menuitem", { name, exact: true }).click();
+}
+
+async function reconnectSidebar(page: Page): Promise<void> {
+  await page.reload();
+  await waitForSidebarHydration(page);
+}
+
+async function expectNoWorkspaceSortChoice(page: Page): Promise<void> {
+  await page.getByLabel("Display preferences", { exact: true }).click();
+  await expect(page.getByRole("menuitem", { name: /^Sort/ })).toHaveCount(0);
+}
+
+async function promptWorkspace(seed: Awaited<ReturnType<typeof seedWorkspace>>, agentId: string) {
+  await seed.client.sendAgentMessage(agentId, "sidebar ordering check");
+  expect((await seed.client.waitForFinish(agentId, 30_000)).status).toBe("idle");
+}
+
+test("Created stays stable, Last prompt follows human submissions and survives tab archive", async ({
+  page,
+}) => {
+  test.setTimeout(120_000);
+  const seed = await seedWorkspace({ repoPrefix: "sidebar-sort-" });
+  try {
+    const newer = await seed.client.createWorkspace({
+      source: { kind: "directory", path: seed.repoPath, projectId: seed.projectId },
+      title: "Newer workspace",
+    });
+    if (!newer.workspace) throw new Error(newer.error ?? "Workspace creation failed");
+    const agent = await seed.client.createAgent({
+      provider: "mock",
+      cwd: seed.repoPath,
+      workspaceId: seed.workspaceId,
+      modeId: "load-test",
+      model: "e2e-fast-stream",
+      title: "Ordering agent",
+    });
+    const newerAgent = await seed.client.createAgent({
+      provider: "mock",
+      cwd: seed.repoPath,
+      workspaceId: newer.workspace.id,
+      modeId: "load-test",
+      model: "e2e-fast-stream",
+      title: "Newer agent",
+    });
+    await gotoAppShell(page);
+    await waitForSidebarHydration(page);
+    const oldId = `sidebar-workspace-row-${getServerId()}:${seed.workspaceId}`;
+    const newId = `sidebar-workspace-row-${getServerId()}:${newer.workspace.id}`;
+    const rows = page.locator(`[data-testid="${oldId}"], [data-testid="${newId}"]`);
+    await expect.poll(() => rowTestIds(rows)).toEqual([newId, oldId]);
+    await promptWorkspace(seed, agent.id);
+    await expect.poll(() => rowTestIds(rows)).toEqual([newId, oldId]);
+    await selectWorkspaceSort(page, "Last prompt");
+    await expect.poll(() => rowTestIds(rows)).toEqual([oldId, newId]);
+    await promptWorkspace(seed, newerAgent.id);
+    await expect.poll(() => rowTestIds(rows)).toEqual([newId, oldId]);
+    await promptWorkspace(seed, agent.id);
+    await expect.poll(() => rowTestIds(rows)).toEqual([oldId, newId]);
+    await seed.client.archiveAgent(agent.id);
+    await expect.poll(() => rowTestIds(rows)).toEqual([oldId, newId]);
+    await reconnectSidebar(page);
+    await expect.poll(() => rowTestIds(rows)).toEqual([oldId, newId]);
+    await selectWorkspaceSort(page, "Created");
+    await expect.poll(() => rowTestIds(rows)).toEqual([newId, oldId]);
+    await selectSidebarStatusGrouping(page);
+    await expectNoWorkspaceSortChoice(page);
+  } finally {
+    await seed.cleanup();
+  }
+});
+
+async function seedCompactProject() {
+  const seed = await seedWorkspace({
+    repoPrefix: "sidebar-visibility-",
+    title: "Oldest workspace",
+  });
+  const ids = [seed.workspaceId];
+  for (let index = 2; index <= 12; index += 1) {
+    const created = await seed.client.createWorkspace({
+      source: { kind: "directory", path: seed.repoPath, projectId: seed.projectId },
+      title: `Workspace ${index}`,
+    });
+    if (!created.workspace) throw new Error(created.error ?? "Workspace creation failed");
+    ids.unshift(created.workspace.id);
+  }
+  const agent = await seed.client.createAgent({
+    provider: "mock",
+    model: "e2e-fast-stream",
+    modeId: "load-test",
+    cwd: seed.repoPath,
+    workspaceId: seed.workspaceId,
+    title: "Overflow agent",
+  });
+  return { seed, ids, agent };
+}
+
+async function expectWorkspaceOrder(rows: Locator, ids: string[]) {
+  await expect
+    .poll(() => rowTestIds(rows))
+    .toEqual(ids.map((id) => `sidebar-workspace-row-${getServerId()}:${id}`));
+}
+
+async function revealWorkspaces(list: Locator, action: "Show more" | "Show less") {
+  await list.getByLabel(action, { exact: true }).click();
+}
+
+async function selectProjectGrouping(page: Page) {
+  await page.getByLabel("Display preferences", { exact: true }).click();
+  await page.getByRole("menuitem", { name: /^Group/ }).click();
+  await page.getByTestId("sidebar-grouping-project").click();
+}
+
+type CompactProject = Awaited<ReturnType<typeof seedCompactProject>>;
+
+function compactProjectRows(page: Page, seed: CompactProject["seed"]) {
+  const list = page.getByTestId(`sidebar-workspace-list-${seed.projectKey}`);
+  return {
+    rows: list.locator('[data-testid^="sidebar-workspace-row-"]'),
+    group: list.locator(".."),
+    project: page.getByTestId(`sidebar-project-row-${projectEquivalenceViewKey(seed.projectKey)}`),
+  };
+}
+
+async function expectActiveOverflowTransitions(page: Page, { seed, ids, agent }: CompactProject) {
+  const { rows } = compactProjectRows(page, seed);
+  await expectWorkspaceOrder(rows, ids.slice(0, 7));
+
+  await seed.client.sendAgentMessage(agent.id, "show active overflow");
+  await expectWorkspaceOrder(rows, [...ids.slice(0, 7), ids[11]]);
+  await seed.client.waitForFinish(agent.id, 15_000);
+  await expectWorkspaceOrder(rows, [...ids.slice(0, 7), ids[11]]);
+  await seed.client.clearWorkspaceAttention(seed.workspaceId);
+  await expectWorkspaceOrder(rows, ids.slice(0, 7));
+}
+
+async function expectRevealSurvivesSortingAndCollapse(
+  page: Page,
+  { seed, ids, agent }: CompactProject,
+) {
+  const { rows, group, project } = compactProjectRows(page, seed);
+  const retainedRows = await rows.elementHandles();
+  await revealWorkspaces(group, "Show more");
+  await expectWorkspaceOrder(rows, ids);
+  for (const [index, retained] of retainedRows.entries()) {
+    expect(
+      await rows.nth(index).evaluate((current, previous) => current === previous, retained),
+    ).toBe(true);
+  }
+  await project.click();
+  await expect(rows).toHaveCount(0);
+  await project.click();
+  await expectWorkspaceOrder(rows, ids);
+  await seed.client.sendAgentMessage(agent.id, "expanded overflow");
+  await seed.client.waitForFinish(agent.id, 15_000);
+  await seed.client.clearWorkspaceAttention(seed.workspaceId);
+  await expectWorkspaceOrder(rows, ids);
+  await selectWorkspaceSort(page, "Last prompt");
+  await expectWorkspaceOrder(rows, [ids[11], ...ids.slice(0, 11)]);
+  const revealedRow = await rows.nth(8).elementHandle();
+  await revealWorkspaces(group, "Show less");
+  await expectWorkspaceOrder(rows, [ids[11], ...ids.slice(0, 6)]);
+  await selectWorkspaceSort(page, "Created");
+  await expectWorkspaceOrder(rows, ids.slice(0, 7));
+  expect(await revealedRow!.evaluate((row) => row.isConnected)).toBe(false);
+  await reconnectSidebar(page);
+  await expectWorkspaceOrder(rows, ids.slice(0, 7));
+}
+
+async function expectStatusBucketsRetainActiveOverflow(
+  page: Page,
+  { seed, ids, agent }: CompactProject,
+) {
+  const { rows } = compactProjectRows(page, seed);
+  await selectSidebarStatusGrouping(page);
+  const done = page.getByTestId("sidebar-status-group-rows-done");
+  const doneRows = done.locator('[data-testid^="sidebar-workspace-row-"]');
+  await expect(doneRows).toHaveCount(7);
+  await revealWorkspaces(done, "Show more");
+  await expect(doneRows).toHaveCount(12);
+  await seed.client.sendAgentMessage(agent.id, "status overflow");
+  await seed.client.waitForFinish(agent.id, 15_000);
+  await expect(
+    page
+      .getByTestId("sidebar-status-group-rows-attention")
+      .getByText("Oldest workspace", { exact: true }),
+  ).toBeVisible();
+  await expect(doneRows).toHaveCount(11);
+  await seed.client.clearWorkspaceAttention(seed.workspaceId);
+  await expect(doneRows).toHaveCount(12);
+  await revealWorkspaces(done, "Show less");
+  await expect(doneRows).toHaveCount(7);
+  const activeAgents: Array<{ id: string }> = [];
+  for (const workspaceId of ids.slice(0, 8)) {
+    activeAgents.push(
+      await seed.client.createAgent({
+        provider: "mock",
+        model: "e2e-fast-stream",
+        modeId: "load-test",
+        cwd: seed.repoPath,
+        workspaceId,
+        title: "Active overflow agent",
+      }),
+    );
+  }
+  await Promise.all(
+    activeAgents.map((item) => seed.client.sendAgentMessage(item.id, "active bucket")),
+  );
+  await Promise.all(activeAgents.map((item) => seed.client.waitForFinish(item.id, 15_000)));
+  const attention = page.getByTestId("sidebar-status-group-rows-attention");
+  await expect(attention.locator('[data-testid^="sidebar-workspace-row-"]')).toHaveCount(8);
+  await expect(attention.getByLabel("Show more", { exact: true })).toHaveCount(0);
+  for (const workspaceId of ids.slice(0, 8)) await seed.client.clearWorkspaceAttention(workspaceId);
+  await expect(doneRows).toHaveCount(7);
+  await selectProjectGrouping(page);
+  await expectWorkspaceOrder(rows, ids.slice(0, 7));
+}
+
+test("compact groups retain active overflow and reveal the current ordered rows", async ({
+  page,
+}) => {
+  test.setTimeout(120_000);
+  const fixture = await seedCompactProject();
+  try {
+    await gotoAppShell(page);
+    await waitForSidebarHydration(page);
+    await test.step("Active overflow appears without intervening Done rows", () =>
+      expectActiveOverflowTransitions(page, fixture));
+    await test.step("Reveal follows current sort and survives collapse", () =>
+      expectRevealSurvivesSortingAndCollapse(page, fixture));
+    await test.step("Status reveals Done rows and keeps every active row", () =>
+      expectStatusBucketsRetainActiveOverflow(page, fixture));
+  } finally {
+    await fixture.seed.cleanup();
+  }
+});
+
+async function restorePreBetaOrder(page: Page, projectKey: string, workspaceKeys: string[]) {
+  await page.evaluate(
+    ({ projectKey: scope, workspaceKeys: order }) => {
+      localStorage.setItem(
+        "sidebar-project-workspace-order",
+        JSON.stringify({
+          version: 1,
+          state: {
+            projectOrder: [scope],
+            pinnedWorkspaceOrder: [],
+            workspaceOrderByProject: { [scope]: order },
+          },
+        }),
+      );
+    },
+    { projectKey, workspaceKeys },
+  );
+  await reconnectSidebar(page);
+}
+
+test("Manual restores pre-beta order and keeps drag order across sorting and reloads", async ({
+  page,
+}) => {
+  const seed = await seedWorkspace({ repoPrefix: "sidebar-manual-" });
+  try {
+    const second = await seed.client.createWorkspace({
+      source: { kind: "directory", path: seed.repoPath, projectId: seed.projectId },
+      title: "New manual workspace",
+    });
+    if (!second.workspace) throw new Error(second.error ?? "Workspace creation failed");
+    const keys = [seed.workspaceId, second.workspace.id].map((id) => `${getServerId()}:${id}`);
+    const ids = keys.map((key) => `sidebar-workspace-row-${key}`);
+    const rows = page.locator(ids.map((id) => `[data-testid="${id}"]`).join(", "));
+    await gotoAppShell(page);
+    await waitForSidebarHydration(page);
+    await restorePreBetaOrder(page, projectEquivalenceViewKey(seed.projectKey), keys);
+    await expect.poll(() => rowTestIds(rows)).toEqual([ids[1], ids[0]]);
+    await selectWorkspaceSort(page, "Manual");
+    await expect.poll(() => rowTestIds(rows)).toEqual(ids);
+    await selectWorkspaceSort(page, "Created");
+    await expect.poll(() => rowTestIds(rows)).toEqual([ids[1], ids[0]]);
+    await selectWorkspaceSort(page, "Last prompt");
+    await selectWorkspaceSort(page, "Manual");
+    await expect.poll(() => rowTestIds(rows)).toEqual(ids);
+    await quickDragFirstRowAfterSecond(rows, pressWorkspaceRow);
+    await reconnectSidebar(page);
+    await expect.poll(() => rowTestIds(rows)).toEqual([ids[1], ids[0]]);
+    await quickDragFirstRowAfterSecond(rows, pressWorkspaceRow);
+    await selectWorkspaceSort(page, "Created");
+    await reconnectSidebar(page);
+    await selectWorkspaceSort(page, "Manual");
+    await expect.poll(() => rowTestIds(rows)).toEqual(ids);
+  } finally {
+    await seed.cleanup();
   }
 });

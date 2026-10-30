@@ -94,11 +94,11 @@ test("a quota result never completes a turn even when its SDK subtype is success
   const session = await createSession();
   const internal = asInternals<{
     activeForegroundTurnId: string | null;
-    translateMessageToEvents(message: unknown): AgentStreamEvent[];
+    translateMessageToEvents(message: unknown): Promise<AgentStreamEvent[]>;
   }>(session);
   internal.activeForegroundTurnId = "quota-turn";
   try {
-    internal.translateMessageToEvents({
+    await internal.translateMessageToEvents({
       type: "assistant",
       error: "rate_limit",
       message: { content: [{ type: "text", text: "Session limit reached" }] },
@@ -106,7 +106,7 @@ test("a quota result never completes a turn even when its SDK subtype is success
       session_id: "session-quota",
       uuid: "quota-assistant",
     });
-    const events = internal.translateMessageToEvents({
+    const events = await internal.translateMessageToEvents({
       type: "result",
       subtype: "success",
       is_error: true,
@@ -142,19 +142,19 @@ test.each([
     const session = await createSession();
     const internal = asInternals<{
       activeForegroundTurnId: string | null;
-      translateMessageToEvents(message: unknown): AgentStreamEvent[];
+      translateMessageToEvents(message: unknown): Promise<AgentStreamEvent[]>;
     }>(session);
     internal.activeForegroundTurnId = signal === "unbound" ? null : "typed-turn";
     try {
       if (signal === "rejected" || signal === "allowed_warning")
-        internal.translateMessageToEvents({
+        await internal.translateMessageToEvents({
           type: "rate_limit_event",
           rate_limit_info: { status: signal },
           uuid: "limit",
           session_id: "session-typed",
         });
       if (signal === "sidechain" || signal === "unbound")
-        internal.translateMessageToEvents({
+        await internal.translateMessageToEvents({
           type: "assistant",
           error: "rate_limit",
           message: { content: [] },
@@ -163,7 +163,7 @@ test.each([
           session_id: "session-typed",
         });
       internal.activeForegroundTurnId = "typed-turn";
-      const events = internal.translateMessageToEvents({
+      const events = await internal.translateMessageToEvents({
         type: "result",
         subtype: "success",
         is_error: isError,
@@ -182,7 +182,7 @@ test.each([
       if (isError) expect(events.some((event) => event.type === "turn_failed")).toBe(true);
       // A typed frame from the prior turn cannot arm the next result.
       internal.activeForegroundTurnId = "next-turn";
-      const next = internal.translateMessageToEvents({
+      const next = await internal.translateMessageToEvents({
         type: "result",
         subtype: "success",
         is_error: true,
@@ -210,11 +210,11 @@ test.each(["error_max_turns", "error_max_budget_usd", "recovered_execution_error
     const session = await createSession();
     const internal = asInternals<{
       activeForegroundTurnId: string | null;
-      translateMessageToEvents(message: unknown): AgentStreamEvent[];
+      translateMessageToEvents(message: unknown): Promise<AgentStreamEvent[]>;
     }>(session);
     internal.activeForegroundTurnId = "prior-quota-candidate";
     try {
-      internal.translateMessageToEvents({
+      await internal.translateMessageToEvents({
         type: "assistant",
         error: "rate_limit",
         message: { content: [] },
@@ -222,13 +222,13 @@ test.each(["error_max_turns", "error_max_budget_usd", "recovered_execution_error
         session_id: "typed-session",
       });
       if (outcome === "recovered_execution_error")
-        internal.translateMessageToEvents({
+        await internal.translateMessageToEvents({
           type: "assistant",
           message: { content: [{ type: "text", text: "Retry recovered" }] },
           uuid: "recovery",
           session_id: "typed-session",
         });
-      const events = internal.translateMessageToEvents({
+      const events = await internal.translateMessageToEvents({
         type: "result",
         subtype: outcome === "recovered_execution_error" ? "error_during_execution" : outcome,
         is_error: true,
