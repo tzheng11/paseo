@@ -708,3 +708,9 @@ Every entry covers `previous stable release → release source`: first beta, lat
 - [ ] EAS Android `build_android` completes for the same tag
 - [ ] EAS Android `submit_android` succeeds, putting the build on its Play Store track
 - [ ] The release heartbeat was created after the tag push and deleted only after every item above passed
+
+## Impower custom distribution
+
+The Impower Desktop package sets `paseoDistribution.updates` to `manual`. Its update adapter does not check or download the upstream feed, and neither the manual install entry point nor quit-time installation may install a cached upstream update. Missing distribution policy also leaves automatic updates disabled; an upstream feed requires an explicit build-time `upstream` policy. This prevents an official update from replacing the custom fixes and rewriting fork-only state. Updates use the separately verified fleet rollout.
+
+Both the official and custom stable packages report `0.14.0`. Desktop only restarts its daemon for a version-string mismatch, so a custom rollout must explicitly stop the old daemon, prove it is down, and verify the started runtime against the custom artifact/source digests. A matching version or App filename does not prove that the custom server is running. This release rule grants no live action or waiver.

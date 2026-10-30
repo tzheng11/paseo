@@ -33,6 +33,16 @@ export {
   type AppUpdateInstallResult,
 };
 
+import { desktopUpdatesEnabled } from "./update-policy.js";
+
+// Custom distributions must not download or install upstream replacements,
+// including a cached update when the application quits.
+if (!desktopUpdatesEnabled) {
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = false;
+  autoUpdater.autoRunAppAfterInstall = false;
+}
+
 let cachedStagingUserIdPromise: Promise<string> | null = null;
 
 const UPDATE_CHANNEL_NOT_PUBLISHED_CODE = "ERR_UPDATER_CHANNEL_FILE_NOT_FOUND";
@@ -225,6 +235,7 @@ class ElectronAppUpdateRuntime implements AppUpdateRuntime {
 const appUpdateService = createAppUpdateService({
   runtime: new ElectronAppUpdateRuntime(),
   isPackaged: () => app.isPackaged,
+  updatesEnabled: desktopUpdatesEnabled,
   now: () => Date.now(),
   bucket: async () => bucketFromStagingUserId(await getStagingUserId()),
   reportCheckError: (error) => {

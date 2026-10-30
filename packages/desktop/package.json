@@ -47,5 +47,9 @@
     "vitest": "^4.1.6",
     "wait-on": "8.0.5"
   },
-  "desktopName": "Paseo.desktop"
+  "desktopName": "Paseo.desktop",
+  "paseoDistribution": {
+    "name": "impower",
+    "updates": "manual"
+  }
 }

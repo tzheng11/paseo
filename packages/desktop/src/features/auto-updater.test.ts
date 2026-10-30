@@ -4,10 +4,14 @@ import path from "node:path";
 import { UUID } from "builder-util-runtime";
 import { describe, expect, it, vi } from "vitest";
 
-const { autoUpdaterMock } = vi.hoisted(() => {
+const { autoUpdaterMock, updatePolicyMock } = vi.hoisted(() => {
   const handlers = new Map<string, (value: unknown) => void>();
   return {
+    updatePolicyMock: { enabled: true },
     autoUpdaterMock: {
+      autoDownload: true,
+      autoInstallOnAppQuit: true,
+      autoRunAppAfterInstall: true,
       handlers,
       logger: {
         debug: vi.fn(),
@@ -29,6 +33,12 @@ vi.mock("electron", () => ({
   app: {
     getPath: vi.fn(),
     isPackaged: true,
+  },
+}));
+
+vi.mock("./update-policy.js", () => ({
+  get desktopUpdatesEnabled() {
+    return updatePolicyMock.enabled;
   },
 }));
 
@@ -314,6 +324,52 @@ describe("shouldAdmitToRollout", () => {
       expect(second).toBe(first);
     } finally {
       await rm(tempDir, { force: true, recursive: true });
+    }
+  });
+});
+
+describe("custom distribution update policy", () => {
+  it("binds the actual package to managed updates and blocks the real adapter entry points", async () => {
+    const policy = await vi.importActual<typeof import("./update-policy.js")>("./update-policy.js");
+    expect(policy.desktopUpdatesEnabled).toBe(false);
+    updatePolicyMock.enabled = false;
+    vi.resetModules();
+    autoUpdaterMock.checkForUpdates.mockClear();
+    autoUpdaterMock.downloadUpdate.mockClear();
+    autoUpdaterMock.quitAndInstall.mockClear();
+    const beforeQuit = vi.fn();
+    try {
+      const managed = await import("./auto-updater.js");
+      expect(autoUpdaterMock.autoDownload).toBe(false);
+      expect(autoUpdaterMock.autoInstallOnAppQuit).toBe(false);
+      expect(autoUpdaterMock.autoRunAppAfterInstall).toBe(false);
+      const check = await managed.checkForAppUpdate({
+        currentVersion: "0.14.0",
+        releaseChannel: "stable",
+        intent: "automatic",
+      });
+      expect(check.hasUpdate).toBe(false);
+      const install = await managed.downloadAndInstallUpdate(
+        { currentVersion: "0.14.0", releaseChannel: "stable" },
+        beforeQuit,
+      );
+      expect(install.installed).toBe(false);
+      // A stale updater notification must not make the manual adapter install on quit.
+      autoUpdaterMock.handlers.get("update-downloaded")?.({ version: "0.14.1" });
+      expect(
+        await managed.installAppUpdateOnQuit({
+          currentVersion: "0.14.0",
+          releaseChannel: "stable",
+          signal: new AbortController().signal,
+        }),
+      ).toBe(false);
+      expect(autoUpdaterMock.checkForUpdates).not.toHaveBeenCalled();
+      expect(autoUpdaterMock.downloadUpdate).not.toHaveBeenCalled();
+      expect(autoUpdaterMock.quitAndInstall).not.toHaveBeenCalled();
+      expect(beforeQuit).not.toHaveBeenCalled();
+    } finally {
+      updatePolicyMock.enabled = true;
+      vi.resetModules();
     }
   });
 });
