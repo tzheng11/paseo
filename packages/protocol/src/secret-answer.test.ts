@@ -124,8 +124,6 @@ describe("secret answers", () => {
     "What is the API key format?",
     "I fixed token validation.",
     "Please review password handling.",
-    "Enter token",
-    "Paste your tokens",
     "What is a password?",
   ])("preserves ordinary replies to credential discussion (%#)", (context) => {
     expect(redactSecretAnswer("yes", context)).toBe("yes");
@@ -162,6 +160,7 @@ const ordinaryPrompts = [
   "api_key=$API_KEY",
   "api_key=${API_KEY}",
   "api_key=<your-api-key>",
+  "The invalidated first pass: don't re-run anything to work out what it opened.",
   "Head is 41c4e4c0bd7709490212ac97f0beda98ae2812ad, base 48e0c6e50680e0a049de5cafbd8d693826e78c34.",
   "sha256: a734139041ee4b89220c99a6568a6704aa5464c04b02559ad2164e1f9a5338ac",
   "agent id bc299fea-5481-48e4-bb5f-31fc299789a1 token count 1500",
@@ -480,4 +479,152 @@ describe("structural routing keys", () => {
       expect(redactSecretKey(key)).toBe(SECRET_ANSWER_NOTICE);
     },
   );
+});
+
+describe("reviewer punctuated credential regression matrix", () => {
+  test.each([
+    ['export DB_PASSWORD="ab&cd#1234!xyz"', "ab&cd#1234!xyz"],
+    ['password: "x?7kL:9mQ2vR4tZ"', "x?7kL:9mQ2vR4tZ"],
+    ["my password is ab#cd1234567", "ab#cd1234567"],
+    ["api key: ab;cd1234efgh5678", "ab;cd1234efgh5678"],
+    ['--password "ab(cd)1234efgh"', "ab(cd)1234efgh"],
+    ["Cookie: session=ab#cd1234567", "ab#cd1234567"],
+    ["password=ab#cd1234567xyz", "ab#cd1234567xyz"],
+    ["the password is Tr0ub4dor&3xyz", "Tr0ub4dor&3xyz"],
+    ["password=abcd1234#efgh5678", "abcd1234#efgh5678"],
+  ])("withholds the complete punctuated value %#", (text, value) => {
+    expect(redactSecretAnswer(text!, "Anything else?")).toBe(SECRET_ANSWER_NOTICE);
+    const result = redactSecretPrompt(text!);
+    expect(result).not.toContain(value);
+    expect(result).toContain(SECRET_ANSWER_NOTICE);
+  });
+  test("keeps matching outer quotes and unlabelled surrounding punctuation", () => {
+    const text = 'before DB_PASSWORD="ab&cd#1234!xyz"; after';
+    expect(redactSecretPrompt(text)).toBe(`before DB_PASSWORD="${SECRET_ANSWER_NOTICE}"; after`);
+  });
+  test.each(["tiny", "hunter", "1234", "punct!#&?;:()", "Uint8Array", "getApiKey1234(config)"])(
+    "password labels accept arbitrary values %#",
+    (value) => {
+      expect(redactSecretPrompt(`password=${value}`)).toBe(`password=${SECRET_ANSWER_NOTICE}`);
+    },
+  );
+});
+
+describe("reviewer credential question regression matrix", () => {
+  test.each([
+    "What is your password?",
+    "What is the root password?",
+    "What is the sudo password?",
+    "What is the admin password?",
+    "What is the database password?",
+    "Enter the VPN password",
+    "Enter your password to continue",
+    "Please enter the password for mac-mini-1",
+    "Password for mac-mini-1?",
+    "What is the password for this server?",
+    "Enter your GitHub password",
+    "What is the SSH passphrase?",
+    "Admin password",
+    "Sudo password:",
+    "Enter the VPN passcode",
+    "PIN",
+    "What is the admin PIN?",
+    "Please provide the service secret token",
+    "Enter the customer API key for this host",
+    "Paste your SSH token for mac-mini-1",
+    "Enter token",
+    "Paste your tokens",
+    "Provide the secret",
+    "Give me the PIN",
+    "Type your passcode to continue",
+    "What is the secret for this host?",
+  ])("protects an arbitrary answer to a direct value request %#", (context) => {
+    expect(redactSecretAnswer("xK9#mP2$vL5q", context)).toBe(SECRET_ANSWER_NOTICE);
+    expect(redactSecretPrompt("xK9#mP2$vL5q", context)).toBe(SECRET_ANSWER_NOTICE);
+  });
+  test.each([
+    "Should we reset the admin password?",
+    "Which password manager should we use?",
+    "Password reset",
+    "Admin password manager",
+    "What is a password?",
+    "Should PIN validation be enabled?",
+    "Please review password handling.",
+  ])("preserves discussion rather than requesting the value %#", (context) => {
+    expect(redactSecretAnswer("yes", context)).toBe("yes");
+    expect(redactSecretPrompt("yes", context)).toBe("yes");
+  });
+});
+
+describe("reviewer ordinary identifier regression matrix", () => {
+  test.each([
+    "claude-sonnet-5-5",
+    "release-2026-11-01",
+    "iss-6389-secret-answers",
+    "us-east-1-production",
+    "postgres-16-alpine",
+    "2026-11-01T21:40:48Z",
+    "user2@example-company.com",
+    "Button2Component.tsx",
+    "agent-message2.test.ts",
+    "config.region2.default",
+    "v2026.11.01-beta.2",
+    "2026-11-01T21:40:48+00:00",
+    "2026-11-01T21:40:48.123-0600",
+  ])("keeps ordinary neutral structured identifiers %#", (value) => {
+    expect(redactSecretAnswer(value, "Which one should I use?")).toBe(value);
+  });
+  test.each([
+    "Please fix packages/server/src/aws/S3Client/upload.ts",
+    "see src/main/java/com/acme/auth/OAuth2LoginController.java now",
+    "rename AgentPromptContentBlockV2Serializer please",
+    "const privateKey: Uint8Array = load()",
+    "credentials: OAuth2Credentials",
+    "secretName: tls-cert-2024",
+    "secret_name: prod-db-credentials-2",
+    "credentials_file: /Users/me/.config/gcloud/application_default_credentials.json",
+    "GOOGLE_APPLICATION_CREDENTIALS=/etc/app/service_account_credentials.json",
+    "const apiKey = getApiKey1234(config)",
+    "secretary: John2Smith",
+  ])("keeps wordlike code, paths and non-secret field names %#", (text) => {
+    expect(redactSecretPrompt(text)).toBe(text);
+  });
+});
+
+describe("additional explicit provider formats", () => {
+  test.each([
+    "https://hooks.slack.com/services/T00000000/B00000000/SYNTHETICsyntheticSYNTHETIC1",
+    "glpat-SYNTHETIC1234567890ab",
+    "hf_SYNTHETIC1234567890abcd",
+  ])("withholds explicit credential formats %#", (value) => {
+    expect(redactSecretAnswer(value)).toBe(SECRET_ANSWER_NOTICE);
+    expect(redactSecretPrompt(`before ${value} after`)).toBe(
+      `before ${SECRET_ANSWER_NOTICE} after`,
+    );
+  });
+});
+
+describe("encoded local image paths", () => {
+  test.each([
+    "Emit settled assistant image Markdown: ![Encoded destination image](/private/var/folders/d9/hy1jfhyj777cr2cb7wzsq8h00000gn/T/agent-tab-image-stability-N6asqz/My%20image%20%D0%9C%D0%BE%D0%B8.png)",
+    "/Users/tim/Development/source/S3Client/My%20image%20%D0%9C%D0%BE%D0%B8.png",
+    "assets/generated/agent-tab-image-stability-N6asqz/My%20image%20%D0%9C%D0%BE%D0%B8.png",
+    "/Users/tim/source/My image Мои.png",
+    "assets/generated/My image Мои.png",
+    "/Users/tim/source/literal%20filename.png",
+  ])("preserves ordinary encoded and spaced local paths in both policies %#", (text) => {
+    expect(redactSecretPrompt(text)).toBe(text);
+    expect(redactSecretAnswer(text)).toBe(text);
+  });
+  test("continues protecting leading-slash opaque base64 values", () => {
+    expect(redactSecretPrompt("/" + syntheticHmac)).toBe(SECRET_ANSWER_NOTICE);
+  });
+  test("does not confuse the Manager's synthetic AWS secret with camel-case path segments", () => {
+    const value = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+    const text = `export AWS_SECRET_ACCESS_KEY=${value}\nnext line stays`;
+    expect(redactSecretPrompt(text)).toBe(
+      `export AWS_SECRET_ACCESS_KEY=${SECRET_ANSWER_NOTICE}\nnext line stays`,
+    );
+    expect(redactSecretAnswer(text)).toBe(SECRET_ANSWER_NOTICE);
+  });
 });

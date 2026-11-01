@@ -224,6 +224,7 @@ import { workspaceIdsOnCheckout } from "./workspace-directory.js";
 import { configureGitProcessPolicy } from "../utils/run-git-command.js";
 import { resolveGitProcessPolicy } from "../utils/git-process-scheduler.js";
 import { resolveFirstAgentPromptTitle } from "./agent/create-agent-title.js";
+import { redactFirstAgentContext } from "./agent/secret-answer.js";
 import {
   createAgentCommand,
   type CreateAgentCommandDependencies,
@@ -1080,6 +1081,7 @@ export async function createPaseoDaemon(
     firstAgentContext?: FirstAgentContext,
     context?: { callerWorkspaceId?: string },
   ): Promise<string> => {
+    firstAgentContext = firstAgentContext ? redactFirstAgentContext(firstAgentContext) : undefined;
     const workspace = await workspaceProvisioning.createWorkspaceForDirectory(
       cwd,
       resolveFirstAgentPromptTitle(firstAgentContext),
@@ -1344,6 +1346,7 @@ export async function createPaseoDaemon(
     cwd: string;
     firstAgentContext: FirstAgentContext;
   }) => {
+    input = { ...input, firstAgentContext: redactFirstAgentContext(input.firstAgentContext) };
     const workspace = await workspaceProvisioning.createWorkspaceForDirectory(
       input.cwd,
       resolveFirstAgentPromptTitle(input.firstAgentContext),
@@ -1360,6 +1363,7 @@ export async function createPaseoDaemon(
     cwd: string;
     firstAgentContext: FirstAgentContext;
   }) => {
+    input = { ...input, firstAgentContext: redactFirstAgentContext(input.firstAgentContext) };
     const result = await createPaseoWorktreeForTools({
       cwd: input.cwd,
       firstAgentContext: input.firstAgentContext,

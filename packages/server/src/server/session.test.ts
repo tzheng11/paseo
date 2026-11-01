@@ -315,6 +315,10 @@ vi.mock("./worktree-bootstrap.js", async (importOriginal) => {
 });
 
 interface SessionForTestOptions {
+  logger?: SessionOptions["logger"];
+  agentManagerInstance?: AgentManager;
+  agentStorageInstance?: AgentStorage;
+  messageReceipts?: SessionOptions["messageReceipts"];
   sendToSource?: SessionOptions["onMessageToSource"];
   clientId?: string;
   clientCapabilities?: SessionOptions["clientCapabilities"];
@@ -367,7 +371,7 @@ interface SessionForTestOptions {
 }
 
 function createSessionForTest(options: SessionForTestOptions = {}): Session {
-  const logger = pino({ level: "silent" });
+  const logger = options.logger ?? pino({ level: "silent" });
   const github = options.github ?? {
     invalidate: vi.fn(),
     searchIssuesAndPrs: vi.fn(),
@@ -399,7 +403,7 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
   const messages = options.messages ?? [];
 
   const sessionOptions: SessionOptions = {
-    messageReceipts: createMessageReceiptsStub(),
+    messageReceipts: options.messageReceipts ?? createMessageReceiptsStub(),
     agentMessages: createAgentMessageDeliveryStub(),
     creationService: createTestCreationService(),
     clientId: options.clientId ?? "test-client",
@@ -422,17 +426,21 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
     downloadTokenStore: options.downloadTokenStore ?? asDownloadTokenStore(),
     pushNotifications: options.pushNotifications ?? asPushNotifications(),
     paseoHome: options.paseoHome ?? "/tmp/paseo-home",
-    agentManager: asAgentManager({
-      listAgents: vi.fn(() => []),
-      listProviderSubagentActivity: vi.fn(() => []),
-      subscribe: vi.fn(() => () => {}),
-      ...options.agentManager,
-    }),
-    agentStorage: asAgentStorage({
-      get: vi.fn().mockResolvedValue(undefined),
-      list: vi.fn().mockResolvedValue([]),
-      ...options.agentStorage,
-    }),
+    agentManager:
+      options.agentManagerInstance ??
+      asAgentManager({
+        listAgents: vi.fn(() => []),
+        listProviderSubagentActivity: vi.fn(() => []),
+        subscribe: vi.fn(() => () => {}),
+        ...options.agentManager,
+      }),
+    agentStorage:
+      options.agentStorageInstance ??
+      asAgentStorage({
+        get: vi.fn().mockResolvedValue(undefined),
+        list: vi.fn().mockResolvedValue([]),
+        ...options.agentStorage,
+      }),
     projectRegistry: {
       list: vi.fn().mockResolvedValue([]),
       get: vi.fn(),
@@ -6526,5 +6534,128 @@ test("a failing direct source observes fire-and-forget file replies without unha
     process.off("unhandledRejection", collect);
     await session.cleanup();
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("first-prompt secrets are removed before provisional titles and session log prefixes", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "session-first-prompt-secret-"));
+  const logs: string[] = [];
+  const logger = pino({ level: "trace" }, { write: (chunk) => logs.push(chunk) });
+  const storage = new AgentStorage(join(directory, "agents"), logger);
+  const manager = new AgentManager({
+    clients: { codex: createTestAgentClient("codex") },
+    registry: storage,
+    logger,
+  });
+  const secret = `sk-proj-${"Synthetic1_".repeat(8)}`;
+  const messages: unknown[] = [];
+  const receiptRequests: unknown[] = [];
+  const session = createSessionForTest({
+    logger,
+    agentManagerInstance: manager,
+    agentStorageInstance: storage,
+    messages,
+    messageReceipts: {
+      send: async (input) => {
+        receiptRequests.push(input.request);
+        await input.prepare?.();
+        await input.send();
+      },
+    },
+  });
+  try {
+    for (const text of [`Deploy with ${secret} then verify.`, "Fix the login flow"]) {
+      const agent = await manager.createAgent({ provider: "codex", cwd: directory }, undefined, {
+        workspaceId: undefined,
+      });
+      await session.handleMessage({
+        type: "send_agent_message_request",
+        requestId: `request-${agent.id}`,
+        messageId: `message-${agent.id}`,
+        agentId: agent.id,
+        text,
+      });
+      await manager.waitForAgentEvent(agent.id, { waitForActive: true });
+      await manager.flush();
+      const stored = await storage.get(agent.id);
+      expect(stored?.title).toContain(text.includes(secret) ? "[redacted:secret]" : text);
+      expect(JSON.stringify(stored)).not.toContain(secret);
+      expect(JSON.stringify(manager.getTimeline(agent.id))).not.toContain(secret);
+    }
+    const legacyAgent = await manager.createAgent(
+      { provider: "codex", cwd: directory },
+      undefined,
+      { workspaceId: undefined },
+    );
+    expect(
+      await asSessionInternals(session).handleSendAgentMessage(
+        legacyAgent.id,
+        `Deploy with ${secret} then verify.`,
+      ),
+    ).toEqual({ ok: true });
+    await manager.waitForAgentEvent(legacyAgent.id, { waitForActive: true });
+    const shortSecret = "xK9#mP2$vL5q";
+    for (const { question, text, expected } of [
+      { question: "Enter your password:", text: shortSecret, expected: "[redacted:secret]" },
+      { question: "Should password validation be enabled?", text: "yes", expected: "yes" },
+      { question: "Enter your password:", text: "Use defaults", expected: "Use defaults" },
+    ]) {
+      const agent = await manager.createAgent({ provider: "codex", cwd: directory }, undefined, {
+        workspaceId: undefined,
+      });
+      await manager.appendTimelineItem(agent.id, { type: "assistant_message", text: question });
+      await session.handleMessage({
+        type: "send_agent_message_request",
+        requestId: `request-${agent.id}`,
+        messageId: `message-${agent.id}`,
+        agentId: agent.id,
+        text,
+      });
+      await manager.waitForAgentEvent(agent.id, { waitForActive: true });
+      await manager.flush();
+      const stored = await storage.get(agent.id);
+      expect(stored?.title).toContain(expected);
+      expect(JSON.stringify(stored)).not.toContain(shortSecret);
+      expect(JSON.stringify(manager.getTimeline(agent.id))).not.toContain(shortSecret);
+    }
+    const spokenAgent = await manager.createAgent(
+      { provider: "codex", cwd: directory },
+      undefined,
+      { workspaceId: undefined },
+    );
+    await manager.appendTimelineItem(spokenAgent.id, {
+      type: "assistant_message",
+      text: "Enter your password:",
+    });
+    expect(
+      await asSessionInternals(session).handleSendAgentMessage(
+        spokenAgent.id,
+        shortSecret,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { spokenInput: true },
+      ),
+    ).toEqual({ ok: true });
+    await manager.waitForAgentEvent(spokenAgent.id, { waitForActive: true });
+    expect(JSON.stringify(manager.getTimeline(spokenAgent.id))).not.toContain(shortSecret);
+    expect(JSON.stringify(receiptRequests)).not.toContain(shortSecret);
+    expect(logs.join("\n")).not.toContain(shortSecret);
+    expect(logs.join("\n")).not.toContain(secret);
+    expect(logs.join("\n")).not.toContain(secret.slice(0, 25));
+    expect(logs.join("\n")).toContain("Fix the login flow");
+    expect(messages).toContainEqual(
+      expect.objectContaining({
+        type: "send_agent_message_response",
+        payload: expect.objectContaining({ accepted: true }),
+      }),
+    );
+  } finally {
+    manager.prepareForShutdown();
+    await Promise.all(manager.listAgents().map((agent) => manager.closeAgent(agent.id)));
+    await manager.flushForShutdown();
+    await storage.flush();
+    rmSync(directory, { recursive: true, force: true });
   }
 });

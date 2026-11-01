@@ -103,7 +103,7 @@ async function drainAgentRunIterator(
   }
 }
 
-async function prepareAnswerPromptForDispatch(
+export async function prepareAnswerPromptForDispatch(
   agentManager: AgentRunController,
   agentId: string,
   prompt: AgentPromptInput,
@@ -120,7 +120,11 @@ async function prepareAnswerPromptForDispatch(
       agentManager.getAnswerTurnIdentity?.(agentId) ??
       after?.activeForegroundTurnId ??
       after?.activeTurnId;
-    if (currentTurnId && currentTurnId !== expectedTurnId) throw new AgentSteerTurnChangedError();
+    // An input submitted while idle still follows normal steer/replacement admission
+    // if another input starts first. Only an input already aimed at a turn owns a fence.
+    if (expectedTurnId && currentTurnId && currentTurnId !== expectedTurnId) {
+      throw new AgentSteerTurnChangedError();
+    }
   }
   return prompt;
 }

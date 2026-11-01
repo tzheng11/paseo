@@ -6,7 +6,7 @@ const MAX_NORMALIZATION_PASSES = 16;
 
 // Ported from Studio's redact-segment-secrets.ts on origin/develop (8e33d51882ca).
 // Answers use whole-field withholding rather than transcript substring replacement.
-const SECRET_KEY_WORDS = String.raw`secret|hmac|passwd|password|credential|private[_-]?key|access[_-]?key|api[_-]?key|auth[_-]?token|bearer[_-]?token|session[_-]?token`;
+const SECRET_KEY_WORDS = String.raw`key|secret|hmac|passwd|password|passphrase|passcode|pin|credentials?|private[_-]?key|access[_-]?key|api[_-]?key|auth[_-]?token|bearer[_-]?token|session[_-]?token`;
 const LITERAL_PATTERNS: readonly RegExp[] = [
   /\bGOOG[0-9A-Z]{12,60}\b/,
   /\b(?:AKIA|ASIA)[0-9A-Z]{12,60}\b/,
@@ -22,12 +22,16 @@ const LITERAL_PATTERNS: readonly RegExp[] = [
   /\bAIza[A-Za-z0-9_-]{30,}/,
   /\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}/,
   /\b(?:re_|sntrys_)[A-Za-z0-9_]{16,}/,
+  /\bglpat-[A-Za-z0-9_-]{16,}/,
+  /\bhf_[A-Za-z0-9_-]{16,}/,
+  /https:\/\/hooks\.slack\.com\/services\/T[A-Z0-9]{6,}\/B[A-Z0-9]{6,}\/[A-Za-z0-9_-]{16,}/,
 ];
 const JWT_PATTERN =
   /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,4096}\.(?:[A-Za-z0-9_-]{1,4096}|(?=\.[A-Za-z0-9_-]{1}))(?:\.[A-Za-z0-9_-]{0,4096}){0,3}/;
 // The same authorization schemes can be pasted without their HTTP header name.
 const AUTHORIZATION_SCHEME_PATTERN = /\b(?:Bearer|Basic)[ \t]+[A-Za-z0-9+/=_.%-]{16,4096}/i;
-const SECRET_KEY_PATTERN = new RegExp(SECRET_KEY_WORDS, "i");
+const SECRET_KEY_PATTERN = new RegExp(`(?:^|[_ .-])(?:${SECRET_KEY_WORDS})$`, "i");
+const PASSWORD_KEY_PATTERN = /(?:^|[_ .-])(?:password|passwd|passphrase|passcode|pin|pwd)$/i;
 const ASSIGNMENT_PATTERN = /\b([A-Za-z0-9_.-]{1,64})["']?\s{0,64}[:=]\s{0,64}["']?/g;
 const TOKEN_KEY_PATTERN =
   /(?:(?:access|refresh|mcp)[_-]?token|(?<![A-Za-z0-9])id[_-]?token|(?<![A-Za-z0-9_.-])token|protection[_-]bypass)$/i;
@@ -43,25 +47,12 @@ const WORDS_ONLY_VALUE =
 const NON_SECRET_VALUE = /^(?:true|false|null|undefined|[\d.]+)$/i;
 const SIGNED_URL_SIGNER_PARAM = /^x-(?:goog|amz)-credential$/i;
 const DIAGNOSTIC_SECRET_KEY = /^(?:authorization|daemonPublicKeyB64|relayKey)$/i;
-const QUALIFIED_CREDENTIAL = String.raw`(?:passwords?|passwds?|passphrases?|credentials?|(?:private|api|access|secret)[ _-]?keys?|(?:api|auth(?:entication)?|bearer|session|access|refresh|id)[ _-]?tokens?)`;
-const FIELD_MODIFIERS = String.raw`(?:(?:your|the|mac|macos|login|account|service|user|current|new)\s+){0,5}`;
-const FIELD_END = String.raw`(?:\s+(?:value|please|required|optional|needed))?(?:\s+\((?:required|optional)\))?\s*[:?.]?`;
-const FIELD_TITLE_PATTERN = new RegExp(
-  String.raw`^(?:${FIELD_MODIFIERS}${QUALIFIED_CREDENTIAL}${FIELD_END}|(?:keys?|tokens?|secret)\s*[:?]?)$`,
-  "i",
-);
-const FIELD_QUALIFIER_PATTERN = new RegExp(
-  String.raw`^${QUALIFIED_CREDENTIAL}\s+(?:for|of|to)\s+(?:(?:your|the)\s+)?(?:account|mac|macos|login|service|user)\s*[:?]$`,
-  "i",
-);
-const IMPERATIVE_CREDENTIAL_PATTERN = new RegExp(
-  String.raw`\b(?:enter|paste|provide|type|supply|give|send|share|input)\s+(?:me\s+)?(?:(?:your|the|a|an|both|mac|macos|login|account|service|user|current|new)\s+){0,5}${QUALIFIED_CREDENTIAL}${FIELD_END}$`,
-  "i",
-);
-const INTERROGATIVE_CREDENTIAL_PATTERN = new RegExp(
-  String.raw`\bwhat(?:'s|\s+is|\s+are)\s+(?:(?:your|the|current|new|mac|macos|login|account)\s+){1,5}${QUALIFIED_CREDENTIAL}\s*\??$`,
-  "i",
-);
+const QUALIFIED_CREDENTIAL_PATTERN =
+  /\b(?:passwords?|passwds?|passphrases?|passcodes?|pins?|secrets?|credentials?|(?:private|api|access|secret)[ _-]?keys?|(?:secret|api|auth(?:entication)?|bearer|session|access|refresh|id)[ _-]?tokens?|tokens?)\b/gi;
+const CREDENTIAL_DISCUSSION_PATTERN =
+  /\b(?:reset|manager|management|handling|rotation|validation|validator|format|pattern|length|storage|policy|budget|count|enabled|type|difference|findings?|recovery|scanning|scan)\b/i;
+const NON_SECRET_PASSWORD_VALUE =
+  /^(?:required|optional|none|expired|missing|placeholder|example|password|passwd|passphrase|passcode|pin|true|false|null|undefined|not|enabled|disabled|and|or)[;,.]?$/i;
 const ENCODED_CHARACTER_PATTERN =
   /%((?:25)*[\da-f]{2})|\\u([\da-f]{4})|\\x([\da-f]{2})|&#x([\da-f]{1,6});?|&#(\d{1,7});?|&(colon|equals|quot|apos);|\\([\\"'/nrt])/gi;
 
@@ -86,13 +77,24 @@ interface AssignmentCandidate {
 }
 
 function isExcludedKey(key: string): boolean {
-  return NON_SECRET_KEY_PATTERN.test(key.replace(/([a-z0-9])([A-Z])/g, "$1_$2"));
+  return NON_SECRET_KEY_PATTERN.test(keyWords(key));
+}
+
+function keyWords(key: string): string {
+  return key.replace(/([a-z0-9])([A-Z])/g, "$1_$2");
+}
+
+function isPasswordKey(key: string): boolean {
+  return (
+    PASSWORD_KEY_PATTERN.test(keyWords(key)) || /(?:^|_)PASS$|^(?:PGPASSWORD|MYSQL_PWD)$/.test(key)
+  );
 }
 
 function isSecretKey(key: string): boolean {
   if (isExcludedKey(key)) return false;
   return (
-    SECRET_KEY_PATTERN.test(key) ||
+    SECRET_KEY_PATTERN.test(keyWords(key)) ||
+    isPasswordKey(key) ||
     TOKEN_KEY_PATTERN.test(key) ||
     ENV_TOKEN_KEY_PATTERN.test(key) ||
     ENV_SECRET_KEY_PATTERN.test(key) ||
@@ -107,6 +109,7 @@ function isValueReference(value: string): boolean {
     ) ||
     value.startsWith("${") ||
     value.startsWith("{{") ||
+    value.startsWith("<") ||
     value.startsWith("[redacted")
   );
 }
@@ -115,14 +118,41 @@ function isKnownIdentifier(value: string): boolean {
   return UUID_PATTERN.test(value) || (HEX_LENGTHS.has(value.length) && /^[\da-f]+$/i.test(value));
 }
 
+function isWordlikeIdentifier(value: string): boolean {
+  const name = value.replace(/\.[A-Za-z]{1,8}$/, "");
+  if (!/^[A-Za-z][A-Za-z0-9]*$/.test(name) || !/[A-Z]/.test(name)) return false;
+  const words = [...name.matchAll(/[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\d|$)|\d+/g)];
+  let longWords = 0;
+  let read = 0;
+  for (const word of words) {
+    read += word[0].length;
+    const namedWord = word.index === 0 || /^[A-Z]/.test(word[0]);
+    if (namedWord && /^[A-Za-z]{3,}$/.test(word[0])) longWords += 1;
+  }
+  if (read !== name.length) return false;
+  return longWords >= 2 || (longWords >= 1 && /^[A-Z]\d/.test(name));
+}
+
+function isOrdinaryAnswerIdentifier(value: string): boolean {
+  if (isWordlikeIdentifier(value)) return true;
+  return (
+    /^[a-z][a-z0-9]*(?:[-_.](?:[a-z][a-z0-9]*|\d+)){1,}$/.test(value) ||
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})$/.test(value) ||
+    /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/.test(value)
+  );
+}
+
+function isCodeValue(value: string): boolean {
+  return (
+    isWordlikeIdentifier(value) ||
+    /^(?:[A-Za-z_$][\w$]*\.)+[A-Za-z_$][\w$]*$/.test(value) ||
+    /^(?:[A-Za-z_$][\w$]*\.)*[A-Za-z_$][\w$]*\([^)]*\)(?:\.[A-Za-z_$][\w$]*)?$/.test(value)
+  );
+}
+
 function isSafeLocation(value: string): boolean {
   if (/^(?:[A-Za-z][A-Za-z0-9+.-]{1,31}:\/\/|\/|\.\.?\/|~\/|[A-Za-z]:\\)/.test(value)) return true;
-  if (!value.includes("/")) return false;
-  return value
-    .split("/")
-    .every((part) =>
-      /^(?:[a-z0-9_.-]+|(?:[A-Z]?[a-z]{2,})(?:[A-Z][a-z]{2,})*[0-9]*(?:\.[a-z]{1,8})?)$/.test(part),
-    );
+  return isWordlikePath(value);
 }
 
 function isShapedValue(value: string, minimum = 8): boolean {
@@ -130,6 +160,7 @@ function isShapedValue(value: string, minimum = 8): boolean {
     value.length >= minimum &&
     !isValueReference(value) &&
     !isSafeLocation(value) &&
+    !isCodeValue(value) &&
     isTokenValue(value) &&
     /[A-Za-z]/.test(value) &&
     /\d/.test(value)
@@ -137,36 +168,36 @@ function isShapedValue(value: string, minimum = 8): boolean {
 }
 
 function isSecretAssignment({ key, value, query }: AssignmentCandidate): boolean {
-  if (isExcludedKey(key) || isValueReference(value) || NON_SECRET_VALUE.test(value)) {
+  if (isExcludedKey(key) || isValueReference(value)) {
     return false;
   }
-  const secretKey = SECRET_KEY_PATTERN.test(key);
+  if (isPasswordKey(key)) return value !== "" && !NON_SECRET_PASSWORD_VALUE.test(value);
+  if (NON_SECRET_VALUE.test(value)) return false;
+  if (query) return isSecretQueryAssignment(key, value);
+  const secretKey = SECRET_KEY_PATTERN.test(keyWords(key));
   const tokenKey =
     TOKEN_KEY_PATTERN.test(key) ||
     ENV_TOKEN_KEY_PATTERN.test(key) ||
     ENV_SECRET_KEY_PATTERN.test(key);
-  if (query) {
-    const secretQueryKey = secretKey || tokenKey;
-    return (
-      secretQueryKey &&
-      !SIGNED_URL_SIGNER_PARAM.test(key) &&
-      value.length >= 8 &&
-      isTokenValue(value)
-    );
-  }
-  const passphrase =
-    /(?:password|passwd|passphrase)$/i.test(key) &&
-    /^[A-Za-z]{2,}(?:-[A-Za-z]{2,}){2,}$/.test(value);
-  if (passphrase) return true;
-  if (!isTokenValue(value) || isDottedCode(value)) return false;
+  if (!isTokenValue(value) || isDottedCode(value) || isSafeLocation(value) || isCodeValue(value))
+    return false;
   if (DIAGNOSTIC_SECRET_KEY.test(key)) return value.length >= 8;
-  if (secretKey) return value.length >= 8;
+  if (secretKey) return isShapedValue(value);
   if (ENV_SECRET_KEY_PATTERN.test(key)) return isShapedValue(value);
   return (
     tokenKey &&
     value.length >= 16 &&
     /^[A-Za-z0-9+/=_%-][A-Za-z0-9+/=_.%-]*[A-Za-z0-9+/=_%-]$/.test(value)
   );
+}
+
+function isSecretQueryAssignment(key: string, value: string): boolean {
+  const queryKey =
+    SECRET_KEY_PATTERN.test(keyWords(key)) ||
+    TOKEN_KEY_PATTERN.test(key) ||
+    ENV_TOKEN_KEY_PATTERN.test(key) ||
+    ENV_SECRET_KEY_PATTERN.test(key);
+  return queryKey && !SIGNED_URL_SIGNER_PARAM.test(key) && value.length >= 8 && isTokenValue(value);
 }
 
 export interface SecretPromptSpan {
@@ -266,12 +297,37 @@ function detectionView(text: string): DetectionView {
 
 function credentialRequest(line: string): boolean {
   const clean = line.replace(/[*_~`#[\]]/g, "").trim();
-  if (FIELD_TITLE_PATTERN.test(clean) || FIELD_QUALIFIER_PATTERN.test(clean)) return true;
-  const request =
-    IMPERATIVE_CREDENTIAL_PATTERN.exec(clean) ?? INTERROGATIVE_CREDENTIAL_PATTERN.exec(clean);
-  if (!request) return false;
-  const before = clean.slice(0, request.index);
-  return /(?:^|[.!?:,]\s*)(?:please\s+|(?:can|could|would)\s+you\s+)?$/i.test(before);
+  if (/^(?:keys?|tokens?|secret)\s*[:?]?$/i.test(clean)) return true;
+  for (const noun of clean.matchAll(QUALIFIED_CREDENTIAL_PATTERN)) {
+    // Only a bounded final qualifier can complete a request; skip earlier mentions in one pass.
+    if (clean.length - noun.index - noun[0].length > 256) continue;
+    const before = clean.slice(0, noun.index).trim();
+    const after = clean.slice(noun.index + noun[0].length).trim();
+    if (CREDENTIAL_DISCUSSION_PATTERN.test(after)) continue;
+    const ending =
+      /^(?:(?:value|please|required|optional|needed)\s*)?(?:\((?:required|optional)\)\s*)?(?:(?:for|of|on)\s+[^.!?\n]{1,128}|to\s+(?:continue|proceed|sign\s+in|log\s+in))?\s*[:?.]?$/i.test(
+        after,
+      );
+    if (!ending) continue;
+    const title =
+      (before === "" || /^[A-Za-z0-9_.-]+(?:\s+[A-Za-z0-9_.-]+){0,7}$/.test(before)) &&
+      !/\b(?:what|which|is|are|should|can|could|would|need|want|think|review|reset|manager|manage|use|using|check|discuss|explain|enter|paste|provide|type|supply|give|send|share|input)\b/i.test(
+        before,
+      );
+    if (title) return true;
+    const imperative =
+      /\b(?:enter|paste|provide|type|supply|give|send|share|input)(?:\s+[A-Za-z0-9_.-]+){0,8}$/i.exec(
+        before,
+      );
+    const interrogative = /\bwhat(?:'s|\s+is|\s+are)(?:\s+(?!a\b|an\b)[A-Za-z0-9_.-]+){1,8}$/i.exec(
+      before,
+    );
+    const request = imperative ?? interrogative;
+    if (!request) continue;
+    const prefix = before.slice(0, request.index);
+    if (/(?:^|[.!?:,]\s*)(?:please\s+|(?:can|could|would)\s+you\s+)?$/i.test(prefix)) return true;
+  }
+  return false;
 }
 
 function requestsCredential(context: string): boolean {
@@ -299,9 +355,12 @@ function isLiteralCharacter(view: DetectionView | undefined, index: number): boo
 
 function assignedValueEnd(text: string, start: number, view?: DetectionView): number {
   let end = start;
+  const opening = text[start - 1];
+  const quote = opening === '"' || opening === "'";
+  const openingLiteral = isLiteralCharacter(view, start - 1);
   while (end < text.length) {
-    const delimiter = /[\s'"`;:,}\]\\()[<>?&#]/.test(text[end]!);
-    if (delimiter && isLiteralCharacter(view, end)) break;
+    if (quote && text[end] === opening && isLiteralCharacter(view, end) === openingLiteral) break;
+    if (!quote && /\s/.test(text[end]!) && isLiteralCharacter(view, end)) break;
     end += 1;
   }
   return end;
@@ -397,7 +456,13 @@ function labelledValueSpans(
     while (end > start && text[end - 1] === ".") end -= 1;
     const value = assignedValue(text, start, end, view);
     const passphrase = /^[A-Za-z]{2,}(?:-[A-Za-z]{2,}){2,}$/.test(value);
-    if (isShapedValue(value) || passphrase) spans.push({ start, end });
+    const passwordLabel = /\b(?:password|passwd|passphrase|passcode|pin)\b/i.test(match[0]);
+    const passwordValue =
+      passwordLabel &&
+      value !== "" &&
+      !isValueReference(value) &&
+      !NON_SECRET_PASSWORD_VALUE.test(value);
+    if (passwordValue || isShapedValue(value) || passphrase) spans.push({ start, end });
     scanner.lastIndex = Math.max(scanner.lastIndex, next);
   }
   return spans;
@@ -476,7 +541,13 @@ function cookieSpans(text: string, view?: DetectionView): SecretPromptSpan[] {
     let entry: RegExpExecArray | null;
     while ((entry = entries.exec(line)) !== null) {
       const valueStart = start + entry.index + entry[0].length;
-      const valueEnd = Math.min(end, assignedValueEnd(text, valueStart, view));
+      let valueEnd = Math.min(end, assignedValueEnd(text, valueStart, view));
+      for (let index = valueStart; index < valueEnd; index += 1) {
+        if (text[index] === ";" && isLiteralCharacter(view, index)) {
+          valueEnd = index;
+          break;
+        }
+      }
       const value = assignedValue(text, valueStart, valueEnd, view);
       if (isShapedValue(value)) spans.push({ start: valueStart, end: valueEnd });
       entries.lastIndex = Math.max(entries.lastIndex, valueEnd - start);
@@ -498,7 +569,13 @@ function entropyOf(value: string): number {
 }
 
 function isEntropyValue(value: string): boolean {
-  if (value.length < 32 || isKnownIdentifier(value) || isWordlikePath(value)) return false;
+  if (
+    value.length < 32 ||
+    isKnownIdentifier(value) ||
+    isWordlikePath(value) ||
+    isWordlikeIdentifier(value)
+  )
+    return false;
   const mixed = /[A-Z]/.test(value) && /[a-z]/.test(value) && /\d/.test(value);
   if (!mixed || !isTokenValue(value)) return false;
   return entropyOf(value) >= 3.5;
@@ -506,16 +583,28 @@ function isEntropyValue(value: string): boolean {
 
 function isWordlikePath(value: string): boolean {
   if (!value.includes("/")) return false;
-  return value
-    .split("/")
-    .every(
-      (part) =>
-        part === "" ||
-        isKnownIdentifier(part) ||
-        /^(?:[a-z0-9_.-]+|(?:[A-Z]?[a-z]{2,})(?:[A-Z][a-z]{2,})*[0-9]*(?:\.[a-z]{1,8})?)$/.test(
-          part,
-        ),
-    );
+  const parts = value.split("/").filter((part) => part !== "");
+  const readableDirectory = /^(?:[a-z][a-z0-9_.-]*|[A-Z][a-z]{1,23})$/.test(parts[0] ?? "");
+  const filename = /\.[A-Za-z][A-Za-z0-9]{0,7}$/.test(parts[parts.length - 1] ?? "");
+  if (!readableDirectory && !filename) return false;
+  if (parts.every(isWordlikePathSegment)) return true;
+  // Two readable directories establish a local path even when generated filenames are opaque.
+  return (
+    parts.length >= 3 &&
+    isWordlikePathSegment(parts[0]!) &&
+    isWordlikePathSegment(parts[1]!) &&
+    parts.every((part) => !/[+=]/.test(part))
+  );
+}
+
+function isWordlikePathSegment(part: string): boolean {
+  return (
+    isWordlikeIdentifier(part) ||
+    isKnownIdentifier(part) ||
+    /^[A-Za-z]{1,24}$/.test(part) ||
+    /^[a-z0-9_.-]+$/.test(part) ||
+    /^[a-z][a-z0-9]*(?:-[a-z][a-z0-9]*){1,}-[A-Za-z0-9]+$/.test(part)
+  );
 }
 
 function entropySpans(text: string): SecretPromptSpan[] {
@@ -659,6 +748,7 @@ export function redactSecretAnswer(text: string, context?: string): string {
     /[A-Za-z]/.test(text) &&
     /\d/.test(text) &&
     !isKnownIdentifier(text) &&
+    !isOrdinaryAnswerIdentifier(text) &&
     !isSafeLocation(text) &&
     !isValueReference(text) &&
     !/^(?:data:|sha(?:1|224|256|384|512)-)/i.test(text);

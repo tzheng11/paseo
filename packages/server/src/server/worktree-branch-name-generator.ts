@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { redactSecretPrompt } from "@getpaseo/protocol/secret-answer";
 import type { FirstAgentContext } from "@getpaseo/protocol/messages";
 import type { AgentManager } from "./agent/agent-manager.js";
 import {
@@ -92,10 +93,11 @@ export interface GeneratedWorkspaceName {
 export async function generateBranchNameFromFirstAgentContext(
   options: GenerateBranchNameFromFirstAgentContextOptions,
 ): Promise<GeneratedWorkspaceName | null> {
-  const seed = buildAgentBranchNameSeed(options.firstAgentContext);
-  if (!seed) {
+  const rawSeed = buildAgentBranchNameSeed(options.firstAgentContext);
+  if (!rawSeed) {
     return null;
   }
+  const seed = redactSecretPrompt(rawSeed);
 
   const generator =
     options.deps?.generateStructuredAgentResponseWithFallback ??

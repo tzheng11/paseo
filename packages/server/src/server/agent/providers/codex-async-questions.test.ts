@@ -495,3 +495,27 @@ for (const active of [true, false]) {
     },
   );
 }
+
+test("an offered synthetic credential-shaped choice reaches Codex and persistence unchanged", async () => {
+  const value = "sk-proj-" + "Synthetic1".repeat(8);
+  const item = { ...questionItem, questions: [{ title: "Enter your password", options: [value] }] };
+  const { session, appServer, ask } = await setup(undefined, false, item);
+  const { manager, agent } = await manage(session);
+  try {
+    await ask();
+    const [permission] = session.getPendingPermissions();
+    await manager.respondToPermission(agent.id, permission.id, {
+      behavior: "allow",
+      updatedInput: { answers: { "Question 1": value } },
+    });
+    await manager.flush();
+    expect(manager.getAgent(agent.id)?.persistence?.metadata?.asyncQuestions).toMatchObject([
+      { resolution: [value] },
+    ]);
+    expect(
+      JSON.stringify(appServer.requests().filter((request) => request.method === "turn/steer")),
+    ).toContain(value);
+  } finally {
+    await manager.closeAgent(agent.id);
+  }
+});

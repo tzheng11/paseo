@@ -7,6 +7,7 @@ import type {
 import {
   redactPermissionResponse,
   redactPromptInput,
+  redactFirstAgentContext,
   SECRET_ANSWER_NOTICE,
 } from "./secret-answer.js";
 
@@ -26,6 +27,141 @@ const request: AgentPermissionRequest = {
 };
 
 describe("permission answer sanitization", () => {
+  test("offered string and object choices survive even when credential-shaped or requested", () => {
+    const offered = ["aB3dE7gH9kLmN2pQ5rT8", "sk-proj-" + "Synthetic1".repeat(8)];
+    for (const option of offered) {
+      for (const options of [
+        [option],
+        [{ label: option }],
+        [{ value: option, label: "Use existing" }],
+      ]) {
+        const question = {
+          ...request,
+          input: { questions: [{ header: "Password", question: "Enter your password", options }] },
+        };
+        for (const answers of [{ Password: option }, [option], { "Enter your password": option }]) {
+          const response: AgentPermissionResponse = {
+            behavior: "allow",
+            updatedInput: { answers },
+          };
+          expect(redactPermissionResponse(response, question)).toEqual(response);
+        }
+      }
+    }
+  });
+
+  test("standalone question choices are preserved in direct answer fields", () => {
+    const option = "aB3dE7gH9kLmN2pQ5rT8";
+    const question = { ...request, title: "Password", input: { options: [{ label: option }] } };
+    const response: AgentPermissionResponse = {
+      behavior: "allow",
+      updatedInput: { answer: option },
+    };
+    expect(redactPermissionResponse(response, question)).toEqual(response);
+  });
+
+  test("full question keys isolate ordinary neighbours from a password question", () => {
+    const question = {
+      ...request,
+      input: {
+        questions: [
+          { question: "Which region?", header: "Region" },
+          { question: "What is your password?", header: "Password" },
+        ],
+      },
+    };
+    expect(
+      redactPermissionResponse(
+        {
+          behavior: "allow",
+          updatedInput: {
+            answers: {
+              "Which region?": "us-east-1",
+              "What is your password?": "hunter2x",
+            },
+          },
+        },
+        question,
+      ),
+    ).toEqual({
+      behavior: "allow",
+      updatedInput: {
+        answers: {
+          "Which region?": "us-east-1",
+          "What is your password?": SECRET_ANSWER_NOTICE,
+        },
+      },
+    });
+  });
+
+  test.each([
+    "What is the root password?",
+    "What is the sudo password?",
+    "What is the admin password?",
+    "What is the database password?",
+    "Enter the VPN password",
+    "Enter your password to continue",
+    "Please enter the password for mac-mini-1",
+    "Password for mac-mini-1?",
+    "What is the password for this server?",
+    "Enter your GitHub password",
+    "What is the SSH passphrase?",
+    "Admin password",
+    "Sudo password:",
+    "Provide the admin PIN to continue",
+    "Paste your SSH token for mac-mini-1",
+    "Enter token",
+    "Paste your tokens",
+    "Provide the secret",
+    "What is your PIN?",
+  ])("withholds direct value requests through structured permission answers (%#)", (text) => {
+    const question = { ...request, input: { questions: [{ header: "Account", question: text }] } };
+    const response: AgentPermissionResponse = {
+      behavior: "allow",
+      updatedInput: { answers: { Account: "xK9#mP2$vL5q" } },
+    };
+    expect(redactPermissionResponse(response, question)).toEqual({
+      behavior: "allow",
+      updatedInput: { answers: { Account: SECRET_ANSWER_NOTICE } },
+    });
+  });
+
+  test.each([
+    ["Should I reset the password?", "yes, go ahead"],
+    ["Which password manager do you use?", "1Password"],
+  ])("keeps replies to credential discussion (%#)", (text, value) => {
+    const question = { ...request, input: { questions: [{ header: "Account", question: text }] } };
+    const response: AgentPermissionResponse = {
+      behavior: "allow",
+      updatedInput: { answers: { Account: value } },
+    };
+    expect(redactPermissionResponse(response, question)).toEqual(response);
+  });
+
+  test.each([
+    "claude-sonnet-5-5",
+    "release-2026-11-01",
+    "iss-6389-secret-answers",
+    "us-east-1-production",
+    "postgres-16-alpine",
+    "2026-11-01T21:40:48Z",
+    "user2@example-company.com",
+    "Button2Component.tsx",
+  ])("preserves ordinary structured identifiers in answers and feedback (%#)", (value) => {
+    const question = {
+      ...request,
+      input: { questions: [{ header: "Choice", question: "Which one?" }] },
+    };
+    const response: AgentPermissionResponse = {
+      behavior: "allow",
+      updatedInput: { answers: { Choice: value } },
+    };
+    expect(redactPermissionResponse(response, question)).toEqual(response);
+    expect(redactPermissionResponse({ behavior: "deny", message: value })).toEqual({
+      behavior: "deny",
+      message: value,
+    });
+  });
   test("withholds only the answer to the sensitive question", () => {
     const response: AgentPermissionResponse = {
       behavior: "allow",
@@ -232,6 +368,20 @@ describe("permission answer sanitization", () => {
   });
 });
 
+describe("first prompt naming context", () => {
+  test("sanitizes a copied naming seed while retaining ordinary bytes", () => {
+    const context = { prompt: "Deploy with password=Xy7kL9mQ2vR4tZ1", attachments: undefined };
+    expect(redactFirstAgentContext(context)).toEqual({
+      ...context,
+      prompt: `Deploy with password=${SECRET_ANSWER_NOTICE}`,
+    });
+    expect(context.prompt).toContain("Xy7kL9mQ2vR4tZ1");
+    expect(redactFirstAgentContext({ prompt: "Deploy ordinary source" })).toEqual({
+      prompt: "Deploy ordinary source",
+    });
+  });
+});
+
 describe("chat and steering answer sanitization", () => {
   test.each([
     [
@@ -246,11 +396,17 @@ describe("chat and steering answer sanitization", () => {
   });
 
   test("redacts secret spans and single-token replies to the latest strict credential request", () => {
+    const aws = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+    expect(redactPromptInput(`export AWS_SECRET_ACCESS_KEY=${aws}\nnext line stays`)).toBe(
+      `export AWS_SECRET_ACCESS_KEY=${SECRET_ANSWER_NOTICE}\nnext line stays`,
+    );
     expect(redactPromptInput(syntheticKey)).toBe(SECRET_ANSWER_NOTICE);
     expect(redactPromptInput(`Keep this prefix ${syntheticKey} and this suffix.`)).toBe(
       `Keep this prefix ${SECRET_ANSWER_NOTICE} and this suffix.`,
     );
     expect(redactPromptInput("x", "Enter your password:")).toBe(SECRET_ANSWER_NOTICE);
+    expect(redactPromptInput("x", "Enter token")).toBe(SECRET_ANSWER_NOTICE);
+    expect(redactPromptInput("x", "Provide the secret")).toBe(SECRET_ANSWER_NOTICE);
     expect(redactPromptInput("Use the existing configuration", "Enter your password:")).toBe(
       "Use the existing configuration",
     );
@@ -331,7 +487,7 @@ describe("chat and steering answer sanitization", () => {
   test.each([
     "Should password validation be enabled?",
     "Which token budget should we use?",
-    "Enter token",
+    "Should we enter token validation mode?",
     "Enter the token budget",
     "I updated the API key validation code.",
     "Enter your password. Then explain how you will test.",

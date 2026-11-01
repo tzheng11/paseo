@@ -64,3 +64,49 @@ test("auto-name preserves workspace archival that lands during its metadata writ
     archivedAt,
   });
 });
+
+test("first-prompt workspace naming receives sanitized context and preserves ordinary titles", async () => {
+  const secret = `sk-proj-${"Synthetic1_".repeat(8)}`;
+  for (const prompt of [`Deploy with ${secret} then verify.`, "Fix the login flow"]) {
+    let workspace = createPersistedWorkspaceRecord({
+      workspaceId: "workspace-first-prompt",
+      projectId: "project-first-prompt",
+      cwd: "/workspace",
+      kind: "directory",
+      displayName: "workspace",
+      createdAt: "2026-08-08T00:00:00.000Z",
+      updatedAt: "2026-08-08T00:00:00.000Z",
+    });
+    const emitted = deferred();
+    const contexts: unknown[] = [];
+    const autoName = new WorkspaceAutoName({
+      agentManager: {} as AgentManager,
+      workspaceRegistry: {
+        update: async (_id, updater) => {
+          workspace = updater(workspace);
+          return workspace;
+        },
+      },
+      workspaceGitService: {} as WorkspaceGitService,
+      providerSnapshotManager: {} as ProviderSnapshotManager,
+      readDaemonConfig: () => ({}),
+      gitMutation: { notifyGitMutation: async () => {} },
+      emitWorkspaceUpdateForCwd: async () => {},
+      emitWorkspaceUpdateForWorkspaceId: async () => emitted.resolve(),
+      logger: pino({ level: "silent" }),
+      generateWorkspaceName: async ({ firstAgentContext }) => {
+        contexts.push(firstAgentContext);
+        return { title: firstAgentContext?.prompt ?? "", branch: null };
+      },
+    });
+    autoName.scheduleForDirectory({
+      workspaceId: workspace.workspaceId,
+      cwd: workspace.cwd,
+      firstAgentContext: { prompt },
+    });
+    await emitted.promise;
+    expect(JSON.stringify(contexts)).not.toContain(secret);
+    expect(JSON.stringify(workspace)).not.toContain(secret);
+    expect(workspace.title).toContain(prompt.includes(secret) ? "[redacted:secret]" : prompt);
+  }
+});

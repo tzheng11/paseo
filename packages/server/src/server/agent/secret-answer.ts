@@ -1,4 +1,5 @@
 import { AgentAttachmentSchema, TextAttachmentSchema } from "@getpaseo/protocol/messages";
+import type { FirstAgentContext } from "@getpaseo/protocol/messages";
 import {
   redactSecretAnswer,
   redactSecretKey,
@@ -28,10 +29,30 @@ interface ScanBudget {
   characters: number;
 }
 
-interface AnswerContext {
+interface QuestionAnswerContext {
   text: string;
-  questions: ReadonlyMap<string, string>;
+  options: ReadonlySet<string>;
+}
+
+interface AnswerContext extends QuestionAnswerContext {
+  questions: ReadonlyMap<string, QuestionAnswerContext>;
   answerMap: boolean;
+}
+
+const NO_OPTIONS: ReadonlySet<string> = new Set();
+
+function offeredOptions(value: unknown): ReadonlySet<string> {
+  const options = new Set<string>();
+  if (!Array.isArray(value)) return options;
+  for (const option of value) {
+    if (typeof option === "string") options.add(option);
+    else if (isRecord(option)) {
+      for (const label of [option.label, option.value, option.id]) {
+        if (typeof label === "string") options.add(label);
+      }
+    }
+  }
+  return options;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -49,15 +70,24 @@ function isSecretMetadataAssignment(key: string, value: unknown): boolean {
   return redactSecretKey(assignment) !== assignment;
 }
 
-function questionContexts(request?: AgentPermissionRequest): ReadonlyMap<string, string> {
-  const contexts = new Map<string, string>();
+function questionContexts(
+  request?: AgentPermissionRequest,
+): ReadonlyMap<string, QuestionAnswerContext> {
+  const contexts = new Map<string, QuestionAnswerContext>();
   const questions = request?.input?.questions;
-  if (!Array.isArray(questions)) return contexts;
+  if (!Array.isArray(questions)) {
+    contexts.set("", {
+      text: requestContext(request),
+      options: offeredOptions(request?.input?.options),
+    });
+    return contexts;
+  }
   if (questions.length > MAX_ENTRIES) {
-    contexts.set("", "password");
+    contexts.set("", { text: "password", options: NO_OPTIONS });
     return contexts;
   }
   const allContexts: string[] = [];
+  const allOptions = new Set<string>();
   let characters = 0;
   for (const [index, question] of questions.entries()) {
     if (!isRecord(question)) continue;
@@ -72,15 +102,28 @@ function questionContexts(request?: AgentPermissionRequest): ReadonlyMap<string,
       .filter((part) => part !== undefined)
       .join("\n");
     characters += text.length;
-    if (characters > MAX_CHARACTERS) return new Map([["", "password"]]);
+    if (characters > MAX_CHARACTERS)
+      return new Map([["", { text: "password", options: NO_OPTIONS }]]);
     allContexts.push(text);
-    contexts.set(String(index), text);
-    contexts.set(`Question ${index + 1}`, text);
-    for (const identifier of [question.id, question.header, question.title]) {
-      if (typeof identifier === "string") contexts.set(identifier, text);
+    const options = offeredOptions(question.options);
+    for (const option of options) allOptions.add(option);
+    const context = { text, options };
+    contexts.set(String(index), context);
+    contexts.set(`Question ${index + 1}`, context);
+    for (const identifier of [
+      question.id,
+      question.header,
+      question.title,
+      question.question,
+      question.prompt,
+    ]) {
+      if (typeof identifier === "string") {
+        contexts.set(identifier, context);
+        contexts.set(identifier.trim(), context);
+      }
     }
   }
-  contexts.set("", allContexts.join("\n"));
+  contexts.set("", { text: allContexts.join("\n"), options: allOptions });
   return contexts;
 }
 
@@ -118,6 +161,7 @@ function redactValue(
   if (depth > MAX_DEPTH || budget.entries <= 0) return SECRET_ANSWER_NOTICE;
   budget.entries -= 1;
   if (typeof value === "string") {
+    if (context.options.has(value)) return value;
     budget.characters -= value.length;
     if (budget.characters < 0) return SECRET_ANSWER_NOTICE;
     return redactSecretAnswer(value, context.text);
@@ -126,9 +170,8 @@ function redactValue(
     if (value.length > budget.entries) return SECRET_ANSWER_NOTICE;
     return value.map((item, index) => {
       if (!context.answerMap) return redactValue(item, context, budget, depth + 1);
-      const text =
-        context.questions.get(String(index)) ?? context.questions.get("") ?? context.text;
-      const itemContext = { ...context, text, answerMap: false };
+      const question = context.questions.get(String(index)) ?? context.questions.get("");
+      const itemContext = { ...context, ...question, answerMap: false };
       return redactValue(item, itemContext, budget, depth + 1);
     });
   }
@@ -156,14 +199,16 @@ function redactObject(
     const namedSecret = !context.answerMap && isExplicitSecretKey(key);
     const answerField = /^(?:answer|text|message|feedback)$/.test(key);
     const directAnswer = answerField ? context.questions.get("") : undefined;
-    let text = question ?? directAnswer ?? context.text;
-    if (namedSecret) text = "password";
+    const valueContext = question ?? directAnswer ?? context;
     const nextContext = {
-      text,
+      ...valueContext,
+      text: namedSecret ? "password" : valueContext.text,
       questions: context.questions,
       answerMap: key === "answers" && !context.answerMap,
     };
-    const assignmentWasWithheld = !context.answerMap && isSecretMetadataAssignment(key, item);
+    const offered = typeof item === "string" && nextContext.options.has(item);
+    const assignmentWasWithheld =
+      !offered && !context.answerMap && isSecretMetadataAssignment(key, item);
     const safeValue =
       keyWasWithheld || assignmentWasWithheld
         ? SECRET_ANSWER_NOTICE
@@ -191,23 +236,36 @@ export function redactPermissionResponse(
 ): AgentPermissionResponse {
   const text = requestContext(request);
   const questions = questionContexts(request);
-  const context = { text, questions, answerMap: false };
+  const context = {
+    text,
+    questions,
+    options: Array.isArray(request?.input?.questions)
+      ? NO_OPTIONS
+      : (questions.get("")?.options ?? NO_OPTIONS),
+    answerMap: false,
+  };
   const selectedActionId = response.selectedActionId;
   const safeAction =
     selectedActionId === undefined ? {} : { selectedActionId: redactSecretKey(selectedActionId) };
   if (response.behavior === "deny") {
-    const questionText = [...questions.values()].join("\n");
+    const questionText = [...questions.values()].map((question) => question.text).join("\n");
     const messageContext = `${text}\n${questionText}`;
     const message = response.message;
     const safeMessage =
-      message === undefined ? {} : { message: redactSecretAnswer(message, messageContext) };
+      message === undefined
+        ? {}
+        : {
+            message: questions.get("")?.options.has(message)
+              ? message
+              : redactSecretAnswer(message, messageContext),
+          };
     return { ...response, ...safeAction, ...safeMessage };
   }
   const updatedInput = response.updatedInput;
   const safeInput =
     updatedInput === undefined ? {} : { updatedInput: redactMetadata(updatedInput, context) };
   const updatedPermissions = response.updatedPermissions;
-  const permissionContext = { text: "", questions, answerMap: false };
+  const permissionContext = { text: "", questions, options: NO_OPTIONS, answerMap: false };
   const safePermissions =
     updatedPermissions === undefined
       ? {}
@@ -231,6 +289,21 @@ function redactPromptMetadata(value: unknown): unknown {
     redactPromptMetadata(item),
   ]);
   return Object.fromEntries(entries);
+}
+
+/** Name generation receives the same safe prompt and attachment values as a provider turn. */
+export function redactFirstAgentContext(context: FirstAgentContext): FirstAgentContext {
+  return {
+    ...context,
+    ...(context.prompt === undefined ? {} : { prompt: redactSecretPrompt(context.prompt) }),
+    ...(context.attachments === undefined
+      ? {}
+      : {
+          attachments: context.attachments.map((attachment) =>
+            AgentAttachmentSchema.parse(redactPromptMetadata(attachment)),
+          ),
+        }),
+  };
 }
 
 interface PromptTextCursor {
