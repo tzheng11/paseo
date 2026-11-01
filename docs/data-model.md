@@ -146,8 +146,9 @@ shared answer boundary before provider dispatch and snapshot persistence. A reco
 or an answer to a strict credential request replaces that entire field with a notice directing
 you to a secret store. Neutral questions also withhold a whole-field single token of at least 16
 characters mixing letters and digits, except ordinary identifiers (including version/region slugs,
-timestamps, emails and file names), hashes, UUIDs and safe URLs or paths. Exact choices offered by
-the agent always pass through. Question text, header and positional keys resolve the context for
+timestamps, emails and file names), hashes, UUIDs, lowercase-prefix-plus-hex IDs such as `wks_<hex>`
+and `prj_<hex>`, and safe URLs or paths. Known credential prefixes take precedence over the hex-ID
+exemption. Exact choices offered by the agent always pass through. Question text, header and positional keys resolve the context for
 each answer independently. Structured metadata retains depth and size caps and fails closed at
 those limits.
 
@@ -171,7 +172,10 @@ preserving the active editor. Ordinary assignment values, placeholders and envir
 remain text. Outside URLs, labelled values retain punctuation until whitespace or their matching
 closing quote, so redaction cannot expose a suffix. Credential assignment keys must end at a word
 or case boundary; paths, calls, member expressions and wordlike types are ordinary key/token
-values. First-prompt titles, workspace naming seeds and log previews receive the redacted copy
+values. Labelled tokens of at least 16 characters mixing upper case, lower case, digits and symbols
+are protected, including quoted values. A pass assignment is protected only for a token-shaped
+value, so ordinary prose such as "pass: 3 tests" stays text. First-prompt titles, workspace naming
+seeds and log previews receive the redacted copy
 before truncation or generation. Existing stored conversations are not rewritten by this control.
 
 ### Nested: AgentFeature (discriminated union on `type`)

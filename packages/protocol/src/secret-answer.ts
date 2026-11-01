@@ -6,7 +6,7 @@ const MAX_NORMALIZATION_PASSES = 16;
 
 // Ported from Studio's redact-segment-secrets.ts on origin/develop (8e33d51882ca).
 // Answers use whole-field withholding rather than transcript substring replacement.
-const SECRET_KEY_WORDS = String.raw`key|secret|hmac|passwd|password|passphrase|passcode|pin|credentials?|private[_-]?key|access[_-]?key|api[_-]?key|auth[_-]?token|bearer[_-]?token|session[_-]?token`;
+const SECRET_KEY_WORDS = String.raw`key|secret|hmac|pass|passwd|password|passphrase|passcode|pin|credentials?|private[_-]?key|access[_-]?key|api[_-]?key|auth[_-]?token|bearer[_-]?token|session[_-]?token`;
 const LITERAL_PATTERNS: readonly RegExp[] = [
   /\bGOOG[0-9A-Z]{12,60}\b/,
   /\b(?:AKIA|ASIA)[0-9A-Z]{12,60}\b/,
@@ -115,7 +115,11 @@ function isValueReference(value: string): boolean {
 }
 
 function isKnownIdentifier(value: string): boolean {
-  return UUID_PATTERN.test(value) || (HEX_LENGTHS.has(value.length) && /^[\da-f]+$/i.test(value));
+  return (
+    UUID_PATTERN.test(value) ||
+    (HEX_LENGTHS.has(value.length) && /^[\da-f]+$/i.test(value)) ||
+    /^[a-z]+_[\da-fA-F]+$/.test(value)
+  );
 }
 
 function isWordlikeIdentifier(value: string): boolean {
@@ -167,6 +171,16 @@ function isShapedValue(value: string, minimum = 8): boolean {
   );
 }
 
+function isMixedSymbolToken(value: string): boolean {
+  return (
+    value.length >= 16 &&
+    /[A-Z]/.test(value) &&
+    /[a-z]/.test(value) &&
+    /\d/.test(value) &&
+    /[^A-Za-z0-9\s]/.test(value)
+  );
+}
+
 function isSecretAssignment({ key, value, query }: AssignmentCandidate): boolean {
   if (isExcludedKey(key) || isValueReference(value)) {
     return false;
@@ -179,7 +193,13 @@ function isSecretAssignment({ key, value, query }: AssignmentCandidate): boolean
     TOKEN_KEY_PATTERN.test(key) ||
     ENV_TOKEN_KEY_PATTERN.test(key) ||
     ENV_SECRET_KEY_PATTERN.test(key);
-  if (!isTokenValue(value) || isDottedCode(value) || isSafeLocation(value) || isCodeValue(value))
+  const mixedSymbolToken = isMixedSymbolToken(value);
+  if (
+    !isTokenValue(value) ||
+    (isDottedCode(value) && !mixedSymbolToken) ||
+    isSafeLocation(value) ||
+    isCodeValue(value)
+  )
     return false;
   if (DIAGNOSTIC_SECRET_KEY.test(key)) return value.length >= 8;
   if (secretKey) return isShapedValue(value);
@@ -187,7 +207,7 @@ function isSecretAssignment({ key, value, query }: AssignmentCandidate): boolean
   return (
     tokenKey &&
     value.length >= 16 &&
-    /^[A-Za-z0-9+/=_%-][A-Za-z0-9+/=_.%-]*[A-Za-z0-9+/=_%-]$/.test(value)
+    (/^[A-Za-z0-9+/=_%-][A-Za-z0-9+/=_.%-]*[A-Za-z0-9+/=_%-]$/.test(value) || mixedSymbolToken)
   );
 }
 

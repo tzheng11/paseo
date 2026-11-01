@@ -394,6 +394,94 @@ describe("expanded synthetic secret matrix", () => {
   });
 });
 
+describe("manager battery 6 calibration", () => {
+  const symbolToken = "Zq8!rT2$wX5&nB7k";
+
+  test.each(["key", "token", "secret", "credential", "apiKey", "pass"])(
+    "redacts complete mixed-symbol values assigned to %s",
+    (key) => {
+      for (const value of [symbolToken, "Zq8.rT2$wX5&nB7k"]) {
+        for (const quote of ["", '"', "'"]) {
+          for (const separator of [": ", " = "]) {
+            const text = key + separator + quote + value + quote + " after";
+            expect(redactSecretPrompt(text)).toBe(text.replace(value, SECRET_ANSWER_NOTICE));
+            expect(redactSecretAnswer(text)).toBe(SECRET_ANSWER_NOTICE);
+          }
+        }
+      }
+    },
+  );
+
+  test.each([
+    "pass: 3 tests",
+    "pass = required",
+    "pass: first",
+    "pass: testSuite1234",
+    "pass: getApiKey1234(config)",
+    "token = getApiKey1234(config)",
+    "secret = config.apiKey1234",
+    "const tokenCount: number = countTokens(text)",
+    "apiKeyName: openai-prod-key-2",
+    "password_policy: min12chars",
+    "SECRET_MANAGER_PROJECT=impower-production",
+    "passwordHash: Argon2Hasher",
+    "credentialsPath = ~/.config/gcloud/adc2.json",
+    "open src/features/s3Upload/Base64Encoder2.ts",
+    "the class Utf8ToUtf16Converter is slow",
+    "run brands/hyperbola/apps/web2/src/app/page.tsx",
+    "use the md5Sum and sha1Digest helpers",
+    "use aB3dE7gH9kL2mN5pQ8rT here",
+  ])("keeps ordinary pass labels, code and accepted chat gaps %#", (text) => {
+    expect(redactSecretPrompt(text)).toBe(text);
+    expect(redactSecretAnswer(text, "Anything else?")).toBe(text);
+  });
+
+  test.each([
+    "wks_9a12e95ee4e4af87",
+    "prj_44e33a8ea8d50705",
+    "task_9A12E95EE4E4AF87",
+    "wks_9a12e95ee4e4af879A12E95EE4E4AF87",
+  ])("keeps prefixed hex IDs in neutral answers and chat %#", (value) => {
+    expect(redactSecretAnswer(value, "Which value?")).toBe(value);
+    expect(redactSecretPrompt("use " + value + " here")).toBe("use " + value + " here");
+    expect(redactSecretAnswer(value, "Enter your password")).toBe(SECRET_ANSWER_NOTICE);
+  });
+
+  test.each(["sk_live_", "sk_test_", "rk_live_", "re_", "hf_", "npm_", "ghp_", "sntrys_"])(
+    "known credential prefix %s wins over a hex suffix",
+    (prefix) => {
+      const value = prefix + "9a12e95ee4e4af87";
+      expect(redactSecretAnswer(value, "Which value?")).toBe(SECRET_ANSWER_NOTICE);
+      expect(redactSecretPrompt("use " + value + " here")).toBe(
+        "use " + SECRET_ANSWER_NOTICE + " here",
+      );
+    },
+  );
+
+  test.each([
+    "Could you give me the staging DB password?",
+    "Type the keychain password",
+    "Provide your Apple ID password",
+    "What is the password for user deploy?",
+    "Paste the API key for Resend",
+    "Enter the 1Password master password",
+    "Router admin password?",
+    "What passcode should I use for the Mac?",
+  ])("withholds new direct request wording %#", (question) => {
+    expect(redactSecretAnswer(symbolToken, question)).toBe(SECRET_ANSWER_NOTICE);
+  });
+
+  test.each([
+    ["Should I rotate the database password now?", "yes, rotate it"],
+    ["Did the password reset email arrive?", "not yet"],
+    ["Which secret store should we use?", "Secret Manager"],
+    ["Do you want me to enter the password?", "no, I will do it"],
+  ])("keeps answers to discussions rather than value requests: %s", (question, answer) => {
+    expect(redactSecretAnswer(answer!, question)).toBe(answer);
+    expect(redactSecretPrompt(answer!, question)).toBe(answer);
+  });
+});
+
 describe("neutral structured answer calibration", () => {
   test.each([syntheticHmac, "aB3dE7gH9kLmN2pQ5rT8", "abc123xyz4567890"])(
     "withholds mixed single-token answers %#",

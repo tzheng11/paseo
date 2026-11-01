@@ -12,6 +12,7 @@ import {
 } from "./secret-answer.js";
 
 const syntheticKey = `sk-proj-${"Synthetic1_".repeat(8)}`;
+const syntheticHexSuffix = "9a12e95ee4e4af8744e33a8ea8d50705";
 const request: AgentPermissionRequest = {
   id: "permission-synthetic",
   provider: "codex",
@@ -25,6 +26,63 @@ const request: AgentPermissionRequest = {
     ],
   },
 };
+
+describe("battery 6 runtime boundary matrix", () => {
+  test.each([
+    ['token = "Zq8!rT2$wX5&nB7k"', `token = "${SECRET_ANSWER_NOTICE}"`],
+    ["token = Zq8!rT2$wX5&nB7k", `token = ${SECRET_ANSWER_NOTICE}`],
+    ["pass: Zq8!rT2$wX5&nB7k", `pass: ${SECRET_ANSWER_NOTICE}`],
+    ["pass: 3 tests", "pass: 3 tests"],
+  ])(
+    "redacts labeled mixed-symbol values while preserving ordinary neighbours (%#)",
+    (prompt, expected) => {
+      expect(redactPromptInput(prompt)).toBe(expected);
+      expect(redactPromptInput([{ type: "text", text: prompt }])).toEqual([
+        { type: "text", text: expected },
+      ]);
+    },
+  );
+
+  test.each([
+    { value: "wks_9a12e95ee4e4af87", withheld: false },
+    { value: "prj_44e33a8ea8d50705", withheld: false },
+    { value: "sk_live_" + syntheticHexSuffix, withheld: true },
+    { value: "re_" + syntheticHexSuffix, withheld: true },
+    { value: "hf_" + syntheticHexSuffix, withheld: true },
+  ])(
+    "distinguishes native identifiers from known credentials with hex suffixes (%#)",
+    ({ value, withheld }) => {
+      const expected = withheld ? SECRET_ANSWER_NOTICE : value;
+      const neutral = {
+        ...request,
+        input: { questions: [{ header: "Choice", question: "Which one?" }] },
+      };
+      expect(
+        redactPermissionResponse(
+          { behavior: "allow", updatedInput: { answers: { Choice: value } } },
+          neutral,
+        ),
+      ).toEqual({
+        behavior: "allow",
+        updatedInput: { answers: { Choice: expected } },
+      });
+      expect(redactPermissionResponse({ behavior: "deny", message: value })).toEqual({
+        behavior: "deny",
+        message: expected,
+      });
+      expect(redactPromptInput(`before ${value} after`)).toBe(`before ${expected} after`);
+    },
+  );
+
+  test("preserves the accepted unlabeled 20-character chat token", () => {
+    const value = "aB3dE7gH9kLmN2pQ5rT8";
+    expect(redactPromptInput(value)).toBe(value);
+    expect(redactPromptInput(`before ${value} after`)).toBe(`before ${value} after`);
+    expect(redactPromptInput([{ type: "text", text: value }])).toEqual([
+      { type: "text", text: value },
+    ]);
+  });
+});
 
 describe("permission answer sanitization", () => {
   test("offered string and object choices survive even when credential-shaped or requested", () => {
