@@ -4169,11 +4169,7 @@ export class Session {
     options?: { spokenInput?: boolean },
   ): Promise<{ ok: true } | { ok: false; error: string }> {
     try {
-      await ensureAgentLoaded(agentId, {
-        agentManager: this.agentManager,
-        agentStorage: this.agentStorage,
-        logger: this.sessionLogger,
-      });
+      await this.loadAgentForMessage(agentId);
       const prepared = await prepareAnswerPromptForDispatch(
         this.agentManager,
         agentId,
@@ -8645,6 +8641,31 @@ export class Session {
     }
   }
 
+  private async loadAgentForMessage(agentId: string): Promise<void> {
+    const record = await this.agentStorage.get(agentId);
+    let archivedAtToRestore: string | null = null;
+    if (
+      record?.archivedAt &&
+      (await unarchiveAgentState(this.agentStorage, this.agentManager, agentId))
+    ) {
+      archivedAtToRestore = record.archivedAt;
+    }
+    try {
+      await ensureAgentLoaded(agentId, {
+        agentManager: this.agentManager,
+        agentStorage: this.agentStorage,
+        logger: this.sessionLogger,
+      });
+    } catch (error) {
+      // Match sendPromptToAgent: interactive sends restore before resuming,
+      // and a failed load leaves an archived agent at its original timestamp.
+      if (archivedAtToRestore) {
+        await this.agentManager.archiveSnapshot(agentId, archivedAtToRestore);
+      }
+      throw error;
+    }
+  }
+
   private async handleSendAgentMessageRequest(
     msg: Extract<SessionInboundMessage, { type: "send_agent_message_request" }>,
   ): Promise<void> {
@@ -8666,11 +8687,7 @@ export class Session {
     try {
       const agentId = resolved.agentId;
 
-      await ensureAgentLoaded(agentId, {
-        agentManager: this.agentManager,
-        agentStorage: this.agentStorage,
-        logger: this.sessionLogger,
-      });
+      await this.loadAgentForMessage(agentId);
       const prompt = await prepareAnswerPromptForDispatch(
         this.agentManager,
         agentId,

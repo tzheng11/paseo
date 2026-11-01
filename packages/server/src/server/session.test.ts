@@ -6537,6 +6537,91 @@ test("a failing direct source observes fire-and-forget file replies without unha
   }
 });
 
+test.each([
+  { surface: "legacy", resumeFails: false },
+  { surface: "request", resumeFails: false },
+  { surface: "legacy", resumeFails: true },
+  { surface: "request", resumeFails: true },
+] as const)(
+  "archived-agent $surface sends match main restoration (resume failure: $resumeFails)",
+  async ({ surface, resumeFails }) => {
+    const directory = mkdtempSync(join(tmpdir(), "session-archived-send-"));
+    const logger = pino({ level: "silent" });
+    const storage = new AgentStorage(join(directory, "agents"), logger);
+    const forwarded: unknown[] = [];
+    const client = createTestAgentClient("codex", {
+      onStartTurn: (prompt) => forwarded.push(prompt),
+    });
+    const resume = client.resumeSession.bind(client);
+    const resumes = vi.spyOn(client, "resumeSession").mockImplementation(async (...args) => {
+      // A send must restore the interactive session first. History-only resume
+      // is not an interchangeable precursor: a provider can reject that mode.
+      if (args[3]?.purpose === "history") {
+        throw new Error("Synthetic provider does not support archived history resume");
+      }
+      if (resumeFails) {
+        throw new Error("Synthetic interactive resume failure");
+      }
+      return resume(...args);
+    });
+    const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({
+      agentManagerInstance: manager,
+      agentStorageInstance: storage,
+      messages,
+    });
+    try {
+      const agent = await manager.createAgent(
+        { provider: "codex", cwd: directory, title: "Archived send" },
+        undefined,
+        { workspaceId: undefined },
+      );
+      const archivedAt = "2026-01-02T00:00:00.000Z";
+      await manager.archiveSnapshot(agent.id, archivedAt);
+      expect(manager.getAgent(agent.id)).toBeNull();
+      if (surface === "legacy") {
+        expect(
+          await asSessionInternals(session).handleSendAgentMessage(agent.id, "Continue"),
+        ).toEqual(
+          resumeFails ? { ok: false, error: "Synthetic interactive resume failure" } : { ok: true },
+        );
+      } else {
+        await session.handleMessage({
+          type: "send_agent_message_request",
+          requestId: "archived-send",
+          agentId: agent.id,
+          text: "Continue",
+        });
+        expect(findByType(messages, "send_agent_message_response")?.payload).toMatchObject({
+          accepted: !resumeFails,
+          error: resumeFails ? "Synthetic interactive resume failure" : null,
+        });
+      }
+      if (!resumeFails) {
+        await manager.waitForAgentEvent(agent.id, { waitForActive: true });
+      }
+      await manager.flush();
+      expect((await storage.get(agent.id))?.archivedAt).toBe(resumeFails ? archivedAt : null);
+      expect(resumes).toHaveBeenCalledTimes(1);
+      expect(resumes.mock.calls[0]?.[3]?.purpose).toBe("interactive");
+      if (resumeFails) {
+        expect(manager.getAgent(agent.id)).toBeNull();
+        expect(forwarded).toEqual([]);
+      } else {
+        expect(JSON.stringify(forwarded)).toContain("Continue");
+      }
+    } finally {
+      await session.cleanup();
+      manager.prepareForShutdown();
+      await Promise.all(manager.listAgents().map((agent) => manager.closeAgent(agent.id)));
+      await manager.flushForShutdown();
+      await storage.flush();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
+
 test("first-prompt secrets are removed before provisional titles and session log prefixes", async () => {
   const directory = mkdtempSync(join(tmpdir(), "session-first-prompt-secret-"));
   const logs: string[] = [];

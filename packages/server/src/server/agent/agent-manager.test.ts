@@ -15375,7 +15375,8 @@ test("secret answer stream and out-of-band prompts are redacted before providers
   }
   await manager.flush();
   await drainAsyncGenerator(manager.streamAgent(agent.id, "blue"));
-  expect(session.received.at(-1)).toBe("blue");
+  // Consecutive assistant segments form one message; B protects a credential noun anywhere in it.
+  expect(session.received.at(-1)).toBe(SECRET_ANSWER_NOTICE);
   session.pushEvent({
     type: "timeline",
     provider: "codex",
@@ -15386,7 +15387,8 @@ test("secret answer stream and out-of-band prompts are redacted before providers
   });
   await manager.flush();
   await drainAsyncGenerator(manager.streamAgent(agent.id, "tiny"));
-  expect(session.received.at(-1)).toBe("tiny");
+  // B also keeps the credential context when instructions follow the request.
+  expect(session.received.at(-1)).toBe(SECRET_ANSWER_NOTICE);
   session.pushEvent({
     type: "timeline",
     provider: "codex",

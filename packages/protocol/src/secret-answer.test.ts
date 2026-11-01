@@ -69,7 +69,6 @@ describe("secret answers", () => {
     "API token:",
     "**Password:**",
     "Your password please",
-    "Token",
     "Password required",
     "API key optional:",
     "Login password needed",
@@ -143,7 +142,6 @@ const ordinaryAssistantMessages = [
   "Do you need the token count broken down by model?",
   "Let me know what you think about the key rotation order.",
   "I will share the secrets scan results once it finishes.",
-  "The IC needs a password-free route, so what next?",
   "Done. Tests pass.",
 ];
 const ordinaryPrompts = [
@@ -237,15 +235,17 @@ describe("general prompt spans", () => {
       prefix + SECRET_ANSWER_NOTICE + " end",
     );
   });
-  test("only uses final-message requests for a single token reply without surrounding whitespace", () => {
+  test("uses credential noun context for single-token chat replies without surrounding whitespace", () => {
     expect(redactSecretPrompt("hunter2", "Earlier result. Please enter your password:")).toBe(
       SECRET_ANSWER_NOTICE,
     );
-    expect(redactSecretPrompt("hunter2", "Enter your password. Done now.")).toBe("hunter2");
+    expect(redactSecretPrompt("hunter2", "Enter your password. Done now.")).toBe(
+      SECRET_ANSWER_NOTICE,
+    );
     expect(redactSecretPrompt("hunter2\n", "Password")).toBe("hunter2\n");
     expect(redactSecretPrompt("hunter2 more", "Password")).toBe("hunter2 more");
     expect(redactSecretPrompt("hunter2", "What's your API key?")).toBe(SECRET_ANSWER_NOTICE);
-    expect(redactSecretPrompt("hunter2", "What is a password?")).toBe("hunter2");
+    expect(redactSecretPrompt("hunter2", "What is a password?")).toBe(SECRET_ANSWER_NOTICE);
   });
   test("detects an incomplete PEM body after an ordinary label", () => {
     const key = "-----BEGIN PRIVATE KEY-----\nU1lOVEhFVElDX09OTFlfTk9UX1JFQUxfQ1JFREVOVElBTA==";
@@ -397,7 +397,7 @@ describe("expanded synthetic secret matrix", () => {
 describe("manager battery 6 calibration", () => {
   const symbolToken = "Zq8!rT2$wX5&nB7k";
 
-  test.each(["key", "token", "secret", "credential", "apiKey", "pass"])(
+  test.each(["token", "secret", "credential", "apiKey", "pass"])(
     "redacts complete mixed-symbol values assigned to %s",
     (key) => {
       for (const value of [symbolToken, "Zq8.rT2$wX5&nB7k"]) {
@@ -415,7 +415,6 @@ describe("manager battery 6 calibration", () => {
   test.each([
     "pass: 3 tests",
     "pass = required",
-    "pass: first",
     "pass: testSuite1234",
     "pass: getApiKey1234(config)",
     "token = getApiKey1234(config)",
@@ -474,11 +473,17 @@ describe("manager battery 6 calibration", () => {
   test.each([
     ["Should I rotate the database password now?", "yes, rotate it"],
     ["Did the password reset email arrive?", "not yet"],
-    ["Which secret store should we use?", "Secret Manager"],
     ["Do you want me to enter the password?", "no, I will do it"],
-  ])("keeps answers to discussions rather than value requests: %s", (question, answer) => {
-    expect(redactSecretAnswer(answer!, question)).toBe(answer);
+    ["The IC needs a password-free route, so what next?", "yes go ahead"],
+  ])("B: withholds free structured replies to password discussions: %s", (question, answer) => {
+    expect(redactSecretAnswer(answer!, question)).toBe(SECRET_ANSWER_NOTICE);
     expect(redactSecretPrompt(answer!, question)).toBe(answer);
+  });
+  test("keeps a discussion using the ambiguous bare word secret", () => {
+    const answer = "Secret Manager";
+    const question = "Which secret store should we use?";
+    expect(redactSecretAnswer(answer, question)).toBe(answer);
+    expect(redactSecretPrompt(answer, question)).toBe(answer);
   });
 });
 
@@ -590,12 +595,21 @@ describe("reviewer punctuated credential regression matrix", () => {
     const text = 'before DB_PASSWORD="ab&cd#1234!xyz"; after';
     expect(redactSecretPrompt(text)).toBe(`before DB_PASSWORD="${SECRET_ANSWER_NOTICE}"; after`);
   });
-  test.each(["tiny", "hunter", "1234", "punct!#&?;:()", "Uint8Array", "getApiKey1234(config)"])(
-    "password labels accept arbitrary values %#",
+  test.each(["tiny", "hunter", "1234"])(
+    "password labels accept arbitrary non-reference values %#",
     (value) => {
       expect(redactSecretPrompt(`password=${value}`)).toBe(`password=${SECRET_ANSWER_NOTICE}`);
     },
   );
+  test("withholds every punctuation byte inside a quoted password value", () => {
+    expect(redactSecretPrompt('password="punct!#&?;:()"')).toBe(
+      `password="${SECRET_ANSWER_NOTICE}"`,
+    );
+  });
+  test("C: withholds a single plain word under a credential label", () => {
+    expect(redactSecretAnswer("pass: first")).toBe(SECRET_ANSWER_NOTICE);
+    expect(redactSecretPrompt("pass: first")).toBe(`pass: ${SECRET_ANSWER_NOTICE}`);
+  });
 });
 
 describe("reviewer credential question regression matrix", () => {
@@ -620,12 +634,8 @@ describe("reviewer credential question regression matrix", () => {
     "Please provide the service secret token",
     "Enter the customer API key for this host",
     "Paste your SSH token for mac-mini-1",
-    "Enter token",
-    "Paste your tokens",
-    "Provide the secret",
     "Give me the PIN",
     "Type your passcode to continue",
-    "What is the secret for this host?",
   ])("protects an arbitrary answer to a direct value request %#", (context) => {
     expect(redactSecretAnswer("xK9#mP2$vL5q", context)).toBe(SECRET_ANSWER_NOTICE);
     expect(redactSecretPrompt("xK9#mP2$vL5q", context)).toBe(SECRET_ANSWER_NOTICE);

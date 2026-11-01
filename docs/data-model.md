@@ -142,41 +142,65 @@ Each agent is stored as a separate JSON file, grouped by project directory.
 ### Human answers and secrets
 
 Structured question answers, permission input and denial feedback pass through the daemon's
-shared answer boundary before provider dispatch and snapshot persistence. A recognizable secret
-or an answer to a strict credential request replaces that entire field with a notice directing
-you to a secret store. Neutral questions also withhold a whole-field single token of at least 16
-characters mixing letters and digits, except ordinary identifiers (including version/region slugs,
-timestamps, emails and file names), hashes, UUIDs, lowercase-prefix-plus-hex IDs such as `wks_<hex>`
-and `prj_<hex>`, and safe URLs or paths. Known credential prefixes take precedence over the hex-ID
-exemption. Exact choices offered by the agent always pass through. Question text, header and positional keys resolve the context for
-each answer independently. Structured metadata retains depth and size caps and fails closed at
-those limits.
+shared answer boundary before provider dispatch and snapshot persistence. Recognizable secrets
+replace the complete field with a notice directing the person to a secret store. A question that
+mentions a credential noun also withholds its free-text answer, regardless of request wording.
+Exact offered options, yes/no and empty answers pass through. This deliberately withholds free
+text even for discussions such as which password hashing algorithm to use. Question text, header
+and positional keys keep neighbouring answers independent. Structured metadata retains depth and
+size caps and fails closed at those limits.
+
+Credential nouns include the password/passwd/passphrase/passcode family; uppercase PIN or
+qualified pin code, pin number and your pin; 2FA/OTP and one-time, verification or recovery codes;
+qualified API/secret/access/private keys and auth/access/bearer/refresh/API/session tokens; and
+client secrets. Bare key, token and lowercase pin are ambiguous, so design-token and dependency
+pin questions remain ordinary. Credential noun recognition does not list request openers or endings.
 
 Chat, plan feedback sent as chat, steering, replacement, out-of-band and agent-to-agent prompts
-replace only matched secret values; surrounding text stays byte-exact. These prompts are scanned
-in full, without a size cutoff. Besides provider key formats, the shared policy detects credential
-assignments, URL passwords, cookie values, credential flags and labelled prose. Generic base64 or
-base64url runs of at least 32 characters must contain upper case, lower case and digits and meet
-a 3.5-bit-per-character entropy threshold; hex, UUID, data URI, integrity-hash and word-like path
-controls stay text, including identifiers with digits inside words such as OAuth2LoginController.
-A direct request for a credential value accepts host/account modifiers and a trailing host or
-purpose; questions about resetting or managing credentials do not request a value. In chat,
-context applies only when the latest assistant message ends in that request or field title and
-your reply is one token without whitespace. A shapeless secret
-inside a longer chat message is an accepted gap; ISS-6390's secret-store reference flow is the
-route for that case. Normalization uses at most 16 passes; more deeply nested mixed escape
-formats may remain unrecognized. Unknown encoding alone never marks text as a secret.
+replace matched spans while preserving surrounding bytes and scan the whole input without a size
+cutoff. Chat context uses the latest assistant message and a reply consisting of one token without
+whitespace; credential noun presence in that message replaces the earlier ending-based rule.
+The app applies the chat policy to durable composer, initial-prompt and review-comment drafts,
+preserving the active editor. First-prompt titles, workspace naming seeds and log previews receive
+the redacted copy before truncation or generation.
 
-The app uses the chat policy for durable composer, initial-prompt and review-comment drafts while
-preserving the active editor. Ordinary assignment values, placeholders and environment references
-remain text. Outside URLs, labelled values retain punctuation until whitespace or their matching
-closing quote, so redaction cannot expose a suffix. Credential assignment keys must end at a word
-or case boundary; paths, calls, member expressions and wordlike types are ordinary key/token
-values. Labelled tokens of at least 16 characters mixing upper case, lower case, digits and symbols
-are protected, including quoted values. A pass assignment is protected only for a token-shaped
-value, so ordinary prose such as "pass: 3 tests" stays text. First-prompt titles, workspace naming
-seeds and log previews receive the redacted copy
-before truncation or generation. Existing stored conversations are not rewritten by this control.
+Credential labels include the password family and pass, apiKey/api_key, secretKey, accessKey,
+clientSecret, authToken, accessToken, refreshToken, privateKey, token, secret and credential.
+Bare key and storage/idempotency/cache/primary/foreign keys are not credential labels. Under a
+credential label, ordinary-looking literals are protected too, including lowercase words and
+hunter2x. Type annotations and unions, wordlike type/reference names, member or environment
+references, version/number specifiers and placeholders remain text. Plain numeric passwords stay
+protected; dotted and version-prefixed specifiers remain ordinary. Ambiguous pass counters and
+prose mentions are kept. Existing code calls and paths remain ordinary references.
+
+A matching opening value quote defines its closing boundary. A closing label quote is never
+reused as an opening quote; an unmatched opening quote consumes only the run to the next
+whitespace. Query values end at an ampersand or hash; unquoted shell assignments end at a
+semicolon, double ampersand or pipe. Elsewhere punctuation remains part of a value until
+whitespace, with trailing syntax terminators retained. Redaction preserves encoded offsets and
+does not remove the next query parameter, shell command or code terminator.
+
+Known provider key formats, credential URL passwords, cookies, flags and labelled prose remain
+protected. Unlabelled base64/base64url runs require at least 32 characters, upper case, lower case,
+digits and 3.5 bits per character of entropy. A structural word-run measure separates identifiers
+from random values using vowel-bearing coverage, natural casing and compact numeric/acronym tags.
+It is shared by entropy, code/reference classification and neutral structured-answer exemptions;
+it has no source-name allowlist or vocabulary lookup. Neutral answers also keep hashes, UUIDs,
+lowercase-prefix-plus-hex IDs, versions, timestamps, emails and safe locations. Known credential
+prefixes take precedence over identifier exemptions.
+
+The checked-in generated tests use fixed seed 0x06389143 and 2,000 letter-led mixed base62 tokens
+at each length 20, 32, 40 and 64, exercised in every required credential-label/neutral-answer
+position and bare chat at lengths 32 and above. The identifier snapshot contains 17,112 unique
+identifiers of at least 16 characters harvested from 1,985 non-test source files. All are checked
+in bare chat, const-assignment code and neutral answers. Regenerate it with the protocol script
+generate-secret-identifier-snapshot.mjs after source changes; runtime detection does not read it.
+
+Accepted gaps are a shapeless 20-character token in unlabelled chat and a neutral lowercase slug
+with digits such as blue7-ocean3-tiger9. The existing secret-store reference follow-up ISS-6390 is
+the route for values that cannot be distinguished safely from ordinary text. Normalization uses
+at most 16 passes, so more deeply nested mixed encodings may remain unrecognized. Existing stored
+conversations are not rewritten by this control.
 
 ### Nested: AgentFeature (discriminated union on `type`)
 

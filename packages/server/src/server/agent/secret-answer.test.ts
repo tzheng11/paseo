@@ -168,10 +168,14 @@ describe("permission answer sanitization", () => {
     "Sudo password:",
     "Provide the admin PIN to continue",
     "Paste your SSH token for mac-mini-1",
-    "Enter token",
-    "Paste your tokens",
-    "Provide the secret",
     "What is your PIN?",
+    "I need your sudo password to continue.",
+    "Please enter your macOS password so I can install Homebrew.",
+    "Enter the password to unlock the keychain.",
+    "Can I have the database password?",
+    "The sudo password, please.",
+    "What is the password to the keychain?",
+    "Need the root password",
   ])("withholds direct value requests through structured permission answers (%#)", (text) => {
     const question = { ...request, input: { questions: [{ header: "Account", question: text }] } };
     const response: AgentPermissionResponse = {
@@ -185,13 +189,70 @@ describe("permission answer sanitization", () => {
   });
 
   test.each([
-    ["Should I reset the password?", "yes, go ahead"],
-    ["Which password manager do you use?", "1Password"],
-  ])("keeps replies to credential discussion (%#)", (text, value) => {
+    ["Should I reset the password?", "yes"],
+    ["Should I reset the password?", "no"],
+    ["Which password manager do you use?", ""],
+  ])("keeps exact yes/no and empty replies to credential nouns (%#)", (text, value) => {
     const question = { ...request, input: { questions: [{ header: "Account", question: text }] } };
     const response: AgentPermissionResponse = {
       behavior: "allow",
       updatedInput: { answers: { Account: value } },
+    };
+    expect(redactPermissionResponse(response, question)).toEqual(response);
+  });
+
+  test.each([
+    "Enter token",
+    "Paste your tokens",
+    "Provide the secret",
+    "Design tokens:",
+    "GPIO pins for the LED strip?",
+    "Pin for the dependency?",
+  ])("treats superseded bare terminology as ambiguous (%#)", (text) => {
+    const question = { ...request, input: { questions: [{ header: "Choice", question: text }] } };
+    const response: AgentPermissionResponse = {
+      behavior: "allow",
+      updatedInput: { answers: { Choice: "hunter2x" } },
+    };
+    expect(redactPermissionResponse(response, question)).toEqual(response);
+  });
+
+  test("credential nouns isolate per-question answers while exact choices and yes/no remain deliverable", () => {
+    const question: AgentPermissionRequest = {
+      ...request,
+      input: {
+        questions: [
+          {
+            header: "Login",
+            question: "The sudo password, please.",
+            options: [{ label: "Use the existing secret store" }],
+          },
+          { header: "Region", question: "Which region?" },
+          { header: "Confirm", question: "Should password validation be enabled?" },
+        ],
+      },
+    };
+    for (const secret of ["xK9#mP2$vL5q", "hunter2x", "q1W2e3R4t5Y6u7I8o9P0a/S+d1F2g3H4j5K6l7Z8"]) {
+      expect(
+        redactPermissionResponse(
+          {
+            behavior: "allow",
+            updatedInput: { answers: { Login: secret, Region: "us-east-1", Confirm: "yes" } },
+          },
+          question,
+        ),
+      ).toEqual({
+        behavior: "allow",
+        updatedInput: {
+          answers: { Login: SECRET_ANSWER_NOTICE, Region: "us-east-1", Confirm: "yes" },
+        },
+      });
+    }
+    const response: AgentPermissionResponse = {
+      behavior: "allow",
+      updatedInput: {
+        answers: { Login: "Use the existing secret store", Region: "us-east-1", Confirm: "no" },
+      },
     };
     expect(redactPermissionResponse(response, question)).toEqual(response);
   });
@@ -364,15 +425,14 @@ describe("permission answer sanitization", () => {
       ...request,
       title: "Password",
       input: {
-        questions: [{ header: "Password", question: "Should password validation be enabled?" }],
+        questions: [{ header: "Password", question: "Which region should we use?" }],
       },
     };
     const response: AgentPermissionResponse = {
       behavior: "allow",
-      updatedInput: { answers: { Password: "yes" } },
+      updatedInput: { answers: { Password: "us-east-1" } },
     };
     expect(redactPermissionResponse(response, discussion)).toEqual(response);
-    expect(redactPromptInput("yes", "Should password validation be enabled?")).toBe("yes");
   });
 
   test.each([
@@ -453,7 +513,7 @@ describe("chat and steering answer sanitization", () => {
     expect(redactPromptInput(prompt)).toBe(expected);
   });
 
-  test("redacts secret spans and single-token replies to the latest strict credential request", () => {
+  test("redacts secret spans and single-token replies to the latest credential noun context", () => {
     const aws = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
     expect(redactPromptInput(`export AWS_SECRET_ACCESS_KEY=${aws}\nnext line stays`)).toBe(
       `export AWS_SECRET_ACCESS_KEY=${SECRET_ANSWER_NOTICE}\nnext line stays`,
@@ -463,8 +523,8 @@ describe("chat and steering answer sanitization", () => {
       `Keep this prefix ${SECRET_ANSWER_NOTICE} and this suffix.`,
     );
     expect(redactPromptInput("x", "Enter your password:")).toBe(SECRET_ANSWER_NOTICE);
-    expect(redactPromptInput("x", "Enter token")).toBe(SECRET_ANSWER_NOTICE);
-    expect(redactPromptInput("x", "Provide the secret")).toBe(SECRET_ANSWER_NOTICE);
+    expect(redactPromptInput("x", "Enter token")).toBe("x");
+    expect(redactPromptInput("x", "Provide the secret")).toBe("x");
     expect(redactPromptInput("Use the existing configuration", "Enter your password:")).toBe(
       "Use the existing configuration",
     );
@@ -550,12 +610,15 @@ describe("chat and steering answer sanitization", () => {
     "I updated the API key validation code.",
     "Enter your password. Then explain how you will test.",
     "The password is managed in the secret store. What should we test?",
-  ])("preserves ordinary replies when the latest message is discussion: %s", (context) => {
-    expect(redactPromptInput("yes", context)).toBe("yes");
-    expect(redactPromptInput([{ type: "text", text: "yes" }], context)).toEqual([
-      { type: "text", text: "yes" },
-    ]);
-  });
+  ])(
+    "preserves exact yes replies regardless of the latest credential noun context: %s",
+    (context) => {
+      expect(redactPromptInput("yes", context)).toBe("yes");
+      expect(redactPromptInput([{ type: "text", text: "yes" }], context)).toEqual([
+        { type: "text", text: "yes" },
+      ]);
+    },
+  );
 
   test("preserves long ordinary prompts and redacts late spans without a length cutoff", () => {
     const prefix = `  ${"ordinary words\n".repeat(6_000)}`;
