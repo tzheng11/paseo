@@ -129,6 +129,8 @@ import {
 import { withTimeout } from "../../utils/promise-timeout.js";
 import { extractAttention } from "../persistence-hooks.js";
 
+import { redactPermissionResponse, redactPromptInput } from "./secret-answer.js";
+
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
 const IMPORTABLE_SESSION_LIST_TIMEOUT_MS = 90_000;
@@ -3339,6 +3341,7 @@ export class AgentManager {
    */
   tryRunOutOfBand(agentId: string, prompt: AgentPromptInput, options?: AgentRunOptions): boolean {
     const agent = this.requireSessionAgent(agentId);
+    prompt = this.redactAnswerPrompt(agent, prompt);
     // Providers parse slash commands from the raw text, so a command another agent sent
     // must reach them without its sender envelope.
     const agentMessage = typeof prompt === "string" ? parseAgentMessage(prompt) : null;
@@ -3529,6 +3532,7 @@ export class AgentManager {
   ): AsyncGenerator<AgentStreamEvent> {
     this.reloadOperations?.assertWriterAdmissionSync(agentId, writerClaim);
     const existingAgent = this.requireSessionAgent(agentId);
+    prompt = this.redactAnswerPrompt(existingAgent, prompt);
     this.logger.trace(
       {
         agentId,
@@ -3567,6 +3571,17 @@ export class AgentManager {
     const streamForwarder = async function* streamForwarder(this: AgentManager) {
       let turnId: string;
       let turnStream: ReturnType<AgentRunState["createTurnStream"]> | null = null;
+      // Restored history may live only on disk. An unreadable question cannot
+      // authorize forwarding its answer, and must not strand the pending run.
+      try {
+        prompt = await this.prepareAnswerPrompt(agentId, prompt);
+      } catch (error) {
+        agent.pendingReplacement = false;
+        pendingRun.start = { status: "failed", error: "Could not read answer context" };
+        this.finalizeForegroundTurn(agent);
+        this.runs.settleForegroundRun(agentId, pendingRun.token);
+        throw error;
+      }
       turnId = await this.startPendingForegroundTurn({
         agent,
         agentId,
@@ -3735,6 +3750,9 @@ export class AgentManager {
     }
 
     const agent = this.requireSessionAgent(agentId);
+    // Cancellation resolves pending questions. Withhold their answers while that
+    // context still exists, before switching to the replacement turn.
+    prompt = this.redactAnswerPrompt(agent, prompt);
     agent.pendingReplacement = true;
     agent.lifecycle = "running";
     this.touchUpdatedAt(agent);
@@ -3760,6 +3778,7 @@ export class AgentManager {
     this.invalidateQuotaRecovery(agentId);
     const agent = this.requireSessionAgent(agentId);
     const expectedTurnId = agent.activeForegroundTurnId ?? agent.activeTurnId;
+    prompt = await this.prepareAnswerPrompt(agentId, prompt);
     if (!expectedTurnId || !agent.session.steerActiveTurn) {
       return { status: "unavailable" };
     }
@@ -3794,6 +3813,7 @@ export class AgentManager {
     this.invalidateQuotaRecovery(agentId);
     const agent = this.requireSessionAgent(agentId);
     const expectedTurnId = agent.activeForegroundTurnId ?? agent.activeTurnId;
+    prompt = await this.prepareAnswerPrompt(agentId, prompt);
     if (!expectedTurnId) {
       return { status: "inactive" };
     }
@@ -4072,6 +4092,69 @@ export class AgentManager {
     });
   }
 
+  getAnswerTurnIdentity(agentId: string): string | null {
+    const snapshot = this.getAgent(agentId);
+    return (
+      this.runs.getRun(agentId)?.token ??
+      snapshot?.activeForegroundTurnId ??
+      snapshot?.activeTurnId ??
+      null
+    );
+  }
+
+  async prepareAnswerPrompt(agentId: string, prompt: AgentPromptInput): Promise<AgentPromptInput> {
+    const agent = this.requireSessionAgent(agentId);
+    prompt = this.redactAnswerPrompt(agent, prompt);
+    const latest = await this.getLastConversationItemFromStores(agentId);
+    const question =
+      latest?.type === "assistant_message"
+        ? ((await this.getLastAssistantMessageFromStores(agentId)) ?? latest.text)
+        : undefined;
+    return this.redactAnswerPrompt(agent, prompt, question);
+  }
+
+  getPendingPermissionRequest(
+    agentId: string,
+    requestId: string,
+  ): AgentPermissionRequest | undefined {
+    const agent = this.requireAgent(agentId);
+    return (
+      agent.session.getPendingPermissions().find((request) => request.id === requestId) ??
+      agent.pendingPermissions.get(requestId)
+    );
+  }
+
+  private redactAnswerPrompt(
+    agent: ActiveManagedAgent,
+    prompt: AgentPromptInput,
+    question?: string,
+  ): AgentPromptInput {
+    // Provider events enter the manager through a queue; a human can answer before
+    // that queue publishes the question into the manager's projection.
+    const requests = Array.from(
+      new Map(
+        [...agent.pendingPermissions.values(), ...agent.session.getPendingPermissions()].map(
+          (request) => [request.id, request],
+        ),
+      ).values(),
+    );
+    const latest = this.timelineStore.getLastConversationItem(agent.id);
+    const context =
+      question ??
+      (latest?.type === "assistant_message"
+        ? this.timelineStore.getLastAssistantMessageSegment(agent.id)
+        : undefined);
+    if (context)
+      requests.push({
+        id: "chat-question",
+        provider: agent.provider,
+        name: "chat",
+        kind: "question",
+        title: context,
+      });
+    return redactPromptInput(prompt, requests);
+  }
+
   async respondToPermission(
     agentId: string,
     requestId: string,
@@ -4084,6 +4167,10 @@ export class AgentManager {
     agent.inFlightPermissionResponses.add(requestId);
 
     try {
+      response = redactPermissionResponse(
+        response,
+        this.getPendingPermissionRequest(agentId, requestId),
+      );
       const result = await agent.session.respondToPermission(requestId, response);
       agent.pendingPermissions.delete(requestId);
 
@@ -4406,6 +4493,24 @@ export class AgentManager {
     }
     const durableMessage = await this.durableTimelineStore.getLastAssistantMessage(agentId);
     return durableMessage ? `${durableMessage}${liveSegment.text}` : liveSegment.text;
+  }
+
+  private async getLastConversationItemFromStores(
+    agentId: string,
+  ): Promise<AgentTimelineItem | null> {
+    const live = this.timelineStore.getLastConversationItem(agentId);
+    if (live || !this.durableTimelineStore) return live;
+    const page = await this.durableTimelineStore.fetchCommitted(agentId, {
+      direction: "tail",
+      limit: 128,
+    });
+    const conversation = page.rows.findLast(
+      (row) => row.item.type === "user_message" || row.item.type === "assistant_message",
+    );
+    // Bounded context reads fail closed when an earlier question could be outside the window.
+    return (
+      conversation?.item ?? (page.hasOlder ? { type: "assistant_message", text: "Password" } : null)
+    );
   }
 
   private async getLastItemFromStores(agentId: string): Promise<AgentTimelineItem | null> {

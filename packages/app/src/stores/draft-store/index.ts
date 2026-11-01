@@ -34,7 +34,11 @@ import {
   type MigrateLegacyImages,
   PersistedDraftStoreSchema,
 } from "./migration";
-import { createDraftPersistStorage } from "./persistence";
+import {
+  createDraftPersistStorage,
+  draftAnswerContext,
+  redactPersistedDrafts,
+} from "./persistence";
 import { createValidatedPersistStorage } from "@/storage/validated-persist-storage";
 
 export type { DraftInput, DraftLifecycleState } from "./state";
@@ -230,6 +234,26 @@ function scheduleAttachmentGc(): void {
   setTimeout(() => {
     void runAttachmentGc();
   }, 0);
+}
+
+function contextForPersistedDraft(draftKey: string): string {
+  if (!draftKey.startsWith("agent:")) return "";
+  const separator = draftKey.indexOf(":", "agent:".length);
+  if (separator < 0) return "";
+  const serverId = draftKey.slice("agent:".length, separator);
+  const agentId = draftKey.slice(separator + 1);
+  const session = useSessionStore.getState().sessions[serverId];
+  if (!session) return "";
+  const messages = [
+    ...(session.agentStreamTail.get(agentId) ?? []),
+    ...(session.agentStreamHead.get(agentId) ?? []),
+  ].filter((item) => item.kind === "user_message" || item.kind === "assistant_message");
+  return draftAnswerContext({
+    pendingQuestions: [...session.pendingPermissions.values()]
+      .filter((permission) => permission.agentId === agentId)
+      .map((permission) => permission.request),
+    latestMessage: messages.at(-1),
+  });
 }
 
 async function migrateAllLegacyDrafts(): Promise<void> {
@@ -429,7 +453,8 @@ export const useDraftStore = create<DraftStore>()(
       name: "paseo-drafts",
       version: DRAFT_STORE_VERSION,
       storage: draftPersistStorage,
-      partialize: ({ drafts, createModalDraft }) => ({ drafts, createModalDraft }),
+      partialize: ({ drafts, createModalDraft }) =>
+        redactPersistedDrafts({ drafts, createModalDraft }, contextForPersistedDraft),
       migrate: (state) =>
         migratePersistedState(state, {
           migrateLegacyImages,

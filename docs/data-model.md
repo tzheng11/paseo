@@ -139,6 +139,19 @@ Each agent is stored as a separate JSON file, grouped by project directory.
 | `nativeHandle` | `any?`                 | Provider-specific handle (Codex thread ID, Claude resume token, etc.) |
 | `metadata`     | `Record<string, any>?` | Extra metadata                                                        |
 
+### Human answers and secrets
+
+Question answers, permission input and denial feedback pass through the daemon's shared answer
+boundary before provider dispatch and snapshot persistence. Chat answers, plan feedback, steering
+and replacement turns use the same policy. Recognizable credentials and answers to credential
+requests become a notice explaining that the value was withheld and should use a secret store.
+The entire text value is withheld so a partial pattern match cannot expose the remainder.
+
+The app applies that policy to durable draft copies, including initial prompts, while preserving
+the active editor. Detection is bounded and fails closed on oversized answers. Unlabelled values
+without a recognizable credential shape remain ordinary text; the secret-store reference flow is
+separate work. Existing stored conversations are not rewritten by this control.
+
 ### Nested: AgentFeature (discriminated union on `type`)
 
 **Toggle:**

@@ -1,0 +1,268 @@
+import { AgentAttachmentSchema } from "@getpaseo/protocol/messages";
+import { redactSecretAnswer, SECRET_ANSWER_NOTICE } from "@getpaseo/protocol/secret-answer";
+import type {
+  AgentMetadata,
+  AgentPermissionRequest,
+  AgentPermissionResponse,
+  AgentPromptContentBlock,
+  AgentPromptInput,
+} from "./agent-sdk-types.js";
+
+export { redactSecretAnswer, SECRET_ANSWER_NOTICE };
+
+const MAX_DEPTH = 12;
+const MAX_ENTRIES = 5_000;
+const MAX_CHARACTERS = 262_144;
+const SECRET_METADATA_KEY =
+  /(?:^|[_ .-])(?:secret|hmac|passwd|password|passphrase|credential|authorization|relay[_-]?key|daemon[_-]?public[_-]?key[_-]?b64|private[_-]?key|access[_-]?key|api[_-]?key|auth[_-]?token|bearer[_-]?token|session[_-]?token)$/i;
+
+interface ScanBudget {
+  entries: number;
+  characters: number;
+}
+
+interface AnswerContext {
+  text: string;
+  questions: ReadonlyMap<string, string>;
+  answerMap: boolean;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isExplicitSecretKey(key: string): boolean {
+  const words = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2");
+  return SECRET_METADATA_KEY.test(words);
+}
+
+function isSecretMetadataAssignment(key: string, value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  const assignment = `${key}=${value}`;
+  return redactSecretAnswer(assignment) !== assignment;
+}
+
+function questionContexts(request?: AgentPermissionRequest): ReadonlyMap<string, string> {
+  const contexts = new Map<string, string>();
+  const questions = request?.input?.questions;
+  if (!Array.isArray(questions)) return contexts;
+  if (questions.length > MAX_ENTRIES) {
+    contexts.set("", "password");
+    return contexts;
+  }
+  const allContexts: string[] = [];
+  let characters = 0;
+  for (const [index, question] of questions.entries()) {
+    if (!isRecord(question)) continue;
+    const substantive = [question.question, question.prompt, question.description].filter(
+      (part): part is string => typeof part === "string" && part.trim() !== "",
+    );
+    const labels = [question.title, question.header];
+    const label =
+      labels.find((part): part is string => typeof part === "string" && part.trim() !== "") ?? "";
+    const questionText = substantive.length > 0 ? substantive.join("\n") : label;
+    const text = [questionText, request?.description]
+      .filter((part) => part !== undefined)
+      .join("\n");
+    characters += text.length;
+    if (characters > MAX_CHARACTERS) return new Map([["", "password"]]);
+    allContexts.push(text);
+    contexts.set(String(index), text);
+    contexts.set(`Question ${index + 1}`, text);
+    for (const identifier of [question.id, question.header, question.title]) {
+      if (typeof identifier === "string") contexts.set(identifier, text);
+    }
+  }
+  contexts.set("", allContexts.join("\n"));
+  return contexts;
+}
+
+function requestContext(request?: AgentPermissionRequest): string {
+  if (!request) return "";
+  const questions = request.input?.questions;
+  if (Array.isArray(questions)) {
+    if (questions.length > MAX_ENTRIES) return "password";
+    const substantive = questions.some((question) => {
+      if (!isRecord(question)) return false;
+      return [question.question, question.prompt, question.title, question.description].some(
+        (part) => typeof part === "string" && part.trim() !== "",
+      );
+    });
+    if (substantive) return request.description ?? "";
+  }
+  const parts = [
+    request.title,
+    request.description,
+    request.input?.question,
+    request.input?.prompt,
+    request.input?.title,
+    request.input?.description,
+    request.input?.header,
+  ];
+  return parts.filter((part): part is string => typeof part === "string").join("\n");
+}
+
+function redactValue(
+  value: unknown,
+  context: AnswerContext,
+  budget: ScanBudget,
+  depth = 0,
+): unknown {
+  if (depth > MAX_DEPTH || budget.entries <= 0) return SECRET_ANSWER_NOTICE;
+  budget.entries -= 1;
+  if (typeof value === "string") {
+    budget.characters -= value.length;
+    if (budget.characters < 0) return SECRET_ANSWER_NOTICE;
+    return redactSecretAnswer(value, context.text);
+  }
+  if (Array.isArray(value)) {
+    if (value.length > budget.entries) return SECRET_ANSWER_NOTICE;
+    return value.map((item, index) => {
+      if (!context.answerMap) return redactValue(item, context, budget, depth + 1);
+      const text =
+        context.questions.get(String(index)) ?? context.questions.get("") ?? context.text;
+      const itemContext = { ...context, text, answerMap: false };
+      return redactValue(item, itemContext, budget, depth + 1);
+    });
+  }
+  if (!isRecord(value)) return value;
+  return redactObject(value, context, budget, depth);
+}
+
+function redactObject(
+  value: AgentMetadata,
+  context: AnswerContext,
+  budget: ScanBudget,
+  depth: number,
+): AgentMetadata | string {
+  const entries = Object.entries(value);
+  if (entries.length > budget.entries) return SECRET_ANSWER_NOTICE;
+  const redacted: AgentMetadata = {};
+  for (const [index, [key, item]] of entries.entries()) {
+    budget.characters -= key.length;
+    const checkedKey = redactSecretAnswer(key);
+    const keyWasWithheld = checkedKey !== key || budget.characters < 0;
+    const safeKey = keyWasWithheld ? `[redacted:secret-key-${index}]` : key;
+    const question = context.answerMap
+      ? (context.questions.get(key) ?? context.questions.get(""))
+      : undefined;
+    const namedSecret = !context.answerMap && isExplicitSecretKey(key);
+    const answerField = /^(?:answer|text|message|feedback)$/.test(key);
+    const directAnswer = answerField ? context.questions.get("") : undefined;
+    let text = question ?? directAnswer ?? context.text;
+    if (namedSecret) text = "password";
+    const nextContext = {
+      text,
+      questions: context.questions,
+      answerMap: key === "answers" && !context.answerMap,
+    };
+    const assignmentWasWithheld = !context.answerMap && isSecretMetadataAssignment(key, item);
+    const safeValue =
+      keyWasWithheld || assignmentWasWithheld
+        ? SECRET_ANSWER_NOTICE
+        : redactValue(item, nextContext, budget, depth + 1);
+    Object.defineProperty(redacted, safeKey, {
+      value: safeValue,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+  }
+  return redacted;
+}
+
+function redactMetadata(metadata: AgentMetadata, context: AnswerContext): AgentMetadata {
+  const budget = { entries: MAX_ENTRIES, characters: MAX_CHARACTERS };
+  const redacted = redactValue(metadata, context, budget);
+  return isRecord(redacted) ? redacted : { redacted: SECRET_ANSWER_NOTICE };
+}
+
+/** Sanitize every answer-bearing response field before provider or persistence code sees it. */
+export function redactPermissionResponse(
+  response: AgentPermissionResponse,
+  request?: AgentPermissionRequest,
+): AgentPermissionResponse {
+  const text = requestContext(request);
+  const questions = questionContexts(request);
+  const context = { text, questions, answerMap: false };
+  const selectedActionId = response.selectedActionId;
+  const safeAction =
+    selectedActionId === undefined
+      ? {}
+      : { selectedActionId: redactSecretAnswer(selectedActionId) };
+  if (response.behavior === "deny") {
+    const questionText = [...questions.values()].join("\n");
+    const messageContext = `${text}\n${questionText}`;
+    const message = response.message;
+    const safeMessage =
+      message === undefined ? {} : { message: redactSecretAnswer(message, messageContext) };
+    return { ...response, ...safeAction, ...safeMessage };
+  }
+  const updatedInput = response.updatedInput;
+  const safeInput =
+    updatedInput === undefined ? {} : { updatedInput: redactMetadata(updatedInput, context) };
+  const updatedPermissions = response.updatedPermissions;
+  const permissionContext = { text: "", questions, answerMap: false };
+  const safePermissions =
+    updatedPermissions === undefined
+      ? {}
+      : {
+          updatedPermissions:
+            updatedPermissions.length > MAX_ENTRIES
+              ? [{ redacted: SECRET_ANSWER_NOTICE }]
+              : updatedPermissions.map((permission) =>
+                  redactMetadata(permission, permissionContext),
+                ),
+        };
+  return { ...response, ...safeAction, ...safeInput, ...safePermissions };
+}
+
+function redactPromptBlock(
+  block: AgentPromptContentBlock,
+  context: string,
+): AgentPromptContentBlock {
+  if (block.type === "image") return block;
+  if (block.type === "text" && !("mimeType" in block)) {
+    return { ...block, text: redactSecretAnswer(block.text, context) };
+  }
+  // Attachments also carry human-authored text (review comments, titles and resource metadata).
+  // The schema preserves their wire shape; a cap that removes required fields becomes a notice.
+  if (redactSecretAnswer("answer", context) === SECRET_ANSWER_NOTICE) {
+    return { type: "text", text: SECRET_ANSWER_NOTICE };
+  }
+  const answerContext = { text: "", questions: new Map<string, string>(), answerMap: false };
+  const budget = { entries: MAX_ENTRIES, characters: MAX_CHARACTERS };
+  const parsed = AgentAttachmentSchema.safeParse(redactValue(block, answerContext, budget));
+  return parsed.success ? parsed.data : { type: "text", text: SECRET_ANSWER_NOTICE };
+}
+
+/** Chat and steering can be answers too, including replies to a pending secret request. */
+export function redactPromptInput(
+  prompt: AgentPromptInput,
+  requests?: Iterable<AgentPermissionRequest>,
+): AgentPromptInput {
+  const contexts: string[] = [];
+  if (requests) {
+    let count = 0;
+    for (const request of requests) {
+      count += 1;
+      if (count > MAX_ENTRIES) return SECRET_ANSWER_NOTICE;
+      contexts.push(requestContext(request), ...questionContexts(request).values());
+    }
+  }
+  const context = contexts.join("\n");
+  if (typeof prompt === "string") return redactSecretAnswer(prompt, context);
+  if (!Array.isArray(prompt) || prompt.length > MAX_ENTRIES) return SECRET_ANSWER_NOTICE;
+  // Providers concatenate text blocks. Detect the same view before allowing fragments through.
+  const text = prompt
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("");
+  const combinedWasWithheld = redactSecretAnswer(text, context) !== text;
+  return prompt.map((block) => {
+    if (combinedWasWithheld && block.type === "text") {
+      return { type: "text", text: SECRET_ANSWER_NOTICE };
+    }
+    return redactPromptBlock(block, context);
+  });
+}

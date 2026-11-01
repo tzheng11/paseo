@@ -5397,7 +5397,7 @@ export class Session {
     response: AgentPermissionResponse,
   ): Promise<void> {
     try {
-      await respondToAgentPermission({
+      const resolution = await respondToAgentPermission({
         agentManager: this.agentManager,
         agentId,
         requestId,
@@ -5410,7 +5410,7 @@ export class Session {
       if (this.delivery.isModern(this.delivery.currentSource)) {
         this.delivery.reply({
           type: "agent_permission_resolved",
-          payload: { agentId, requestId, resolution: response },
+          payload: { agentId, requestId, resolution },
         });
       }
     } catch (error) {

@@ -6,12 +6,18 @@ import type {
   AgentPermissionResult,
   AgentRunOptions,
   AgentPermissionResponse,
+  AgentPermissionRequest,
 } from "./agent-sdk-types.js";
 import type { AgentStreamEvent } from "../messages.js";
 import { respondToAgentPermission } from "./permission-response.js";
 
 class FakePermissionAgentManager {
   permissionResult: AgentPermissionResult | void;
+  permissionRequest?: AgentPermissionRequest;
+
+  getPendingPermissionRequest() {
+    return this.permissionRequest;
+  }
   hasRunInFlight = false;
   outOfBandHandled = false;
   permissionResponses: Array<{
@@ -139,4 +145,43 @@ describe("respondToAgentPermission", () => {
       },
     ]);
   });
+});
+
+test("withholds secret answers in provider input and the returned WebSocket resolution", async () => {
+  const agentManager = new FakePermissionAgentManager();
+  const secret = "sk-proj-" + "SYNTHETIC".repeat(8);
+  const response = { behavior: "deny" as const, message: secret };
+  const result = await respondToAgentPermission({
+    agentManager,
+    agentId: "agent-1",
+    requestId: "permission-1",
+    response,
+    logger: createTestLogger(),
+  });
+  expect(result.behavior).toBe("deny");
+  expect(JSON.stringify(result)).not.toContain(secret);
+  expect(JSON.stringify(result)).toContain("withheld");
+  expect(agentManager.permissionResponses[0].response).toEqual(result);
+  expect(response.message).toBe(secret);
+});
+
+test("uses authoritative pending questions before the manager projection is populated", async () => {
+  const agentManager = new FakePermissionAgentManager();
+  agentManager.permissionRequest = {
+    id: "early-question",
+    provider: "codex",
+    kind: "question",
+    name: "request_user_input_async",
+    input: { questions: [{ header: "Question 1", question: "Your password:" }] },
+  };
+  const result = await respondToAgentPermission({
+    agentManager,
+    agentId: "agent-1",
+    requestId: "early-question",
+    response: { behavior: "allow", updatedInput: { answers: { "Question 1": "tiny" } } },
+    logger: createTestLogger(),
+  });
+  expect(agentManager.permissionResponses[0].response).toEqual(result);
+  expect(JSON.stringify(result)).not.toContain("tiny");
+  expect(JSON.stringify(result)).toContain("withheld");
 });
