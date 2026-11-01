@@ -1,6 +1,7 @@
 import { AgentAttachmentSchema, TextAttachmentSchema } from "@getpaseo/protocol/messages";
 import {
   redactSecretAnswer,
+  redactSecretKey,
   redactSecretPrompt,
   secretPromptSpans,
   SECRET_ANSWER_NOTICE,
@@ -45,7 +46,7 @@ function isExplicitSecretKey(key: string): boolean {
 function isSecretMetadataAssignment(key: string, value: unknown): boolean {
   if (typeof value !== "string") return false;
   const assignment = `${key}=${value}`;
-  return redactSecretAnswer(assignment) !== assignment;
+  return redactSecretKey(assignment) !== assignment;
 }
 
 function questionContexts(request?: AgentPermissionRequest): ReadonlyMap<string, string> {
@@ -146,7 +147,7 @@ function redactObject(
   const redacted: AgentMetadata = {};
   for (const [index, [key, item]] of entries.entries()) {
     budget.characters -= key.length;
-    const checkedKey = redactSecretAnswer(key);
+    const checkedKey = redactSecretKey(key);
     const keyWasWithheld = checkedKey !== key || budget.characters < 0;
     const safeKey = keyWasWithheld ? `[redacted:secret-key-${index}]` : key;
     const question = context.answerMap
@@ -193,9 +194,7 @@ export function redactPermissionResponse(
   const context = { text, questions, answerMap: false };
   const selectedActionId = response.selectedActionId;
   const safeAction =
-    selectedActionId === undefined
-      ? {}
-      : { selectedActionId: redactSecretAnswer(selectedActionId) };
+    selectedActionId === undefined ? {} : { selectedActionId: redactSecretKey(selectedActionId) };
   if (response.behavior === "deny") {
     const questionText = [...questions.values()].join("\n");
     const messageContext = `${text}\n${questionText}`;
@@ -228,7 +227,7 @@ function redactPromptMetadata(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(redactPromptMetadata);
   if (!isRecord(value)) return value;
   const entries = Object.entries(value).map(([key, item]) => [
-    redactSecretPrompt(key),
+    redactSecretKey(key),
     redactPromptMetadata(item),
   ]);
   return Object.fromEntries(entries);

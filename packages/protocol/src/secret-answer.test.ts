@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import {
   redactSecretAnswer,
+  redactSecretKey,
   redactSecretPrompt,
   secretPromptSpans,
   SECRET_ANSWER_NOTICE,
@@ -161,6 +162,22 @@ const ordinaryPrompts = [
   "api_key=$API_KEY",
   "api_key=${API_KEY}",
   "api_key=<your-api-key>",
+  "Head is 41c4e4c0bd7709490212ac97f0beda98ae2812ad, base 48e0c6e50680e0a049de5cafbd8d693826e78c34.",
+  "sha256: a734139041ee4b89220c99a6568a6704aa5464c04b02559ad2164e1f9a5338ac",
+  "agent id bc299fea-5481-48e4-bb5f-31fc299789a1 token count 1500",
+  "Issue page 40bb71dd7bc7818a8f89fb2be1ccaac2 key finding",
+  "Set max_tokens: 4096 and token_count: 1500 in the config.",
+  "apiKey: process.env.ANTHROPIC_API_KEY",
+  "password=$DB_PASSWORD and token=${GITHUB_TOKEN}",
+  "secret: {{ secrets.FOO }} and password: <your password>",
+  'api_key = os.environ["ANTHROPIC_API_KEY"]',
+  "const token = await getToken(); const key = cache.get(id);",
+  "key: /Users/tim/.ssh/id_ed25519 and cert: ./tls/server.pem",
+  "Fingerprints: Anthropic 482b782fc066; GCS access d7bcaf4de8e3, secret 4dee46de6542.",
+  "token: getAuthenticationTokenFromSessionStorageManagerFactory",
+  "password: required; api_key: optional; secret: none; token: expired",
+  "data:image/png;base64," + "iVBORw0KGgoAAAANSUhEUgAA".repeat(40),
+  "integrity sha512-" + "Zm9vYmFyYmF6".repeat(7) + "==",
 ];
 
 describe("Manager ordinary-input regression battery", () => {
@@ -208,6 +225,12 @@ describe("general prompt spans", () => {
       `Before ${SECRET_ANSWER_NOTICE} after`,
     );
   });
+  test("removes encoded literal suffixes and preserves ordinary trailing prose", () => {
+    const secret = "sk-ant-" + "a".repeat(40) + "%20SYNTHETIC1234567890";
+    expect(redactSecretPrompt(`Before ${secret} after`)).toBe(
+      `Before ${SECRET_ANSWER_NOTICE} after`,
+    );
+  });
   test("finds secrets near the end of a large ordinary prompt", () => {
     const prefix = "ordinary line\n".repeat(20_000);
     const secret = "sk-ant-" + "a".repeat(40);
@@ -229,4 +252,232 @@ describe("general prompt spans", () => {
     const key = "-----BEGIN PRIVATE KEY-----\nU1lOVEhFVElDX09OTFlfTk9UX1JFQUxfQ1JFREVOVElBTA==";
     expect(redactSecretPrompt("Private key: " + key)).toBe("Private key: " + SECRET_ANSWER_NOTICE);
   });
+});
+
+const syntheticMixed = "aB3dE7gH".repeat(5);
+const syntheticHmac = "q1W2e3R4t5Y6u7I8o9P0a/S+d1F2g3H4j5K6l7Z8";
+const syntheticUrlPassword = "Zx9Qw8Er7Ty6";
+const expandedSecrets = [
+  ["postgres URL", "postgres://admin:s3cr3tPass99@db.internal:5432/app", "s3cr3tPass99"],
+  ["mysql URL", "mysql://root:Tr0ub4dor3x@10.0.0.5/app", "Tr0ub4dor3x"],
+  ["redis URL", "redis://:p4ssw0rdLong@cache:6379", "p4ssw0rdLong"],
+  [
+    "mongo URL",
+    "mongodb+srv://svc:" + syntheticUrlPassword + "@cluster0.mongodb.net/db",
+    syntheticUrlPassword,
+  ],
+  [
+    "https URL",
+    "https://bob:" + syntheticUrlPassword + "@internal.example.com/path",
+    syntheticUrlPassword,
+  ],
+  [
+    "database env",
+    "DATABASE_URL=postgres://u:" + syntheticUrlPassword + "@h/db",
+    syntheticUrlPassword,
+  ],
+  ["AWS ID", "key AKIAIOSFODNN7EXAMPLE here", "AKIAIOSFODNN7EXAMPLE"],
+  ["Slack", "xoxb-1234567890-0987654321-" + syntheticMixed, syntheticMixed],
+  ["Stripe live", "sk_live_" + syntheticMixed, syntheticMixed],
+  ["Stripe test", "sk_test_" + syntheticMixed, syntheticMixed],
+  ["Stripe restricted", "rk_live_" + syntheticMixed, syntheticMixed],
+  ["npm", "npm_" + syntheticMixed, syntheticMixed],
+  ["GitHub PAT", "github_pat_" + syntheticMixed + "_" + syntheticMixed, syntheticMixed],
+  ["GitHub OAuth", "gho_" + syntheticMixed, syntheticMixed],
+  ["OpenAI project", "sk-proj-" + syntheticMixed + syntheticMixed, syntheticMixed],
+  ["Google", "AIzaSyA" + syntheticMixed.slice(0, 32), syntheticMixed.slice(0, 32)],
+  ["SendGrid", "SG." + syntheticMixed.slice(0, 22) + "." + syntheticMixed, syntheticMixed],
+  ["Resend", "re_" + syntheticMixed, syntheticMixed],
+  ["Sentry", "sntrys_" + syntheticMixed + syntheticMixed, syntheticMixed],
+  ["API header", "x-api-key: " + syntheticMixed, syntheticMixed],
+  ["Cookie", "Cookie: session=" + syntheticMixed, syntheticMixed],
+  ["Set-Cookie", "Set-Cookie: session=" + syntheticMixed + "; Path=/; HttpOnly", syntheticMixed],
+  [
+    "curl user",
+    "curl -u admin:" + syntheticUrlPassword + " https://x.example",
+    syntheticUrlPassword,
+  ],
+  ["password flag", "mysql --password " + syntheticUrlPassword + " -h db", syntheticUrlPassword],
+  ["token flag", "gh --token=" + syntheticMixed, syntheticMixed],
+  ["PGPASSWORD", "PGPASSWORD=" + syntheticUrlPassword + " psql -h db", syntheticUrlPassword],
+  ["npmrc", "//registry.npmjs.org/:_authToken=" + syntheticMixed, syntheticMixed],
+  [
+    "natural password",
+    "the password is " + syntheticUrlPassword + " for that box",
+    syntheticUrlPassword,
+  ],
+  ["natural key", "my api key is " + syntheticMixed, syntheticMixed],
+  ["YAML", "client_secret: " + syntheticMixed, syntheticMixed],
+  ["TOML", 'api_key = "' + syntheticMixed + '"', syntheticMixed],
+  ["TS", 'const apiKey = "' + syntheticMixed + '";', syntheticMixed],
+  ["labelled hex", "secret key: " + "ab12".repeat(16), "ab12".repeat(16)],
+  ["unlabelled HMAC", syntheticHmac, syntheticHmac],
+  ["two values", `password=${syntheticMixed} token=${syntheticMixed}x`, syntheticMixed],
+  [
+    "multiline env",
+    `A_KEY=${syntheticMixed}\nB_SECRET=${syntheticMixed}y\nC=plain`,
+    syntheticMixed,
+  ],
+];
+
+describe("expanded synthetic secret matrix", () => {
+  test.each(expandedSecrets)("D2: %s", (_name, text, value) => {
+    const result = redactSecretPrompt(text!);
+    expect(result).not.toContain(value);
+    expect(result).toContain(SECRET_ANSWER_NOTICE);
+  });
+  test.each([
+    "open http://localhost:3000/a?b=1",
+    "git@github.com:org/repo.git",
+    "https://bob@internal.example.com/path",
+    "postgres://user:${PASSWORD}@host/db",
+    "postgres://$USER:$PASS@host/db",
+    "postgres://user:<password>@host/db",
+    "postgres://user:password@localhost:5432/app",
+    "https://example.com:8080/a@b",
+    "meet at 12:30, email bob@example.com",
+    "ask @reviewer about https://github.com/tzheng11/paseo/pull/56",
+    "npm i @studio/agentic@1.2.3 from https://registry.npmjs.org/",
+    "pass --password and it prompts",
+    'mysql --password "$DB_PASS"',
+    "The token is expired and the key is missing.",
+    "the password is required for that box",
+    "my api key is not working, it says unauthorized",
+    "Cookie: consent banner keeps showing",
+    "x-api-key: required",
+    "/Users/tim/Development/importantWorkspace2026/anotherFile12345.ts",
+    "https://example.test/path/" + syntheticHmac + "?id=" + syntheticMixed,
+  ])("B2: preserves ordinary URL, flag and prose %#", (text) => {
+    expect(redactSecretPrompt(text)).toBe(text);
+  });
+  test("redacts only URL passwords and preserves authority and path bytes", () => {
+    const text = `before postgres://admin:${syntheticUrlPassword}@db:5432/app after`;
+    expect(redactSecretPrompt(text)).toBe(
+      `before postgres://admin:${SECRET_ANSWER_NOTICE}@db:5432/app after`,
+    );
+  });
+  test("maps encoded URL password offsets without changing URL syntax", () => {
+    const text = `🧪 postgres%3A%2F%2Fuser%3A${syntheticUrlPassword}%40host/db ✅`;
+    expect(redactSecretPrompt(text)).toBe(
+      `🧪 postgres%3A%2F%2Fuser%3A${SECRET_ANSWER_NOTICE}%40host/db ✅`,
+    );
+  });
+  test.each(["%2F", "%3F", "%23", "%20", "%27", "%22", "%3C", "%3E"])(
+    "keeps encoded password delimiters inside URL userinfo (%s)",
+    (separator) => {
+      const value = `Ab3Cd4Ef5${separator}Gh6Ij7Kl8`;
+      const text = `before postgres://admin:${value}@db.internal/app after`;
+      expect(redactSecretPrompt(text)).toBe(
+        `before postgres://admin:${SECRET_ANSWER_NOTICE}@db.internal/app after`,
+      );
+      expect(redactSecretAnswer(text)).toBe(SECRET_ANSWER_NOTICE);
+    },
+  );
+  test("supports single-character and long RFC URI schemes", () => {
+    for (const scheme of ["a", "custom".repeat(20)]) {
+      const text = `${scheme}://u:Ab3Cd4Ef5@host/db`;
+      expect(redactSecretPrompt(text)).toBe(`${scheme}://u:${SECRET_ANSWER_NOTICE}@host/db`);
+    }
+  });
+  test.each([
+    ["password=", "abc123%22xyz789"],
+    ["--password=", "abc123%22xyz789"],
+    ["the password is ", "abc123%22xyz789"],
+    ["--token=", "Ab3Cd4Ef5%20Gh6Ij7Kl8"],
+    ["Cookie: session=", "abc123%3Bxyz789"],
+    ["Set-Cookie: session=", "abc123%22xyz789"],
+    ["Cookie: session=", "abc123%0Axyz789"],
+    ["Cookie: session=", "abc123%09xyz789"],
+  ])("keeps encoded delimiters inside a labelled value (%s)", (label, value) => {
+    expect(redactSecretPrompt(`${label}${value} after`)).toBe(
+      `${label}${SECRET_ANSWER_NOTICE} after`,
+    );
+  });
+});
+
+describe("neutral structured answer calibration", () => {
+  test.each([syntheticHmac, "aB3dE7gH9kLmN2pQ5rT8", "abc123xyz4567890"])(
+    "withholds mixed single-token answers %#",
+    (text) => {
+      expect(redactSecretAnswer(text, "Which one should I use?")).toBe(SECRET_ANSWER_NOTICE);
+    },
+  );
+  test.each([
+    "aB3dE7gH9kLm",
+    "ab12".repeat(16),
+    "41c4e4c0bd7709490212ac97f0beda98ae2812ad",
+    "bc299fea-5481-48e4-bb5f-31fc299789a1",
+    "https://example.test/aB3dE7gH9kLmN2pQ5rT8",
+    "/Users/tim/project1234567890",
+    "Use the existing session",
+  ])("preserves ordinary neutral answers %#", (text) => {
+    expect(redactSecretAnswer(text, "Which one should I use?")).toBe(text);
+  });
+  test("retains the accepted short and longer shapeless general-chat gaps", () => {
+    expect(redactSecretPrompt("aB3dE7gH9kLm")).toBe("aB3dE7gH9kLm");
+    expect(redactSecretPrompt("my password has several ordinary words")).toBe(
+      "my password has several ordinary words",
+    );
+  });
+  test("a leading slash does not exempt a base64 secret from chat entropy scanning", () => {
+    expect(redactSecretPrompt("/" + syntheticHmac)).toBe(SECRET_ANSWER_NOTICE);
+    const ordinary = "/Users/tim/source/anotherWorkspace2026/sourceFile12345.ts";
+    expect(redactSecretPrompt(ordinary)).toBe(ordinary);
+    expect(redactSecretAnswer(ordinary)).toBe(ordinary);
+  });
+});
+
+describe("environment label calibration", () => {
+  test.each([
+    "A_KEY",
+    "B_SECRET",
+    "MY_SERVICE_KEY",
+    "STRIPE_KEY",
+    "RESEND_KEY",
+    "OPENAI_KEY",
+    "SENTRY_DSN",
+    "DB_PASS",
+    "DB_PWD",
+    "WEBHOOK_SIGNING_SECRET",
+    "SESSION_COOKIE",
+    "AUTH",
+    "BASIC_AUTH",
+    "PRIVATE_KEY",
+    "SSH_KEY",
+    "ENCRYPTION_KEY",
+    "JWT",
+  ])("withholds shaped values under %s", (key) => {
+    expect(redactSecretPrompt(`${key}=${syntheticMixed}`)).toBe(`${key}=${SECRET_ANSWER_NOTICE}`);
+  });
+  test.each([
+    "CLIENT_ID",
+    "PUBLIC_KEY",
+    "SORT_KEY",
+    "PRIMARY_KEY",
+    "CACHE_KEY",
+    "FOREIGN_KEY",
+    "PARTITION_KEY",
+  ])("preserves high-entropy benign value under %s", (key) => {
+    expect(redactSecretPrompt(`${key}=${syntheticHmac}`)).toBe(`${key}=${syntheticHmac}`);
+    expect(redactSecretPrompt(`"${key}": "${syntheticHmac}"`)).toBe(`"${key}": "${syntheticHmac}"`);
+    const encodedValue = syntheticHmac + "%20" + syntheticHmac;
+    expect(redactSecretPrompt(`${key}=${encodedValue}`)).toBe(`${key}=${encodedValue}`);
+  });
+});
+
+describe("structural routing keys", () => {
+  test.each([
+    "authenticationConfigurationVersion2",
+    "projectAuthenticationConfigurationV2",
+    "questionIdentifier1234567890WithDetails",
+    "approve-action-12345",
+  ])("preserves ordinary routing identifiers %#", (key) => {
+    expect(redactSecretKey(key)).toBe(key);
+  });
+  test.each(["sk-ant-" + syntheticMixed, "ghp_" + syntheticMixed])(
+    "withholds explicit credentials used as keys %#",
+    (key) => {
+      expect(redactSecretKey(key)).toBe(SECRET_ANSWER_NOTICE);
+    },
+  );
 });

@@ -144,21 +144,25 @@ Each agent is stored as a separate JSON file, grouped by project directory.
 Structured question answers, permission input and denial feedback pass through the daemon's
 shared answer boundary before provider dispatch and snapshot persistence. A recognizable secret
 or an answer to a strict credential request replaces that entire field with a notice directing
-you to a secret store. Structured metadata retains depth and size caps and fails closed at those
-limits.
+you to a secret store. Neutral questions also withhold a whole-field single token of at least 16
+characters mixing letters and digits, except git/SHA hashes, UUIDs and safe URLs or paths.
+Structured metadata retains depth and size caps and fails closed at those limits.
 
 Chat, plan feedback sent as chat, steering, replacement, out-of-band and agent-to-agent prompts
 replace only matched secret values; surrounding text stays byte-exact. These prompts are scanned
-in full, without a size cutoff. Credential context applies only when the last assistant message
-ends in a direct credential request or credential field title and your reply is a single token
+in full, without a size cutoff. Besides provider key formats, the shared policy detects credential
+assignments, URL passwords, cookie values, credential flags and labelled prose. Generic base64 or
+base64url runs of at least 32 characters must contain upper case, lower case and digits and meet
+a 3.5-bit-per-character entropy threshold; hex, UUID, data URI, integrity-hash and word-like path
+controls stay text. Credential context applies only when the last assistant message ends in a direct credential request or credential field title and your reply is a single token
 with no whitespace. Bare key/token words count only as exact field titles. A shapeless secret
 inside a longer chat message is an accepted gap; ISS-6390's secret-store reference flow is the
 route for that case. Normalization uses at most 16 passes; more deeply nested mixed escape
 formats may remain unrecognized. Unknown encoding alone never marks text as a secret.
 
 The app uses the chat policy for durable composer, initial-prompt and review-comment drafts while
-preserving the active editor. Ordinary assignment values, placeholders and environment references remain text.
-Existing stored conversations are not rewritten by this control.
+preserving the active editor. Ordinary assignment values, placeholders and environment references
+remain text. Existing stored conversations are not rewritten by this control.
 
 ### Nested: AgentFeature (discriminated union on `type`)
 

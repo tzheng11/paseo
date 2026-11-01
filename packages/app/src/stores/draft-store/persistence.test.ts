@@ -112,7 +112,7 @@ describe("draft persistence", () => {
   });
 
   it("withholds synthetic secrets from durable draft checkpoints without changing the editor", async () => {
-    const syntheticSecret = `sk-proj-${"synthetic".repeat(8)}`;
+    const syntheticSecret = "q1W2e3R4t5Y6u7I8o9P0a/S+d1F2g3H4j5K6l7Z8";
     const record = (text: string): DraftRecord => ({
       input: { text, attachments: [] },
       lifecycle: "active",
@@ -185,7 +185,7 @@ describe("draft persistence", () => {
   });
 
   it("preserves text around synthetic keys in all durable drafts", () => {
-    const key = `sk-proj-${"synthetic".repeat(8)}`;
+    const key = "q1W2e3R4t5Y6u7I8o9P0a/S+d1F2g3H4j5K6l7Z8";
     expect(checkpoint(`  before\n${key}\nafter  `)).toBe(
       `  before\n${SECRET_ANSWER_NOTICE}\nafter  `,
     );

@@ -15237,7 +15237,7 @@ test("secret answer permission responses reach providers and durable records onl
   }
   const session = new AnswerSession({ provider: "codex", cwd: process.cwd() });
   const { manager, storage, agent } = await createSecretAnswerTestManager(session);
-  const syntheticSecret = `sk-proj-${"synthetic".repeat(8)}`;
+  const syntheticSecret = "q1W2e3R4t5Y6u7I8o9P0a/S+d1F2g3H4j5K6l7Z8";
   const question: Request = {
     id: "question",
     provider: "codex",
@@ -15345,7 +15345,7 @@ test("secret answer stream and out-of-band prompts are redacted before providers
   }
   const session = new AnswerSession({ provider: "codex", cwd: process.cwd() });
   const { manager, storage, agent } = await createSecretAnswerTestManager(session);
-  const syntheticSecret = `sk-proj-${"synthetic".repeat(8)}`;
+  const syntheticSecret = "q1W2e3R4t5Y6u7I8o9P0a/S+d1F2g3H4j5K6l7Z8";
   const secretPrompt = `  before\n${syntheticSecret}\nafter  `;
   const safePrompt = `  before\n${SECRET_ANSWER_NOTICE}\nafter  `;
   await drainAsyncGenerator(
@@ -15451,7 +15451,7 @@ test("secret answer steering and replacement sanitize both provider delivery and
   const { manager, storage, agent } = await createSecretAnswerTestManager(session);
   const initialRun = drainAsyncGenerator(manager.streamAgent(agent.id, "initial"));
   await manager.waitForAgentRunStart(agent.id);
-  const syntheticSecret = `sk-proj-${"synthetic".repeat(8)}`;
+  const syntheticSecret = "q1W2e3R4t5Y6u7I8o9P0a/S+d1F2g3H4j5K6l7Z8";
   const secretPrompt = `before ${syntheticSecret} after\n`;
   const safePrompt = `before ${SECRET_ANSWER_NOTICE} after\n`;
   expect(

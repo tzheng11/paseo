@@ -174,7 +174,7 @@ describe("normalizePersistedState", () => {
 
 describe("serializeReviewDraftState", () => {
   it("redacts only secret spans in persisted review comments without changing the editor", async () => {
-    const key = `sk-proj-${"synthetic".repeat(8)}`;
+    const key = "q1W2e3R4t5Y6u7I8o9P0a/S+d1F2g3H4j5K6l7Z8";
     const body = `  Before\n${key}\nAfter  `;
     const comment = makeComment({ body });
     const state = addCommentToState(emptyState(), { key: "review:key", comment });

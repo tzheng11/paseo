@@ -16,6 +16,12 @@ const LITERAL_PATTERNS: readonly RegExp[] = [
   /(?<![A-Za-z0-9])impr_(?:mcp|oat)_[A-Za-z0-9_-]{16,512}/,
   /\b(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,})\b/,
   /\bdtn_[A-Za-z0-9]{16,}\b/,
+  /\bxox[baprs]-[A-Za-z0-9-]{16,}/,
+  /\b(?:sk_(?:live|test)_|rk_(?:(?:live|test)_)?)[A-Za-z0-9_]{16,}/,
+  /\bnpm_[A-Za-z0-9]{16,}/,
+  /\bAIza[A-Za-z0-9_-]{30,}/,
+  /\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}/,
+  /\b(?:re_|sntrys_)[A-Za-z0-9_]{16,}/,
 ];
 const JWT_PATTERN =
   /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,4096}\.(?:[A-Za-z0-9_-]{1,4096}|(?=\.[A-Za-z0-9_-]{1}))(?:\.[A-Za-z0-9_-]{0,4096}){0,3}/;
@@ -26,6 +32,12 @@ const ASSIGNMENT_PATTERN = /\b([A-Za-z0-9_.-]{1,64})["']?\s{0,64}[:=]\s{0,64}["'
 const TOKEN_KEY_PATTERN =
   /(?:(?:access|refresh|mcp)[_-]?token|(?<![A-Za-z0-9])id[_-]?token|(?<![A-Za-z0-9_.-])token|protection[_-]bypass)$/i;
 const ENV_TOKEN_KEY_PATTERN = /(?:^|[^A-Za-z0-9_])[A-Z][A-Z0-9_]{0,60}_TOKEN$/;
+const ENV_SECRET_KEY_PATTERN =
+  /(?:^|_)(?:KEY|PASS|PWD|AUTH|COOKIE|DSN|JWT)$|^(?:PGPASSWORD|MYSQL_PWD)$/;
+const NON_SECRET_KEY_PATTERN =
+  /(?:^|_)(?:PUBLIC|SORT|PRIMARY|CACHE|FOREIGN|PARTITION)_?KEY$|(?:^|_)ID$/i;
+const HEX_LENGTHS = new Set([7, 8, 12, 32, 40, 64, 96, 128]);
+const UUID_PATTERN = /^[\da-f]{8}-(?:[\da-f]{4}-){3}[\da-f]{12}$/i;
 const WORDS_ONLY_VALUE =
   /^(?:[a-z]{1,24}(?:[_-][a-z]{1,24}){1,16}|[A-Z]{1,24}(?:[_-][A-Z]{1,24}){1,16}|(?:[A-Z][a-z]{0,24}[_-]?){2,8}|[a-z]{1,24}(?:[A-Z][a-z]{1,24}){1,16})$/;
 const NON_SECRET_VALUE = /^(?:true|false|null|undefined|[\d.]+)$/i;
@@ -73,21 +85,66 @@ interface AssignmentCandidate {
   query: boolean;
 }
 
-function isSecretAssignment({ key, value, query }: AssignmentCandidate): boolean {
-  const reference =
-    /^(?:process\.env\.[A-Za-z_][A-Za-z0-9_]*|\$[A-Za-z_][A-Za-z0-9_]*|<[^<>\r\n]{1,256}>)$/.test(
+function isExcludedKey(key: string): boolean {
+  return NON_SECRET_KEY_PATTERN.test(key.replace(/([a-z0-9])([A-Z])/g, "$1_$2"));
+}
+
+function isSecretKey(key: string): boolean {
+  if (isExcludedKey(key)) return false;
+  return (
+    SECRET_KEY_PATTERN.test(key) ||
+    TOKEN_KEY_PATTERN.test(key) ||
+    ENV_TOKEN_KEY_PATTERN.test(key) ||
+    ENV_SECRET_KEY_PATTERN.test(key) ||
+    DIAGNOSTIC_SECRET_KEY.test(key)
+  );
+}
+
+function isValueReference(value: string): boolean {
+  return (
+    /^(?:process\.env\.[A-Za-z_][A-Za-z0-9_]*|os\.environ|\$[A-Za-z_][A-Za-z0-9_]*|<[^<>\r\n]{1,256}>)$/.test(
       value,
-    );
-  if (
-    value.startsWith("[redacted") ||
+    ) ||
     value.startsWith("${") ||
-    reference ||
-    NON_SECRET_VALUE.test(value)
-  ) {
+    value.startsWith("{{") ||
+    value.startsWith("[redacted")
+  );
+}
+
+function isKnownIdentifier(value: string): boolean {
+  return UUID_PATTERN.test(value) || (HEX_LENGTHS.has(value.length) && /^[\da-f]+$/i.test(value));
+}
+
+function isSafeLocation(value: string): boolean {
+  if (/^(?:[A-Za-z][A-Za-z0-9+.-]{1,31}:\/\/|\/|\.\.?\/|~\/|[A-Za-z]:\\)/.test(value)) return true;
+  if (!value.includes("/")) return false;
+  return value
+    .split("/")
+    .every((part) =>
+      /^(?:[a-z0-9_.-]+|(?:[A-Z]?[a-z]{2,})(?:[A-Z][a-z]{2,})*[0-9]*(?:\.[a-z]{1,8})?)$/.test(part),
+    );
+}
+
+function isShapedValue(value: string, minimum = 8): boolean {
+  return (
+    value.length >= minimum &&
+    !isValueReference(value) &&
+    !isSafeLocation(value) &&
+    isTokenValue(value) &&
+    /[A-Za-z]/.test(value) &&
+    /\d/.test(value)
+  );
+}
+
+function isSecretAssignment({ key, value, query }: AssignmentCandidate): boolean {
+  if (isExcludedKey(key) || isValueReference(value) || NON_SECRET_VALUE.test(value)) {
     return false;
   }
   const secretKey = SECRET_KEY_PATTERN.test(key);
-  const tokenKey = TOKEN_KEY_PATTERN.test(key) || ENV_TOKEN_KEY_PATTERN.test(key);
+  const tokenKey =
+    TOKEN_KEY_PATTERN.test(key) ||
+    ENV_TOKEN_KEY_PATTERN.test(key) ||
+    ENV_SECRET_KEY_PATTERN.test(key);
   if (query) {
     const secretQueryKey = secretKey || tokenKey;
     return (
@@ -104,6 +161,7 @@ function isSecretAssignment({ key, value, query }: AssignmentCandidate): boolean
   if (!isTokenValue(value) || isDottedCode(value)) return false;
   if (DIAGNOSTIC_SECRET_KEY.test(key)) return value.length >= 8;
   if (secretKey) return value.length >= 8;
+  if (ENV_SECRET_KEY_PATTERN.test(key)) return isShapedValue(value);
   return (
     tokenKey &&
     value.length >= 16 &&
@@ -233,19 +291,47 @@ function isOpaqueCharacter(character: string): boolean {
   return /^[A-Za-z0-9+/=_.%~-]$/.test(character);
 }
 
-function endOfOpaqueValue(text: string, start: number): number {
+function isLiteralCharacter(view: DetectionView | undefined, index: number): boolean {
+  const start = view?.starts?.[index];
+  const end = view?.ends?.[index];
+  return start === undefined || end === start + 1;
+}
+
+function assignedValueEnd(text: string, start: number, view?: DetectionView): number {
   let end = start;
-  while (end < text.length && isOpaqueCharacter(text[end]!)) end += 1;
+  while (end < text.length) {
+    const delimiter = /[\s'"`;:,}\]\\()[<>?&#]/.test(text[end]!);
+    if (delimiter && isLiteralCharacter(view, end)) break;
+    end += 1;
+  }
+  return end;
+}
+
+function assignedValue(text: string, start: number, end: number, view?: DetectionView): string {
+  if (!view?.starts) return text.slice(start, end);
+  const characters: string[] = [];
+  for (let index = start; index < end; index += 1) {
+    const character = text[index]!;
+    const encodedDelimiter = !isLiteralCharacter(view, index) && !isOpaqueCharacter(character);
+    characters.push(encodedDelimiter ? `%${character.charCodeAt(0).toString(16)}` : character);
+  }
+  return characters.join("");
+}
+
+function endOfOpaqueValue(text: string, start: number, view?: DetectionView): number {
+  let end = start;
+  while (end < text.length && (isOpaqueCharacter(text[end]!) || !isLiteralCharacter(view, end)))
+    end += 1;
   while (end > start && text[end - 1] === ".") end -= 1;
   return end;
 }
 
-function literalSpans(text: string, pattern: RegExp): SecretPromptSpan[] {
+function literalSpans(text: string, pattern: RegExp, view?: DetectionView): SecretPromptSpan[] {
   const spans: SecretPromptSpan[] = [];
   const scanner = new RegExp(pattern.source, "g" + (pattern.ignoreCase ? "i" : ""));
   let match: RegExpExecArray | null;
   while ((match = scanner.exec(text)) !== null) {
-    let end = endOfOpaqueValue(text, match.index + match[0].length);
+    let end = endOfOpaqueValue(text, match.index + match[0].length, view);
     while (end > match.index && text[end - 1] === ".") end -= 1;
     spans.push({ start: match.index, end });
     scanner.lastIndex = end;
@@ -276,36 +362,214 @@ function privateKeySpans(text: string): SecretPromptSpan[] {
   return spans;
 }
 
-function assignmentSpans(text: string): SecretPromptSpan[] {
+function assignmentSpans(text: string, view?: DetectionView): SecretPromptSpan[] {
   const spans: SecretPromptSpan[] = [];
   const scanner = new RegExp(ASSIGNMENT_PATTERN.source, "g");
   let match: RegExpExecArray | null;
   while ((match = scanner.exec(text)) !== null) {
     const key = match[1]!;
-    const candidate =
-      SECRET_KEY_PATTERN.test(key) ||
-      TOKEN_KEY_PATTERN.test(key) ||
-      ENV_TOKEN_KEY_PATTERN.test(key) ||
-      DIAGNOSTIC_SECRET_KEY.test(key);
-    if (!candidate) continue;
+    if (!isSecretKey(key)) continue;
     const start = match.index + match[0].length;
     const before = text[match.index - 1];
     const query = before === "?" || before === "&";
-    let end = start;
-    while (end < text.length && !/[\s'"`;:,}\]\\()[<>?&#]/.test(text[end]!)) {
-      end += 1;
-    }
+    let end = assignedValueEnd(text, start, view);
     const next = end;
     while (end > start && text[end - 1] === ".") end -= 1;
-    const value = text.slice(start, end);
+    const value = assignedValue(text, start, end, view);
     if (isSecretAssignment({ key, value, query })) spans.push({ start, end });
     scanner.lastIndex = Math.max(scanner.lastIndex, next);
   }
   return spans;
 }
 
-function authorizationSpans(text: string): SecretPromptSpan[] {
-  const spans = literalSpans(text, AUTHORIZATION_SCHEME_PATTERN);
+function labelledValueSpans(
+  text: string,
+  pattern: RegExp,
+  view?: DetectionView,
+): SecretPromptSpan[] {
+  const spans: SecretPromptSpan[] = [];
+  const scanner = new RegExp(pattern.source, pattern.flags);
+  let match: RegExpExecArray | null;
+  while ((match = scanner.exec(text)) !== null) {
+    const start = match.index + match[0].length;
+    let end = assignedValueEnd(text, start, view);
+    const next = end;
+    while (end > start && text[end - 1] === ".") end -= 1;
+    const value = assignedValue(text, start, end, view);
+    const passphrase = /^[A-Za-z]{2,}(?:-[A-Za-z]{2,}){2,}$/.test(value);
+    if (isShapedValue(value) || passphrase) spans.push({ start, end });
+    scanner.lastIndex = Math.max(scanner.lastIndex, next);
+  }
+  return spans;
+}
+
+function naturalCredentialSpans(text: string, view?: DetectionView): SecretPromptSpan[] {
+  return labelledValueSpans(
+    text,
+    /\b(?:password|passwd|passphrase|api[ _-]?key|secret[ _-]?key)(?:\s{1,16}is\s{1,16}|\s{0,16}[:=]\s{0,16})["']?/gi,
+    view,
+  );
+}
+
+function flagSpans(text: string, view?: DetectionView): SecretPromptSpan[] {
+  return labelledValueSpans(
+    text,
+    /--(?:password|passwd|passphrase|token|api[-_]key|secret)(?:=|[ \t]{1,16})["']?/gi,
+    view,
+  );
+}
+
+function userPasswordSpans(
+  text: string,
+  pattern: RegExp,
+  url: boolean,
+  view?: DetectionView,
+): SecretPromptSpan[] {
+  const spans: SecretPromptSpan[] = [];
+  const scanner = new RegExp(pattern.source, pattern.flags);
+  let match: RegExpExecArray | null;
+  while ((match = scanner.exec(text)) !== null) {
+    let start = match.index + match[0].length;
+    if (url) {
+      if (text.slice(start, start + 3) !== "://") continue;
+      start += 3;
+    }
+    let end = start;
+    while (end < text.length) {
+      const literal = isLiteralCharacter(view, end);
+      if (literal && /[\s'"`<>]/.test(text[end]!)) break;
+      if (url && literal && /[/?#]/.test(text[end]!)) break;
+      end += 1;
+    }
+    const authority = text.slice(start, end);
+    const at = url ? authority.lastIndexOf("@") : authority.length;
+    const colon = authority.indexOf(":");
+    if (colon >= 0 && at > colon) {
+      const passwordStart = start + colon + 1;
+      const passwordEnd = start + at;
+      const password = text.slice(passwordStart, passwordEnd);
+      if (isShapedValue(password)) spans.push({ start: passwordStart, end: passwordEnd });
+    }
+    scanner.lastIndex = Math.max(scanner.lastIndex, end);
+  }
+  return spans;
+}
+
+function urlPasswordSpans(text: string, view?: DetectionView): SecretPromptSpan[] {
+  return userPasswordSpans(text, /[A-Za-z][A-Za-z0-9+.-]*/g, true, view);
+}
+
+function curlUserSpans(text: string, view?: DetectionView): SecretPromptSpan[] {
+  return userPasswordSpans(text, /(?:^|\s)(?:-u|--user)(?:=|[ \t]{1,16})["']?/g, false, view);
+}
+
+function cookieSpans(text: string, view?: DetectionView): SecretPromptSpan[] {
+  const spans: SecretPromptSpan[] = [];
+  const scanner = /\b(?:Cookie|Set-Cookie):[ \t]{0,16}/gi;
+  let header: RegExpExecArray | null;
+  while ((header = scanner.exec(text)) !== null) {
+    const start = header.index + header[0].length;
+    let end = start;
+    while (end < text.length && !(text[end] === "\n" && isLiteralCharacter(view, end))) end += 1;
+    const line = text.slice(start, end);
+    const entries = /\b[A-Za-z0-9_-]{1,64}=/g;
+    let entry: RegExpExecArray | null;
+    while ((entry = entries.exec(line)) !== null) {
+      const valueStart = start + entry.index + entry[0].length;
+      const valueEnd = Math.min(end, assignedValueEnd(text, valueStart, view));
+      const value = assignedValue(text, valueStart, valueEnd, view);
+      if (isShapedValue(value)) spans.push({ start: valueStart, end: valueEnd });
+      entries.lastIndex = Math.max(entries.lastIndex, valueEnd - start);
+    }
+    scanner.lastIndex = end;
+  }
+  return spans;
+}
+
+function entropyOf(value: string): number {
+  const frequencies = new Map<string, number>();
+  for (const character of value) frequencies.set(character, (frequencies.get(character) ?? 0) + 1);
+  let entropy = 0;
+  for (const count of frequencies.values()) {
+    const proportion = count / value.length;
+    entropy -= proportion * Math.log2(proportion);
+  }
+  return entropy;
+}
+
+function isEntropyValue(value: string): boolean {
+  if (value.length < 32 || isKnownIdentifier(value) || isWordlikePath(value)) return false;
+  const mixed = /[A-Z]/.test(value) && /[a-z]/.test(value) && /\d/.test(value);
+  if (!mixed || !isTokenValue(value)) return false;
+  return entropyOf(value) >= 3.5;
+}
+
+function isWordlikePath(value: string): boolean {
+  if (!value.includes("/")) return false;
+  return value
+    .split("/")
+    .every(
+      (part) =>
+        part === "" ||
+        isKnownIdentifier(part) ||
+        /^(?:[a-z0-9_.-]+|(?:[A-Z]?[a-z]{2,})(?:[A-Z][a-z]{2,})*[0-9]*(?:\.[a-z]{1,8})?)$/.test(
+          part,
+        ),
+    );
+}
+
+function entropySpans(text: string): SecretPromptSpan[] {
+  const spans: SecretPromptSpan[] = [];
+  // Chunk exclusions keep URLs, data URIs, integrity hashes and path segments readable.
+  for (const chunk of text.matchAll(/\S+/g)) {
+    if (
+      /(?:data:[^\s]*base64,|[A-Za-z][A-Za-z0-9+.-]{1,31}:\/\/|sha(?:1|224|256|384|512)-)/i.test(
+        chunk[0],
+      )
+    )
+      continue;
+    const assigned = /^([A-Za-z0-9_.-]{1,64})=/.exec(chunk[0]);
+    if (assigned && isExcludedKey(assigned[1]!)) continue;
+    for (const candidate of chunk[0].matchAll(/[A-Za-z0-9+/_-]{32,}={0,2}/g)) {
+      const value = candidate[0];
+      if (!isEntropyValue(value)) continue;
+      const start = chunk.index + candidate.index;
+      spans.push({ start, end: start + value.length });
+    }
+  }
+  return spans;
+}
+
+function benignAssignmentSpans(text: string, view?: DetectionView): SecretPromptSpan[] {
+  const spans: SecretPromptSpan[] = [];
+  const scanner = new RegExp(ASSIGNMENT_PATTERN.source, "g");
+  let match: RegExpExecArray | null;
+  while ((match = scanner.exec(text)) !== null) {
+    if (!isExcludedKey(match[1]!)) continue;
+    const start = match.index + match[0].length;
+    const end = assignedValueEnd(text, start, view);
+    spans.push({ start, end });
+    scanner.lastIndex = Math.max(scanner.lastIndex, end);
+  }
+  return spans;
+}
+
+function excludeSpans(
+  spans: SecretPromptSpan[],
+  exclusions: SecretPromptSpan[],
+): SecretPromptSpan[] {
+  const kept: SecretPromptSpan[] = [];
+  let index = 0;
+  for (const span of spans) {
+    while (exclusions[index] && exclusions[index]!.end <= span.start) index += 1;
+    const exclusion = exclusions[index];
+    if (!exclusion || exclusion.start >= span.end) kept.push(span);
+  }
+  return kept;
+}
+
+function authorizationSpans(text: string, view?: DetectionView): SecretPromptSpan[] {
+  const spans = literalSpans(text, AUTHORIZATION_SCHEME_PATTERN, view);
   return spans.map((span) => {
     const scheme = /^(?:Bearer|Basic)[ \t]+/i.exec(text.slice(span.start, span.end));
     return { start: span.start + (scheme?.[0].length ?? 0), end: span.end };
@@ -335,23 +599,41 @@ function mergeSpans(streams: SecretPromptSpan[][]): SecretPromptSpan[] {
 }
 
 /** Original UTF-16 offsets; spans are sorted, merged, and never include surrounding prose. */
+function scanSecretSpans(text: string, includeEntropy: boolean): SecretPromptSpan[] {
+  const view = detectionView(text);
+  const literals = [...LITERAL_PATTERNS, JWT_PATTERN];
+  const streams = literals.map((pattern) => literalSpans(view.text, pattern, view));
+  streams.push(
+    privateKeySpans(view.text),
+    assignmentSpans(view.text, view),
+    authorizationSpans(view.text, view),
+    urlPasswordSpans(view.text, view),
+    curlUserSpans(view.text, view),
+    flagSpans(view.text, view),
+    cookieSpans(view.text, view),
+    naturalCredentialSpans(view.text, view),
+  );
+  if (includeEntropy)
+    streams.push(excludeSpans(entropySpans(view.text), benignAssignmentSpans(view.text, view)));
+  return mergeSpans(streams).map((span) => ({
+    start: view.starts?.[span.start] ?? span.start,
+    end: view.ends?.[span.end - 1] ?? span.end,
+  }));
+}
+
+/** Original UTF-16 offsets; spans are sorted, merged, and never include surrounding prose. */
 export function secretPromptSpans(text: string, context?: string): SecretPromptSpan[] {
   if (text === "" || text === SECRET_ANSWER_NOTICE) return [];
   if (context !== undefined && /^\S+$/.test(text) && endsWithCredentialRequest(context)) {
     return [{ start: 0, end: text.length }];
   }
-  const view = detectionView(text);
-  const literals = [...LITERAL_PATTERNS, JWT_PATTERN];
-  const streams = literals.map((pattern) => literalSpans(view.text, pattern));
-  streams.push(
-    privateKeySpans(view.text),
-    assignmentSpans(view.text),
-    authorizationSpans(view.text),
-  );
-  return mergeSpans(streams).map((span) => ({
-    start: view.starts?.[span.start] ?? span.start,
-    end: view.ends?.[span.end - 1] ?? span.end,
-  }));
+  return scanSecretSpans(text, true);
+}
+
+/** Routing keys use explicit credential formats, never value entropy or conversational context. */
+export function redactSecretKey(text: string): string {
+  if (text === "" || text === SECRET_ANSWER_NOTICE) return text;
+  return scanSecretSpans(text, false).length > 0 ? SECRET_ANSWER_NOTICE : text;
 }
 
 /** General chat preserves every ordinary byte and scans the complete input, regardless of size. */
@@ -372,5 +654,14 @@ export function redactSecretPrompt(text: string, context?: string): string {
 export function redactSecretAnswer(text: string, context?: string): string {
   if (text === "" || text === SECRET_ANSWER_NOTICE) return text;
   if (context !== undefined && requestsCredential(context)) return SECRET_ANSWER_NOTICE;
+  const neutralSecret =
+    /^\S{16,}$/.test(text) &&
+    /[A-Za-z]/.test(text) &&
+    /\d/.test(text) &&
+    !isKnownIdentifier(text) &&
+    !isSafeLocation(text) &&
+    !isValueReference(text) &&
+    !/^(?:data:|sha(?:1|224|256|384|512)-)/i.test(text);
+  if (neutralSecret) return SECRET_ANSWER_NOTICE;
   return secretPromptSpans(text).length > 0 ? SECRET_ANSWER_NOTICE : text;
 }

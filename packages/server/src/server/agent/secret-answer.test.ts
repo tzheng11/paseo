@@ -107,11 +107,41 @@ describe("permission answer sanitization", () => {
   test("ordinary routing values and answers pass through unchanged", () => {
     const response: AgentPermissionResponse = {
       behavior: "allow",
-      selectedActionId: "approve-once",
-      updatedInput: { answers: { Color: "  Blue\n" }, explanation: "Use option 2" },
+      selectedActionId: "projectAuthenticationConfigurationV2",
+      updatedInput: {
+        answers: { Color: "  Blue\n" },
+        explanation: "Use option 2",
+        questionIdentifier1234: "Blue",
+        authenticationConfigurationVersion2: "Blue",
+        questionIdentifier1234567890WithDetails: "Blue",
+      },
       updatedPermissions: [{ type: "allow", scope: "session", enabled: true }],
     };
     expect(redactPermissionResponse(response, request)).toEqual(response);
+  });
+
+  test.each([
+    "q1W2e3R4t5Y6u7I8o9P0a/S+d1F2g3H4j5K6l7Z8",
+    "aB3dE7gH9kLmN2pQ5rT8",
+    "postgres://admin:s3cr3tPass99@db.internal:5432/app",
+  ])("withholds opaque neutral-question answers and permission feedback (%#)", (value) => {
+    const neutral = {
+      ...request,
+      input: { questions: [{ header: "Choice", question: "Which one?" }] },
+    };
+    expect(
+      redactPermissionResponse(
+        { behavior: "allow", updatedInput: { answers: { Choice: value } } },
+        neutral,
+      ),
+    ).toEqual({ behavior: "allow", updatedInput: { answers: { Choice: SECRET_ANSWER_NOTICE } } });
+    expect(redactPermissionResponse({ behavior: "deny", message: value })).toEqual({
+      behavior: "deny",
+      message: SECRET_ANSWER_NOTICE,
+    });
+    expect(
+      redactPermissionResponse({ behavior: "allow", updatedPermissions: [{ value }] }),
+    ).toEqual({ behavior: "allow", updatedPermissions: [{ value: SECRET_ANSWER_NOTICE }] });
   });
 
   test("preserves ordinary token counters, failure codes and configuration flags in metadata", () => {
@@ -203,6 +233,18 @@ describe("permission answer sanitization", () => {
 });
 
 describe("chat and steering answer sanitization", () => {
+  test.each([
+    [
+      "prefix postgres://u:Ab3Cd4Ef5%20Gh6Ij7@host/db suffix",
+      `prefix postgres://u:${SECRET_ANSWER_NOTICE}@host/db suffix`,
+    ],
+    ["prefix password=abc123%22xyz789 suffix", `prefix password=${SECRET_ANSWER_NOTICE} suffix`],
+    ["prefix --token=Ab3Cd4Ef5%20Gh6Ij7 suffix", `prefix --token=${SECRET_ANSWER_NOTICE} suffix`],
+    ["Cookie: session=abc123%3Bxyz789\nnext", `Cookie: session=${SECRET_ANSWER_NOTICE}\nnext`],
+  ])("removes encoded value tails through the runtime prompt boundary (%#)", (prompt, expected) => {
+    expect(redactPromptInput(prompt)).toBe(expected);
+  });
+
   test("redacts secret spans and single-token replies to the latest strict credential request", () => {
     expect(redactPromptInput(syntheticKey)).toBe(SECRET_ANSWER_NOTICE);
     expect(redactPromptInput(`Keep this prefix ${syntheticKey} and this suffix.`)).toBe(

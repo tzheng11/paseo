@@ -445,6 +445,12 @@ test("lists only native item identifiers for retention without reading timeline 
 for (const active of [true, false]) {
   test.each([
     ["Which color?", "sk-proj-" + "SYNTHETIC".repeat(8), true],
+    ["Which one?", "q1W2e3R4t5Y6u7I8o9P0a/S+d1F2g3H4j5K6l7Z8", true],
+    ["Which one?", "aB3dE7gH9kLmN2pQ5rT8", true],
+    ["Which one?", "postgres://admin:s3cr3tPass99@db.internal:5432/app", true],
+    ["Which one?", "41c4e4c0bd7709490212ac97f0beda98ae2812ad", false],
+    ["Which one?", "bc299fea-5481-48e4-bb5f-31fc299789a1", false],
+    ["Which one?", "https://example.test/issue/123456789", false],
     ["Enter your Mac password", "tiny", true],
     ["Which color?", "Green", false],
   ])(
