@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { SECRET_ANSWER_NOTICE } from "@getpaseo/protocol/secret-answer";
 import type { StateStorage } from "zustand/middleware";
 import type { ParsedDiffFile } from "@/git/use-diff-query";
 import { createValidatedPersistStorage } from "@/storage/validated-persist-storage";
@@ -172,6 +173,38 @@ describe("normalizePersistedState", () => {
 });
 
 describe("serializeReviewDraftState", () => {
+  it("redacts only secret spans in persisted review comments without changing the editor", async () => {
+    const key = `sk-proj-${"synthetic".repeat(8)}`;
+    const body = `  Before\n${key}\nAfter  `;
+    const comment = makeComment({ body });
+    const state = addCommentToState(emptyState(), { key: "review:key", comment });
+    const backing = createMemoryStorage();
+    const storage = createValidatedPersistStorage(backing, SerializedReviewDraftStateSchema);
+    await storage.setItem("@paseo:review-draft-store", {
+      state: serializeReviewDraftState(state),
+      version: 2,
+    });
+    const saved = await storage.getItem("@paseo:review-draft-store");
+    expect(saved?.state.drafts["review:key"][0].body).toBe(
+      `  Before\n${SECRET_ANSWER_NOTICE}\nAfter  `,
+    );
+    expect(JSON.stringify(saved)).not.toContain(key);
+    expect(state.drafts["review:key"][0].body).toBe(body);
+  });
+
+  it("preserves ordinary review prose and large log pastes byte-exact", () => {
+    for (const body of [
+      "In the schema, password: required for local accounts only.",
+      "log line without anything sensitive in it\n".repeat(1800),
+    ]) {
+      const state = addCommentToState(emptyState(), {
+        key: "review:key",
+        comment: makeComment({ body }),
+      });
+      expect(serializeReviewDraftState(state).drafts["review:key"][0].body).toBe(body);
+    }
+  });
+
   it("serialized output does not contain the legacy activeModesByScope field", () => {
     const state = addCommentToState(emptyState(), { key: "review:key", comment: makeComment() });
 

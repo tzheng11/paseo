@@ -1,5 +1,9 @@
 import { describe, expect, test } from "vitest";
-import type { AgentPermissionRequest, AgentPermissionResponse } from "./agent-sdk-types.js";
+import type {
+  AgentPermissionRequest,
+  AgentPermissionResponse,
+  AgentPromptInput,
+} from "./agent-sdk-types.js";
 import {
   redactPermissionResponse,
   redactPromptInput,
@@ -144,7 +148,7 @@ describe("permission answer sanitization", () => {
       updatedInput: { answers: { Password: "yes" } },
     };
     expect(redactPermissionResponse(response, discussion)).toEqual(response);
-    expect(redactPromptInput("yes", [discussion])).toBe("yes");
+    expect(redactPromptInput("yes", "Should password validation be enabled?")).toBe("yes");
   });
 
   test.each([
@@ -164,7 +168,6 @@ describe("permission answer sanitization", () => {
       behavior: "allow",
       updatedInput: { answers: { Account: SECRET_ANSWER_NOTICE } },
     });
-    expect(redactPromptInput("x", [described])).toBe(SECRET_ANSWER_NOTICE);
   });
 
   test("includes an explicit credential request in the overall card description", () => {
@@ -200,23 +203,33 @@ describe("permission answer sanitization", () => {
 });
 
 describe("chat and steering answer sanitization", () => {
-  test("withholds secret strings and arbitrary replies to secret questions", () => {
+  test("redacts secret spans and single-token replies to the latest strict credential request", () => {
     expect(redactPromptInput(syntheticKey)).toBe(SECRET_ANSWER_NOTICE);
-    expect(redactPromptInput("x", [request])).toBe(SECRET_ANSWER_NOTICE);
+    expect(redactPromptInput(`Keep this prefix ${syntheticKey} and this suffix.`)).toBe(
+      `Keep this prefix ${SECRET_ANSWER_NOTICE} and this suffix.`,
+    );
+    expect(redactPromptInput("x", "Enter your password:")).toBe(SECRET_ANSWER_NOTICE);
+    expect(redactPromptInput("Use the existing configuration", "Enter your password:")).toBe(
+      "Use the existing configuration",
+    );
     expect(redactPromptInput([{ type: "text", text: syntheticKey }])).toEqual([
       { type: "text", text: SECRET_ANSWER_NOTICE },
     ]);
   });
 
-  test("withholds a secret split across provider text blocks", () => {
+  test("preserves every ordinary fragment when a secret crosses provider text blocks", () => {
     expect(
       redactPromptInput([
-        { type: "text", text: syntheticKey.slice(0, 5) },
-        { type: "text", text: syntheticKey.slice(5) },
+        { type: "text", text: `  before\n${syntheticKey.slice(0, 5)}` },
+        { type: "image", data: "synthetic-image", mimeType: "image/png" },
+        { type: "text", text: syntheticKey.slice(5, 25) },
+        { type: "text", text: `${syntheticKey.slice(25)}\n after  ` },
       ]),
     ).toEqual([
-      { type: "text", text: SECRET_ANSWER_NOTICE },
-      { type: "text", text: SECRET_ANSWER_NOTICE },
+      { type: "text", text: `  before\n${SECRET_ANSWER_NOTICE}` },
+      { type: "image", data: "synthetic-image", mimeType: "image/png" },
+      { type: "text", text: "" },
+      { type: "text", text: "\n after  " },
     ]);
   });
 
@@ -226,7 +239,7 @@ describe("chat and steering answer sanitization", () => {
         type: "text",
         mimeType: "text/plain",
         text: "ordinary attachment",
-        title: syntheticKey,
+        title: `Title before ${syntheticKey} title after`,
       },
       {
         type: "review",
@@ -238,7 +251,7 @@ describe("chat and steering answer sanitization", () => {
             filePath: "synthetic.ts",
             side: "new",
             lineNumber: 1,
-            body: syntheticKey,
+            body: `Review before ${syntheticKey} review after`,
             context: {
               hunkHeader: "@@ synthetic @@",
               targetLine: { oldLineNumber: null, newLineNumber: 1, type: "add", content: "safe" },
@@ -250,6 +263,18 @@ describe("chat and steering answer sanitization", () => {
     ]);
     expect(JSON.stringify(redacted)).not.toContain(syntheticKey);
     expect(JSON.stringify(redacted)).toContain(SECRET_ANSWER_NOTICE);
+    expect(redacted).toMatchObject([
+      {
+        type: "text",
+        mimeType: "text/plain",
+        text: "ordinary attachment",
+        title: `Title before ${SECRET_ANSWER_NOTICE} title after`,
+      },
+      {
+        type: "review",
+        comments: [{ body: `Review before ${SECRET_ANSWER_NOTICE} review after` }],
+      },
+    ]);
   });
 
   test("preserves ordinary text, image data and attachment metadata", () => {
@@ -259,6 +284,81 @@ describe("chat and steering answer sanitization", () => {
       { type: "text" as const, mimeType: "text/plain" as const, text: "safe", title: "Notes" },
     ];
     expect(redactPromptInput(prompt)).toEqual(prompt);
+  });
+
+  test.each([
+    "Should password validation be enabled?",
+    "Which token budget should we use?",
+    "Enter token",
+    "Enter the token budget",
+    "I updated the API key validation code.",
+    "Enter your password. Then explain how you will test.",
+    "The password is managed in the secret store. What should we test?",
+  ])("preserves ordinary replies when the latest message is discussion: %s", (context) => {
+    expect(redactPromptInput("yes", context)).toBe("yes");
+    expect(redactPromptInput([{ type: "text", text: "yes" }], context)).toEqual([
+      { type: "text", text: "yes" },
+    ]);
+  });
+
+  test("preserves long ordinary prompts and redacts late spans without a length cutoff", () => {
+    const prefix = `  ${"ordinary words\n".repeat(6_000)}`;
+    const suffix = `\n${"more ordinary text\n".repeat(6_000)}  `;
+    const ordinary = prefix + suffix;
+    expect(ordinary.length).toBeGreaterThan(65_536);
+    expect(redactPromptInput(ordinary)).toBe(ordinary);
+    expect(redactPromptInput(`${prefix}${syntheticKey}${suffix}`)).toBe(
+      `${prefix}${SECRET_ANSWER_NOTICE}${suffix}`,
+    );
+    expect(redactPromptInput(ordinary, "Enter your password:")).toBe(ordinary);
+  });
+
+  test("preserves large prompt arrays and attachments while redacting their secret spans", () => {
+    const prompt: AgentPromptInput = Array.from({ length: 5_001 }, (_, index) => ({
+      type: "text",
+      text: `ordinary block ${index}\n`,
+    }));
+    prompt.push({
+      type: "text",
+      mimeType: "text/plain",
+      title: "Notes",
+      text: `${"ordinary attachment\n".repeat(5_000)}${syntheticKey}\nattachment suffix`,
+    });
+    const redacted = redactPromptInput(prompt);
+    expect(Array.isArray(redacted)).toBe(true);
+    if (!Array.isArray(redacted)) throw new Error("Expected prompt blocks");
+    expect(redacted).toHaveLength(prompt.length);
+    expect(redacted.slice(0, 5_001)).toEqual(prompt.slice(0, 5_001));
+    expect(redacted.at(-1)).toEqual({
+      ...prompt.at(-1),
+      text: `${"ordinary attachment\n".repeat(5_000)}${SECRET_ANSWER_NOTICE}\nattachment suffix`,
+    });
+  });
+
+  test("maps encoded split secrets to the original blocks and retains existing notice text", () => {
+    const encoded = [...syntheticKey]
+      .map((character) => `%${character.charCodeAt(0).toString(16)}`)
+      .join("");
+    const prefix = `😀 ${SECRET_ANSWER_NOTICE}\nordinary prefix `;
+    const prompt: AgentPromptInput = [
+      { type: "text", mimeType: "text/plain", title: "Notes", text: prefix + encoded.slice(0, 14) },
+      { type: "text", text: encoded.slice(14) + " ordinary suffix" },
+    ];
+    expect(redactPromptInput(prompt)).toEqual([
+      { type: "text", mimeType: "text/plain", title: "Notes", text: prefix + SECRET_ANSWER_NOTICE },
+      { type: "text", text: " ordinary suffix" },
+    ]);
+  });
+
+  test("keeps multi-block ordinary prose when a credential request would withhold a single token", () => {
+    const prompt: AgentPromptInput = [
+      { type: "text", text: "Use " },
+      { type: "text", text: "the existing config" },
+    ];
+    expect(redactPromptInput(prompt, "Enter your password:")).toEqual(prompt);
+    expect(redactPromptInput([{ type: "text", text: "x" }], "Enter your password:")).toEqual([
+      { type: "text", text: SECRET_ANSWER_NOTICE },
+    ]);
   });
 });
 

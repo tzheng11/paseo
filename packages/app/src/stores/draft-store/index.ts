@@ -249,9 +249,6 @@ function contextForPersistedDraft(draftKey: string): string {
     ...(session.agentStreamHead.get(agentId) ?? []),
   ].filter((item) => item.kind === "user_message" || item.kind === "assistant_message");
   return draftAnswerContext({
-    pendingQuestions: [...session.pendingPermissions.values()]
-      .filter((permission) => permission.agentId === agentId)
-      .map((permission) => permission.request),
     latestMessage: messages.at(-1),
   });
 }

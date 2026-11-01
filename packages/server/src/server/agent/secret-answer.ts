@@ -1,5 +1,11 @@
-import { AgentAttachmentSchema } from "@getpaseo/protocol/messages";
-import { redactSecretAnswer, SECRET_ANSWER_NOTICE } from "@getpaseo/protocol/secret-answer";
+import { AgentAttachmentSchema, TextAttachmentSchema } from "@getpaseo/protocol/messages";
+import {
+  redactSecretAnswer,
+  redactSecretPrompt,
+  secretPromptSpans,
+  SECRET_ANSWER_NOTICE,
+  type SecretPromptSpan,
+} from "@getpaseo/protocol/secret-answer";
 import type {
   AgentMetadata,
   AgentPermissionRequest,
@@ -217,52 +223,71 @@ export function redactPermissionResponse(
   return { ...response, ...safeAction, ...safeInput, ...safePermissions };
 }
 
-function redactPromptBlock(
-  block: AgentPromptContentBlock,
-  context: string,
-): AgentPromptContentBlock {
-  if (block.type === "image") return block;
-  if (block.type === "text" && !("mimeType" in block)) {
-    return { ...block, text: redactSecretAnswer(block.text, context) };
-  }
-  // Attachments also carry human-authored text (review comments, titles and resource metadata).
-  // The schema preserves their wire shape; a cap that removes required fields becomes a notice.
-  if (redactSecretAnswer("answer", context) === SECRET_ANSWER_NOTICE) {
-    return { type: "text", text: SECRET_ANSWER_NOTICE };
-  }
-  const answerContext = { text: "", questions: new Map<string, string>(), answerMap: false };
-  const budget = { entries: MAX_ENTRIES, characters: MAX_CHARACTERS };
-  const parsed = AgentAttachmentSchema.safeParse(redactValue(block, answerContext, budget));
-  return parsed.success ? parsed.data : { type: "text", text: SECRET_ANSWER_NOTICE };
+function redactPromptMetadata(value: unknown): unknown {
+  if (typeof value === "string") return redactSecretPrompt(value);
+  if (Array.isArray(value)) return value.map(redactPromptMetadata);
+  if (!isRecord(value)) return value;
+  const entries = Object.entries(value).map(([key, item]) => [
+    redactSecretPrompt(key),
+    redactPromptMetadata(item),
+  ]);
+  return Object.fromEntries(entries);
 }
 
-/** Chat and steering can be answers too, including replies to a pending secret request. */
-export function redactPromptInput(
-  prompt: AgentPromptInput,
-  requests?: Iterable<AgentPermissionRequest>,
-): AgentPromptInput {
-  const contexts: string[] = [];
-  if (requests) {
-    let count = 0;
-    for (const request of requests) {
-      count += 1;
-      if (count > MAX_ENTRIES) return SECRET_ANSWER_NOTICE;
-      contexts.push(requestContext(request), ...questionContexts(request).values());
+interface PromptTextCursor {
+  offset: number;
+  spanIndex: number;
+  spans: readonly SecretPromptSpan[];
+}
+
+/** A secret crossing blocks gets one notice, while each ordinary fragment stays in its block. */
+function redactJoinedTextBlock(text: string, cursor: PromptTextCursor): string {
+  const start = cursor.offset;
+  const end = start + text.length;
+  cursor.offset = end;
+  const parts: string[] = [];
+  let position = start;
+  while (cursor.spanIndex < cursor.spans.length) {
+    const span = cursor.spans[cursor.spanIndex]!;
+    if (span.start >= end) break;
+    if (span.end <= start) {
+      cursor.spanIndex += 1;
+      continue;
     }
+    const overlapStart = Math.max(span.start, start);
+    parts.push(text.slice(position - start, overlapStart - start));
+    if (span.start >= start) parts.push(SECRET_ANSWER_NOTICE);
+    position = Math.min(span.end, end);
+    if (span.end > end) break;
+    cursor.spanIndex += 1;
   }
-  const context = contexts.join("\n");
-  if (typeof prompt === "string") return redactSecretAnswer(prompt, context);
-  if (!Array.isArray(prompt) || prompt.length > MAX_ENTRIES) return SECRET_ANSWER_NOTICE;
-  // Providers concatenate text blocks. Detect the same view before allowing fragments through.
-  const text = prompt
-    .filter((block) => block.type === "text")
-    .map((block) => block.text)
-    .join("");
-  const combinedWasWithheld = redactSecretAnswer(text, context) !== text;
-  return prompt.map((block) => {
-    if (combinedWasWithheld && block.type === "text") {
-      return { type: "text", text: SECRET_ANSWER_NOTICE };
-    }
-    return redactPromptBlock(block, context);
-  });
+  parts.push(text.slice(position - start));
+  return parts.join("");
+}
+
+function redactPromptBlock(
+  block: AgentPromptContentBlock,
+  cursor: PromptTextCursor,
+): AgentPromptContentBlock {
+  if (block.type === "image") return block;
+  if (block.type !== "text") return AgentAttachmentSchema.parse(redactPromptMetadata(block));
+  const text = redactJoinedTextBlock(block.text, cursor);
+  if (!("mimeType" in block)) return { ...block, text };
+  const attachment = TextAttachmentSchema.parse(redactPromptMetadata(block));
+  return { ...attachment, text };
+}
+
+/** All prompt entrypoints share span redaction; context is the latest actual assistant message. */
+export function redactPromptInput(prompt: AgentPromptInput, context?: string): AgentPromptInput {
+  if (typeof prompt === "string") return redactSecretPrompt(prompt, context);
+  if (!Array.isArray(prompt)) return SECRET_ANSWER_NOTICE;
+  // Providers concatenate text blocks. Detect that same view, then map spans to the original blocks.
+  const textBlocks = prompt.filter((block) => block.type === "text");
+  const text = textBlocks.map((block) => block.text).join("");
+  const cursor: PromptTextCursor = {
+    offset: 0,
+    spanIndex: 0,
+    spans: secretPromptSpans(text, context),
+  };
+  return prompt.map((block) => redactPromptBlock(block, cursor));
 }

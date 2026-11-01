@@ -3341,7 +3341,9 @@ export class AgentManager {
    */
   tryRunOutOfBand(agentId: string, prompt: AgentPromptInput, options?: AgentRunOptions): boolean {
     const agent = this.requireSessionAgent(agentId);
-    prompt = this.redactAnswerPrompt(agent, prompt);
+    // startAgentRun already selected asynchronous answer context. Do not reclassify
+    // its reply against a different message during synchronous command dispatch.
+    prompt = redactPromptInput(prompt);
     // Providers parse slash commands from the raw text, so a command another agent sent
     // must reach them without its sender envelope.
     const agentMessage = typeof prompt === "string" ? parseAgentMessage(prompt) : null;
@@ -3532,7 +3534,6 @@ export class AgentManager {
   ): AsyncGenerator<AgentStreamEvent> {
     this.reloadOperations?.assertWriterAdmissionSync(agentId, writerClaim);
     const existingAgent = this.requireSessionAgent(agentId);
-    prompt = this.redactAnswerPrompt(existingAgent, prompt);
     this.logger.trace(
       {
         agentId,
@@ -3750,9 +3751,12 @@ export class AgentManager {
     }
 
     const agent = this.requireSessionAgent(agentId);
-    // Cancellation resolves pending questions. Withhold their answers while that
-    // context still exists, before switching to the replacement turn.
-    prompt = this.redactAnswerPrompt(agent, prompt);
+    // Read the last assistant message before cancellation changes the timeline.
+    const answerTurnIdentity = this.getAnswerTurnIdentity(agentId);
+    prompt = await this.prepareAnswerPrompt(agentId, prompt);
+    if (this.getAnswerTurnIdentity(agentId) !== answerTurnIdentity) {
+      throw new AgentSteerTurnChangedError();
+    }
     agent.pendingReplacement = true;
     agent.lifecycle = "running";
     this.touchUpdatedAt(agent);
@@ -4103,14 +4107,11 @@ export class AgentManager {
   }
 
   async prepareAnswerPrompt(agentId: string, prompt: AgentPromptInput): Promise<AgentPromptInput> {
-    const agent = this.requireSessionAgent(agentId);
-    prompt = this.redactAnswerPrompt(agent, prompt);
+    this.requireSessionAgent(agentId);
+    prompt = redactPromptInput(prompt);
     const latest = await this.getLastConversationItemFromStores(agentId);
-    const question =
-      latest?.type === "assistant_message"
-        ? ((await this.getLastAssistantMessageFromStores(agentId)) ?? latest.text)
-        : undefined;
-    return this.redactAnswerPrompt(agent, prompt, question);
+    const question = latest?.type === "assistant_message" ? latest.text : undefined;
+    return redactPromptInput(prompt, question);
   }
 
   getPendingPermissionRequest(
@@ -4122,37 +4123,6 @@ export class AgentManager {
       agent.session.getPendingPermissions().find((request) => request.id === requestId) ??
       agent.pendingPermissions.get(requestId)
     );
-  }
-
-  private redactAnswerPrompt(
-    agent: ActiveManagedAgent,
-    prompt: AgentPromptInput,
-    question?: string,
-  ): AgentPromptInput {
-    // Provider events enter the manager through a queue; a human can answer before
-    // that queue publishes the question into the manager's projection.
-    const requests = Array.from(
-      new Map(
-        [...agent.pendingPermissions.values(), ...agent.session.getPendingPermissions()].map(
-          (request) => [request.id, request],
-        ),
-      ).values(),
-    );
-    const latest = this.timelineStore.getLastConversationItem(agent.id);
-    const context =
-      question ??
-      (latest?.type === "assistant_message"
-        ? this.timelineStore.getLastAssistantMessageSegment(agent.id)
-        : undefined);
-    if (context)
-      requests.push({
-        id: "chat-question",
-        provider: agent.provider,
-        name: "chat",
-        kind: "question",
-        title: context,
-      });
-    return redactPromptInput(prompt, requests);
   }
 
   async respondToPermission(
@@ -4507,10 +4477,8 @@ export class AgentManager {
     const conversation = page.rows.findLast(
       (row) => row.item.type === "user_message" || row.item.type === "assistant_message",
     );
-    // Bounded context reads fail closed when an earlier question could be outside the window.
-    return (
-      conversation?.item ?? (page.hasOlder ? { type: "assistant_message", text: "Password" } : null)
-    );
+    // Unknown older context does not authorize withholding an ordinary chat reply.
+    return conversation?.item ?? null;
   }
 
   private async getLastItemFromStores(agentId: string): Promise<AgentTimelineItem | null> {

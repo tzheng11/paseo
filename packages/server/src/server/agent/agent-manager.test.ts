@@ -7403,6 +7403,7 @@ test("waitForAgentEvent does not resolve idle until foreground turn is finalized
   const storagePath = join(workdir, "agents");
   const storage = new AgentStorage(storagePath, logger);
   const releaseTurnCompleted = deferred<void>();
+  const turnStarted = deferred<void>();
 
   class SlowTerminalSession extends TestAgentSession {
     override async startTurn(): Promise<{ turnId: string }> {
@@ -7443,13 +7444,12 @@ test("waitForAgentEvent does not resolve idle until foreground turn is finalized
 
   const stream = manager.streamAgent(snapshot.id, "hello");
   const consumePromise = (async () => {
-    for await (const _event of stream) {
-      // Drain events so manager lifecycle progresses naturally.
+    for await (const event of stream) {
+      if (event.type === "turn_started") turnStarted.resolve();
     }
   })();
 
-  // Wait for the turn to start
-  await new Promise<void>((resolve) => setTimeout(resolve, 20));
+  await turnStarted.promise;
 
   const waitPromise = manager.waitForAgentEvent(snapshot.id);
 
@@ -15346,14 +15346,47 @@ test("secret answer stream and out-of-band prompts are redacted before providers
   const session = new AnswerSession({ provider: "codex", cwd: process.cwd() });
   const { manager, storage, agent } = await createSecretAnswerTestManager(session);
   const syntheticSecret = `sk-proj-${"synthetic".repeat(8)}`;
+  const secretPrompt = `  before\n${syntheticSecret}\nafter  `;
+  const safePrompt = `  before\n${SECRET_ANSWER_NOTICE}\nafter  `;
   await drainAsyncGenerator(
-    manager.streamAgent(agent.id, syntheticSecret, { clientMessageId: "secret-stream" }),
+    manager.streamAgent(agent.id, secretPrompt, { clientMessageId: "secret-stream" }),
   );
-  expect(session.received.at(-1)).toBe(SECRET_ANSWER_NOTICE);
+  expect(session.received.at(-1)).toBe(safePrompt);
   await drainAsyncGenerator(
     manager.streamAgent(agent.id, "  ordinary answer\n", { clientMessageId: "ordinary-stream" }),
   );
   expect(session.received.at(-1)).toBe("  ordinary answer\n");
+  for (const text of [
+    "The secret-scan: required check failed on this PR, please look.",
+    "Why does this fail? const client = new S3({ accessKeyId: process.env.KEY_ID })",
+    "Fix this yaml:\n  secretName: my-app-config\n  image: nginx",
+    "In the schema, password: required for local accounts only.",
+    "log line without anything sensitive in it\n".repeat(1800),
+  ]) {
+    await drainAsyncGenerator(manager.streamAgent(agent.id, text));
+    expect(session.received.at(-1)).toBe(text);
+  }
+  for (const text of ["Enter your password:", "Which color?"]) {
+    session.pushEvent({
+      type: "timeline",
+      provider: "codex",
+      item: { type: "assistant_message", text },
+    });
+  }
+  await manager.flush();
+  await drainAsyncGenerator(manager.streamAgent(agent.id, "blue"));
+  expect(session.received.at(-1)).toBe("blue");
+  session.pushEvent({
+    type: "timeline",
+    provider: "codex",
+    item: {
+      type: "assistant_message",
+      text: "Enter your password:\nThen follow the keychain instructions.",
+    },
+  });
+  await manager.flush();
+  await drainAsyncGenerator(manager.streamAgent(agent.id, "tiny"));
+  expect(session.received.at(-1)).toBe("tiny");
   session.pushEvent({
     type: "timeline",
     provider: "codex",
@@ -15382,7 +15415,7 @@ test("secret answer stream and out-of-band prompts are redacted before providers
       clientMessageId: "secret-command",
     }),
   ).toBe(true);
-  expect(session.received.at(-1)).toBe(SECRET_ANSWER_NOTICE);
+  expect(session.received.at(-1)).toBe(`/command ${SECRET_ANSWER_NOTICE}`);
   expect(
     manager.tryRunOutOfBand(agent.id, "/ordinary", { clientMessageId: "ordinary-command" }),
   ).toBe(true);
@@ -15419,16 +15452,18 @@ test("secret answer steering and replacement sanitize both provider delivery and
   const initialRun = drainAsyncGenerator(manager.streamAgent(agent.id, "initial"));
   await manager.waitForAgentRunStart(agent.id);
   const syntheticSecret = `sk-proj-${"synthetic".repeat(8)}`;
+  const secretPrompt = `before ${syntheticSecret} after\n`;
+  const safePrompt = `before ${SECRET_ANSWER_NOTICE} after\n`;
   expect(
-    await manager.steerAgentRun(agent.id, syntheticSecret, { clientMessageId: "secret-steer" }),
+    await manager.steerAgentRun(agent.id, secretPrompt, { clientMessageId: "secret-steer" }),
   ).toEqual({ status: "accepted" });
-  expect(session.steered.at(-1)).toBe(SECRET_ANSWER_NOTICE);
+  expect(session.steered.at(-1)).toBe(safePrompt);
   expect(
-    await manager.steerOrReplaceActiveTurn(agent.id, syntheticSecret, {
+    await manager.steerOrReplaceActiveTurn(agent.id, secretPrompt, {
       clientMessageId: "secret-steer-or-replace",
     }),
   ).toEqual({ status: "steered" });
-  expect(session.steered.at(-1)).toBe(SECRET_ANSWER_NOTICE);
+  expect(session.steered.at(-1)).toBe(safePrompt);
   expect(
     await manager.steerAgentRun(agent.id, "  ordinary steer\n", {
       clientMessageId: "ordinary-steer",
@@ -15436,7 +15471,7 @@ test("secret answer steering and replacement sanitize both provider delivery and
   ).toEqual({ status: "accepted" });
   expect(session.steered.at(-1)).toBe("  ordinary steer\n");
   session.steerResult = "unavailable";
-  const replacement = await manager.steerOrReplaceActiveTurn(agent.id, syntheticSecret, {
+  const replacement = await manager.steerOrReplaceActiveTurn(agent.id, secretPrompt, {
     clientMessageId: "secret-replacement",
   });
   expect(replacement.status).toBe("replaced");
@@ -15444,12 +15479,12 @@ test("secret answer steering and replacement sanitize both provider delivery and
   const replacementRun = drainAsyncGenerator(replacement.iterator);
   await initialRun;
   await manager.waitForAgentRunStart(agent.id);
-  expect(session.startPrompts.at(-1)).toBe(SECRET_ANSWER_NOTICE);
+  expect(session.startPrompts.at(-1)).toBe(safePrompt);
   session.steerResult = "accepted";
   session.pushEvent({
     type: "timeline",
     provider: "codex",
-    item: { type: "assistant_message", text: "What is your password?" },
+    item: { type: "assistant_message", text: "Please enter your password." },
   });
   await manager.flush();
   expect(
@@ -15537,6 +15572,12 @@ test("secret answer replacement preserves credential question context across can
     name: "question",
     input: { questions: [{ header: "Login", question: "Enter your password" }] },
   });
+  session.pushEvent({
+    type: "timeline",
+    provider: "codex",
+    item: { type: "assistant_message", text: "Enter your password" },
+  });
+  await manager.flush();
   const replacement = await manager.replaceAgentRun(agent.id, "synthetic-short-password", {
     clientMessageId: "replacement-password",
   });
