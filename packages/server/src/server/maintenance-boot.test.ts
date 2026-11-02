@@ -1,5 +1,5 @@
 import http from "node:http";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
@@ -34,23 +34,20 @@ async function fixture(start = vi.fn(async () => {}), timeout = 300000, publish 
   await mkdir(home, { mode: 0o700 });
   await mkdir(directory, { mode: 0o700 });
   await writeFile(path.join(home, "server-id"), "srv_test-original\n", { mode: 0o600 });
-  const control = await startWorkerWithMaintenance(
-    start,
-    {
-      PASEO_HOME: home,
-      PASEO_MAINTENANCE_BOOT: "closed",
-      PASEO_MAINTENANCE_CONTROL_DIR: directory,
-      PASEO_MAINTENANCE_BOOT_TIMEOUT_MS: String(timeout),
-    },
-    fatal,
-    publish,
-  );
+  const env = {
+    PASEO_HOME: home,
+    PASEO_MAINTENANCE_BOOT: "closed",
+    PASEO_MAINTENANCE_CONTROL_DIR: directory,
+    PASEO_MAINTENANCE_BOOT_TIMEOUT_MS: String(timeout),
+  };
+  const control = await startWorkerWithMaintenance(start, env, fatal, publish);
   if (!control) throw new Error("missing control");
   cleanups.push(() => control.close());
   const token = await readFile(path.join(directory, "token"), "utf8");
   const identity = control.inspect();
   return {
     control,
+    env,
     directory,
     home,
     start,
@@ -147,6 +144,30 @@ unixTest("only a credentialed exact-generation release starts bootstrap, once", 
   expect((await f.request("POST", "/v1/release", f.bound)).status).toBe(409);
   expect((await f.request("POST", "/v1/drain", f.bound)).status).toBe(409);
   expect(f.control.inspect().capabilities.activeDrain).toBe(false);
+});
+
+unixTest("consumed maintenance flags never leak into worker descendants", async () => {
+  let childKeys: string[] | null = null;
+  const f = await fixture(
+    vi.fn(async () => {
+      const child = spawnSync(
+        process.execPath,
+        [
+          "-e",
+          "console.log(JSON.stringify(Object.keys(process.env).filter(k=>k.startsWith('PASEO_MAINTENANCE_'))))",
+        ],
+        { env: f.env, encoding: "utf8", timeout: 3000 },
+      );
+      expect(child.error).toBeUndefined();
+      expect(child.status).toBe(0);
+      childKeys = JSON.parse(child.stdout);
+    }),
+  );
+  expect(Object.keys(f.env).filter((key) => key.startsWith("PASEO_MAINTENANCE_"))).toEqual([]);
+  expect(f.env.PASEO_HOME).toBe(f.home);
+  expect((await f.request("POST", "/v1/release", f.bound)).status).toBe(202);
+  await vi.waitFor(() => expect(f.control.inspect().phase).toBe("released"));
+  expect(childKeys).toEqual([]);
 });
 
 unixTest("concurrent releases cannot construct a second daemon", async () => {

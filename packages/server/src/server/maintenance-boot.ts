@@ -343,5 +343,10 @@ export async function startWorkerWithMaintenance<T>(
     onStarted?.(result);
     return null;
   }
+  // These are one-use worker bootstrap inputs, never descendant launch policy.
+  // Keep the captured options for the control endpoint and its input rechecks.
+  delete env.PASEO_MAINTENANCE_BOOT;
+  delete env.PASEO_MAINTENANCE_CONTROL_DIR;
+  delete env.PASEO_MAINTENANCE_BOOT_TIMEOUT_MS;
   return startMaintenanceBoot(options, start, onStartupFailure, onStarted);
 }

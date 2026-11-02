@@ -88,7 +88,9 @@ remains an unknown attempt for the controller to inspect.
 Successful startup commits `started.json` before publishing readiness to the
 supervisor. Only after that readiness is published does the supervisor remove
 maintenance variables from future workers; ordinary crash and client-requested
-restarts then run normally. The private control socket and epoch belong to the
+restarts then run normally. The first worker captures and removes its own
+maintenance variables before waiting, so agents, terminals and lifecycle scripts
+cannot inherit the one-use boot policy. The private control socket and epoch belong to the
 first worker, not its replacements. Do not persist maintenance variables in the
 final login LaunchAgent. A new supervisor using the consumed directory refuses
 to start; a one-time handover and ordinary login startup have different inputs.
