@@ -194,7 +194,7 @@ describe("serializeReviewDraftState", () => {
 
   it("preserves ordinary review prose and large log pastes byte-exact", () => {
     for (const body of [
-      "In the schema, password: required for local accounts only.",
+      "Use the existing validation for local accounts only.",
       "log line without anything sensitive in it\n".repeat(1800),
     ]) {
       const state = addCommentToState(emptyState(), {
@@ -203,6 +203,17 @@ describe("serializeReviewDraftState", () => {
       });
       expect(serializeReviewDraftState(state).drafts["review:key"][0].body).toBe(body);
     }
+  });
+
+  it("uses the closed password-label exceptions for review checkpoints", () => {
+    // Ruling 9 excludes required from the password placeholder exceptions.
+    const state = addCommentToState(emptyState(), {
+      key: "review:key",
+      comment: makeComment({ body: "In the schema, password: required for local accounts only." }),
+    });
+    expect(serializeReviewDraftState(state).drafts["review:key"][0].body).toBe(
+      `In the schema, password: ${SECRET_ANSWER_NOTICE} for local accounts only.`,
+    );
   });
 
   it("serialized output does not contain the legacy activeModesByScope field", () => {

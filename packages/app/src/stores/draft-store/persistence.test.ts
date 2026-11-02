@@ -175,10 +175,12 @@ describe("draft persistence", () => {
     expect(draftAnswerContext({})).toBe("");
   });
 
-  it("withholds single-token replies only after a strict request at the end", () => {
+  it("withholds single-token replies after a real credential request sentence", () => {
     expect(checkpoint("x", "Please provide your password.")).toBe(SECRET_ANSWER_NOTICE);
     expect(checkpoint("x", "Password:")).toBe(SECRET_ANSWER_NOTICE);
-    expect(checkpoint("x", "Please provide your password. Meanwhile, tests pass.")).toBe("x");
+    expect(checkpoint("x", "Please provide your password. Meanwhile, tests pass.")).toBe(
+      SECRET_ANSWER_NOTICE,
+    );
     expect(checkpoint("yes go ahead", "Please provide your password.")).toBe("yes go ahead");
     expect(checkpoint("yes", "Which key should I use for the React list?")).toBe("yes");
     expect(checkpoint("x", "x".repeat(65_537))).toBe("x");
@@ -198,8 +200,14 @@ describe("draft persistence", () => {
     "The secret-scan: required check failed on this PR, please look.",
     "Why does this fail? const client = new S3({ accessKeyId: process.env.KEY_ID })",
     "Fix this yaml:\n  secretName: my-app-config\n  image: nginx",
-    "In the schema, password: required for local accounts only.",
   ])("preserves ordinary draft bytes: %s", (text) => {
     expect(checkpoint(text)).toBe(text);
+  });
+
+  it("uses the closed password-label exceptions for draft checkpoints", () => {
+    // Ruling 9 excludes required from the password placeholder exceptions.
+    expect(checkpoint("In the schema, password: required for local accounts only.")).toBe(
+      `In the schema, password: ${SECRET_ANSWER_NOTICE} for local accounts only.`,
+    );
   });
 });

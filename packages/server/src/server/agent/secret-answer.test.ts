@@ -32,7 +32,8 @@ describe("battery 6 runtime boundary matrix", () => {
     ['token = "Zq8!rT2$wX5&nB7k"', `token = "${SECRET_ANSWER_NOTICE}"`],
     ["token = Zq8!rT2$wX5&nB7k", `token = ${SECRET_ANSWER_NOTICE}`],
     ["pass: Zq8!rT2$wX5&nB7k", `pass: ${SECRET_ANSWER_NOTICE}`],
-    ["pass: 3 tests", "pass: 3 tests"],
+    // Ruling 9 makes a bare pass field a password label; 3 is not a closed exception.
+    ["pass: 3 tests", `pass: ${SECRET_ANSWER_NOTICE} tests`],
   ])(
     "redacts labeled mixed-symbol values while preserving ordinary neighbours (%#)",
     (prompt, expected) => {
@@ -176,6 +177,24 @@ describe("permission answer sanitization", () => {
     "The sudo password, please.",
     "What is the password to the keychain?",
     "Need the root password",
+    "What is the accessToken?",
+    "What is the clientSecret?",
+    "What's the secretKey?",
+    "What is the APIKEY?",
+    "What is the GITHUB_CLIENT_SECRET?",
+    "Set STRIPE_SECRET_KEY to what?",
+    "Enter the pass code",
+    "What's the MFA code?",
+    "Paste the login credentials",
+    "Paste the HMAC key",
+    "Paste the service account key",
+    "What's the root pwd?",
+    "What's the db pass?",
+    "What is the signing key?",
+    "What's the backup code?",
+    "Enter the 6-digit code from your authenticator app",
+    "Paste the webhook secret",
+    "Provide the secret",
   ])("withholds direct value requests through structured permission answers (%#)", (text) => {
     const question = { ...request, input: { questions: [{ header: "Account", question: text }] } };
     const response: AgentPermissionResponse = {
@@ -204,10 +223,13 @@ describe("permission answer sanitization", () => {
   test.each([
     "Enter token",
     "Paste your tokens",
-    "Provide the secret",
     "Design tokens:",
     "GPIO pins for the LED strip?",
     "Pin for the dependency?",
+    "What's the secret name?",
+    "Which secret manager should I use?",
+    "Paste the secret sauce recipe",
+    "Secret scanning is enabled",
   ])("treats superseded bare terminology as ambiguous (%#)", (text) => {
     const question = { ...request, input: { questions: [{ header: "Choice", question: text }] } };
     const response: AgentPermissionResponse = {
@@ -376,28 +398,34 @@ describe("permission answer sanitization", () => {
   });
 
   test.each([
-    "q1W2e3R4t5Y6u7I8o9P0a/S+d1F2g3H4j5K6l7Z8",
-    "aB3dE7gH9kLmN2pQ5rT8",
-    "postgres://admin:s3cr3tPass99@db.internal:5432/app",
-  ])("withholds opaque neutral-question answers and permission feedback (%#)", (value) => {
-    const neutral = {
-      ...request,
-      input: { questions: [{ header: "Choice", question: "Which one?" }] },
-    };
-    expect(
-      redactPermissionResponse(
-        { behavior: "allow", updatedInput: { answers: { Choice: value } } },
-        neutral,
-      ),
-    ).toEqual({ behavior: "allow", updatedInput: { answers: { Choice: SECRET_ANSWER_NOTICE } } });
-    expect(redactPermissionResponse({ behavior: "deny", message: value })).toEqual({
-      behavior: "deny",
-      message: SECRET_ANSWER_NOTICE,
-    });
-    expect(
-      redactPermissionResponse({ behavior: "allow", updatedPermissions: [{ value }] }),
-    ).toEqual({ behavior: "allow", updatedPermissions: [{ value: SECRET_ANSWER_NOTICE }] });
-  });
+    { value: "q1W2e3R4t5Y6u7I8o9P0a/S+d1F2g3H4j5K6l7Z8", expected: SECRET_ANSWER_NOTICE },
+    { value: "aB3dE7gH9kLmN2pQ5rT8", expected: SECRET_ANSWER_NOTICE },
+    {
+      value: "postgres://admin:s3cr3tPass99@db.internal:5432/app",
+      expected: `postgres://admin:${SECRET_ANSWER_NOTICE}@db.internal:5432/app`,
+    },
+  ])(
+    "withholds secret spans in neutral answers and permission feedback (%#)",
+    ({ value, expected }) => {
+      const neutral = {
+        ...request,
+        input: { questions: [{ header: "Choice", question: "Which one?" }] },
+      };
+      expect(
+        redactPermissionResponse(
+          { behavior: "allow", updatedInput: { answers: { Choice: value } } },
+          neutral,
+        ),
+      ).toEqual({ behavior: "allow", updatedInput: { answers: { Choice: expected } } });
+      expect(redactPermissionResponse({ behavior: "deny", message: value })).toEqual({
+        behavior: "deny",
+        message: expected,
+      });
+      expect(
+        redactPermissionResponse({ behavior: "allow", updatedPermissions: [{ value }] }),
+      ).toEqual({ behavior: "allow", updatedPermissions: [{ value: SECRET_ANSWER_NOTICE }] });
+    },
+  );
 
   test("preserves ordinary token counters, failure codes and configuration flags in metadata", () => {
     const metadata = {
@@ -513,7 +541,7 @@ describe("chat and steering answer sanitization", () => {
     expect(redactPromptInput(prompt)).toBe(expected);
   });
 
-  test("redacts secret spans and single-token replies to the latest credential noun context", () => {
+  test("redacts secret spans and single-token replies to the latest real credential request", () => {
     const aws = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
     expect(redactPromptInput(`export AWS_SECRET_ACCESS_KEY=${aws}\nnext line stays`)).toBe(
       `export AWS_SECRET_ACCESS_KEY=${SECRET_ANSWER_NOTICE}\nnext line stays`,
@@ -524,7 +552,7 @@ describe("chat and steering answer sanitization", () => {
     );
     expect(redactPromptInput("x", "Enter your password:")).toBe(SECRET_ANSWER_NOTICE);
     expect(redactPromptInput("x", "Enter token")).toBe("x");
-    expect(redactPromptInput("x", "Provide the secret")).toBe("x");
+    expect(redactPromptInput("x", "Provide the secret")).toBe(SECRET_ANSWER_NOTICE);
     expect(redactPromptInput("Use the existing configuration", "Enter your password:")).toBe(
       "Use the existing configuration",
     );
@@ -619,6 +647,24 @@ describe("chat and steering answer sanitization", () => {
       ]);
     },
   );
+
+  test.each([
+    "I fixed the password reset bug in auth.ts and added three tests. All 42 pass. Should I continue with the settings page?",
+    "Done. The API key is now read from process.env in config.ts…",
+    "Should I rotate the API key?",
+  ])("keeps chat replies after credential statements and yes/no questions: %s", (context) => {
+    for (const value of [
+      "ok",
+      "continue",
+      "lgtm",
+      "go",
+      "2",
+      "thanks!",
+      "continue with the settings page",
+    ]) {
+      expect(redactPromptInput(value, context)).toBe(value);
+    }
+  });
 
   test("preserves long ordinary prompts and redacts late spans without a length cutoff", () => {
     const prefix = `  ${"ordinary words\n".repeat(6_000)}`;

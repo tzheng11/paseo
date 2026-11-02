@@ -15284,7 +15284,7 @@ test("secret answer permission responses reach providers and durable records onl
     {
       request: { id: "plan", provider: "codex", kind: "plan", name: "ExitPlanMode" },
       response: { behavior: "deny", message: `Revise using ${syntheticSecret}` },
-      expected: { behavior: "deny", message: SECRET_ANSWER_NOTICE },
+      expected: { behavior: "deny", message: `Revise using ${SECRET_ANSWER_NOTICE}` },
     },
     {
       request: question,
@@ -15360,12 +15360,18 @@ test("secret answer stream and out-of-band prompts are redacted before providers
     "The secret-scan: required check failed on this PR, please look.",
     "Why does this fail? const client = new S3({ accessKeyId: process.env.KEY_ID })",
     "Fix this yaml:\n  secretName: my-app-config\n  image: nginx",
-    "In the schema, password: required for local accounts only.",
     "log line without anything sensitive in it\n".repeat(1800),
   ]) {
     await drainAsyncGenerator(manager.streamAgent(agent.id, text));
     expect(session.received.at(-1)).toBe(text);
   }
+  // Ruling 9 excludes required from the closed password-label exceptions.
+  await drainAsyncGenerator(
+    manager.streamAgent(agent.id, "In the schema, password: required for local accounts only."),
+  );
+  expect(session.received.at(-1)).toBe(
+    `In the schema, password: ${SECRET_ANSWER_NOTICE} for local accounts only.`,
+  );
   for (const text of ["Enter your password:", "Which color?"]) {
     session.pushEvent({
       type: "timeline",
@@ -15375,7 +15381,7 @@ test("secret answer stream and out-of-band prompts are redacted before providers
   }
   await manager.flush();
   await drainAsyncGenerator(manager.streamAgent(agent.id, "blue"));
-  // Consecutive assistant segments form one message; B protects a credential noun anywhere in it.
+  // Consecutive assistant segments form one message that still contains a real credential request.
   expect(session.received.at(-1)).toBe(SECRET_ANSWER_NOTICE);
   session.pushEvent({
     type: "timeline",
@@ -15387,7 +15393,7 @@ test("secret answer stream and out-of-band prompts are redacted before providers
   });
   await manager.flush();
   await drainAsyncGenerator(manager.streamAgent(agent.id, "tiny"));
-  // B also keeps the credential context when instructions follow the request.
+  // A real request remains credential context when instructions follow it.
   expect(session.received.at(-1)).toBe(SECRET_ANSWER_NOTICE);
   session.pushEvent({
     type: "timeline",

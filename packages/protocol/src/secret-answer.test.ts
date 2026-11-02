@@ -28,9 +28,12 @@ describe("secret answers", () => {
     "eyJhbGciOiJub25lIn0.e30.",
     "-----BEGIN PRIVATE KEY-----\nSYNTHETIC\n-----END PRIVATE KEY-----",
     "-----BEGIN RSA PRIVATE KEY-----\nSYNTHETIC",
-  ])("withholds the complete field for a recognizable credential (%#)", (secret) => {
+  ])("redacts recognizable credential spans in a neutral answer (%#)", (secret) => {
     const answer = `Before ${secret}+synthetic-tail after`;
-    expect(redactSecretAnswer(answer)).toBe(SECRET_ANSWER_NOTICE);
+    const result = redactSecretAnswer(answer);
+    expect(result).toContain(SECRET_ANSWER_NOTICE);
+    expect(result).not.toContain(secret);
+    expect(result).toBe(redactSecretPrompt(answer));
   });
 
   test.each([
@@ -50,8 +53,11 @@ describe("secret answers", () => {
     "relayKey=SYNTHETIC1234567890",
     "Bearer SYNTHETIC_12345678901234567890",
     "Basic U1lOVEhFVElDX09OTFlfTk9UX0FSRUFMX0NSRURFTlRJQUw=",
-  ])("withholds quoted, encoded and suffix-bearing assignments (%#)", (answer) => {
-    expect(redactSecretAnswer(answer)).toBe(SECRET_ANSWER_NOTICE);
+  ])("redacts quoted, encoded and suffix-bearing assignments in neutral answers (%#)", (answer) => {
+    const result = redactSecretAnswer(answer);
+    expect(result).toContain(SECRET_ANSWER_NOTICE);
+    expect(result).not.toBe(answer);
+    expect(result).toBe(redactSecretPrompt(answer));
   });
 
   test.each([
@@ -114,7 +120,9 @@ describe("secret answers", () => {
     expect(redactSecretAnswer("x", "a".repeat(65_537))).toBe("x");
     let encoded = "api_key=SYNTHETIC1234567890";
     for (let pass = 0; pass < 8; pass += 1) encoded = encodeURIComponent(encoded);
-    expect(redactSecretAnswer(encoded)).toBe(SECRET_ANSWER_NOTICE);
+    expect(redactSecretAnswer(encoded)).toBe(
+      encoded.replace("SYNTHETIC1234567890", SECRET_ANSWER_NOTICE),
+    );
   });
 
   test.each([
@@ -148,7 +156,6 @@ const ordinaryPrompts = [
   "The secret-scan: required check failed on this PR, please look.",
   "Tim kept these holds, credentials: anything that uses a key.",
   "Set GCS_AGENT_FILES_HMAC_SECRET_KEY: placeholder in the example file.",
-  "In the schema, password: required for local accounts only.",
   "Fix this yaml:\n  secretName: my-app-config\n  image: nginx",
   "Why does this fail? const client = new S3({ accessKeyId: process.env.KEY_ID })",
   "authorization: Bearer token goes in the header, see the docs.",
@@ -172,7 +179,6 @@ const ordinaryPrompts = [
   "key: /Users/tim/.ssh/id_ed25519 and cert: ./tls/server.pem",
   "Fingerprints: Anthropic 482b782fc066; GCS access d7bcaf4de8e3, secret 4dee46de6542.",
   "token: getAuthenticationTokenFromSessionStorageManagerFactory",
-  "password: required; api_key: optional; secret: none; token: expired",
   "data:image/png;base64," + "iVBORw0KGgoAAAANSUhEUgAA".repeat(40),
   "integrity sha512-" + "Zm9vYmFyYmF6".repeat(7) + "==",
 ];
@@ -192,7 +198,9 @@ describe("Manager ordinary-input regression battery", () => {
     ["hunter2", "Enter your Mac password"],
     ["hunter2", "Password"],
   ])("D: synthetic secret protection %#", (text, context) => {
-    expect(redactSecretAnswer(text!, context)).toBe(SECRET_ANSWER_NOTICE);
+    expect(redactSecretAnswer(text!, context)).toBe(
+      context === undefined ? redactSecretPrompt(text!) : SECRET_ANSWER_NOTICE,
+    );
     expect(redactSecretPrompt(text!, context)).not.toBe(text);
   });
 });
@@ -235,7 +243,7 @@ describe("general prompt spans", () => {
       prefix + SECRET_ANSWER_NOTICE + " end",
     );
   });
-  test("uses credential noun context for single-token chat replies without surrounding whitespace", () => {
+  test("uses credential value requests for single-token chat replies without surrounding whitespace", () => {
     expect(redactSecretPrompt("hunter2", "Earlier result. Please enter your password:")).toBe(
       SECRET_ANSWER_NOTICE,
     );
@@ -245,7 +253,9 @@ describe("general prompt spans", () => {
     expect(redactSecretPrompt("hunter2\n", "Password")).toBe("hunter2\n");
     expect(redactSecretPrompt("hunter2 more", "Password")).toBe("hunter2 more");
     expect(redactSecretPrompt("hunter2", "What's your API key?")).toBe(SECRET_ANSWER_NOTICE);
-    expect(redactSecretPrompt("hunter2", "What is a password?")).toBe(SECRET_ANSWER_NOTICE);
+    // Latest K keeps conceptual chat discussion; the structured B noun policy
+    // remains intentionally broader than the chat request policy.
+    expect(redactSecretPrompt("hunter2", "What is a password?")).toBe("hunter2");
   });
   test("detects an incomplete PEM body after an ordinary label", () => {
     const key = "-----BEGIN PRIVATE KEY-----\nU1lOVEhFVElDX09OTFlfTk9UX1JFQUxfQ1JFREVOVElBTA==";
@@ -345,7 +355,6 @@ describe("expanded synthetic secret matrix", () => {
     "Cookie: consent banner keeps showing",
     "x-api-key: required",
     "/Users/tim/Development/importantWorkspace2026/anotherFile12345.ts",
-    "https://example.test/path/" + syntheticHmac + "?id=" + syntheticMixed,
   ])("B2: preserves ordinary URL, flag and prose %#", (text) => {
     expect(redactSecretPrompt(text)).toBe(text);
   });
@@ -369,7 +378,9 @@ describe("expanded synthetic secret matrix", () => {
       expect(redactSecretPrompt(text)).toBe(
         `before postgres://admin:${SECRET_ANSWER_NOTICE}@db.internal/app after`,
       );
-      expect(redactSecretAnswer(text)).toBe(SECRET_ANSWER_NOTICE);
+      expect(redactSecretAnswer(text)).toBe(
+        `before postgres://admin:${SECRET_ANSWER_NOTICE}@db.internal/app after`,
+      );
     },
   );
   test("supports single-character and long RFC URI schemes", () => {
@@ -405,7 +416,7 @@ describe("manager battery 6 calibration", () => {
           for (const separator of [": ", " = "]) {
             const text = key + separator + quote + value + quote + " after";
             expect(redactSecretPrompt(text)).toBe(text.replace(value, SECRET_ANSWER_NOTICE));
-            expect(redactSecretAnswer(text)).toBe(SECRET_ANSWER_NOTICE);
+            expect(redactSecretAnswer(text)).toBe(text.replace(value, SECRET_ANSWER_NOTICE));
           }
         }
       }
@@ -413,9 +424,6 @@ describe("manager battery 6 calibration", () => {
   );
 
   test.each([
-    "pass: 3 tests",
-    "pass = required",
-    "pass: testSuite1234",
     "pass: getApiKey1234(config)",
     "token = getApiKey1234(config)",
     "secret = config.apiKey1234",
@@ -435,16 +443,14 @@ describe("manager battery 6 calibration", () => {
     expect(redactSecretAnswer(text, "Anything else?")).toBe(text);
   });
 
-  test.each([
-    "wks_9a12e95ee4e4af87",
-    "prj_44e33a8ea8d50705",
-    "task_9A12E95EE4E4AF87",
-    "wks_9a12e95ee4e4af879A12E95EE4E4AF87",
-  ])("keeps prefixed hex IDs in neutral answers and chat %#", (value) => {
-    expect(redactSecretAnswer(value, "Which value?")).toBe(value);
-    expect(redactSecretPrompt("use " + value + " here")).toBe("use " + value + " here");
-    expect(redactSecretAnswer(value, "Enter your password")).toBe(SECRET_ANSWER_NOTICE);
-  });
+  test.each(["wks_9a12e95ee4e4af87", "prj_44e33a8ea8d50705", "task_9A12E95EE4E4AF87"])(
+    "keeps prefixed hex IDs in neutral answers and chat %#",
+    (value) => {
+      expect(redactSecretAnswer(value, "Which value?")).toBe(value);
+      expect(redactSecretPrompt("use " + value + " here")).toBe("use " + value + " here");
+      expect(redactSecretAnswer(value, "Enter your password")).toBe(SECRET_ANSWER_NOTICE);
+    },
+  );
 
   test.each(["sk_live_", "sk_test_", "rk_live_", "re_", "hf_", "npm_", "ghp_", "sntrys_"])(
     "known credential prefix %s wins over a hex suffix",
@@ -549,11 +555,15 @@ describe("environment label calibration", () => {
     "CACHE_KEY",
     "FOREIGN_KEY",
     "PARTITION_KEY",
-  ])("preserves high-entropy benign value under %s", (key) => {
-    expect(redactSecretPrompt(`${key}=${syntheticHmac}`)).toBe(`${key}=${syntheticHmac}`);
-    expect(redactSecretPrompt(`"${key}": "${syntheticHmac}"`)).toBe(`"${key}": "${syntheticHmac}"`);
+  ])("preserves excluded labels while redacting their entropy value under %s", (key) => {
+    expect(redactSecretPrompt(`${key}=${syntheticHmac}`)).toBe(`${key}=${SECRET_ANSWER_NOTICE}`);
+    expect(redactSecretPrompt(`"${key}": "${syntheticHmac}"`)).toBe(
+      `"${key}": "${SECRET_ANSWER_NOTICE}"`,
+    );
     const encodedValue = syntheticHmac + "%20" + syntheticHmac;
-    expect(redactSecretPrompt(`${key}=${encodedValue}`)).toBe(`${key}=${encodedValue}`);
+    expect(redactSecretPrompt(`${key}=${encodedValue}`)).toBe(
+      `${key}=${SECRET_ANSWER_NOTICE}%20${SECRET_ANSWER_NOTICE}`,
+    );
   });
 });
 
@@ -586,7 +596,9 @@ describe("reviewer punctuated credential regression matrix", () => {
     ["the password is Tr0ub4dor&3xyz", "Tr0ub4dor&3xyz"],
     ["password=abcd1234#efgh5678", "abcd1234#efgh5678"],
   ])("withholds the complete punctuated value %#", (text, value) => {
-    expect(redactSecretAnswer(text!, "Anything else?")).toBe(SECRET_ANSWER_NOTICE);
+    expect(redactSecretAnswer(text!, "Anything else?")).toBe(
+      text!.replace(value!, SECRET_ANSWER_NOTICE),
+    );
     const result = redactSecretPrompt(text!);
     expect(result).not.toContain(value);
     expect(result).toContain(SECRET_ANSWER_NOTICE);
@@ -607,7 +619,7 @@ describe("reviewer punctuated credential regression matrix", () => {
     );
   });
   test("C: withholds a single plain word under a credential label", () => {
-    expect(redactSecretAnswer("pass: first")).toBe(SECRET_ANSWER_NOTICE);
+    expect(redactSecretAnswer("pass: first")).toBe(`pass: ${SECRET_ANSWER_NOTICE}`);
     expect(redactSecretPrompt("pass: first")).toBe(`pass: ${SECRET_ANSWER_NOTICE}`);
   });
 });
@@ -677,7 +689,6 @@ describe("reviewer ordinary identifier regression matrix", () => {
     "see src/main/java/com/acme/auth/OAuth2LoginController.java now",
     "rename AgentPromptContentBlockV2Serializer please",
     "const privateKey: Uint8Array = load()",
-    "credentials: OAuth2Credentials",
     "secretName: tls-cert-2024",
     "secret_name: prod-db-credentials-2",
     "credentials_file: /Users/me/.config/gcloud/application_default_credentials.json",
@@ -702,6 +713,35 @@ describe("additional explicit provider formats", () => {
   });
 });
 
+describe("current credential tiers and J/L policy", () => {
+  // Password-family values and shaped credential values stay protected;
+  // rooted calls and member expressions remain valid references.
+  test.each([
+    ["credentials: OAuth2Credentials", "OAuth2Credentials"],
+    ["pass: testSuite1234", "testSuite1234"],
+  ])("password and shaped credential values remain protected %#", (text, value) => {
+    const start = text!.lastIndexOf(value!);
+    expect(redactSecretPrompt(text!)).toBe(
+      text!.slice(0, start) + SECRET_ANSWER_NOTICE + text!.slice(start + value!.length),
+    );
+    expect(redactSecretAnswer(text!)).toBe(text!.replace(value!, SECRET_ANSWER_NOTICE));
+  });
+
+  test("J does not exempt a 32-character hex suffix because it has a workspace prefix", () => {
+    const value = "wks_9a12e95ee4e4af879A12E95EE4E4AF87";
+    expect(redactSecretAnswer(value, "Which value?")).toBe(SECRET_ANSWER_NOTICE);
+    expect(redactSecretPrompt(`use ${value} here`)).toBe(`use ${SECRET_ANSWER_NOTICE} here`);
+  });
+
+  test.each(["Provide the secret", "What is the secret for this host?"])(
+    "L recognizes an explicit secret request: %s",
+    (question) => {
+      expect(redactSecretAnswer("hunter2x", question)).toBe(SECRET_ANSWER_NOTICE);
+      expect(redactSecretPrompt("hunter2x", question)).toBe(SECRET_ANSWER_NOTICE);
+    },
+  );
+});
+
 describe("encoded local image paths", () => {
   test.each([
     "Emit settled assistant image Markdown: ![Encoded destination image](/private/var/folders/d9/hy1jfhyj777cr2cb7wzsq8h00000gn/T/agent-tab-image-stability-N6asqz/My%20image%20%D0%9C%D0%BE%D0%B8.png)",
@@ -723,6 +763,42 @@ describe("encoded local image paths", () => {
     expect(redactSecretPrompt(text)).toBe(
       `export AWS_SECRET_ACCESS_KEY=${SECRET_ANSWER_NOTICE}\nnext line stays`,
     );
-    expect(redactSecretAnswer(text)).toBe(SECRET_ANSWER_NOTICE);
+    expect(redactSecretAnswer(text)).toBe(
+      `export AWS_SECRET_ACCESS_KEY=${SECRET_ANSWER_NOTICE}\nnext line stays`,
+    );
+  });
+});
+
+describe("ruling9 changes to older K2 expectations", () => {
+  test.each([
+    [
+      "In the schema, password: required for local accounts only.",
+      `In the schema, password: ${SECRET_ANSWER_NOTICE} for local accounts only.`,
+    ],
+    [
+      "password: required; api_key: optional; secret: none; token: expired",
+      `password: ${SECRET_ANSWER_NOTICE}; api_key: optional; secret: none; token: expired`,
+    ],
+    ["pass: 3 tests", `pass: ${SECRET_ANSWER_NOTICE} tests`],
+    ["pass = required", `pass = ${SECRET_ANSWER_NOTICE}`],
+  ])(
+    "uses closed password exceptions rather than the old broad placeholder list %#",
+    (input, expected) => {
+      expect(redactSecretPrompt(input!)).toBe(expected);
+      expect(redactSecretAnswer(input!, "Which one should I use?")).toBe(expected);
+    },
+  );
+  test.each(["token: tok,", "token: hunter2x", "credential: 'include'", "pin: 1234"])(
+    "keeps short tier2 values and an unqualified pin label %#",
+    (input) => {
+      expect(redactSecretPrompt(input)).toBe(input);
+      expect(redactSecretAnswer(input)).toBe(input);
+    },
+  );
+  test("a URL path exemption does not exempt a high-entropy query value", () => {
+    const input = "https://example.test/path/" + syntheticHmac + "?id=" + syntheticMixed;
+    const expected = "https://example.test/path/" + syntheticHmac + "?id=" + SECRET_ANSWER_NOTICE;
+    expect(redactSecretPrompt(input)).toBe(expected);
+    expect(redactSecretAnswer(input)).toBe(expected);
   });
 });
