@@ -6,13 +6,13 @@ import { fileURLToPath } from "node:url";
 import ts from "typescript";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
-const listed = execFileSync("rg", ["--files", "packages", "-g", "**/src/**/*.ts"], {
+const listed = execFileSync("git", ["ls-files", "-z", "--", "packages"], {
   cwd: repository,
   encoding: "utf8",
 });
 const files = listed
-  .trim()
-  .split("\n")
+  .split("\0")
+  .filter((path) => /^packages\/.+\/src\/.*\.ts$/.test(path))
   .filter(
     (path) =>
       !/(?:^|\/)(?:__tests__|__fixtures__|__mocks__|tests?|fixtures?|mocks?)(?:[-_][^/]*)?(?:\/|$)/i.test(
@@ -38,7 +38,7 @@ for (const path of files) {
 }
 const snapshot = {
   method:
-    "TypeScript scanner Identifier tokens >=16 UTF-16 characters in non-test packages/**/src/**/*.ts; unique names, strings and comments excluded",
+    "TypeScript scanner Identifier tokens >=16 UTF-16 characters in tracked non-test packages/**/src/**/*.ts; unique names, strings and comments excluded",
   exclusions:
     "test/spec/fixture/mock filename components and test/fixture/mock directories, including suffixed directories such as test-utils",
   files: files.length,

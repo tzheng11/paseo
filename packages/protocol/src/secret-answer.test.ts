@@ -618,9 +618,9 @@ describe("reviewer punctuated credential regression matrix", () => {
       `password="${SECRET_ANSWER_NOTICE}"`,
     );
   });
-  test("C: withholds a single plain word under a credential label", () => {
-    expect(redactSecretAnswer("pass: first")).toBe(`pass: ${SECRET_ANSWER_NOTICE}`);
-    expect(redactSecretPrompt("pass: first")).toBe(`pass: ${SECRET_ANSWER_NOTICE}`);
+  test("ruling10 treats an unqualified pass label as tier two", () => {
+    expect(redactSecretAnswer("pass: first")).toBe("pass: first");
+    expect(redactSecretPrompt("pass: first")).toBe("pass: first");
   });
 });
 
@@ -716,15 +716,24 @@ describe("additional explicit provider formats", () => {
 describe("current credential tiers and J/L policy", () => {
   // Password-family values and shaped credential values stay protected;
   // rooted calls and member expressions remain valid references.
-  test.each([
-    ["credentials: OAuth2Credentials", "OAuth2Credentials"],
-    ["pass: testSuite1234", "testSuite1234"],
-  ])("password and shaped credential values remain protected %#", (text, value) => {
-    const start = text!.lastIndexOf(value!);
-    expect(redactSecretPrompt(text!)).toBe(
-      text!.slice(0, start) + SECRET_ANSWER_NOTICE + text!.slice(start + value!.length),
+  test.each([["pass: testSuite1234", "testSuite1234"]])(
+    "password and shaped credential values remain protected %#",
+    (text, value) => {
+      const start = text!.lastIndexOf(value!);
+      expect(redactSecretPrompt(text!)).toBe(
+        text!.slice(0, start) + SECRET_ANSWER_NOTICE + text!.slice(start + value!.length),
+      );
+      expect(redactSecretAnswer(text!)).toBe(text!.replace(value!, SECRET_ANSWER_NOTICE));
+    },
+  );
+
+  test("ruling10 keeps a digit-bearing type with a closed credential suffix in tier two", () => {
+    expect(redactSecretPrompt("credentials: OAuth2Credentials")).toBe(
+      "credentials: OAuth2Credentials",
     );
-    expect(redactSecretAnswer(text!)).toBe(text!.replace(value!, SECRET_ANSWER_NOTICE));
+    expect(redactSecretAnswer("credentials: OAuth2Credentials")).toBe(
+      "credentials: OAuth2Credentials",
+    );
   });
 
   test("J does not exempt a 32-character hex suffix because it has a workspace prefix", () => {
@@ -779,13 +788,18 @@ describe("ruling9 changes to older K2 expectations", () => {
       "password: required; api_key: optional; secret: none; token: expired",
       `password: ${SECRET_ANSWER_NOTICE}; api_key: optional; secret: none; token: expired`,
     ],
-    ["pass: 3 tests", `pass: ${SECRET_ANSWER_NOTICE} tests`],
-    ["pass = required", `pass = ${SECRET_ANSWER_NOTICE}`],
   ])(
     "uses closed password exceptions rather than the old broad placeholder list %#",
     (input, expected) => {
       expect(redactSecretPrompt(input!)).toBe(expected);
       expect(redactSecretAnswer(input!, "Which one should I use?")).toBe(expected);
+    },
+  );
+  test.each(["pass: 3 tests", "pass = required"])(
+    "ruling10 keeps unshaped bare pass values: %s",
+    (input) => {
+      expect(redactSecretPrompt(input)).toBe(input);
+      expect(redactSecretAnswer(input)).toBe(input);
     },
   );
   test.each(["token: tok,", "token: hunter2x", "credential: 'include'", "pin: 1234"])(

@@ -5,13 +5,13 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
-const listed = execFileSync("rg", ["--files", "packages", "-g", "**/src/**/*.ts"], {
+const listed = execFileSync("git", ["ls-files", "-z", "--", "packages"], {
   cwd: repository,
   encoding: "utf8",
 });
 const files = listed
-  .trim()
-  .split("\n")
+  .split("\0")
+  .filter((path) => /^packages\/.+\/src\/.*\.ts$/.test(path))
   .filter(
     (path) =>
       !/(?:^|\/)(?:__tests__|__fixtures__|__mocks__|tests?|fixtures?|mocks?)(?:[-_][^/]*)?(?:\/|$)/i.test(
@@ -35,7 +35,7 @@ for (const path of files) {
 }
 const snapshot = {
   method:
-    "Every complete line containing token|secret|key|password|pass|credential|auth|pin (case-insensitive substring) in non-test packages/**/src/**/*.ts; 1-based line numbers and original bytes excluding LF",
+    "Every complete line containing token|secret|key|password|pass|credential|auth|pin (case-insensitive substring) in tracked non-test packages/**/src/**/*.ts; 1-based line numbers and original bytes excluding LF",
   exclusions:
     "test/spec/fixture/mock filename components and test/fixture/mock directories, including suffixed directories such as test-utils",
   files: files.length,

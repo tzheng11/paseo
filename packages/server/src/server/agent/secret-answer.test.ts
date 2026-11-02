@@ -32,8 +32,9 @@ describe("battery 6 runtime boundary matrix", () => {
     ['token = "Zq8!rT2$wX5&nB7k"', `token = "${SECRET_ANSWER_NOTICE}"`],
     ["token = Zq8!rT2$wX5&nB7k", `token = ${SECRET_ANSWER_NOTICE}`],
     ["pass: Zq8!rT2$wX5&nB7k", `pass: ${SECRET_ANSWER_NOTICE}`],
-    // Ruling 9 makes a bare pass field a password label; 3 is not a closed exception.
-    ["pass: 3 tests", `pass: ${SECRET_ANSWER_NOTICE} tests`],
+    // Consolidated item 8 restores bare pass to tier 2; the qualified label is tier 1.
+    ["pass: 3 tests", "pass: 3 tests"],
+    ["db pass: hunter2x", `db pass: ${SECRET_ANSWER_NOTICE}`],
   ])(
     "redacts labeled mixed-symbol values while preserving ordinary neighbours (%#)",
     (prompt, expected) => {

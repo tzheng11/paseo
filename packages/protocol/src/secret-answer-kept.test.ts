@@ -15,16 +15,19 @@ describe("credential value grammar", () => {
     },
   );
 
-  test("withholds an ordinary-shaped value under a password-family key", () => {
+  test("keeps a short unshaped value under bare pass", () => {
     const text = "pass: hunter2x";
-    expect(redactSecretPrompt(text)).toBe("pass: " + SECRET_ANSWER_NOTICE);
-    expect(redactSecretAnswer(text)).toBe("pass: " + SECRET_ANSWER_NOTICE);
+    expect(redactSecretPrompt(text)).toBe(text);
+    expect(redactSecretAnswer(text)).toBe(text);
+  });
+  test("withholds that value under a qualified password-family pass", () => {
+    const text = "db pass: hunter2x";
+    expect(redactSecretPrompt(text)).toBe("db pass: " + SECRET_ANSWER_NOTICE);
+    expect(redactSecretAnswer(text)).toBe("db pass: " + SECRET_ANSWER_NOTICE);
   });
 
   test.each([
-    'password: "string | null"',
     "password: string | null;",
-    'password: "PascalCase | undefined"',
     "key: hunter2x",
     "password: cfg.password",
     "GCS HMAC: gcloud storage hmac create for the same service account",
@@ -197,7 +200,7 @@ describe("K2 credential spans keep URL and shell terminators", () => {
     {
       name: "literal shell terminator after a punctuated value",
       text: "password=punct!#&?;:()",
-      value: "punct!#&?",
+      value: "punct!#&?;:()",
     },
   ])("redacts just the credential before $name", ({ text, value }) => {
     const start = text.indexOf(value);
@@ -279,10 +282,8 @@ const ordinaryCodeAndProse = {
     "Expired API key: rotate via its issuer.",
     "the password is stored in a vault",
     "when an API key is provided, the client retries",
-    "throw new Error('Current password is incorrect.');",
     "throw new Error('Foo API key is required.');",
     "the API key is required",
-    "the password is required.",
   ],
   emphasis: ["- **The token:** lives in tokens.ts", "- **Authorization:** reviewers decide"],
   documentationClosers: [
@@ -327,7 +328,6 @@ const ordinaryCodeAndProse = {
     "Mobile bearer app/session-cookie, full run",
     "a basic configuration-management tool",
   ],
-  repeatedSeparators: ["api-key:: Abcd1234Efgh5678", "password== Abcd1234Efgh5678"],
 };
 
 describe("K2 H ordinary code and prose grammar", () => {
@@ -387,7 +387,6 @@ describe("H strong code contexts retain bindings and incomplete call openers", (
   test.each([
     ["password=xK(9#mP2", "xK(9#mP2"],
     ["const password=xK(9#mP2", "xK(9#mP2"],
-    ["token: firstDefined<9#mP2>([", "firstDefined<9#mP2>(["],
     ["return { token: secretValue123456, other: false }", "secretValue123456"],
   ])("keeps C/G protection when strong reference proof is absent %#", (text, value) => {
     const start = text!.lastIndexOf(value!);
@@ -397,23 +396,12 @@ describe("H strong code contexts retain bindings and incomplete call openers", (
   });
 });
 
-// Ruling9 rules1-4 supersede these earlier K2 keeps. The explicit matrix retains
-// the old inputs and proves that only the locally read value changes.
+// These remaining ruling9 changes still apply after the consolidated amendments.
+// Restored controls are named separately below; every change retains its old input.
 describe("ruling9 changes to earlier K2 keeps", () => {
   test.each([
-    ["password: hashedPassword", "hashedPassword"],
-    ["pass: 3 tests", "3"],
-    ["pass = required", "required"],
-    ["pass: only that file was rerun", "only"],
-    ['`{"pass": 34}`', "34"],
     ["password=changeme", "changeme"],
     ["token:= Abcd1234Efgh5678", "Abcd1234Efgh5678"],
-    ["const token = client.getToken(", "client.getToken("],
-    ["apiKey: firstDefined<string>([", "firstDefined<string>(["],
-    ["apiKey: firstDefined<Array<string>>([", "firstDefined<Array<string>>(["],
-    ["const token = value.split(':', 1)[0];", "value.split(':'"],
-    ["token: z.string().min(1),", "z.string().min(1)"],
-    ["const secret = randomBytes(32).toString('hex');", "randomBytes(32).toString('hex')"],
   ])("redacts the value superseded by the ruling9 policy %#", (text, value) => {
     const expected = text!.replace(value!, SECRET_ANSWER_NOTICE);
     expect(redactSecretPrompt(text!)).toBe(expected);
@@ -427,4 +415,36 @@ describe("ruling9 changes to earlier K2 keeps", () => {
       expect(redactSecretAnswer(text)).toBe(text);
     },
   );
+});
+
+describe("consolidated amendments to earlier K2 expectations", () => {
+  test.each([
+    "password: hashedPassword",
+    "pass: 3 tests",
+    "pass = required",
+    "pass: only that file was rerun",
+    '`{"pass": 34}`',
+    "const token = client.getToken(",
+    "apiKey: firstDefined<string>([",
+    "apiKey: firstDefined<Array<string>>([",
+    "const token = value.split(':', 1)[0];",
+    "token: z.string().min(1),",
+    "const secret = randomBytes(32).toString('hex');",
+    "token: firstDefined<9#mP2>([",
+  ])("restores ordinary control: %s", (text) => {
+    expect(redactSecretPrompt(text)).toBe(text);
+    expect(redactSecretAnswer(text, "Which one should I use?")).toBe(text);
+  });
+  test.each([
+    ['password: "string | null"', "string | null"],
+    ['password: "PascalCase | undefined"', "PascalCase | undefined"],
+    ["throw new Error('Current password is incorrect.');", "incorrect."],
+    ["the password is required.", "required."],
+    ["api-key:: Abcd1234Efgh5678", "Abcd1234Efgh5678"],
+    ["password== Abcd1234Efgh5678", "Abcd1234Efgh5678"],
+  ])("protects amended local value: %s", (text, value) => {
+    const expected = text!.replace(value!, SECRET_ANSWER_NOTICE);
+    expect(redactSecretPrompt(text!)).toBe(expected);
+    expect(redactSecretAnswer(text!, "Which one should I use?")).toBe(expected);
+  });
 });

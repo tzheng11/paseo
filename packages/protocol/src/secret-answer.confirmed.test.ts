@@ -91,10 +91,10 @@ const cases = findings.flatMap((finding) =>
     .map((value, index) => Object.assign({ id: finding.id, variant: index + 1 }, value)),
 );
 
-describe("ruling9 confirmed findings with original IDs", () => {
+describe("confirmed findings with explicit consolidated policy amendments", () => {
   test("accounts for all 80 source findings and all 68 confirmed findings", () => {
     expect(createHash("sha256").update(JSON.stringify(restoredSource)).digest("hex")).toBe(
-      "05c3cae4ad7dfdde88bc44f217cb79ae266760ace7fde5bc012c42ab37934115",
+      "2e7b3050e15c14972df6061ce74b2366dfdc62866cc3edc25e171d2ef7aa2505",
     );
     expect(findings).toHaveLength(80);
     expect(findings.filter((finding) => finding.real)).toHaveLength(68);
