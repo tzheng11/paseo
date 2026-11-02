@@ -65,9 +65,10 @@ PASEO_DEV_RESET_HOME=1 npm run dev            # clear and reseed the derived wor
 For a controlled standalone upgrade, launch the supervisor with
 `PASEO_MAINTENANCE_BOOT=closed`, an explicit canonical `PASEO_HOME`, and
 `PASEO_MAINTENANCE_CONTROL_DIR` pointing to a new, empty, owned `0700` directory.
-The home must already contain its original `server-id`. This mode does not create
+The home must already contain its original `server-id`. The worker does not create
 or repair an identity, load normal config, construct daemon bootstrap, open the
 normal endpoint, or start schedules, plugins, providers, hooks, Hub or relay.
+The supervisor still reads its logging configuration and maintains the PID lock.
 Use an independently owned supervisor handle; the ordinary CLI start's readiness
 timeout is not a maintenance launcher. No normal ready IPC is sent before release.
 
@@ -79,8 +80,18 @@ epoch, phase, and capability scope. `POST /v1/release` requires those exact four
 binding fields plus a unique `requestId`. It durably commits one bootstrap attempt
 before returning `202`. Observe `started.json` or the inspect result afterward;
 `202` is not readiness. Startup or persistence failure cannot be retried under a
-new request ID in the same boot. A process crash after the release record leaves
-an unknown attempt for the controller to inspect.
+new request ID in the same boot. Failed startup persists an unknown outcome and
+uses the worker's fatal exit, so partial background tasks cannot keep running
+behind the control socket. If outcome persistence also fails, the release record
+remains an unknown attempt for the controller to inspect.
+
+Successful startup commits `started.json` before publishing readiness to the
+supervisor. Only after that readiness is published does the supervisor remove
+maintenance variables from future workers; ordinary crash and client-requested
+restarts then run normally. The private control socket and epoch belong to the
+first worker, not its replacements. Do not persist maintenance variables in the
+final login LaunchAgent. A new supervisor using the consumed directory refuses
+to start; a one-time handover and ordinary login startup have different inputs.
 
 The initial release deadline defaults to five minutes, capped at fifteen via
 `PASEO_MAINTENANCE_BOOT_TIMEOUT_MS`. Expiry leaves the boot closed. This is a

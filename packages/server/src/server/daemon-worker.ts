@@ -336,6 +336,7 @@ async function main() {
     throw err;
   }
 
+  let ready: Extract<SupervisorLifecycleMessage, { type: "paseo:ready" }>;
   try {
     await daemon.start();
     const listenTarget = daemon.getListenTarget();
@@ -343,11 +344,11 @@ async function main() {
     if (!listen) {
       throw new Error("Daemon did not expose a listen target after startup");
     }
-    sendSupervisorLifecycleMessage({
+    ready = {
       type: "paseo:ready",
       listen,
       serverId: daemon.getServerId(),
-    });
+    };
   } catch (err) {
     logger.fatal({ err }, "Daemon failed to start listening");
     throw err;
@@ -365,6 +366,7 @@ async function main() {
     logger.fatal({ err: reason }, "Unhandled promise rejection — daemon crashing");
     exitAfterPinoFlush();
   });
+  return ready;
 }
 
 // Give pino async streams a moment to flush the fatal log entry to daemon.log
@@ -376,7 +378,9 @@ function exitAfterPinoFlush(): void {
 
 installSupervisorLivenessGuard(resolvePaseoHome());
 
-startWorkerWithMaintenance(main).catch((err) => {
+startWorkerWithMaintenance(main, process.env, exitAfterPinoFlush, (ready) => {
+  process.send?.(ready);
+}).catch((err) => {
   process.stderr.write(`${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`);
   exitAfterPinoFlush();
 });

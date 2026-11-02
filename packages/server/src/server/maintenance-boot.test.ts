@@ -2,6 +2,7 @@ import http from "node:http";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -13,10 +14,19 @@ const unixTest = test.skipIf(process.platform === "win32");
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
   vi.useRealTimers();
-  for (const cleanup of cleanups.splice(0).toReversed()) await cleanup();
+  const errors: unknown[] = [];
+  for (const cleanup of cleanups.splice(0).toReversed()) {
+    try {
+      await cleanup();
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (errors.length) throw new AggregateError(errors, "maintenance test cleanup failed");
 });
 
-async function fixture(start = vi.fn(async () => {}), timeout = 300000) {
+async function fixture(start = vi.fn(async () => {}), timeout = 300000, publish = vi.fn()) {
+  const fatal = vi.fn();
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "pmb-")));
   cleanups.push(() => rm(root, { recursive: true, force: true }));
   const home = path.join(root, "home");
@@ -24,12 +34,17 @@ async function fixture(start = vi.fn(async () => {}), timeout = 300000) {
   await mkdir(home, { mode: 0o700 });
   await mkdir(directory, { mode: 0o700 });
   await writeFile(path.join(home, "server-id"), "srv_test-original\n", { mode: 0o600 });
-  const control = await startWorkerWithMaintenance(start, {
-    PASEO_HOME: home,
-    PASEO_MAINTENANCE_BOOT: "closed",
-    PASEO_MAINTENANCE_CONTROL_DIR: directory,
-    PASEO_MAINTENANCE_BOOT_TIMEOUT_MS: String(timeout),
-  });
+  const control = await startWorkerWithMaintenance(
+    start,
+    {
+      PASEO_HOME: home,
+      PASEO_MAINTENANCE_BOOT: "closed",
+      PASEO_MAINTENANCE_CONTROL_DIR: directory,
+      PASEO_MAINTENANCE_BOOT_TIMEOUT_MS: String(timeout),
+    },
+    fatal,
+    publish,
+  );
   if (!control) throw new Error("missing control");
   cleanups.push(() => control.close());
   const token = await readFile(path.join(directory, "token"), "utf8");
@@ -39,6 +54,8 @@ async function fixture(start = vi.fn(async () => {}), timeout = 300000) {
     directory,
     home,
     start,
+    fatal,
+    publish,
     token,
     bound: { ...identity, requestId: "request-one" },
     request(method: string, url: string, body: unknown = {}, credential = token) {
@@ -273,9 +290,9 @@ unixTest(
   },
 );
 
-unixTest(
+unixTest.each(["disconnect", "graceful"] as const)(
   "the actual worker waits before bootstrap and still exits after supervisor loss",
-  async () => {
+  async (method) => {
     const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "pmbw-")));
     cleanups.push(() => rm(root, { recursive: true, force: true }));
     const home = path.join(root, "home");
@@ -322,7 +339,8 @@ unixTest(
     );
     expect((await readdir(home)).sort()).toEqual(["config.json", "server-id"]);
     expect(errors).toBe("");
-    child.disconnect();
+    if (method === "disconnect") child.disconnect();
+    else child.send({ type: "paseo:graceful-shutdown", reason: "fixture_cancel_before_release" });
     expect(await exit).toEqual([0, null]);
   },
 );
@@ -339,5 +357,140 @@ test.runIf(process.platform === "win32")(
       }),
     ).rejects.toThrow("MAINTENANCE_REQUIRES_UNIX_SOCKET");
     expect(start).not.toHaveBeenCalled();
+  },
+);
+
+unixTest("malformed requests cannot rewrite a drained terminal result", async () => {
+  const f = await fixture();
+  await f.request("POST", "/v1/drain", f.bound);
+  const before = f.control.inspect();
+  await f.request("POST", "/v1/release", null);
+  expect(f.control.inspect()).toEqual(before);
+});
+
+unixTest("a different malformed request cannot fail a release already in progress", async () => {
+  let finish!: () => void;
+  const f = await fixture(
+    vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    ),
+  );
+  try {
+    await f.request("POST", "/v1/release", f.bound);
+    await f.request("POST", "/v1/drain", null);
+    expect(f.control.inspect().phase).toBe("releasing");
+  } finally {
+    finish();
+  }
+});
+
+unixTest("late input drift cannot rewrite a released terminal result", async () => {
+  const f = await fixture();
+  await f.request("POST", "/v1/release", f.bound);
+  await vi.waitFor(() => expect(f.control.inspect().phase).toBe("released"));
+  const before = f.control.inspect();
+  await writeFile(path.join(f.home, "server-id"), "srv_changed\n");
+  await f.request("POST", "/v1/release", f.bound);
+  expect(f.control.inspect()).toEqual(before);
+});
+
+unixTest("failed released bootstrap exits a real worker despite an allocated timer", async () => {
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "pmbf-")));
+  cleanups.push(() => rm(root, { recursive: true, force: true }));
+  const home = path.join(root, "home"),
+    directory = path.join(root, "ctl");
+  await mkdir(home, { mode: 0o700 });
+  await mkdir(directory, { mode: 0o700 });
+  await writeFile(path.join(home, "server-id"), "srv_partial-start\n", { mode: 0o600 });
+  const script = path.join(root, "worker.mjs");
+  const module = new URL("./maintenance-boot.ts", import.meta.url).href;
+  await writeFile(
+    script,
+    `import {startWorkerWithMaintenance} from ${JSON.stringify(module)};
+    import {writeFileSync} from 'node:fs';
+    await startWorkerWithMaintenance(async () => {
+      writeFileSync(${JSON.stringify(path.join(root, "allocated"))}, 'timer allocated');
+      setInterval(() => {}, 10);
+      throw new Error('partial bootstrap');
+    });`,
+  );
+  const child = spawn(process.execPath, ["--import", "tsx", script], {
+    env: {
+      PATH: process.env.PATH,
+      HOME: root,
+      PASEO_HOME: home,
+      PASEO_MAINTENANCE_BOOT: "closed",
+      PASEO_MAINTENANCE_CONTROL_DIR: directory,
+    },
+    stdio: "ignore",
+  });
+  const exit = once(child, "exit");
+  cleanups.push(async () => {
+    child.kill("SIGTERM");
+    await exit;
+  });
+  let binding: Record<string, unknown>;
+  await vi.waitFor(
+    async () => {
+      binding = JSON.parse(await readFile(path.join(directory, "identity.json"), "utf8"));
+    },
+    { timeout: 10000 },
+  );
+  const token = await readFile(path.join(directory, "token"), "utf8");
+  await new Promise<void>((resolve, reject) => {
+    const req = http.request(
+      {
+        socketPath: path.join(directory, "control.sock"),
+        path: "/v1/release",
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, Connection: "close" },
+      },
+      (res) => {
+        res.resume();
+        res.once("end", resolve);
+      },
+    );
+    req.once("error", reject);
+    req.end(JSON.stringify({ ...binding, requestId: "partial-one" }));
+  });
+  const timeout = new Promise<null>((resolve) => {
+    setTimeout(() => resolve(null), 2000).unref();
+  });
+  expect(await Promise.race([exit, timeout])).toEqual([1, null]);
+  expect(await readFile(path.join(root, "allocated"), "utf8")).toBe("timer allocated");
+  expect(JSON.parse(await readFile(path.join(directory, "failed.json"), "utf8"))).toMatchObject({
+    phase: "failed",
+    release: { outcome: "unknown", requestId: "partial-one" },
+  });
+});
+
+unixTest("readiness publication follows the durable started receipt", async () => {
+  const publish = vi.fn();
+  const f = await fixture(undefined, undefined, publish);
+  publish.mockImplementation(() => {
+    expect(JSON.parse(readFileSync(path.join(f.directory, "started.json"), "utf8"))).toMatchObject({
+      phase: "released",
+      release: { outcome: "started" },
+    });
+  });
+  await f.request("POST", "/v1/release", f.bound);
+  await vi.waitFor(() => expect(f.control.inspect().phase).toBe("released"));
+  expect(publish).toHaveBeenCalledTimes(1);
+  expect(f.fatal).not.toHaveBeenCalled();
+});
+
+unixTest(
+  "a failed started-receipt write never publishes readiness and invokes fatal exit",
+  async () => {
+    const f = await fixture();
+    await writeFile(path.join(f.directory, "started.json"), "reserved", { flag: "wx" });
+    await f.request("POST", "/v1/release", f.bound);
+    await vi.waitFor(() => expect(f.fatal).toHaveBeenCalledTimes(1));
+    expect(f.publish).not.toHaveBeenCalled();
+    expect(f.control.inspect()).toMatchObject({ phase: "failed", release: { outcome: "unknown" } });
+    expect(f.start).toHaveBeenCalledTimes(1);
   },
 );

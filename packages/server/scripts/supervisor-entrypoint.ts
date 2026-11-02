@@ -14,7 +14,10 @@ import { PRIVATE_FILE_MODE } from "../src/server/private-files.js";
 import { loadPersistedConfig } from "../src/server/persisted-config.js";
 import { runSupervisor } from "./supervisor.js";
 import { resolveSupervisorLogFile } from "./supervisor-log-config.js";
-import { resolveWorkerExecArgv } from "./supervisor-worker-config.js";
+import {
+  finishMaintenanceBootEnvironment,
+  resolveWorkerExecArgv,
+} from "./supervisor-worker-config.js";
 
 process.title = "Paseo Supervisor";
 
@@ -159,6 +162,9 @@ async function main(): Promise<void> {
     logFile: supervisorLogFile,
     onWorkerReady: async ({ listen, serverId }) => {
       await updatePidLock(paseoHome, { listen, serverId }, { ownerPid: process.pid });
+      // runSupervisor serializes this publication with exit/respawn. The first
+      // worker reports ready only after its maintenance release is durable.
+      finishMaintenanceBootEnvironment(workerEnv);
     },
     onWorkerExit: () =>
       updatePidLock(paseoHome, { listen: null, serverId: null }, { ownerPid: process.pid }),

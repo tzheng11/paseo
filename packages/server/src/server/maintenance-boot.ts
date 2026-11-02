@@ -17,7 +17,7 @@ interface BootOptions {
   timeoutMs: number;
 }
 
-type Phase = "closed" | "expired" | "releasing" | "released" | "failed" | "drained";
+type Phase = "closed" | "expired" | "releasing" | "released" | "failed" | "draining" | "drained";
 
 interface BootSnapshot extends BootBinding {
   protocolVersion: 1;
@@ -102,7 +102,12 @@ function credentialMatches(value: unknown, token: string): boolean {
 }
 
 /** The normal bootstrap is not constructed until an explicit, one-shot release. */
-export async function startMaintenanceBoot(options: BootOptions, start: () => Promise<void>) {
+export async function startMaintenanceBoot<T>(
+  options: BootOptions,
+  start: () => Promise<T>,
+  onStartupFailure: (error: unknown) => void = () => process.exit(1),
+  onStarted?: (result: T) => void,
+) {
   if (
     !Number.isSafeInteger(options.timeoutMs) ||
     options.timeoutMs < 1 ||
@@ -175,9 +180,61 @@ export async function startMaintenanceBoot(options: BootOptions, start: () => Pr
       (await realpath(options.directory)) !== options.directory ||
       (await existingServerId(options.home, uid)) !== binding.serverId
     ) {
-      phase = "failed";
+      if (phase === "closed") phase = "failed";
       throw new Error("MAINTENANCE_INPUTS_CHANGED");
     }
+  };
+  const drainBoot = async (requestId: string, res: http.ServerResponse) => {
+    phase = "draining";
+    drain = { scope: "unreleased-boot", acceptedWork: 0, requestId: requestId };
+    try {
+      await log("drained.json", { ...snapshot(), phase: "drained" });
+    } catch (error) {
+      phase = "failed";
+      drain = null;
+      throw error;
+    }
+    phase = "drained";
+    respond(res, 200, snapshot());
+  };
+  const releaseBoot = async (requestId: string, res: http.ServerResponse) => {
+    phase = "releasing";
+    release = { requestId: requestId, outcome: "starting" };
+    // Commit the one-shot decision before invoking any normal runtime code.
+    try {
+      await log("release.json", snapshot());
+    } catch (error) {
+      phase = "failed";
+      throw error;
+    }
+    respond(res, 202, snapshot());
+    releaseTask = Promise.resolve()
+      .then(start)
+      .then(async (result) => {
+        const started = { requestId: requestId, outcome: "started" as const };
+        await log("started.json", { ...snapshot(), phase: "released", release: started });
+        // In a supervised worker, readiness must follow this durable commit.
+        // Otherwise a receipt failure could trigger an ordinary unguarded respawn.
+        onStarted?.(result);
+        phase = "released";
+        release = started;
+        return;
+      })
+      .catch(async (error: unknown) => {
+        // Startup can have had effects. Never retry or call that a zero-work drain.
+        phase = "failed";
+        release = { requestId: requestId, outcome: "unknown" };
+        try {
+          await log("failed.json", snapshot());
+        } finally {
+          // Bootstrap may have started autonomous tasks before opening its endpoint.
+          // Keep the durable unknown but end the worker, as normal startup does.
+          onStartupFailure(error);
+        }
+      });
+    void releaseTask.catch(() => {
+      process.stderr.write("MAINTENANCE_OUTCOME_PERSISTENCE_FAILED\n");
+    });
   };
   const handle = async (req: http.IncomingMessage, res: http.ServerResponse) => {
     if (!credentialMatches(req.headers.authorization, token)) {
@@ -191,6 +248,10 @@ export async function startMaintenanceBoot(options: BootOptions, start: () => Pr
     }
     if (req.method !== "POST" || (req.url !== "/v1/release" && req.url !== "/v1/drain")) {
       respond(res, 404, { error: "MAINTENANCE_ROUTE_UNSUPPORTED" });
+      return;
+    }
+    if (phase !== "closed") {
+      respond(res, 409, { error: "MAINTENANCE_NOT_CLOSED", ...snapshot() });
       return;
     }
     let raw = "";
@@ -220,41 +281,13 @@ export async function startMaintenanceBoot(options: BootOptions, start: () => Pr
       return;
     }
     if (req.url === "/v1/drain") {
-      phase = "drained";
-      drain = { scope: "unreleased-boot", acceptedWork: 0, requestId: value.requestId };
-      await log("drained.json", snapshot());
-      respond(res, 200, snapshot());
+      await drainBoot(value.requestId, res);
       return;
     }
-    phase = "releasing";
-    release = { requestId: value.requestId, outcome: "starting" };
-    // Commit the one-shot decision before invoking any normal runtime code.
-    await log("release.json", snapshot());
-    respond(res, 202, snapshot());
-    releaseTask = Promise.resolve()
-      .then(start)
-      .then(async () => {
-        phase = "released";
-        release = { requestId: value.requestId as string, outcome: "started" };
-        await log("started.json", snapshot());
-        return;
-      })
-      .catch(async () => {
-        // Startup can have had effects. Never retry or call that a zero-work drain.
-        phase = "failed";
-        release = { requestId: value.requestId as string, outcome: "unknown" };
-        await log("failed.json", snapshot());
-      });
-    void releaseTask.catch(() => {
-      phase = "failed";
-    });
+    await releaseBoot(value.requestId, res);
   };
   const server = http.createServer({ requestTimeout: 5000, headersTimeout: 5000 }, (req, res) => {
     void handle(req, res).catch(() => {
-      if (phase === "releasing" || phase === "drained") {
-        phase = "failed";
-        drain = null;
-      }
       if (!res.headersSent) respond(res, 400, { error: "MAINTENANCE_REQUEST_FAILED" });
       else res.destroy();
     });
@@ -298,11 +331,17 @@ export async function startMaintenanceBoot(options: BootOptions, start: () => Pr
   };
 }
 
-export async function startWorkerWithMaintenance(start: () => Promise<void>, env = process.env) {
+export async function startWorkerWithMaintenance<T>(
+  start: () => Promise<T>,
+  env = process.env,
+  onStartupFailure?: (error: unknown) => void,
+  onStarted?: (result: T) => void,
+) {
   const options = maintenanceBootOptions(env);
   if (!options) {
-    await start();
+    const result = await start();
+    onStarted?.(result);
     return null;
   }
-  return startMaintenanceBoot(options, start);
+  return startMaintenanceBoot(options, start, onStartupFailure, onStarted);
 }
