@@ -3247,10 +3247,15 @@ function readCookieField(
   original: string,
   fieldStart: number,
   lineEnd: number,
-): CookieField {
+  field: CookieField,
+): void {
+  field.span = null;
   let cursor = fieldStart;
   while (cursor < lineEnd && text[cursor] !== "=" && text[cursor] !== ";") cursor += 1;
-  if (text[cursor] !== "=") return { next: cursor + 1, span: null };
+  if (text[cursor] !== "=") {
+    field.next = cursor + 1;
+    return;
+  }
   const key = text.slice(fieldStart, cursor).trim();
   cursor += 1;
   while (text[cursor] === " " || text[cursor] === "\t") cursor += 1;
@@ -3259,7 +3264,7 @@ function readCookieField(
   const start = cursor;
   const end = cookieValueEnd(text, view, original, start, lineEnd, opening, quote);
   cursor = end;
-  const span =
+  field.span =
     /^[A-Za-z0-9_-]+$/.test(key) &&
     credentialValueShape(
       decodedCredentialValue(text, view, original, start, end),
@@ -3270,7 +3275,7 @@ function readCookieField(
       : null;
   if (text[cursor] === quote) cursor += 1;
   while (cursor < lineEnd && text[cursor] !== ";") cursor += 1;
-  return { next: cursor + 1, span };
+  field.next = cursor + 1;
 }
 
 function cookieSpans(text: string, view: DetectionView, original: string): ScanSpan[] {
@@ -3280,8 +3285,9 @@ function cookieSpans(text: string, view: DetectionView, original: string): ScanS
   while ((header = scanner.exec(text)) !== null) {
     let cursor = header.index + header[0].length;
     const lineEnd = cookieLineEnd(text, view, original, cursor);
+    const field: CookieField = { next: cursor, span: null };
     while (cursor < lineEnd) {
-      const field = readCookieField(text, view, original, cursor, lineEnd);
+      readCookieField(text, view, original, cursor, lineEnd, field);
       if (field.span) spans.push(field.span);
       cursor = field.next;
     }
@@ -3372,6 +3378,7 @@ function decodedCredentialValue(
   start: number,
   end: number,
 ): string {
+  if (view.starts === undefined) return text.slice(start, end);
   const parts: string[] = [];
   for (let index = start; index < end; index += 1) {
     const character = text[index]!;
@@ -3486,6 +3493,7 @@ function shouldRedactCredential(
   if (isClosedPlaceholder(value) || isCredentialSubstitution(value)) return false;
   if (candidate.copula && candidate.tier === "password")
     return passwordCopulaShape(value, rawLength);
+  if (candidate.tier === "credential" && !credentialValueShape(value, 12, rawLength)) return false;
   if (candidate.quoted) {
     if (candidate.tier === "password") return true;
     if (!/\d/.test(value) && /\{\{[A-Za-z_]+\}\}/.test(value)) return false;
@@ -3494,7 +3502,7 @@ function shouldRedactCredential(
     isBenignUnquotedCredential(text, candidate, value)
   )
     return false;
-  return candidate.tier === "password" || credentialValueShape(value, 12, rawLength);
+  return true;
 }
 
 function assignmentSpans(text: string, view: DetectionView, original: string): SecretPromptSpan[] {

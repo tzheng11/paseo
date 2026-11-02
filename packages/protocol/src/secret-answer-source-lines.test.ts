@@ -81,6 +81,8 @@ const REVIEWED_K3_LOSSES: Record<string, string> = {
     "A conditional source expression has a quoted password literal followed by a colon, locally matching a credential field (items 1 and 20).",
 };
 
+// This functional corpus includes large checked-in generated assets. Its deadline
+// is separate from the scanner throughput and scaling limits in the performance spec.
 test("K3 keeps tracked source lines except the reviewed named losses", () => {
   expect(snapshot.lines.length).toBe(snapshot.count);
   expect(snapshot.sourceSha256).toMatch(/^[a-f0-9]{64}$/);
@@ -92,4 +94,4 @@ test("K3 keeps tracked source lines except the reviewed named losses", () => {
   expect(unreviewed).toEqual([]);
   expect(residue.length).toBeLessThanOrEqual(30);
   for (const location of residue) expect(REVIEWED_K3_LOSSES[location].length).toBeGreaterThan(20);
-});
+}, 60_000);
