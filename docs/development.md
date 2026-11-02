@@ -60,6 +60,42 @@ PASEO_DEV_SEED_HOME=/path/to/home npm run dev # seed from a different source hom
 PASEO_DEV_RESET_HOME=1 npm run dev            # clear and reseed the derived worktree home
 ```
 
+### Closed maintenance boot
+
+For a controlled standalone upgrade, launch the supervisor with
+`PASEO_MAINTENANCE_BOOT=closed`, an explicit canonical `PASEO_HOME`, and
+`PASEO_MAINTENANCE_CONTROL_DIR` pointing to a new, empty, owned `0700` directory.
+The home must already contain its original `server-id`. This mode does not create
+or repair an identity, load normal config, construct daemon bootstrap, open the
+normal endpoint, or start schedules, plugins, providers, hooks, Hub or relay.
+Use an independently owned supervisor handle; the ordinary CLI start's readiness
+timeout is not a maintenance launcher. No normal ready IPC is sent before release.
+
+The directory contains a private `control.sock`, a `0600` bearer `token`, and an
+immutable `identity.json`. Use HTTP over that Unix socket with
+`Authorization: Bearer <token>`; never expose the token in logs or host registries.
+`GET /v1/inspect` reports the original server ID, process PID, fresh generation and
+epoch, phase, and capability scope. `POST /v1/release` requires those exact four
+binding fields plus a unique `requestId`. It durably commits one bootstrap attempt
+before returning `202`. Observe `started.json` or the inspect result afterward;
+`202` is not readiness. Startup or persistence failure cannot be retried under a
+new request ID in the same boot. A process crash after the release record leaves
+an unknown attempt for the controller to inspect.
+
+The initial release deadline defaults to five minutes, capped at fifteen via
+`PASEO_MAINTENANCE_BOOT_TIMEOUT_MS`. Expiry leaves the boot closed. This is a
+one-shot bootstrap authorization, not a renewable admission lease on a running
+daemon. Unsupported routes and WebSocket upgrades are refused. Supervisor loss
+still exits the worker while it is waiting.
+
+`POST /v1/drain` accepts the same binding only while this boot has never been
+released. Its receipt has `scope: "unreleased-boot"` and zero accepted work, and
+permanently prevents release. The current capability explicitly reports
+`activeDrain: false`; it cannot freeze or drain an already-running daemon. Runtime
+producer admission, accepted-operation draining and restart recovery are separate
+work. In particular, this mode cannot recover RAM-only work from an older daemon
+or replace that first upgrade's work-owner settlement and final-down reconciliation.
+
 ### Daemon endpoints
 
 - Stable daemon launched by the desktop app: `localhost:6767`.

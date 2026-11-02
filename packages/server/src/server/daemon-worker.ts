@@ -1,7 +1,7 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { getHeapStatistics } from "node:v8";
-import { createPaseoDaemon, formatListenTarget } from "./bootstrap.js";
+import { startWorkerWithMaintenance } from "./maintenance-boot.js";
 import { loadConfig } from "./config.js";
 import { resolvePaseoHome } from "./paseo-home.js";
 import { createRootLogger } from "./logger.js";
@@ -10,6 +10,10 @@ import { getProcessDiagnostics } from "./process-diagnostics.js";
 import { workerHeapDiagnostics } from "./worker-heap-diagnostics.js";
 
 process.title = "Paseo Daemon";
+
+// Before bootstrap there are no runtime owners to drain. After bootstrap begins,
+// supervisor requests use the normal daemon shutdown path.
+let supervisorShutdownHandler: (reason: string) => void = () => process.exit(0);
 
 type SupervisorLifecycleMessage =
   | {
@@ -130,8 +134,77 @@ function applyCliFlagOverrides(config: ReturnType<typeof loadConfig>): void {
   }
 }
 
+function installSupervisorLivenessGuard(paseoHome: string): void {
+  if (typeof process.send !== "function") {
+    return;
+  }
+
+  const supervisorPid = process.ppid;
+  let lastSupervisorHeartbeatAt = Date.now();
+  let supervisorExitRequested = false;
+  const exitAfterSupervisorLoss = (reason: string) => {
+    if (supervisorExitRequested) {
+      return;
+    }
+    supervisorExitRequested = true;
+
+    writeWorkerLifecycleLog(paseoHome, "Supervisor liveness lost; worker exiting", {
+      reason,
+      ...getProcessDiagnostics(),
+      supervisorPid,
+      currentParentPid: process.ppid,
+      ipcConnected: typeof process.connected === "boolean" ? process.connected : null,
+      heartbeatAgeMs: Date.now() - lastSupervisorHeartbeatAt,
+    });
+
+    // The supervisor owns the worker's stdout/stderr pipes. Once it is gone,
+    // logging during graceful shutdown can block on the broken pipe and leave
+    // the daemon orphaned, so supervisor loss is a hard process boundary.
+    process.exit(0);
+  };
+
+  process.on("message", (message: unknown) => {
+    if (typeof message !== "object" || message === null || !("type" in message)) {
+      return;
+    }
+    const type = (message as { type?: unknown }).type;
+    if (type === "paseo:supervisor-heartbeat") {
+      lastSupervisorHeartbeatAt = Date.now();
+      return;
+    }
+    if (type === "paseo:graceful-shutdown") {
+      const reason = (message as { reason?: unknown }).reason;
+      supervisorShutdownHandler(
+        typeof reason === "string" ? reason : "supervisor_requested_shutdown",
+      );
+    }
+  });
+  process.on("disconnect", () => exitAfterSupervisorLoss("ipc_disconnect_event"));
+
+  const timer = setInterval(() => {
+    const ipcConnected = typeof process.connected === "boolean" ? process.connected : true;
+    const heartbeatExpired = Date.now() - lastSupervisorHeartbeatAt > 3500;
+    const supervisorChanged = process.ppid !== supervisorPid;
+
+    if (ipcConnected === false) {
+      exitAfterSupervisorLoss("ipc_disconnected");
+      return;
+    }
+    if (supervisorChanged) {
+      exitAfterSupervisorLoss("supervisor_parent_pid_changed");
+      return;
+    }
+    if (heartbeatExpired && !isPidAlive(supervisorPid)) {
+      exitAfterSupervisorLoss("supervisor_pid_dead");
+    }
+  }, 1000);
+  timer.unref();
+}
+
 async function main() {
-  const { paseoHome, logger, config } = bootstrapFromEnvironment();
+  // Maintenance boot must not even construct bootstrap's autonomous producers.
+  const { createPaseoDaemon, formatListenTarget } = await import("./bootstrap.js");
+  const { logger, config } = bootstrapFromEnvironment();
   logger.info(
     workerHeapDiagnostics({
       execArgv: process.execArgv,
@@ -204,6 +277,8 @@ async function main() {
     installExitHook();
   };
 
+  supervisorShutdownHandler = (reason) => beginShutdown("Supervisor shutdown request", { reason });
+
   const sendSupervisorLifecycleMessage = (message: SupervisorLifecycleMessage): boolean => {
     if (typeof process.send !== "function") {
       return false;
@@ -247,75 +322,6 @@ async function main() {
       successExitCode: 0,
     });
   };
-
-  const installSupervisorLivenessGuard = () => {
-    if (typeof process.send !== "function") {
-      return;
-    }
-
-    const supervisorPid = process.ppid;
-    let lastSupervisorHeartbeatAt = Date.now();
-    let supervisorExitRequested = false;
-    const exitAfterSupervisorLoss = (reason: string) => {
-      if (supervisorExitRequested) {
-        return;
-      }
-      supervisorExitRequested = true;
-
-      writeWorkerLifecycleLog(paseoHome, "Supervisor liveness lost; worker exiting", {
-        reason,
-        ...getProcessDiagnostics(),
-        supervisorPid,
-        currentParentPid: process.ppid,
-        ipcConnected: typeof process.connected === "boolean" ? process.connected : null,
-        heartbeatAgeMs: Date.now() - lastSupervisorHeartbeatAt,
-      });
-
-      // The supervisor owns the worker's stdout/stderr pipes. Once it is gone,
-      // logging during graceful shutdown can block on the broken pipe and leave
-      // the daemon orphaned, so supervisor loss is a hard process boundary.
-      process.exit(0);
-    };
-
-    process.on("message", (message: unknown) => {
-      if (typeof message !== "object" || message === null || !("type" in message)) {
-        return;
-      }
-      const type = (message as { type?: unknown }).type;
-      if (type === "paseo:supervisor-heartbeat") {
-        lastSupervisorHeartbeatAt = Date.now();
-        return;
-      }
-      if (type === "paseo:graceful-shutdown") {
-        const reason = (message as { reason?: unknown }).reason;
-        beginShutdown("Supervisor shutdown request", {
-          reason: typeof reason === "string" ? reason : "supervisor_requested_shutdown",
-        });
-      }
-    });
-    process.on("disconnect", () => exitAfterSupervisorLoss("ipc_disconnect_event"));
-
-    const timer = setInterval(() => {
-      const ipcConnected = typeof process.connected === "boolean" ? process.connected : true;
-      const heartbeatExpired = Date.now() - lastSupervisorHeartbeatAt > 3500;
-      const supervisorChanged = process.ppid !== supervisorPid;
-
-      if (ipcConnected === false) {
-        exitAfterSupervisorLoss("ipc_disconnected");
-        return;
-      }
-      if (supervisorChanged) {
-        exitAfterSupervisorLoss("supervisor_parent_pid_changed");
-        return;
-      }
-      if (heartbeatExpired && !isPidAlive(supervisorPid)) {
-        exitAfterSupervisorLoss("supervisor_pid_dead");
-      }
-    }, 1000);
-    timer.unref();
-  };
-
-  installSupervisorLivenessGuard();
 
   try {
     daemon = await createPaseoDaemon(
@@ -368,7 +374,9 @@ function exitAfterPinoFlush(): void {
   setTimeout(() => process.exit(1), 200);
 }
 
-main().catch((err) => {
+installSupervisorLivenessGuard(resolvePaseoHome());
+
+startWorkerWithMaintenance(main).catch((err) => {
   process.stderr.write(`${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`);
   exitAfterPinoFlush();
 });
