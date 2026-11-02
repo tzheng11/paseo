@@ -236,7 +236,9 @@ follow-ups. Both snapshots use tracked files only. Reviewed source exceptions ar
 with reasons; runtime code never reads that list. Neutral digit-tagged identifier losses are an
 explicit trade-off, while bare-chat and code identifiers remain byte-exact. Performance tests cover
 both APIs at 256 KB, 512 KB and 1 MB, requiring a doubling ratio at most 2.5. Ordinary hostile forms
-are bounded at 1.5 seconds per MB and label-dense forms at 3 seconds per MB. Candidate look-aheads
+are bounded at 1.5 seconds per MB and label-dense forms at 3 seconds per MB. Protocol test files
+run serially so the timing checks do not compete with the seeded token-generation matrices.
+The limits are unchanged. Candidate look-aheads
 stop at the same line and 4 KiB; fallback value scanning runs to whitespace. Policy decisions and
 measured snapshot counts are recorded in the Issue Log and PR evidence.
 
