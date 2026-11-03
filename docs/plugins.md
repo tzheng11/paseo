@@ -97,9 +97,10 @@ built-ins have no child PID. These labels are diagnostic correlation, not proces
 Forked plugins report `initialize-received`, `evaluation-started`, `evaluation-completed`,
 `hello-sent`, `server-info-received`, `contribute-started`, `contribute-returned` and `ready-sent`.
 The host also records `session-attached`, `ready-received` and `initialization-timeout`, with
-the last child phase. `elapsedMs` uses the host's clock from attachment; `childElapsedMs` uses
-the child's clock from receipt of initialize. Do not compare their absolute values or assume
-cross-process arrival order. Built-in evaluation occurs in the host and has no child evaluation markers.
+the last child phase. `elapsedMs` uses the host's clock from attachment. For forked plugins,
+`childElapsedMs` starts when initialize is received; for in-process built-ins, it starts at worker
+construction, before attachment. Do not compare these clocks' absolute values or assume cross-process
+arrival order. Built-in evaluation occurs in the host and has no child evaluation markers.
 
 | Last observed boundary                  | What remains unconfirmed                                                    |
 | --------------------------------------- | --------------------------------------------------------------------------- |
