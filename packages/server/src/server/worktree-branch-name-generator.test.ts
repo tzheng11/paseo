@@ -11,6 +11,7 @@ import {
 } from "./paseo-worktree-service.js";
 import { createNoopWorkspaceGitService } from "./test-utils/workspace-git-service-stub.js";
 import { generateBranchNameFromFirstAgentContext } from "./worktree-branch-name-generator.js";
+import { SECRET_ANSWER_NOTICE } from "@getpaseo/protocol/secret-answer";
 import {
   writePaseoWorktreeFirstAgentBranchAutoNameMetadata,
   writePaseoWorktreeMetadata,
@@ -66,6 +67,33 @@ function createStructuredGenerator(result: { title: string; branch: string }) {
 }
 
 describe("generateBranchNameFromFirstAgentContext", () => {
+  test("redacts synthetic first-prompt and attachment secrets before the naming provider", async () => {
+    const secret = `sk-proj-${"Synthetic1_".repeat(8)}`;
+    const structured = createStructuredGenerator({
+      title: "Deploy safely",
+      branch: "deploy-safely",
+    });
+    const logger = createLogger();
+    await generateBranchNameFromFirstAgentContext({
+      agentManager: {} as AgentManager,
+      cwd: "/tmp/repo",
+      firstAgentContext: {
+        prompt: `Deploy with ${secret} then verify.`,
+        attachments: [
+          { type: "text", mimeType: "text/plain", title: "Notes", text: `Before ${secret} after` },
+        ],
+      },
+      logger,
+      deps: { generateStructuredAgentResponseWithFallback: structured.generateStructured },
+    });
+    expect(structured.calls).toHaveLength(1);
+    expect(structured.calls[0]?.prompt).toContain(
+      `Deploy with ${SECRET_ANSWER_NOTICE} then verify.`,
+    );
+    expect(structured.calls[0]?.prompt).toContain(`Before ${SECRET_ANSWER_NOTICE} after`);
+    expect(JSON.stringify(structured.calls)).not.toContain(secret);
+    expect(JSON.stringify(logger)).not.toContain(secret);
+  });
   test("returns title and branch independently — branch is not a slug of the title", async () => {
     const structured = createStructuredGenerator({
       title: "Add payments flow",

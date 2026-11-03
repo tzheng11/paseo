@@ -1,4 +1,35 @@
 import type { PersistStorage } from "zustand/middleware";
+import { redactSecretPrompt } from "@getpaseo/protocol/secret-answer";
+import type { DraftRecord, DraftStoreState } from "./state";
+
+export interface DraftAnswerContext {
+  latestMessage?: { kind: "user_message" | "assistant_message"; text: string };
+}
+
+/** Composer drafts are chat, so only the latest actual assistant message supplies context. */
+export function draftAnswerContext(input: DraftAnswerContext): string {
+  return input.latestMessage?.kind === "assistant_message" ? input.latestMessage.text : "";
+}
+
+/** Copy at the persistence boundary so the live editor keeps its unsaved text. */
+export function redactPersistedDrafts(
+  state: DraftStoreState,
+  contextForDraft: (draftKey: string) => string = () => "",
+): DraftStoreState {
+  const redact = (record: DraftRecord, context?: string): DraftRecord => ({
+    ...record,
+    input: { ...record.input, text: redactSecretPrompt(record.input.text, context) },
+  });
+  return {
+    drafts: Object.fromEntries(
+      Object.entries(state.drafts).map(([key, record]) => [
+        key,
+        redact(record, contextForDraft(key)),
+      ]),
+    ),
+    createModalDraft: state.createModalDraft ? redact(state.createModalDraft) : null,
+  };
+}
 
 export const DRAFT_PERSIST_INTERVAL_MS = 200;
 export interface PersistenceScheduler {

@@ -29,6 +29,7 @@ import { toAgentPayload } from "./agent-projections.js";
 import { projectTimelineRows } from "./timeline-projection.js";
 import { getOpenAgentTabLabel, PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 import { startAgentRun, sendPromptToAgent } from "./agent-prompt.js";
+import { SECRET_ANSWER_NOTICE } from "@getpaseo/protocol/secret-answer";
 import { StaleProviderSessionError } from "./stale-provider-session-error.js";
 import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "./agent-loading.js";
 import { archiveAgentCommand } from "./lifecycle-command.js";
@@ -691,6 +692,7 @@ async function startAndSteerThroughManager(
     activeTurnBehavior: behavior,
     runOptions: { clientMessageId: "replacement-client" },
   });
+  await manager.waitForAgentRunStart(agent.id);
   return { manager, agentId: agent.id, workdir };
 }
 
@@ -7401,6 +7403,7 @@ test("waitForAgentEvent does not resolve idle until foreground turn is finalized
   const storagePath = join(workdir, "agents");
   const storage = new AgentStorage(storagePath, logger);
   const releaseTurnCompleted = deferred<void>();
+  const turnStarted = deferred<void>();
 
   class SlowTerminalSession extends TestAgentSession {
     override async startTurn(): Promise<{ turnId: string }> {
@@ -7441,13 +7444,12 @@ test("waitForAgentEvent does not resolve idle until foreground turn is finalized
 
   const stream = manager.streamAgent(snapshot.id, "hello");
   const consumePromise = (async () => {
-    for await (const _event of stream) {
-      // Drain events so manager lifecycle progresses naturally.
+    for await (const event of stream) {
+      if (event.type === "turn_started") turnStarted.resolve();
     }
   })();
 
-  // Wait for the turn to start
-  await new Promise<void>((resolve) => setTimeout(resolve, 20));
+  await turnStarted.promise;
 
   const waitPromise = manager.waitForAgentEvent(snapshot.id);
 
@@ -15192,4 +15194,475 @@ test("streamed provider message filtering preserves prompt outline positions and
     await storage.flush();
     rmSync(workdir, { recursive: true, force: true });
   }
+});
+
+async function createSecretAnswerTestManager(session: AgentSession) {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-secret-answer-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  onTestFinished(async () => {
+    await manager.closeAgent(agent.id).catch(() => undefined);
+    await manager.flush();
+    await storage.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  });
+  return { manager, storage, agent };
+}
+
+test("secret answer permission responses reach providers and durable records only after redaction", async () => {
+  type Response = import("./agent-sdk-types.js").AgentPermissionResponse;
+  type Request = import("./agent-sdk-types.js").AgentPermissionRequest;
+  class AnswerSession extends TestAgentSession {
+    readonly received: Response[] = [];
+    override async respondToPermission(requestId = "", response: Response = { behavior: "deny" }) {
+      this.received.push(response);
+      this.pushEvent({
+        type: "permission_resolved",
+        provider: "codex",
+        requestId,
+        resolution: response,
+      });
+    }
+    override describePersistence() {
+      return { ...super.describePersistence(), metadata: { received: this.received } };
+    }
+  }
+  const session = new AnswerSession({ provider: "codex", cwd: process.cwd() });
+  const { manager, storage, agent } = await createSecretAnswerTestManager(session);
+  const syntheticSecret = "q1W2e3R4t5Y6u7I8o9P0a/S+d1F2g3H4j5K6l7Z8";
+  const question: Request = {
+    id: "question",
+    provider: "codex",
+    kind: "question",
+    name: "question",
+    input: { questions: [{ header: "Login", question: "Provide your password" }] },
+  };
+  const cases: Array<{ request: Request; response: Response; expected: Response }> = [
+    {
+      request: {
+        ...question,
+        input: { questions: [{ header: "Destination", question: "Where?" }] },
+      },
+      response: {
+        behavior: "allow",
+        updatedInput: {
+          answers: { Destination: syntheticSecret },
+          nested: { value: [syntheticSecret] },
+        },
+        updatedPermissions: [{ rule: { value: syntheticSecret } }],
+      },
+      expected: {
+        behavior: "allow",
+        updatedInput: {
+          answers: { Destination: SECRET_ANSWER_NOTICE },
+          nested: { value: [SECRET_ANSWER_NOTICE] },
+        },
+        updatedPermissions: [{ rule: { value: SECRET_ANSWER_NOTICE } }],
+      },
+    },
+    {
+      request: question,
+      response: {
+        behavior: "allow",
+        updatedInput: { answers: { Login: "synthetic-short-password" } },
+      },
+      expected: { behavior: "allow", updatedInput: { answers: { Login: SECRET_ANSWER_NOTICE } } },
+    },
+    {
+      request: { id: "tool", provider: "codex", kind: "tool", name: "Tool" },
+      response: { behavior: "allow", updatedInput: { command: { value: syntheticSecret } } },
+      expected: { behavior: "allow", updatedInput: { command: { value: SECRET_ANSWER_NOTICE } } },
+    },
+    {
+      request: { id: "plan", provider: "codex", kind: "plan", name: "ExitPlanMode" },
+      response: { behavior: "deny", message: `Revise using ${syntheticSecret}` },
+      expected: { behavior: "deny", message: `Revise using ${SECRET_ANSWER_NOTICE}` },
+    },
+    {
+      request: question,
+      response: { behavior: "deny", message: "synthetic-short-password" },
+      expected: { behavior: "deny", message: SECRET_ANSWER_NOTICE },
+    },
+    {
+      request: {
+        ...question,
+        input: { questions: [{ header: "Colour", question: "Which colour?" }] },
+      },
+      response: {
+        behavior: "allow",
+        updatedInput: { answers: { Colour: "  blue\n" } },
+        updatedPermissions: [{ rule: "allow" }],
+      },
+      expected: {
+        behavior: "allow",
+        updatedInput: { answers: { Colour: "  blue\n" } },
+        updatedPermissions: [{ rule: "allow" }],
+      },
+    },
+    {
+      request: { id: "plan", provider: "codex", kind: "plan", name: "ExitPlanMode" },
+      response: { behavior: "deny", message: "Use the smaller change." },
+      expected: { behavior: "deny", message: "Use the smaller change." },
+    },
+  ];
+  for (const { request, response, expected } of cases) {
+    const original = JSON.stringify(response);
+    manager.getAgent(agent.id)!.pendingPermissions.set(request.id, request);
+    await manager.respondToPermission(agent.id, request.id, response);
+    expect(session.received.at(-1)).toEqual(expected);
+    expect(JSON.stringify(response)).toBe(original);
+    await manager.flush();
+    await storage.flush();
+    const stored = await storage.get(agent.id);
+    expect(stored?.persistence?.metadata?.received).toEqual(session.received);
+    expect(JSON.stringify(stored)).not.toContain(syntheticSecret);
+    expect(JSON.stringify(stored)).not.toContain("synthetic-short-password");
+  }
+});
+
+test("secret answer stream and out-of-band prompts are redacted before providers and storage", async () => {
+  class AnswerSession extends TestAgentSession {
+    readonly received: AgentPromptInput[] = [];
+    override async startTurn(prompt: AgentPromptInput) {
+      this.received.push(prompt);
+      return super.startTurn();
+    }
+    override tryHandleOutOfBand(prompt: AgentPromptInput) {
+      this.received.push(prompt);
+      return { run: async () => {} };
+    }
+    override describePersistence() {
+      return { ...super.describePersistence(), metadata: { received: this.received } };
+    }
+  }
+  const session = new AnswerSession({ provider: "codex", cwd: process.cwd() });
+  const { manager, storage, agent } = await createSecretAnswerTestManager(session);
+  const syntheticSecret = "q1W2e3R4t5Y6u7I8o9P0a/S+d1F2g3H4j5K6l7Z8";
+  const secretPrompt = `  before\n${syntheticSecret}\nafter  `;
+  const safePrompt = `  before\n${SECRET_ANSWER_NOTICE}\nafter  `;
+  await drainAsyncGenerator(
+    manager.streamAgent(agent.id, secretPrompt, { clientMessageId: "secret-stream" }),
+  );
+  expect(session.received.at(-1)).toBe(safePrompt);
+  await drainAsyncGenerator(
+    manager.streamAgent(agent.id, "  ordinary answer\n", { clientMessageId: "ordinary-stream" }),
+  );
+  expect(session.received.at(-1)).toBe("  ordinary answer\n");
+  for (const text of [
+    "The secret-scan: required check failed on this PR, please look.",
+    "Why does this fail? const client = new S3({ accessKeyId: process.env.KEY_ID })",
+    "Fix this yaml:\n  secretName: my-app-config\n  image: nginx",
+    "log line without anything sensitive in it\n".repeat(1800),
+  ]) {
+    await drainAsyncGenerator(manager.streamAgent(agent.id, text));
+    expect(session.received.at(-1)).toBe(text);
+  }
+  // Ruling 9 excludes required from the closed password-label exceptions.
+  await drainAsyncGenerator(
+    manager.streamAgent(agent.id, "In the schema, password: required for local accounts only."),
+  );
+  expect(session.received.at(-1)).toBe(
+    `In the schema, password: ${SECRET_ANSWER_NOTICE} for local accounts only.`,
+  );
+  for (const text of ["Enter your password:", "Which color?"]) {
+    session.pushEvent({
+      type: "timeline",
+      provider: "codex",
+      item: { type: "assistant_message", text },
+    });
+  }
+  await manager.flush();
+  await drainAsyncGenerator(manager.streamAgent(agent.id, "blue"));
+  // Consecutive assistant segments form one message that still contains a real credential request.
+  expect(session.received.at(-1)).toBe(SECRET_ANSWER_NOTICE);
+  session.pushEvent({
+    type: "timeline",
+    provider: "codex",
+    item: {
+      type: "assistant_message",
+      text: "Enter your password:\nThen follow the keychain instructions.",
+    },
+  });
+  await manager.flush();
+  await drainAsyncGenerator(manager.streamAgent(agent.id, "tiny"));
+  // A real request remains credential context when instructions follow it.
+  expect(session.received.at(-1)).toBe(SECRET_ANSWER_NOTICE);
+  session.pushEvent({
+    type: "timeline",
+    provider: "codex",
+    item: { type: "assistant_message", text: "Please provide your Mac password." },
+  });
+  session.pushEvent({
+    type: "timeline",
+    provider: "codex",
+    item: {
+      type: "tool_call",
+      callId: "after-password",
+      name: "shell",
+      status: "completed",
+      error: null,
+    },
+  });
+  await manager.flush();
+  await drainAsyncGenerator(
+    manager.streamAgent(agent.id, "synthetic-short-password", {
+      clientMessageId: "password-stream",
+    }),
+  );
+  expect(session.received.at(-1)).toBe(SECRET_ANSWER_NOTICE);
+  expect(
+    manager.tryRunOutOfBand(agent.id, `/command ${syntheticSecret}`, {
+      clientMessageId: "secret-command",
+    }),
+  ).toBe(true);
+  expect(session.received.at(-1)).toBe(`/command ${SECRET_ANSWER_NOTICE}`);
+  expect(
+    manager.tryRunOutOfBand(agent.id, "/ordinary", { clientMessageId: "ordinary-command" }),
+  ).toBe(true);
+  expect(session.received.at(-1)).toBe("/ordinary");
+  await manager.flush();
+  await storage.flush();
+  const stored = await storage.get(agent.id);
+  expect(stored?.persistence?.metadata?.received).toEqual(session.received);
+  for (const value of [syntheticSecret, "synthetic-short-password"]) {
+    expect(JSON.stringify(stored)).not.toContain(value);
+    expect(JSON.stringify(manager.getTimeline(agent.id))).not.toContain(value);
+  }
+});
+
+test("secret answer steering and replacement sanitize both provider delivery and durable history", async () => {
+  class AnswerSession extends SteeringTestSession {
+    readonly steered: AgentPromptInput[] = [];
+    override async steerActiveTurn(
+      prompt: AgentPromptInput,
+      options: import("./agent-sdk-types.js").SteerActiveTurnOptions,
+    ) {
+      this.steered.push(prompt);
+      return super.steerActiveTurn(prompt, options);
+    }
+    override describePersistence() {
+      return {
+        ...super.describePersistence(),
+        metadata: { starts: this.startPrompts, steers: this.steered },
+      };
+    }
+  }
+  const session = new AnswerSession({ provider: "codex", cwd: process.cwd() });
+  const { manager, storage, agent } = await createSecretAnswerTestManager(session);
+  const initialRun = drainAsyncGenerator(manager.streamAgent(agent.id, "initial"));
+  await manager.waitForAgentRunStart(agent.id);
+  const syntheticSecret = "q1W2e3R4t5Y6u7I8o9P0a/S+d1F2g3H4j5K6l7Z8";
+  const secretPrompt = `before ${syntheticSecret} after\n`;
+  const safePrompt = `before ${SECRET_ANSWER_NOTICE} after\n`;
+  expect(
+    await manager.steerAgentRun(agent.id, secretPrompt, { clientMessageId: "secret-steer" }),
+  ).toEqual({ status: "accepted" });
+  expect(session.steered.at(-1)).toBe(safePrompt);
+  expect(
+    await manager.steerOrReplaceActiveTurn(agent.id, secretPrompt, {
+      clientMessageId: "secret-steer-or-replace",
+    }),
+  ).toEqual({ status: "steered" });
+  expect(session.steered.at(-1)).toBe(safePrompt);
+  expect(
+    await manager.steerAgentRun(agent.id, "  ordinary steer\n", {
+      clientMessageId: "ordinary-steer",
+    }),
+  ).toEqual({ status: "accepted" });
+  expect(session.steered.at(-1)).toBe("  ordinary steer\n");
+  session.steerResult = "unavailable";
+  const replacement = await manager.steerOrReplaceActiveTurn(agent.id, secretPrompt, {
+    clientMessageId: "secret-replacement",
+  });
+  expect(replacement.status).toBe("replaced");
+  if (replacement.status !== "replaced") throw new Error("Expected replacement turn");
+  const replacementRun = drainAsyncGenerator(replacement.iterator);
+  await initialRun;
+  await manager.waitForAgentRunStart(agent.id);
+  expect(session.startPrompts.at(-1)).toBe(safePrompt);
+  session.steerResult = "accepted";
+  session.pushEvent({
+    type: "timeline",
+    provider: "codex",
+    item: { type: "assistant_message", text: "Please enter your password." },
+  });
+  await manager.flush();
+  expect(
+    await manager.steerAgentRun(agent.id, "synthetic-short-password", {
+      clientMessageId: "password-steer",
+    }),
+  ).toEqual({ status: "accepted" });
+  expect(session.steered.at(-1)).toBe(SECRET_ANSWER_NOTICE);
+  session.pushEvent({
+    type: "turn_completed",
+    provider: "codex",
+    turnId: `active-turn-${session.startCount}`,
+  });
+  await replacementRun;
+  await manager.flush();
+  await storage.flush();
+  const stored = await storage.get(agent.id);
+  expect(stored?.persistence?.metadata).toEqual({
+    cwd: agent.cwd,
+    starts: session.startPrompts,
+    steers: session.steered,
+  });
+  for (const value of [syntheticSecret, "synthetic-short-password"]) {
+    expect(JSON.stringify(stored)).not.toContain(value);
+    expect(JSON.stringify(manager.getTimeline(agent.id))).not.toContain(value);
+  }
+});
+
+test("secret answer context read failure releases admission without forwarding or storing the answer", async () => {
+  class FailingContextStore extends RecordingTimelineStore {
+    fail = true;
+    override async fetchCommitted(
+      agentId: string,
+      options?: AgentTimelineFetchOptions,
+    ): Promise<AgentTimelineFetchResult> {
+      if (this.fail) throw new Error("Synthetic context read failure");
+      return super.fetchCommitted(agentId, options);
+    }
+  }
+  const store = new FailingContextStore();
+  const session = new SteeringTestSession({ provider: "codex", cwd: process.cwd() });
+  const manager = new AgentManager({
+    clients: {
+      codex: new (class extends TestAgentClient {
+        override async createSession(): Promise<AgentSession> {
+          return session;
+        }
+      })(),
+    },
+    durableTimelineStore: store,
+    logger,
+  });
+  const agent = await manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
+    workspaceId: undefined,
+  });
+  try {
+    await expect(
+      drainAsyncGenerator(
+        manager.streamAgent(agent.id, "synthetic-short", { clientMessageId: "unreadable-answer" }),
+      ),
+    ).rejects.toThrow("Synthetic context read failure");
+    expect(manager.hasInFlightRun(agent.id)).toBe(false);
+    expect(session.startPrompts).toEqual([]);
+    expect(JSON.stringify(manager.getTimeline(agent.id))).not.toContain("synthetic-short");
+    store.fail = false;
+    const retry = drainAsyncGenerator(manager.streamAgent(agent.id, "ordinary retry"));
+    await manager.waitForAgentRunStart(agent.id);
+    expect(session.startPrompts).toEqual(["ordinary retry"]);
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+    await retry;
+  } finally {
+    await manager.closeAgent(agent.id);
+  }
+});
+
+test("secret answer replacement preserves credential question context across cancellation", async () => {
+  const session = new SteeringTestSession({ provider: "codex", cwd: process.cwd() });
+  const { manager, agent } = await createSecretAnswerTestManager(session);
+  const first = drainAsyncGenerator(manager.streamAgent(agent.id, "initial"));
+  await manager.waitForAgentRunStart(agent.id);
+  manager.getAgent(agent.id)!.pendingPermissions.set("password-question", {
+    id: "password-question",
+    provider: "codex",
+    kind: "question",
+    name: "question",
+    input: { questions: [{ header: "Login", question: "Enter your password" }] },
+  });
+  session.pushEvent({
+    type: "timeline",
+    provider: "codex",
+    item: { type: "assistant_message", text: "Enter your password" },
+  });
+  await manager.flush();
+  const replacement = await manager.replaceAgentRun(agent.id, "synthetic-short-password", {
+    clientMessageId: "replacement-password",
+  });
+  const second = drainAsyncGenerator(replacement);
+  await first;
+  await manager.waitForAgentRunStart(agent.id);
+  expect(session.startPrompts).toEqual(["initial", SECRET_ANSWER_NOTICE]);
+  expect(JSON.stringify(manager.getTimeline(agent.id))).not.toContain("synthetic-short-password");
+  session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-2" });
+  await second;
+});
+
+test("secret answer admission preserves out-of-band commands with restored context", async () => {
+  class OutOfBandSession extends TestAgentSession {
+    received: AgentPromptInput[] = [];
+    override tryHandleOutOfBand(prompt: AgentPromptInput) {
+      this.received.push(prompt);
+      return { run: async () => {} };
+    }
+  }
+  const session = new OutOfBandSession({ provider: "codex", cwd: process.cwd() });
+  const store = new RecordingTimelineStore();
+  const manager = new AgentManager({
+    clients: {
+      codex: new (class extends TestAgentClient {
+        override async createSession(): Promise<AgentSession> {
+          return session;
+        }
+      })(),
+    },
+    durableTimelineStore: store,
+    logger,
+  });
+  const agent = await manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
+    workspaceId: undefined,
+  });
+  try {
+    expect(await startAgentRun(manager, agent.id, "/ordinary", logger)).toEqual({
+      disposition: "out_of_band",
+    });
+    expect(session.received).toEqual(["/ordinary"]);
+    await store.appendCommitted(agent.id, { type: "assistant_message", text: "Your password:" });
+    expect(await startAgentRun(manager, agent.id, "synthetic-short", logger)).toEqual({
+      disposition: "out_of_band",
+    });
+    expect(session.received).toEqual(["/ordinary", SECRET_ANSWER_NOTICE]);
+  } finally {
+    await manager.closeAgent(agent.id);
+  }
+});
+
+test("secret answer preparation cannot steer a newer turn after a delayed context read", async () => {
+  const session = new SteeringTestSession({ provider: "codex", cwd: process.cwd() });
+  const { manager, agent } = await createSecretAnswerTestManager(session);
+  const first = drainAsyncGenerator(manager.streamAgent(agent.id, "initial"));
+  await manager.waitForAgentRunStart(agent.id);
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  vi.spyOn(manager, "prepareAnswerPrompt").mockImplementationOnce(async (_agentId, prompt) => {
+    entered.resolve();
+    await release.promise;
+    return prompt;
+  });
+  const answer = startAgentRun(manager, agent.id, "ordinary answer for A", logger, {
+    replaceRunning: true,
+    activeTurnBehavior: "steer",
+  });
+  await entered.promise;
+  session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+  await first;
+  const second = drainAsyncGenerator(manager.streamAgent(agent.id, "newer B"));
+  await manager.waitForAgentRunStart(agent.id);
+  release.resolve();
+  await expect(answer).rejects.toThrow("turn changed");
+  expect(session.steerCount).toBe(0);
+  expect(session.interruptCount).toBe(0);
+  expect(session.startPrompts).toEqual(["initial", "newer B"]);
+  session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-2" });
+  await second;
 });

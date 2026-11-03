@@ -468,3 +468,95 @@ test("session create with an internal config skips provider session persistence"
   expect(createAgent.mock.calls[1]?.[0]).not.toHaveProperty("internal");
   expect(createAgent.mock.calls[1]?.[2]).not.toHaveProperty("persistSession");
 });
+
+test("first-prompt secrets are removed before MCP workspace callbacks and stored creation titles", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "create-agent-first-prompt-secret-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const agentManager = createRealAgentManager(storage);
+  const secret = `sk-proj-${"Synthetic1_".repeat(8)}`;
+  const contexts: unknown[] = [];
+  try {
+    for (const initialPrompt of [`Deploy with ${secret} then verify.`, "Fix the login flow"]) {
+      const { snapshot } = await createAgentCommand(
+        {
+          agentManager,
+          agentStorage: storage,
+          logger,
+          providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+          ensureWorkspaceForCreate: async (_cwd, context) => {
+            contexts.push(context);
+            return "workspace-safe";
+          },
+        },
+        {
+          kind: "mcp",
+          provider: "codex",
+          title: "",
+          cwd: workdir,
+          initialPrompt,
+          notifyOnFinish: false,
+        },
+      );
+      await agentManager.waitForAgentEvent(snapshot.id, { waitForActive: true });
+      await agentManager.flush();
+      const stored = await storage.get(snapshot.id);
+      expect(stored?.title).toContain(
+        initialPrompt.includes(secret) ? "[redacted:secret]" : initialPrompt,
+      );
+      expect(JSON.stringify(stored)).not.toContain(secret);
+    }
+    expect(JSON.stringify(contexts)).not.toContain(secret);
+    expect(contexts).toContainEqual({ prompt: "Fix the login flow" });
+    expect(contexts).toContainEqual({ prompt: expect.stringContaining("[redacted:secret]") });
+
+    await createAgentCommand(
+      {
+        agentManager,
+        agentStorage: storage,
+        logger,
+        providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+        createPaseoWorktree: async (input) => {
+          contexts.push(input.firstAgentContext);
+          return fakeWorktreeCreator({
+            repoRoot: workdir,
+            createdWorkspaceId: "workspace-worktree-safe",
+          })();
+        },
+      },
+      {
+        kind: "mcp",
+        provider: "codex",
+        title: "Worktree task",
+        cwd: workdir,
+        initialPrompt: `Deploy with ${secret} then verify.`,
+        worktree: { worktreeName: "safe-worktree", baseBranch: "main" },
+        notifyOnFinish: false,
+      },
+    );
+    expect(contexts).toHaveLength(3);
+    expect(JSON.stringify(contexts.at(-1))).not.toContain(secret);
+    expect(contexts.at(-1)).toEqual({ prompt: expect.stringContaining("[redacted:secret]") });
+
+    const { snapshot } = await createAgentCommand(
+      {
+        agentManager,
+        agentStorage: storage,
+        logger,
+        providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+      },
+      {
+        kind: "session",
+        config: { provider: "codex", cwd: workdir },
+        workspaceId: "workspace-session-safe",
+        initialPrompt: `Deploy with ${secret} then verify.`,
+        labels: {},
+        provisionalTitle: `Deploy with ${secret}`,
+        firstAgentContext: { prompt: `Deploy with ${secret}` },
+      },
+    );
+    expect(JSON.stringify(await storage.get(snapshot.id))).not.toContain(secret);
+    expect((await storage.get(snapshot.id))?.title).toContain("[redacted:secret]");
+  } finally {
+    await removeRealAgentManagerWorkdir({ agentManager, storage, workdir });
+  }
+});

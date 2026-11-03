@@ -341,6 +341,14 @@ export class DiskAgentTimelineStore implements AgentRuntimeTimelineStore {
     return found ? this.readRow(state, Number(found.pos)).item : null;
   }
 
+  getLastConversationItem(agentId: string): AgentTimelineItem | null {
+    const state = this.requireState(agentId);
+    const found = this.statement(
+      "SELECT pos FROM rows WHERE sid = ? AND item_type IN ('user_message', 'assistant_message') ORDER BY pos DESC LIMIT 1",
+    ).get(state.key);
+    return found ? this.readRow(state, Number(found.pos)).item : null;
+  }
+
   getLastAssistantMessage(agentId: string): string | null {
     const state = this.requireState(agentId);
     const found = this.statement(

@@ -2,6 +2,7 @@ import type pino from "pino";
 import type { FirstAgentContext } from "@getpaseo/protocol/messages";
 
 import { resolveFirstAgentPromptTitle } from "./agent/create-agent-title.js";
+import { redactFirstAgentContext } from "./agent/secret-answer.js";
 import type { AgentManager } from "./agent/agent-manager.js";
 import type { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import type { StructuredGenerationDaemonConfig } from "./agent/structured-generation-providers.js";
@@ -72,6 +73,7 @@ export class WorkspaceAutoName {
     },
     context: ScheduleContext = {},
   ): void {
+    input = { ...input, firstAgentContext: redactFirstAgentContext(input.firstAgentContext) };
     this.schedule(
       () =>
         this.maybeAutoNameWorkspaceBranchForFirstAgent({
@@ -93,6 +95,7 @@ export class WorkspaceAutoName {
     },
     context: ScheduleContext = {},
   ): void {
+    input = { ...input, firstAgentContext: redactFirstAgentContext(input.firstAgentContext) };
     this.schedule(
       () =>
         this.maybeAutoNameDirectoryWorkspaceTitle({
