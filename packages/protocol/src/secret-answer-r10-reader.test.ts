@@ -186,3 +186,133 @@ describe("consolidated reader rules", () => {
     });
   }
 });
+
+// These outputs were checked against ac106c225 before indexing the local reader.
+// Boundary expectations preserve its existing start-relative 4 KiB lookahead.
+const cachedReaderCases = [
+  [
+    "quote classes preserve percent-encoded delimiters",
+    'password: %22fluffy " inner%22 next=plain',
+    `password: %22${notice}%22 next=plain`,
+  ],
+  [
+    "quote classes preserve nested percent encoding",
+    'password: %2522fluffy " inner%2522 next=plain',
+    `password: %2522${notice}%2522 next=plain`,
+  ],
+  [
+    "quote classes preserve unicode-escaped delimiters",
+    String.raw`password: \u0022fluffy " inner\u0022 next=plain`,
+    String.raw`password: \u0022${notice}\u0022 next=plain`,
+  ],
+  [
+    "a percent-encoded newline does not terminate the quote",
+    'password: "fluffy%0Ainner" next=plain',
+    `password: "${notice}" next=plain`,
+  ],
+  [
+    "a literal newline terminates the quote",
+    'password: "fluffy\ninner" next=plain',
+    `password: "${notice}\ninner" next=plain`,
+  ],
+  [
+    "an encoded opening slash preserves the quoted field",
+    'password: %5C"fluffy" next=plain',
+    `password: %5C"${notice}" next=plain`,
+  ],
+  [
+    "nested substitutions keep their complete reference",
+    "password: ${DB_PASSWORD:-$(read vault/[db])} next=plain",
+    "password: ${DB_PASSWORD:-$(read vault/[db])} next=plain",
+  ],
+  [
+    "an escaped substitution newline preserves the original value extent",
+    "password: $(op\\\n read vault) next=plain",
+    `password: ${notice} next=plain`,
+  ],
+  [
+    "an encoded angle close is not a literal placeholder terminator",
+    "password: <hidden %3E allowed> next=plain",
+    `password: ${notice} next=plain`,
+  ],
+  [
+    "an encoded angle opener is not a literal placeholder opener",
+    "password: %3Chidden allowed> next=plain",
+    `password: ${notice} allowed> next=plain`,
+  ],
+  [
+    "shared quote facts keep adjacent field policies separate",
+    'password: %22fluffy " inner%22; password: "second"; pass: 3 tests',
+    `password: %22${notice}%22; password: "${notice}"; pass: 3 tests`,
+  ],
+] as const;
+
+for (const [api, redact] of [
+  ["prompt", redactSecretPrompt],
+  ["answer", redactSecretAnswer],
+] as const) {
+  describe(`cached local value reader (${api})`, () => {
+    test.each(cachedReaderCases)("%s", (_name, input, expected) => {
+      expect(redact(input)).toBe(expected);
+    });
+
+    test.each([0, 1, 2, 3, 5, 7])("preserves serialized quote escape depth %i", (depth) => {
+      const quote = `${"\\".repeat(depth)}"`;
+      const inner = `${"\\".repeat(2 * depth + 1)}"`;
+      expect(redact(`password: ${quote}fluffy${inner}inner${quote} tail`)).toBe(
+        `password: ${quote}${notice}${quote} tail`,
+      );
+    });
+
+    for (const [opening, closing, width] of [
+      ['"', '"', 1],
+      ["“", "”", 1],
+      ['"""', '"""', 3],
+      ["%22", "%22", 1],
+      [String.raw`\u0022`, String.raw`\u0022`, 1],
+    ] as const) {
+      test.each([-1, 0, 1])(
+        `preserves ${opening} closing quote at the 4 KiB boundary offset %i`,
+        (offset) => {
+          const gap = " ".repeat(4_096 + offset - width - "fluffy".length);
+          const input = `password: ${opening}fluffy${gap}${closing} tail`;
+          const remaining = offset < 0 ? "" : gap;
+          expect(redact(input)).toBe(`password: ${opening}${notice}${remaining}${closing} tail`);
+        },
+      );
+    }
+
+    test.each([-1, 0, 1])("preserves an angle close at the 4 KiB boundary offset %i", (offset) => {
+      const padding = "x".repeat(4_088 + offset);
+      const input = `password: <hidden ${padding}> tail`;
+      expect(redact(input)).toBe(offset < 0 ? input : `password: ${notice} ${padding}> tail`);
+    });
+
+    test.each([-1, 0, 1])(
+      "preserves a substitution close at the 4 KiB boundary offset %i",
+      (offset) => {
+        const padding = "x".repeat(4_091 + offset);
+        const input = `password: $(op ${padding}) tail`;
+        expect(redact(input)).toBe(offset < 0 ? input : `password: ${notice} ${padding}) tail`);
+      },
+    );
+
+    test.each([-1, 0, 1])(
+      "preserves a shell word run at the 4 KiB boundary offset %i",
+      (offset) => {
+        const command = "a".repeat(4_096 + offset);
+        const input = `PASSWORD=fluffy;${command} rest`;
+        expect(redact(input)).toBe(
+          offset <= 0 ? `PASSWORD=${notice};${command} rest` : `PASSWORD=${notice} rest`,
+        );
+      },
+    );
+
+    test.each([4_095, 4_096, 4_097])("preserves %i literal spaces before a value", (length) => {
+      const spaces = " ".repeat(length);
+      expect(redact(`password:${spaces}fluffy; pass: 3 tests`)).toBe(
+        `password:${spaces}${notice}; pass: 3 tests`,
+      );
+    });
+  });
+}

@@ -234,13 +234,15 @@ read them. Test-only manifests report identifier losses and source-line residues
 than printing apparent credentials. Confirmed-finding fixtures record policy overrides and accepted
 follow-ups. Both snapshots use tracked files only. Reviewed source exceptions are named individually
 with reasons; runtime code never reads that list. Neutral digit-tagged identifier losses are an
-explicit trade-off, while bare-chat and code identifiers remain byte-exact. Performance tests cover
-both APIs at 256 KB, 512 KB and 1 MB, requiring a doubling ratio at most 2.5. Ordinary hostile forms
-are bounded at 1.5 seconds per MB and label-dense forms at 3 seconds per MB. Protocol test files
-run serially so the timing checks do not compete with the seeded token-generation matrices.
-The limits are unchanged. Candidate look-aheads
-stop at the same line and 4 KiB; fallback value scanning runs to whitespace. Policy decisions and
-measured snapshot counts are recorded in the Issue Log and PR evidence.
+explicit trade-off, while bare-chat and code identifiers remain byte-exact. CI performance checks
+count actual scanner loop iterations and helper entries in an isolated test-only copy, across the
+credential vocabulary, operators and empty/short/long values. They assert a work bound rather than
+wall time. The separate `packages/protocol/scripts/benchmark-secret-answer.mjs` command records
+median-of-three timings at exactly 1 MB and the worst row at 4 MB; the latency bar is 1.5 seconds
+per MB and the scaling limit is 4.8 times the 1 MB time. Run that benchmark without competing test
+processes on the designated host. Candidate look-aheads retain the same-line 4 KiB boundary;
+request-scoped indexes prevent overlapping lexical and expression walks. Caches are discarded at
+the end of each call. Policy decisions and measured results are recorded in the Issue Log and PR.
 
 The tracked snapshot contains 16,665 identifiers: zero change in chat or code, and 27 accepted
 neutral-answer losses. K3 names 29 source-line exceptions, including quoted UI literals, opaque
@@ -256,8 +258,8 @@ digits such as blue7-ocean3-tiger9, `token: hunter2x`, PascalCase password/type 
 the synthetic `Dragon&&2024`, `Hunter||22` and `Summer??2024`; these are a Manager-owned follow-up
 under the stopping rule. Multiword or whitespace-padded shapeless chat replies do not use context.
 Follow-ups cover additional command flags, CSV/multiline tables, netrc, YAML blocks, Unicode label
-separators, Slack trigger/Discord webhook URLs, PGP/markerless tails and single-case random chat
-values. ISS-6390 covers secret-store references. Normalization stops after 16 passes. Existing stored
+separators, Slack trigger/Discord webhook URLs, PGP/markerless tails, list tails after the first
+redacted value, short PIN copulas and single-case random chat values. ISS-6390 covers secret-store references. Normalization stops after 16 passes. Existing stored
 conversations are not rewritten. Serving runtime adoption belongs to PROJ-218.
 
 ### Nested: AgentFeature (discriminated union on `type`)
