@@ -1100,7 +1100,7 @@ export class VoiceAssistantWebSocketServer {
   public async attachPluginSocket(
     pluginId: string,
     ws: WebSocketLike,
-  ): Promise<{ closed: Promise<void> }> {
+  ): Promise<{ closed: Promise<void>; connectionId?: string }> {
     if (this.connectionLifecycle === "stopping") {
       throw new Error(`Cannot attach plugin session while shutting down: ${pluginId}`);
     }
@@ -1117,7 +1117,7 @@ export class VoiceAssistantWebSocketServer {
       this.finishPluginSocketCleanup(ws);
       throw error;
     }
-    return { closed };
+    return { closed, connectionId: this.socketIdentities.get(ws)?.connectionId };
   }
 
   public updatePrincipalPermissions(

@@ -39,6 +39,7 @@ import { PluginProcessMessageSchema } from "./plugin-process-protocol.js";
 import { PluginSessionSocket } from "./session-socket.js";
 import { InternalPluginChild } from "./internal-child.js";
 import { evaluateBundle } from "./bundle-evaluator.js";
+import { createPluginClientId } from "./plugin-session-identity.js";
 
 const REQUEST_TIMEOUT_MS = 30_000;
 const TOOL_CALL_TIMEOUT_MS = 10 * 60_000;
@@ -52,6 +53,7 @@ interface PluginOutputStream {
 }
 
 interface PluginChild {
+  pid?: number;
   connected: boolean;
   killed: boolean;
   stdout?: PluginOutputStream | null;
@@ -208,7 +210,7 @@ export interface PluginPaseoSessionHost {
   attachPluginSocket(
     pluginId: string,
     socket: PluginSessionSocket,
-  ): Promise<{ closed: Promise<void> }>;
+  ): Promise<{ closed: Promise<void>; connectionId?: string }>;
 }
 
 function resolveWorkerUrl(): URL {
@@ -793,16 +795,49 @@ export class PluginRuntime {
         terminatePluginChild(child);
         throw error;
       });
+    const instanceId = randomUUID();
+    const initializationStarted = performance.now();
+    let lastChildPhase:
+      | Extract<PluginProcessMessage, { type: "initialization.phase" }>["phase"]
+      | null = null;
+    const recordPhase = (phase: string, childElapsedMs?: number) => {
+      const fields = {
+        pluginId,
+        instanceId,
+        childPid: child.pid ?? null,
+        clientId: createPluginClientId(pluginId),
+        connectionId: sessionAttachment.connectionId ?? null,
+        phase,
+        elapsedMs: performance.now() - initializationStarted,
+        ...(childElapsedMs === undefined ? {} : { childElapsedMs }),
+        lastChildPhase,
+      };
+      this.appendLog(
+        pluginId,
+        "stdout",
+        `[paseo] Plugin initialization phase ${JSON.stringify(fields)}`,
+      );
+      try {
+        this.logger.info(fields, "Plugin initialization phase");
+      } catch {
+        this.appendLog(
+          pluginId,
+          "stderr",
+          "[paseo] Plugin initialization structured logging unavailable",
+        );
+      }
+    };
+    recordPhase("session-attached");
     let loaded: LoadedPlugin | null = null;
     let ready: Extract<PluginProcessMessage, { type: "ready" }>;
     try {
       ready = await new Promise<Extract<PluginProcessMessage, { type: "ready" }>>(
         (resolve, reject) => {
           let settled = false;
-          const timeout = setTimeout(
-            () => fail(new Error(`Plugin ${pluginId} did not initialize`)),
-            REQUEST_TIMEOUT_MS,
-          );
+          const timeout = setTimeout(() => {
+            if (!settled) recordPhase("initialization-timeout");
+            fail(new Error(`Plugin ${pluginId} did not initialize`));
+          }, REQUEST_TIMEOUT_MS);
           const fail = (error: Error): void => {
             if (settled) return;
             settled = true;
@@ -820,7 +855,10 @@ export class PluginRuntime {
               return;
             }
             const message = parsed.data;
-            if (message.type === "paseo_frame") {
+            if (message.type === "initialization.phase") {
+              lastChildPhase = message.phase;
+              recordPhase(message.phase, message.elapsedMs);
+            } else if (message.type === "paseo_frame") {
               this.routePluginFrame({
                 session,
                 pluginId,
@@ -833,6 +871,7 @@ export class PluginRuntime {
               session.socket.peerClosed();
             } else if (message.type === "ready") {
               if (settled) return;
+              recordPhase("ready-received");
               settled = true;
               clearTimeout(timeout);
               resolve(message);
@@ -870,7 +909,7 @@ export class PluginRuntime {
     }
     loaded = {
       id: pluginId,
-      instanceId: randomUUID(),
+      instanceId,
       clientBundle,
       requirements,
       methods: new Set(ready.methods),

@@ -78,6 +78,7 @@ export type PluginProcessRequest =
   | { type: "paseo_close" };
 
 export type PluginProcessMessage =
+  | { type: "initialization.phase"; phase: PluginInitializationPhase; elapsedMs: number }
   | { type: "settings.changed"; settingsId: string }
   | { type: "hooks.changed"; hooks: { events: string[]; before: string[] } }
   | {
@@ -108,6 +109,18 @@ export type PluginProcessMessage =
   | { type: "provider.closed"; connectionId: string; error?: string }
   | { type: "paseo_frame"; data: string | Uint8Array; isBinary: boolean }
   | { type: "paseo_close" };
+
+export const PLUGIN_INITIALIZATION_PHASES = [
+  "initialize-received",
+  "evaluation-started",
+  "evaluation-completed",
+  "hello-sent",
+  "server-info-received",
+  "contribute-started",
+  "contribute-returned",
+  "ready-sent",
+] as const;
+export type PluginInitializationPhase = (typeof PLUGIN_INITIALIZATION_PHASES)[number];
 
 const hooksSchema = z.object({ events: z.array(z.string()), before: z.array(z.string()) }).strict();
 
@@ -267,6 +280,13 @@ export const PluginProcessRequestSchema: z.ZodType<PluginProcessRequest> = z.dis
 export const PluginProcessMessageSchema: z.ZodType<PluginProcessMessage> = z.discriminatedUnion(
   "type",
   [
+    z
+      .object({
+        type: z.literal("initialization.phase"),
+        phase: z.enum(PLUGIN_INITIALIZATION_PHASES),
+        elapsedMs: z.number().finite().nonnegative(),
+      })
+      .strict(),
     z.object({ type: z.literal("settings.changed"), settingsId: z.string() }).strict(),
     z.object({ type: z.literal("hooks.changed"), hooks: hooksSchema }).strict(),
     z

@@ -86,6 +86,37 @@ plugin before compiling and starting from disk. A failed reload stays failed; Pa
 the old code. Use `enable`, `disable`, and `remove` to manage one plugin. Removing a directory source
 never deletes it. The global `pluginsEnabled` switch remains available.
 
+### Diagnose server initialization
+
+`Plugin initialization phase` records appear in the daemon log and the existing plugin log tail.
+Correlate `pluginId`, `instanceId`, `childPid`, `clientId` and `connectionId` for one attempt.
+The instance ID becomes the loaded plugin's existing instance ID if startup succeeds; the
+connection ID is the host's existing WebSocket connection ID, including before hello. In-process
+built-ins have no child PID. These labels are diagnostic correlation, not process-birth proof.
+
+Forked plugins report `initialize-received`, `evaluation-started`, `evaluation-completed`,
+`hello-sent`, `server-info-received`, `contribute-started`, `contribute-returned` and `ready-sent`.
+The host also records `session-attached`, `ready-received` and `initialization-timeout`, with
+the last child phase. `elapsedMs` uses the host's clock from attachment; `childElapsedMs` uses
+the child's clock from receipt of initialize. Do not compare their absolute values or assume
+cross-process arrival order. Built-in evaluation occurs in the host and has no child evaluation markers.
+
+| Last observed boundary                  | What remains unconfirmed                                                    |
+| --------------------------------------- | --------------------------------------------------------------------------- |
+| Session attached, no initialize receipt | Child bootstrap, delivery or execution of initialize                        |
+| Evaluation started                      | Bundle evaluation returning                                                 |
+| Hello sent                              | Receipt of a server-info frame over the internal session                    |
+| Server-info received                    | Client parsing/connection completion; this marker observes the frame header |
+| Contribution started                    | The synchronous contribution returning                                      |
+| Contribution returned                   | Cleanup validation, usage metadata and the original ready message           |
+| Ready sent                              | The host accepting the original ready message                               |
+
+Markers are best-effort, emitted once per phase, and contain no frames, credentials, private
+paths or exception text. Missing markers alone do not prove where execution stopped. A child
+phase never makes a plugin ready: the host still requires the original ready message. Initialization
+timeouts and failure handling are unchanged. Inspect a new controlled attempt's own records;
+these diagnostics cannot attribute a previous connection or replay an earlier operation.
+
 ## Client translations
 
 Plugin runtime translations follow the connected app, so never send a daemon locale through RPCs or add plugin resources to the app catalog. The installation owns the translation engine; native portal bridges must carry it alongside RPC and client-state contexts. Keep host label resolution at presentation time so language changes preserve the installation lifetime.

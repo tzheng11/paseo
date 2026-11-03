@@ -6,6 +6,7 @@ import {
   PluginProcessRequestSchema,
   type PluginProcessMessage,
   type PluginProcessRequest,
+  type PluginInitializationPhase,
 } from "./plugin-process-protocol.js";
 import type { UsageSourceRegistration } from "@getpaseo/plugin/server/usage";
 import type { SettingsDefinition, PluginRpcContract } from "@getpaseo/plugin";
@@ -35,11 +36,68 @@ export interface PluginWorkerChannel {
   disconnect(): void;
 }
 
+type RecordInitializationPhase = (phase: PluginInitializationPhase) => void;
+
+function initializationDiagnostics(channel: PluginWorkerChannel): RecordInitializationPhase {
+  const started = performance.now();
+  const recorded = new Set<PluginInitializationPhase>();
+  let warned = false;
+  return (phase) => {
+    if (recorded.has(phase)) return;
+    recorded.add(phase);
+    try {
+      // Best-effort telemetry must not become a startup acknowledgment or a new
+      // failure boundary. No initialization work awaits diagnostic delivery.
+      channel.send(
+        { type: "initialization.phase", phase, elapsedMs: performance.now() - started },
+        () => {},
+      );
+    } catch {
+      if (!warned) {
+        warned = true;
+        console.error("Plugin initialization diagnostics unavailable");
+      }
+    }
+  };
+}
+
+function isInitializationFrame(data: string | Uint8Array, kind: "hello" | "server_info"): boolean {
+  if (typeof data !== "string") return false;
+  try {
+    const frame = JSON.parse(data) as {
+      type?: unknown;
+      message?: { type?: unknown; payload?: { status?: unknown } };
+    } | null;
+    return kind === "hello"
+      ? frame?.type === "hello"
+      : frame?.type === "session" &&
+          frame.message?.type === "status" &&
+          frame.message.payload?.status === "server_info";
+  } catch {
+    // Diagnostics do not consume or validate the underlying protocol frame.
+    return false;
+  }
+}
+
+export function createPluginWorkerFromBundle(options: {
+  channel: PluginWorkerChannel;
+  message: Extract<PluginProcessRequest, { type: "initialize" }>;
+}): ReturnType<typeof createPluginWorker> {
+  const recordInitialization = initializationDiagnostics(options.channel);
+  recordInitialization("initialize-received");
+  recordInitialization("evaluation-started");
+  const contribute = evaluateBundle(options.message.bundle);
+  recordInitialization("evaluation-completed");
+  return createPluginWorker({ channel: options.channel, contribute, recordInitialization });
+}
+
 export function createPluginWorker(options: {
   channel: PluginWorkerChannel;
   contribute: PluginServerContribution;
+  recordInitialization?: RecordInitializationPhase;
 }): { shutdown(): Promise<void> } {
   const { channel, contribute } = options;
+  const recordInitialization = options.recordInitialization ?? initializationDiagnostics(channel);
   let settingsStore: PluginSettingsStore | null = null;
   function registerSettings<Schema extends ZodType>(definition: SettingsDefinition<Schema>) {
     if (!settingsStore) throw new Error("Plugin settings storage is unavailable");
@@ -259,14 +317,39 @@ export function createPluginWorker(options: {
     return closing;
   }
 
+  let helloReported = false;
+  let serverInfoReported = false;
   const transportFactory = createPluginDaemonTransportFactory({
-    send,
+    send(message) {
+      send(message);
+      if (
+        !helloReported &&
+        message.type === "paseo_frame" &&
+        !message.isBinary &&
+        isInitializationFrame(message.data, "hello")
+      ) {
+        helloReported = true;
+        recordInitialization("hello-sent");
+      }
+    },
     onMessage(handler) {
-      return channel.onMessage(handler);
+      return channel.onMessage((message) => {
+        if (
+          !serverInfoReported &&
+          message.type === "paseo_frame" &&
+          !message.isBinary &&
+          isInitializationFrame(message.data, "server_info")
+        ) {
+          serverInfoReported = true;
+          recordInitialization("server-info-received");
+        }
+        handler(message);
+      });
     },
   });
 
   async function initialize(message: Extract<PluginProcessRequest, { type: "initialize" }>) {
+    recordInitialization("initialize-received");
     daemonClient = new DaemonClient({
       url: `ipc://plugin/${encodeURIComponent(message.pluginId)}`,
       clientId: createPluginClientId(message.pluginId),
@@ -283,6 +366,7 @@ export function createPluginWorker(options: {
           send({ type: "settings.changed", settingsId }),
         )
       : null;
+    recordInitialization("contribute-started");
     const contributedCleanup = contribute({
       handle: (contract, handler) =>
         register(contract, (input, context) => handler(contract.input.parse(input), context)),
@@ -292,6 +376,7 @@ export function createPluginWorker(options: {
       on: hooks.on,
       before: hooks.before,
     });
+    recordInitialization("contribute-returned");
     if (typeof contributedCleanup !== "function") {
       throw new Error("Plugin contribution must return a cleanup function");
     }
@@ -316,6 +401,7 @@ export function createPluginWorker(options: {
         .map(providerMetadata),
       usageSources: usageSourceMetadata,
     });
+    recordInitialization("ready-sent");
   }
 
   async function shutdown(): Promise<void> {
@@ -607,7 +693,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     const parsed = PluginProcessRequestSchema.safeParse(raw);
     if (!worker && parsed.success && parsed.data.type === "initialize") {
       try {
-        worker = createPluginWorker({ channel, contribute: evaluateBundle(parsed.data.bundle) });
+        worker = createPluginWorkerFromBundle({ channel, message: parsed.data });
       } catch (error) {
         channel.send({ type: "fatal", error: describeError(error) });
         return;

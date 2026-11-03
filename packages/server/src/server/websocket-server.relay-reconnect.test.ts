@@ -748,6 +748,7 @@ describe("relay external socket reconnect behavior", () => {
 
     const pluginSocket = new MockSocket();
     const attachment = await server.attachPluginSocket("startup", pluginSocket);
+    expect(attachment.connectionId).toMatch(/^conn_[a-f0-9]{32}$/);
     pluginSocket.emit("message", JSON.stringify(createHelloMessage("plugin:startup")));
     await vi.waitFor(() => expect(sessionMock.instances).toHaveLength(1));
 
