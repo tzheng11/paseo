@@ -1997,8 +1997,10 @@ class CredentialLexer {
 interface FlatCredentialRun {
   atoms: Token[];
   operators: Token[];
-  facts: Map<CredentialWordName, [FlatCredentialFacts, FlatCredentialFacts]>;
-  typeFacts: Map<CredentialWordName, FlatCredentialTypeFacts>;
+  facts?: Map<CredentialWordName, [FlatCredentialFacts, FlatCredentialFacts]>;
+  typeFacts?: Map<CredentialWordName, FlatCredentialTypeFacts>;
+  conditionalDepth?: number[] | null;
+  conditionalMinimum?: CredentialRangeIndex;
   conditional?: FlatCredentialConditional;
 }
 
@@ -2030,6 +2032,17 @@ interface FlatCredentialPosition {
   index: number;
 }
 
+/** Stream numeric offsets so large messages never retain a vector of match objects. */
+function credentialMatchOffsets(text: string, scanner: RegExp, ends?: number[]): number[] {
+  const starts: number[] = [];
+  let match: RegExpExecArray | null;
+  while ((match = scanner.exec(text)) !== null) {
+    starts.push(match.index);
+    if (ends) ends.push(match.index + match[0].length);
+  }
+  return starts;
+}
+
 /** All caches belong to one normalized human-message scan. */
 class CredentialParseContext {
   private readonly tokens = new Map<number, Token>();
@@ -2045,13 +2058,10 @@ class CredentialParseContext {
   readonly text: string;
   constructor(text: string) {
     this.text = text;
-    this.lineBreaks = [...text.matchAll(/[\r\n]/g)].map((match) => match.index);
-    this.specialPositions = [...text.matchAll(/\$[({]|[()[\]'"`;|&<>\r\n]/g)].map(
-      (match) => match.index,
-    );
-    const words = [...text.matchAll(/\S+/g)];
-    this.wordStarts = words.map((match) => match.index);
-    this.wordEnds = words.map((match) => match.index + match[0].length);
+    this.lineBreaks = credentialMatchOffsets(text, /[\r\n]/g);
+    this.specialPositions = credentialMatchOffsets(text, /\$[({]|[()[\]'"`;|&<>\r\n]/g);
+    this.wordEnds = [];
+    this.wordStarts = credentialMatchOffsets(text, /\S+/g, this.wordEnds);
     for (const closing of [")", "]", "}"]) this.closingPositions.set(closing, []);
     for (const match of text.matchAll(/[)\]}]/g))
       this.closingPositions.get(match[0])!.push(match.index);
@@ -2098,6 +2108,13 @@ class CredentialParseContext {
   }
   private atom(start: number, limit: number): Token | null {
     const first = this.token(start, limit);
+    if (isInvalidCredentialPrimary(first)) {
+      const known = this.compoundAtoms.get(first.start);
+      if (known && known.end === first.end && known.text === first.text) return known;
+      const failed: Token = { ...first, nodes: [null, null] };
+      if (limit >= this.limit(first.start)) this.compoundAtoms.set(first.start, failed);
+      return failed;
+    }
     const next = this.token(first.end, limit);
     if (isFlatCredentialAtom(first) && !requiresCredentialPostfix(next)) return first;
     const known = this.compoundAtoms.get(first.start);
@@ -2146,8 +2163,6 @@ class CredentialParseContext {
     const run: FlatCredentialRun = {
       atoms: [first],
       operators: [],
-      facts: new Map(),
-      typeFacts: new Map(),
     };
     let atom = first;
     while (atom.kind !== "end" && !isFailedCredentialAtom(atom)) {
@@ -2161,7 +2176,9 @@ class CredentialParseContext {
       run.atoms.push(next);
       atom = next;
     }
-    for (const [index, value] of run.atoms.entries()) positions.set(value.start, { run, index });
+    if (run.atoms.length > 1) {
+      for (const [index, value] of run.atoms.entries()) positions.set(value.start, { run, index });
+    }
 
     return { run, index: 0 };
   }
@@ -2193,6 +2210,7 @@ class CredentialParseContext {
     if (ending === undefined) return undefined;
     if (!ending) return null;
     const predicateMemo = this.words(predicate);
+    if (first === last) return flatCredentialTypeAtom(finalAtom, predicateMemo);
     const facts = flatCredentialTypeFacts(run, predicateMemo);
     return flatCredentialTypeResult(facts, first, last, finalAtom, predicateMemo);
   }
@@ -2220,6 +2238,8 @@ class CredentialParseContext {
     if (ending === undefined) return undefined;
 
     if (!ending) return null;
+    if (first === last) return flatCredentialNode(finalAtom, this.words(predicate), false);
+    if (!flatCredentialConditionalValid(run, first, last)) return null;
     const facts = flatCredentialFacts(run, this.words(predicate));
     return flatCredentialResult(facts, first, last, finalAtom, this.words(predicate));
   }
@@ -2255,6 +2275,13 @@ function isFlatCredentialAtom(token: Token): boolean {
   if (token.nodes) return true;
   if (token.kind === "word") return !token.text.startsWith("$") && !expressionPrefix(token);
   return token.kind === "number" || token.kind === "string" || token.kind === "regex";
+}
+
+/** These lexical tokens cannot enter the existing primary grammar in either context. */
+function isInvalidCredentialPrimary(token: Token): boolean {
+  if (token.kind !== "punct") return false;
+  if (expressionPrefix(token) || openingExpression(token.text)) return false;
+  return token.text !== "`" && token.text !== "${" && token.text !== "$(" && token.text !== "%";
 }
 
 function isFailedCredentialAtom(atom: Token): boolean {
@@ -2314,7 +2341,7 @@ function flatCredentialTypeFacts(
   run: FlatCredentialRun,
   predicate: CredentialWordName,
 ): FlatCredentialTypeFacts {
-  const known = run.typeFacts.get(predicate);
+  const known = run.typeFacts?.get(predicate);
   if (known) return known;
   const facts: FlatCredentialTypeFacts = { invalid: [0], nonWord: [0], arrows: [0] };
   for (const [index, token] of run.atoms.entries()) {
@@ -2324,7 +2351,7 @@ function flatCredentialTypeFacts(
     const operator = run.operators[index];
     if (operator) facts.arrows.push(facts.arrows[index]! + Number(operator.text === "=>"));
   }
-  run.typeFacts.set(predicate, facts);
+  (run.typeFacts ??= new Map()).set(predicate, facts);
   return facts;
 }
 
@@ -2390,15 +2417,34 @@ class CredentialRangeIndex {
   }
 }
 
-function flatCredentialConditional(run: FlatCredentialRun): FlatCredentialConditional | undefined {
-  if (run.conditional) return run.conditional;
+function flatCredentialConditionalDepth(run: FlatCredentialRun): number[] | null {
+  if (run.conditionalDepth !== undefined) return run.conditionalDepth;
   if (!run.operators.some((operator) => operator.text === "?" || operator.text === ":"))
-    return undefined;
+    return (run.conditionalDepth = null);
   const depth = [0];
   for (const operator of run.operators)
     depth.push(
       depth[depth.length - 1]! + Number(operator.text === "?") - Number(operator.text === ":"),
     );
+  return (run.conditionalDepth = depth);
+}
+
+function flatCredentialConditionalValid(
+  run: FlatCredentialRun,
+  first: number,
+  last: number,
+): boolean {
+  const depth = flatCredentialConditionalDepth(run);
+  if (!depth) return true;
+  if (depth[first] !== depth[last]) return false;
+  const minimum = (run.conditionalMinimum ??= new CredentialRangeIndex(depth, false));
+  return minimum.query(first + 1, last + 1, false) >= depth[first]!;
+}
+
+function flatCredentialConditional(run: FlatCredentialRun): FlatCredentialConditional | undefined {
+  if (run.conditional) return run.conditional;
+  const depth = flatCredentialConditionalDepth(run);
+  if (!depth) return undefined;
   const killers = Array.from({ length: run.atoms.length }, () => Infinity);
   const arrows: number[] = [];
   const arrowDepths: number[] = [];
@@ -2414,20 +2460,24 @@ function flatCredentialConditional(run: FlatCredentialRun): FlatCredentialCondit
     const selected = lowerCredentialOffset(arrowDepths, depth[index]! + 1) - 1;
     if (selected >= 0) killers[index] = arrows[selected]!;
   }
-  return (run.conditional = { depth, killers, minimum: new CredentialRangeIndex(depth, false) });
+  return (run.conditional = {
+    depth,
+    killers,
+    minimum: (run.conditionalMinimum ??= new CredentialRangeIndex(depth, false)),
+  });
 }
 
 function flatCredentialFacts(
   run: FlatCredentialRun,
   predicate: CredentialWordName,
 ): [FlatCredentialFacts, FlatCredentialFacts] {
-  const existing = run.facts.get(predicate);
+  const existing = run.facts?.get(predicate);
   if (existing) return existing;
   const facts: [FlatCredentialFacts, FlatCredentialFacts] = [
     buildFlatCredentialFacts(run, predicate, false),
     buildFlatCredentialFacts(run, predicate, true),
   ];
-  run.facts.set(predicate, facts);
+  (run.facts ??= new Map()).set(predicate, facts);
   return facts;
 }
 
@@ -2512,12 +2562,6 @@ function flatCredentialResult(
   const firstArrow = arrows[lowerCredentialOffset(arrows, first)] ?? Infinity;
   const split = firstArrow + 1;
   const conditional = facts[0].conditional;
-  if (
-    conditional &&
-    (conditional.depth[first] !== conditional.depth[last] ||
-      conditional.minimum.query(first + 1, last + 1, false) < conditional.depth[first]!)
-  )
-    return null;
   const finalNode = flatCredentialNode(finalAtom, predicate, firstArrow < last);
   if (first === last) return finalNode;
   if (
@@ -4309,40 +4353,42 @@ function credentialRawLength(view: DetectionView, start: number, end: number): n
 
 interface CredentialPolicyIndex {
   nextSpaceEnd: Uint32Array;
-  nextLineEnd: Uint32Array;
-  nextBrace: Uint32Array;
-  previousBoundary: Int32Array;
+  lines: number[];
+  closingBraces: number[];
+  boundaries: number[];
 }
 
 function credentialPolicyIndex(text: string): CredentialPolicyIndex {
-  const size = text.length;
-  const nextSpaceEnd = new Uint32Array(size + 1);
-  const nextLineEnd = new Uint32Array(size + 1);
-  const nextBrace = new Uint32Array(size + 1);
-  const previousBoundary = new Int32Array(size + 1);
-  nextSpaceEnd[size] = size;
-  nextLineEnd[size] = size;
-  nextBrace[size] = size;
-  let previous = -1;
-  for (let index = 0; index < size; index += 1) {
-    previousBoundary[index] = previous;
-    const character = text[index];
-    if (character === "{" || character === "}" || character === "\n" || character === "\r")
-      previous = index;
+  const nextSpaceEnd = new Uint32Array(text.length + 1);
+  const lines: number[] = [];
+  const closingBraces: number[] = [];
+  const boundaries: number[] = [];
+  const scanner = /[{}\r\n]/g;
+  let match: RegExpExecArray | null;
+  while ((match = scanner.exec(text)) !== null) {
+    boundaries.push(match.index);
+    if (match[0] === "}") closingBraces.push(match.index);
+    else if (match[0] !== "{") lines.push(match.index);
   }
-  previousBoundary[size] = previous;
-  for (let index = size - 1; index >= 0; index -= 1) {
+  nextSpaceEnd[text.length] = text.length;
+  for (let index = text.length - 1; index >= 0; index -= 1) {
     const character = text[index];
     nextSpaceEnd[index] =
       character === " " || character === "\t" ? nextSpaceEnd[index + 1]! : index;
-    nextLineEnd[index] = character === "\n" || character === "\r" ? index : nextLineEnd[index + 1]!;
-    nextBrace[index] = character === "}" ? index : nextBrace[index + 1]!;
   }
-  return { nextSpaceEnd, nextLineEnd, nextBrace, previousBoundary };
+  return { nextSpaceEnd, lines, closingBraces, boundaries };
+}
+
+function policyLineEnd(text: string, start: number, index: CredentialPolicyIndex): number {
+  return Math.min(
+    text.length,
+    start + 4096,
+    index.lines[firstPositionAtOrAfter(index.lines, start)] ?? text.length,
+  );
 }
 
 function lineEndsAfterValue(text: string, end: number, index: CredentialPolicyIndex): boolean {
-  end = Math.min(index.nextSpaceEnd[end]!, end + 4096, index.nextLineEnd[end]!);
+  end = Math.min(index.nextSpaceEnd[end]!, policyLineEnd(text, end, index));
   return end === text.length || text[end] === "\n" || text[end] === "\r";
 }
 
@@ -4354,10 +4400,11 @@ function isDestructuredCredentialName(
   index: CredentialPolicyIndex,
 ): boolean {
   if (!/^[A-Za-z_$]+$/.test(value)) return false;
-  const opening = index.previousBoundary[start]!;
+  const opening = index.boundaries[firstPositionAtOrAfter(index.boundaries, start) - 1] ?? -1;
   if (opening < Math.max(0, start - 256) || text[opening] !== "{") return false;
-  const maximum = Math.min(text.length, end + 4096, index.nextLineEnd[end]!);
-  let closing = index.nextBrace[end]!;
+  const maximum = policyLineEnd(text, end, index);
+  let closing =
+    index.closingBraces[firstPositionAtOrAfter(index.closingBraces, end)] ?? text.length;
   if (closing > maximum || text[closing] !== "}") return false;
   closing += 1;
   if (closing < maximum) closing = Math.min(index.nextSpaceEnd[closing]!, maximum);
