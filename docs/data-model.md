@@ -242,7 +242,9 @@ median-of-three timings at exactly 1 MB and the worst row at 4 MB; the latency b
 per MB and the scaling limit is 4.8 times the 1 MB time. Run that benchmark without competing test
 processes on the designated host. Candidate look-aheads retain the same-line 4 KiB boundary;
 request-scoped indexes prevent overlapping lexical and expression walks. Caches are discarded at
-the end of each call. Policy decisions and measured results are recorded in the Issue Log and PR.
+the end of each call. The checked-in `secret-answer-performance-timings.json` receipt and its
+compressed raw samples cover all 17,769 synthetic 1 MB rows on mac-studio: zero misses, worst
+median 1.028 seconds, and 4.677 seconds at 4 MB (4.548 times). The Issue Log and PR link the receipt.
 
 The tracked snapshot contains 16,665 identifiers: zero change in chat or code, and 27 accepted
 neutral-answer losses. K3 names 29 source-line exceptions, including quoted UI literals, opaque
