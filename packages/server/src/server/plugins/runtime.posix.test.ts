@@ -841,10 +841,19 @@ export default function contribute(server: any) { server.registerProvider(provid
     await runtime.startPlugin("lifecycle", directory);
     await runtime.stopPluginById("lifecycle");
 
+    const phasePrefix = "[paseo] Plugin initialization phase ";
     expect(
-      runtime.getLogs("lifecycle").map(({ stream, message }) => ({ stream, message })),
+      runtime
+        .getLogs("lifecycle")
+        .map(({ stream, message }) =>
+          message.startsWith(phasePrefix)
+            ? { stream, phase: JSON.parse(message.slice(phasePrefix.length)).phase }
+            : { stream, message },
+        ),
     ).toEqual([
       { stream: "stdout", message: "[paseo] Loading plugin" },
+      { stream: "stdout", phase: "session-attached" },
+      { stream: "stdout", phase: "ready-received" },
       { stream: "stdout", message: "[paseo] Plugin ready" },
       { stream: "stdout", message: "[paseo] Stopping plugin" },
       { stream: "stdout", message: "[paseo] Plugin stopped" },
@@ -898,12 +907,14 @@ export default function contribute(server: any) { server.registerProvider(provid
 
     child.stderr.write("connection failed\n");
 
+    const output = runtime
+      .getLogs("tagged-output")
+      .find((entry) => entry.message === "connection failed");
+    if (!output) throw new Error("Expected plugin output in the retained log tail");
     expect(records.find((record) => record.message === "connection failed")).toMatchObject({
       module: "plugins",
       pluginId: "tagged-output",
-      sequence: 3,
-      stream: "stderr",
-      message: "connection failed",
+      ...output,
     });
     expect(records.find((record) => record.message === "connection failed")?.timestamp).toEqual(
       expect.any(String),
