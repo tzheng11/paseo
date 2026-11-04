@@ -8,6 +8,7 @@ import type {
   WorkspaceLayoutEntry,
   WorkspaceLayoutSnapshot,
 } from "@getpaseo/protocol/workspace-layout";
+import { emptyWorkspaceNavigationPreferences } from "@getpaseo/protocol/workspace-layout";
 import {
   FileBackedWorkspaceRegistry,
   type PersistedWorkspaceRecord,
@@ -90,6 +91,12 @@ async function seed(records: PersistedWorkspaceRecord[], activate = true) {
         },
         previousSourceSha256: null,
         entries: records.map((record) => canonical(record)),
+      },
+      {
+        kind: "put-navigation",
+        expectedRevision: 0,
+        preferences: emptyWorkspaceNavigationPreferences(),
+        importResolution: { clientSources: [], resolutionSha256: "0".repeat(64) },
       },
     ],
   });

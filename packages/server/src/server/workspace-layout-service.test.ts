@@ -7,6 +7,7 @@ import type {
   WorkspaceLayoutSnapshot,
   WorkspaceLayoutCommit,
 } from "@getpaseo/protocol/workspace-layout";
+import { emptyWorkspaceNavigationPreferences } from "@getpaseo/protocol/workspace-layout";
 import { createStub } from "./test-utils/class-mocks.js";
 import { WorkspaceLayoutService } from "./workspace-layout-service.js";
 import { hashLayoutValue } from "./workspace-layout-store.js";
@@ -20,7 +21,18 @@ const config = {
 };
 function snapshot(revision = 0): WorkspaceLayoutSnapshot {
   const { role: _role, authorityKeySha256: _key, ...identity } = config;
-  return { stamp: { ...identity, phase: "active", revision }, imports: [], entries: [] };
+  return {
+    stamp: { ...identity, phase: "active", revision },
+    imports: [],
+    entries: [],
+    clientImports: [],
+    navigation: {
+      revision: 1,
+      preferences: emptyWorkspaceNavigationPreferences(),
+      clientSources: [],
+      resolutionSha256: "0".repeat(64),
+    },
+  };
 }
 let home: string;
 const services: WorkspaceLayoutService[] = [];

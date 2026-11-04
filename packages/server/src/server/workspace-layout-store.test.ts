@@ -10,6 +10,7 @@ import type {
   WorkspaceLayoutMutation,
   WorkspaceLayoutSnapshot,
 } from "@getpaseo/protocol/workspace-layout";
+import { emptyWorkspaceNavigationPreferences } from "@getpaseo/protocol/workspace-layout";
 import {
   WorkspaceLayoutStore,
   writeLayoutFileDurably,
@@ -55,6 +56,15 @@ function request(
   return { requestId: randomUUID(), expected: snapshot.stamp, mutations };
 }
 
+function resolveEmptyNavigation(): WorkspaceLayoutMutation {
+  return {
+    kind: "put-navigation",
+    expectedRevision: 0,
+    preferences: emptyWorkspaceNavigationPreferences(),
+    importResolution: { clientSources: [], resolutionSha256: "0".repeat(64) },
+  };
+}
+
 function visibleParents(snapshot: WorkspaceLayoutSnapshot) {
   function section(row: WorkspaceLayoutEntry) {
     if (row.superpinnedAt) return "superpinned" as const;
@@ -92,10 +102,10 @@ describe("canonical workspace layout authority", () => {
     const initial = await store.initialize(identity);
     const groups = Map.groupBy(rows, (row) => row.ref.serverId);
     await store.commit(
-      request(
-        initial,
-        [...groups].map(([host, records]) => imported(host, records)),
-      ),
+      request(initial, [
+        ...[...groups].map(([host, records]) => imported(host, records)),
+        resolveEmptyNavigation(),
+      ]),
     );
     const importing = await store.inspect();
     await store.commit(
@@ -188,7 +198,10 @@ describe("canonical workspace layout authority", () => {
     await store.commit(request(partial, [imported("srv_b", [entry("srv_b", "parent")])]));
     const complete = await store.inspect();
     await store.commit(
-      request(complete, [{ kind: "activate", requiredImports: complete.imports }]),
+      request(complete, [
+        resolveEmptyNavigation(),
+        { kind: "activate", requiredImports: complete.imports },
+      ]),
     );
     expect((await store.inspect()).stamp.phase).toBe("active");
   });
@@ -297,6 +310,150 @@ describe("canonical workspace layout authority", () => {
     expect(await reader.inspect()).toEqual(state);
   });
 
+  it("shares cross-host project and sidebar order durably without deriving pin membership from order arrays", async () => {
+    const state = await seed([
+      entry("srv_a", "same"),
+      { ...entry("srv_b", "same"), pinnedAt: null },
+    ]);
+    const preferences = {
+      ...emptyWorkspaceNavigationPreferences(),
+      projectOrder: ["shared-project", "other-view"],
+      pinnedWorkspaceOrder: ["srv_b:same", "srv_a:same"],
+      workspaceOrderByProject: { "shared-project": ["srv_b:same", "srv_a:same"] },
+      workspaceSortModeByProject: { "shared-project": "alphabetical" as const },
+    };
+    const input = request(state, [
+      { kind: "put-navigation", expectedRevision: state.navigation!.revision, preferences },
+    ]);
+    const receipt = await store.commit(input);
+    expect(await store.commit(input)).toEqual(receipt);
+    const reader = new WorkspaceLayoutStore({ paseoHome: home, identity, serverId: "srv_hub" });
+    const next = await reader.inspect();
+    expect(next.navigation?.preferences).toEqual(preferences);
+    expect(next.entries).toEqual(state.entries);
+    expect(next.entries[1].pinnedAt).toBeNull();
+    await expect(
+      store.commit(
+        request(next, [
+          { kind: "put-navigation", expectedRevision: state.navigation!.revision, preferences },
+        ]),
+      ),
+    ).rejects.toThrow("stale_navigation_revision");
+    expect(await store.inspect()).toEqual(next);
+  });
+
+  it("requires complete source-bound client import resolution and retains dormant client layout provenance", async () => {
+    const source = {
+      sourceId: "desktop-one",
+      sourceSha256: "c".repeat(64),
+      resolutionSha256: "d".repeat(64),
+    };
+    const preferences = {
+      ...emptyWorkspaceNavigationPreferences(),
+      workspaceOrderByProject: { "shared-view": ["srv_a:one"] },
+    };
+    const client = {
+      source,
+      preferences,
+      pinnedWorkspaceTree: {
+        "removed-host:old": { parentWorkspaceKey: "removed-host:parent", siblingOrder: 7 },
+      },
+    };
+    const initial = await store.initialize(identity);
+    await store.commit(
+      request(initial, [
+        imported("srv_a", [entry("srv_a", "one")]),
+        { kind: "import-client", input: client, previousSourceSha256: null },
+      ]),
+    );
+    const importedState = await store.inspect();
+    await expect(
+      store.commit(
+        request(importedState, [
+          {
+            kind: "activate",
+            requiredImports: importedState.imports,
+            requiredClientImports: [source],
+          },
+        ]),
+      ),
+    ).rejects.toThrow("navigation_not_resolved");
+    await expect(
+      store.commit(
+        request(importedState, [
+          {
+            kind: "put-navigation",
+            expectedRevision: 0,
+            preferences,
+            importResolution: { clientSources: [], resolutionSha256: "e".repeat(64) },
+          },
+        ]),
+      ),
+    ).rejects.toThrow("client_import_manifest_mismatch");
+    await store.commit(
+      request(importedState, [
+        {
+          kind: "put-navigation",
+          expectedRevision: 0,
+          preferences,
+          importResolution: { clientSources: [source], resolutionSha256: "e".repeat(64) },
+        },
+      ]),
+    );
+    const resolved = await store.inspect();
+    await expect(
+      store.commit(request(resolved, [{ kind: "activate", requiredImports: resolved.imports }])),
+    ).rejects.toThrow("client_import_manifest_mismatch");
+    await store.commit(
+      request(resolved, [
+        { kind: "activate", requiredImports: resolved.imports, requiredClientImports: [source] },
+      ]),
+    );
+    const active = await store.inspect();
+    expect(active.clientImports).toEqual([client]);
+    expect(active.navigation?.preferences).toEqual(preferences);
+    await expect(
+      store.commit(
+        request(active, [
+          { kind: "import-client", input: client, previousSourceSha256: source.sourceSha256 },
+        ]),
+      ),
+    ).rejects.toThrow("import_closed");
+    await expect(
+      store.commit(
+        request(active, [
+          {
+            kind: "put-navigation",
+            expectedRevision: active.navigation!.revision,
+            preferences,
+            importResolution: { clientSources: [], resolutionSha256: "e".repeat(64) },
+          },
+        ]),
+      ),
+    ).rejects.toThrow("navigation_import_closed");
+  });
+
+  it("refuses duplicate or missing live navigation references without replacing the saved order", async () => {
+    const state = await seed([entry("srv_a", "one")]);
+    for (const keys of [["srv_a:one", "srv_a:one"], ["srv_a:missing"]]) {
+      await expect(
+        store.commit(
+          request(state, [
+            {
+              kind: "put-navigation",
+              expectedRevision: state.navigation!.revision,
+              preferences: {
+                ...emptyWorkspaceNavigationPreferences(),
+                workspaceOrderByProject: { view: keys },
+              },
+            },
+          ]),
+        ),
+      ).rejects.toThrow();
+      expect(await store.inspect()).toEqual(state);
+    }
+  });
+
   it("imports a historical archived-parent placement without erasing the edge or permitting a new invalid assignment", async () => {
     const parent = { ...entry("srv_a", "parent"), archivedAt: timestamp };
     const child = {
@@ -350,6 +507,12 @@ describe("canonical workspace layout authority", () => {
       stamp: { ...identity, phase: "active", revision: 0 },
       entries: rows,
       imports: [],
+      navigation: {
+        revision: 1,
+        preferences: emptyWorkspaceNavigationPreferences(),
+        clientSources: [],
+        resolutionSha256: "0".repeat(64),
+      },
     };
     expect(() => validateLayoutGraph(state)).not.toThrow();
     rows[0].parent = { serverId: "srv_a", workspaceId: "11999" };

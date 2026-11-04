@@ -40,6 +40,9 @@ call their own daemon; its forwarding keeps the authority credential server-side
 ## Durable identity and transactions
 
 The authority owns `workspace-layout.json` relative to its qualified Paseo home.
+The store format is version 2; earlier experimental 0.15 readers must refuse it,
+not strip shared-view fields during recovery. The version label alone never
+qualifies a recovery reader.
 `workspace-layout-initialized.json` prevents an initialized but missing store
 from being recreated empty. A corrupt store, mismatched identity, stale epoch or
 abandoned writer lock requires recovery; none selects a fallback authority.
@@ -85,6 +88,50 @@ request cannot replace a newer snapshot. An actual regression below the revision
 known when the read started, or a same-revision fork, still refuses.
 
 No delete/retirement mutation is exposed in this initial contract.
+
+## Shared navigation and client sources
+
+The snapshot's `navigation` holds one revisioned preference document:
+`workspaceSort` (manual/created/lastPrompt), `projectOrder`, `workspaceOrderByProject`, `workspaceSortModeByProject`,
+`pinnedWorkspaceSortMode`, `pinnedWorkspaceOrder` and
+`superpinnedWorkspaceOrder`. Workspace keys are host-qualified; equal local IDs
+remain distinct. Project view keys are the exact app grouping keys, including
+host/project-qualified fallback keys. Import never matches them by display name
+or guesses an equivalence from a path. These arrays express order only. They
+cannot create or clear ordinary or superpin membership.
+
+`import-client` retains a source ID, original source SHA256, resolution SHA256,
+interpreted preferences and dormant historical client tree. Its original bytes
+remain in the controller's immutable import evidence. Inactive client trees may
+contain obsolete references; retaining that provenance does not activate those
+edges or override canonical entry placements.
+
+`put-navigation` compares `expectedRevision` as well as the global CAS. During
+import it additionally requires `importResolution.clientSources` to match every
+retained client source and records the explicit global `resolutionSha256`.
+Activation requires resolved navigation and an exact `requiredClientImports`
+manifest. Adding or replacing a client source invalidates a resolution against
+the earlier source bytes. Active edits preserve the import provenance and cannot
+replace it. Live order references must exist in the full canonical entry set;
+archived references and unused view keys remain as dormant preferences.
+
+`decodeLegacySidebarLayout(bytes)` validates retained version 0–3 envelopes
+strictly before invoking the app's shared versioned interpretation. Version 0/1
+uses the existing scoped-key migration; version 2/3 preserves exact modern keys.
+Malformed trees, unknown fields and future versions refuse rather than being
+discarded. Its result is source-hashed order data, not a pin observation or an
+automatic conflict resolution. Conflicting client preferences require an explicit
+preview ruling; neither current host selection nor recency chooses a winner.
+
+The separate `sidebar-view` client key contributes global `workspaceSort` through
+`decodeLegacySidebarViewOrdering(bytes)`, using the existing version 0–8 grouping
+migration rule. Filters and grouping remain client preferences. Each source key
+has its own original hash in `clientImports`; partial preferences are provenance,
+and the resolved canonical navigation must explicitly supply the global sort.
+
+This store/API contract does not make an old client's independent local ordering
+canonical. Browser/native writer routing and read-only replica behavior must be
+qualified on the actual client before that client can count toward acceptance.
 
 ## Bootstrap and import
 

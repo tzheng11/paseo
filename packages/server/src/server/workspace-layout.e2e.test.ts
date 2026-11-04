@@ -7,6 +7,7 @@ import pino from "pino";
 import { hashSync } from "bcryptjs";
 import { createHostClient } from "@getpaseo/client/node";
 import type { WorkspaceLayoutEntry } from "@getpaseo/protocol/workspace-layout";
+import { emptyWorkspaceNavigationPreferences } from "@getpaseo/protocol/workspace-layout";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { loadOrCreateDaemonKeyPair } from "./daemon-keypair.js";
 import { createTestPaseoDaemon } from "./test-utils/paseo-daemon.js";
@@ -107,7 +108,7 @@ test("password admission protects actual layout RPCs; two authenticated clients 
     pinnedAt: null,
     superpinnedAt: null,
     parent: null,
-    siblingOrder: 0,
+    siblingOrder: null,
     pinPlacement: null,
     archivedAt: null,
     revision: 0,
@@ -125,6 +126,12 @@ test("password admission protects actual layout RPCs; two authenticated clients 
         },
         previousSourceSha256: null,
         entries: [entry],
+      },
+      {
+        kind: "put-navigation",
+        expectedRevision: 0,
+        preferences: emptyWorkspaceNavigationPreferences(),
+        importResolution: { clientSources: [], resolutionSha256: "0".repeat(64) },
       },
     ],
   });
@@ -155,8 +162,30 @@ test("password admission protects actual layout RPCs; two authenticated clients 
     ],
   });
   await expect.poll(() => revisions.includes(receipt.receipt.stamp.revision)).toBe(true);
+  const pinned = await b.getWorkspaceLayout();
+  await a.commitWorkspaceLayout({
+    requestId: "shared-navigation",
+    expected: pinned.stamp,
+    mutations: [
+      {
+        kind: "put-navigation",
+        expectedRevision: pinned.navigation!.revision,
+        preferences: {
+          ...pinned.navigation!.preferences,
+          projectOrder: ["shared-view"],
+          workspaceOrderByProject: { "shared-view": ["srv_replica:workspace"] },
+          pinnedWorkspaceSortMode: "alphabetical",
+        },
+      },
+    ],
+  });
   const canonical = await b.getWorkspaceLayout();
   expect(canonical.entries[0]).toMatchObject({ pinnedAt: at, superpinnedAt: at });
+  expect(canonical.navigation?.preferences).toMatchObject({
+    projectOrder: ["shared-view"],
+    workspaceOrderByProject: { "shared-view": ["srv_replica:workspace"] },
+    pinnedWorkspaceSortMode: "alphabetical",
+  });
   expect(canonical.stamp.epoch).toBe(mode.epoch);
   await b.close();
   const reconnected = client(password);

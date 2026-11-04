@@ -57,10 +57,48 @@ export const WorkspaceLayoutImportSourceSchema = z.object({
   // Includes any client-order/conflict rulings used by the explicit import.
   resolutionSha256: z.string().regex(/^[a-f0-9]{64}$/),
 });
+const DigestSchema = z.string().regex(/^[a-f0-9]{64}$/);
+const NavigationKeySchema = z
+  .string()
+  .min(3)
+  .max(1024)
+  .regex(/^[^:]+:.+$/);
+export const WorkspaceNavigationPreferencesSchema = z.object({
+  // Optional on the wire for older experimental readers; active stores require it.
+  workspaceSort: z.enum(["manual", "created", "lastPrompt"]).optional(),
+  projectOrder: z.array(IdSchema),
+  pinnedWorkspaceOrder: z.array(NavigationKeySchema),
+  superpinnedWorkspaceOrder: z.array(NavigationKeySchema),
+  pinnedWorkspaceSortMode: z.enum(["manual", "alphabetical", "activity"]),
+  workspaceOrderByProject: z.record(IdSchema, z.array(NavigationKeySchema)),
+  workspaceSortModeByProject: z.record(IdSchema, z.enum(["manual", "alphabetical", "activity"])),
+});
+export const WorkspaceLayoutClientSourceSchema = z.object({
+  sourceId: IdSchema,
+  sourceSha256: DigestSchema,
+  resolutionSha256: DigestSchema,
+});
+export const WorkspaceLayoutClientImportSchema = z.object({
+  source: WorkspaceLayoutClientSourceSchema,
+  preferences: WorkspaceNavigationPreferencesSchema.partial(),
+  // Historical client edges are provenance. Active links belong to entries.
+  pinnedWorkspaceTree: z.record(
+    NavigationKeySchema,
+    WorkspacePinPlacementSchema.omit({ revision: true }),
+  ),
+});
+export const WorkspaceNavigationSchema = z.object({
+  revision: RevisionSchema,
+  preferences: WorkspaceNavigationPreferencesSchema,
+  clientSources: z.array(WorkspaceLayoutClientSourceSchema),
+  resolutionSha256: DigestSchema,
+});
 export const WorkspaceLayoutSnapshotSchema = z.object({
   stamp: WorkspaceLayoutStampSchema,
   entries: z.array(WorkspaceLayoutEntrySchema),
   imports: z.array(WorkspaceLayoutImportSourceSchema),
+  clientImports: z.array(WorkspaceLayoutClientImportSchema).optional(),
+  navigation: WorkspaceNavigationSchema.nullable().optional(),
 });
 
 export const WorkspaceLayoutMutationSchema = z.discriminatedUnion("kind", [
@@ -68,6 +106,7 @@ export const WorkspaceLayoutMutationSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("activate"),
     requiredImports: z.array(WorkspaceLayoutImportSourceSchema).min(1),
+    requiredClientImports: z.array(WorkspaceLayoutClientSourceSchema).optional(),
   }),
   z.object({
     kind: z.literal("import-host"),
@@ -78,6 +117,22 @@ export const WorkspaceLayoutMutationSchema = z.discriminatedUnion("kind", [
       .regex(/^[a-f0-9]{64}$/)
       .nullable(),
     entries: z.array(WorkspaceLayoutEntrySchema),
+  }),
+  z.object({
+    kind: z.literal("import-client"),
+    input: WorkspaceLayoutClientImportSchema,
+    previousSourceSha256: DigestSchema.nullable(),
+  }),
+  z.object({
+    kind: z.literal("put-navigation"),
+    expectedRevision: RevisionSchema,
+    preferences: WorkspaceNavigationPreferencesSchema,
+    importResolution: z
+      .object({
+        clientSources: z.array(WorkspaceLayoutClientSourceSchema),
+        resolutionSha256: DigestSchema,
+      })
+      .optional(),
   }),
 ]);
 export const WorkspaceLayoutCommitSchema = z.object({
@@ -133,6 +188,21 @@ export type WorkspaceLayoutSnapshot = z.infer<typeof WorkspaceLayoutSnapshotSche
 export type WorkspaceLayoutCommit = z.infer<typeof WorkspaceLayoutCommitSchema>;
 export type WorkspaceLayoutMutation = z.infer<typeof WorkspaceLayoutMutationSchema>;
 export type WorkspaceLayoutReceipt = z.infer<typeof WorkspaceLayoutReceiptSchema>;
+export type WorkspaceNavigationPreferences = z.infer<typeof WorkspaceNavigationPreferencesSchema>;
+export type WorkspaceNavigation = z.infer<typeof WorkspaceNavigationSchema>;
+export type WorkspaceLayoutClientImport = z.infer<typeof WorkspaceLayoutClientImportSchema>;
+
+export function emptyWorkspaceNavigationPreferences(): WorkspaceNavigationPreferences {
+  return {
+    workspaceSort: "manual",
+    projectOrder: [],
+    pinnedWorkspaceOrder: [],
+    superpinnedWorkspaceOrder: [],
+    pinnedWorkspaceSortMode: "manual",
+    workspaceOrderByProject: {},
+    workspaceSortModeByProject: {},
+  };
+}
 
 export function workspaceReferenceKey(ref: WorkspaceReference): string {
   return JSON.stringify([ref.serverId, ref.workspaceId]);

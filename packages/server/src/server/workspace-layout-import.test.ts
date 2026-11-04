@@ -1,10 +1,85 @@
 import { createHash } from "node:crypto";
 import { expect, test } from "vitest";
-import { decodeLegacyWorkspaceLayout } from "./workspace-layout-import.js";
+import {
+  decodeLegacyWorkspaceLayout,
+  decodeLegacySidebarLayout,
+  decodeLegacySidebarViewOrdering,
+} from "./workspace-layout-import.js";
 
 const at = "2026-11-04T10:00:00.000Z";
 const base = { workspaceId: "one", projectId: "project", pinnedAt: null, archivedAt: null };
 const encode = (records: unknown[]) => Buffer.from(JSON.stringify(records));
+
+test("the separate sidebar-view source contributes global ordering and never client filters or pin flags", () => {
+  const bytes = Buffer.from(
+    JSON.stringify({
+      version: 8,
+      state: { workspaceSort: "lastPrompt", hostFilters: ["srv_a"], groupMode: "project" },
+    }),
+  );
+  expect(decodeLegacySidebarViewOrdering(bytes).preferences).toEqual({
+    workspaceSort: "lastPrompt",
+  });
+  const old = Buffer.from(
+    JSON.stringify({
+      version: 1,
+      state: { workspaceSort: "lastPrompt", groupModeByServerId: { srv_a: "status" } },
+    }),
+  );
+  expect(decodeLegacySidebarViewOrdering(old).preferences).toEqual({ workspaceSort: "created" });
+  expect(() =>
+    decodeLegacySidebarViewOrdering(Buffer.from(JSON.stringify({ version: 9, state: {} }))),
+  ).toThrow();
+  expect(() =>
+    decodeLegacySidebarViewOrdering(
+      Buffer.from(JSON.stringify({ version: 8, state: { workspaceSort: "unknown" } })),
+    ),
+  ).toThrow();
+});
+
+test("client import preserves version3 view order and dormant trees without promoting order membership into pins", () => {
+  const state = {
+    projectOrder: ["view with space "],
+    pinnedWorkspaceOrder: ["srv_a:one"],
+    superpinnedWorkspaceOrder: ["srv_b:one"],
+    workspaceOrderByProject: { "view with space ": ["srv_b:one", "srv_a:one"] },
+    workspaceSortModeByProject: { "view with space ": "activity" },
+    pinnedWorkspaceSortMode: "alphabetical",
+    pinnedWorkspaceTree: {
+      "srv_a:one": { parentWorkspaceKey: "srv_b:old-parent", siblingOrder: 8 },
+    },
+  };
+  const bytes = Buffer.from(JSON.stringify({ state, version: 3 }));
+  const decoded = decodeLegacySidebarLayout(bytes);
+  expect(decoded.preferences).toEqual(
+    Object.fromEntries(Object.entries(state).filter(([key]) => key !== "pinnedWorkspaceTree")),
+  );
+  expect(decoded.pinnedWorkspaceTree).toEqual(state.pinnedWorkspaceTree);
+  expect(decoded.sourceSha256).toBe(createHash("sha256").update(bytes).digest("hex"));
+  expect(decoded.preferences).not.toHaveProperty("pinnedAt");
+});
+
+test("version1 client import uses the app's exact scoped-key migration and refuses corrupt or future inputs", () => {
+  const saved = {
+    version: 1,
+    state: {
+      projectOrder: [" view ", "view"],
+      workspaceOrderByServerAndProject: { "srv_a::view": ["one", "srv_a:two"] },
+    },
+  };
+  const decoded = decodeLegacySidebarLayout(Buffer.from(JSON.stringify(saved)));
+  expect(decoded.preferences.projectOrder).toEqual(["view"]);
+  expect(decoded.preferences.workspaceOrderByProject).toEqual({ view: ["srv_a:one", "srv_a:two"] });
+  for (const bad of [
+    { ...saved, version: 4 },
+    { ...saved, state: { ...saved.state, unknownFutureField: true } },
+    {
+      ...saved,
+      state: { ...saved.state, pinnedWorkspaceTree: { "srv_a:one": { siblingOrder: "bad" } } },
+    },
+  ])
+    expect(() => decodeLegacySidebarLayout(Buffer.from(JSON.stringify(bad)))).toThrow();
+});
 
 test("the whole upstream014 disk profile decodes unsupported fields without inventing pins or ranks", () => {
   const bytes = encode([base, { ...base, workspaceId: "archived", pinnedAt: at, archivedAt: at }]);

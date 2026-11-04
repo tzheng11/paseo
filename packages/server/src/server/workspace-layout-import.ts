@@ -2,9 +2,14 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import {
   WorkspacePinPlacementSchema,
+  WorkspaceNavigationPreferencesSchema,
   workspaceReferenceKey,
   type WorkspaceLayoutEntry,
 } from "@getpaseo/protocol/workspace-layout";
+import {
+  LegacySidebarOrderStateSchema,
+  migrateSidebarOrderState,
+} from "@getpaseo/protocol/sidebar-order";
 import { WorkspaceLayoutRefusal } from "./workspace-layout-store.js";
 
 const common = z.object({
@@ -27,6 +32,54 @@ const impowerLayout = common.extend({
 });
 
 export type LegacyWorkspaceLayoutProfile = "upstream-014" | "impower-layout-v1";
+
+/** Only the ordering part is canonical; original filter/grouping bytes remain import provenance. */
+export function decodeLegacySidebarViewOrdering(bytes: Uint8Array) {
+  const group = z.enum(["none", "project", "status", "label"]);
+  const saved = z
+    .strictObject({
+      version: z.number().int().min(0).max(8),
+      state: z.strictObject({
+        workspaceSort: z.enum(["manual", "created", "lastPrompt"]).optional(),
+        showBackground: z.boolean().optional(),
+        groupMode: group.optional(),
+        hostFilters: z.array(z.string()).optional(),
+        hostFilter: z.string().nullable().optional(),
+        projectFilters: z.array(z.string()).optional(),
+        groupModeByServerId: z.record(z.string(), group).optional(),
+        labelFilter: z.object({ labels: z.array(z.string()) }).optional(),
+      }),
+    })
+    .parse(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)));
+  // This is the exact existing migrateSidebarViewState ordering rule.
+  const legacyGrouping = Object.values(saved.state.groupModeByServerId ?? {}).length > 0;
+  const workspaceSort = legacyGrouping
+    ? ("created" as const)
+    : (saved.state.workspaceSort ?? "created");
+  return {
+    version: saved.version,
+    sourceSha256: createHash("sha256").update(bytes).digest("hex"),
+    preferences: { workspaceSort },
+    pinnedWorkspaceTree: {},
+  };
+}
+
+/** Use the same versioned interpretation as the app, but refuse malformed retained data before migration. */
+export function decodeLegacySidebarLayout(bytes: Uint8Array) {
+  const saved = z
+    .strictObject({ version: z.number().int().min(0).max(3), state: LegacySidebarOrderStateSchema })
+    .parse(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)));
+  const { pinnedWorkspaceTree, ...interpreted } = migrateSidebarOrderState(
+    saved.state,
+    saved.version,
+  );
+  return {
+    sourceSha256: createHash("sha256").update(bytes).digest("hex"),
+    version: saved.version,
+    preferences: WorkspaceNavigationPreferencesSchema.parse(interpreted),
+    pinnedWorkspaceTree,
+  };
+}
 
 /** Decode retained disk bytes only. The caller separately binds producer provenance and conflict rulings. */
 export function decodeLegacyWorkspaceLayout(input: {

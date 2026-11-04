@@ -19,7 +19,7 @@ import {
 } from "@getpaseo/protocol/workspace-layout";
 
 const StoreSchema = z.strictObject({
-  schemaVersion: z.literal(1),
+  schemaVersion: z.literal(2),
   snapshot: WorkspaceLayoutSnapshotSchema,
   receipts: z.record(z.string(), WorkspaceLayoutReceiptSchema),
 });
@@ -89,11 +89,13 @@ export class WorkspaceLayoutStore {
         initialized: false,
       });
       const file: StoreFile = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         snapshot: {
           stamp: { ...this.identity, revision: 0, phase: "importing" },
           entries: [],
           imports: [],
+          clientImports: [],
+          navigation: null,
         },
         receipts: {},
       };
@@ -217,62 +219,148 @@ function applyMutation(
   revision: number,
 ) {
   switch (mutation.kind) {
-    case "put": {
-      if (snapshot.stamp.phase !== "active") throw new WorkspaceLayoutRefusal("layout_importing");
-      const key = workspaceReferenceKey(mutation.entry.ref);
-      const index = snapshot.entries.findIndex((entry) => workspaceReferenceKey(entry.ref) === key);
-      const prior = index < 0 ? null : snapshot.entries[index];
-      if ((prior?.revision ?? 0) !== mutation.entry.revision)
-        throw new WorkspaceLayoutRefusal("stale_entry_revision");
-      const next = { ...mutation.entry, revision };
-      if (index < 0) snapshot.entries.push(next);
-      else snapshot.entries[index] = next;
-      return;
-    }
-    case "import-host": {
-      if (snapshot.stamp.phase !== "importing") throw new WorkspaceLayoutRefusal("import_closed");
-      const previous = snapshot.imports.find(
-        (source) => source.serverId === mutation.source.serverId,
-      );
-      if ((previous?.sourceSha256 ?? null) !== mutation.previousSourceSha256)
-        throw new WorkspaceLayoutRefusal("stale_import_source");
-      if (mutation.entries.some((entry) => entry.ref.serverId !== mutation.source.serverId))
-        throw new WorkspaceLayoutRefusal("import_host_mismatch");
-      const old = snapshot.entries.filter(
-        (entry) => entry.ref.serverId === mutation.source.serverId,
-      );
-      const keys = new Set(mutation.entries.map((entry) => workspaceReferenceKey(entry.ref)));
-      if (old.some((entry) => !keys.has(workspaceReferenceKey(entry.ref))))
-        throw new WorkspaceLayoutRefusal("import_drops_existing_workspace");
-      snapshot.entries = snapshot.entries.filter(
-        (entry) => entry.ref.serverId !== mutation.source.serverId,
-      );
-      snapshot.entries.push(
-        ...mutation.entries.map((entry) => Object.assign({}, entry, { revision })),
-      );
-      snapshot.imports = snapshot.imports.filter(
-        (source) => source.serverId !== mutation.source.serverId,
-      );
-      snapshot.imports.push(mutation.source);
-      return;
-    }
-    case "activate": {
-      if (snapshot.stamp.phase !== "importing") throw new WorkspaceLayoutRefusal("already_active");
-      const required = new Set(mutation.requiredImports.map((source) => source.serverId));
-      if (
-        required.size !== mutation.requiredImports.length ||
-        required.size !== snapshot.imports.length ||
-        mutation.requiredImports.some(
-          (source) =>
-            !snapshot.imports.some(
-              (imported) => canonicalLayoutJson(imported) === canonicalLayoutJson(source),
-            ),
-        )
-      )
-        throw new WorkspaceLayoutRefusal("import_manifest_mismatch");
-      snapshot.stamp.phase = "active";
-    }
+    case "put":
+      return putLayoutEntry(snapshot, mutation, revision);
+    case "import-host":
+      return importLayoutHost(snapshot, mutation, revision);
+    case "activate":
+      return activateLayout(snapshot, mutation);
+    case "import-client":
+      return importLayoutClient(snapshot, mutation);
+    case "put-navigation":
+      return putNavigation(snapshot, mutation);
   }
+}
+
+function putLayoutEntry(
+  snapshot: WorkspaceLayoutSnapshot,
+  mutation: Extract<WorkspaceLayoutMutation, { kind: "put" }>,
+  revision: number,
+) {
+  if (snapshot.stamp.phase !== "active") throw new WorkspaceLayoutRefusal("layout_importing");
+  const key = workspaceReferenceKey(mutation.entry.ref);
+  const index = snapshot.entries.findIndex((entry) => workspaceReferenceKey(entry.ref) === key);
+  const prior = index < 0 ? null : snapshot.entries[index];
+  if ((prior?.revision ?? 0) !== mutation.entry.revision)
+    throw new WorkspaceLayoutRefusal("stale_entry_revision");
+  const next = { ...mutation.entry, revision };
+  if (index < 0) snapshot.entries.push(next);
+  else snapshot.entries[index] = next;
+  return;
+}
+
+function importLayoutHost(
+  snapshot: WorkspaceLayoutSnapshot,
+  mutation: Extract<WorkspaceLayoutMutation, { kind: "import-host" }>,
+  revision: number,
+) {
+  if (snapshot.stamp.phase !== "importing") throw new WorkspaceLayoutRefusal("import_closed");
+  const previous = snapshot.imports.find((source) => source.serverId === mutation.source.serverId);
+  if ((previous?.sourceSha256 ?? null) !== mutation.previousSourceSha256)
+    throw new WorkspaceLayoutRefusal("stale_import_source");
+  if (mutation.entries.some((entry) => entry.ref.serverId !== mutation.source.serverId))
+    throw new WorkspaceLayoutRefusal("import_host_mismatch");
+  const old = snapshot.entries.filter((entry) => entry.ref.serverId === mutation.source.serverId);
+  const keys = new Set(mutation.entries.map((entry) => workspaceReferenceKey(entry.ref)));
+  if (old.some((entry) => !keys.has(workspaceReferenceKey(entry.ref))))
+    throw new WorkspaceLayoutRefusal("import_drops_existing_workspace");
+  snapshot.entries = snapshot.entries.filter(
+    (entry) => entry.ref.serverId !== mutation.source.serverId,
+  );
+  snapshot.entries.push(...mutation.entries.map((entry) => Object.assign({}, entry, { revision })));
+  snapshot.imports = snapshot.imports.filter(
+    (source) => source.serverId !== mutation.source.serverId,
+  );
+  snapshot.imports.push(mutation.source);
+  return;
+}
+
+function activateLayout(
+  snapshot: WorkspaceLayoutSnapshot,
+  mutation: Extract<WorkspaceLayoutMutation, { kind: "activate" }>,
+) {
+  if (snapshot.stamp.phase !== "importing") throw new WorkspaceLayoutRefusal("already_active");
+  const required = new Set(mutation.requiredImports.map((source) => source.serverId));
+  if (
+    required.size !== mutation.requiredImports.length ||
+    required.size !== snapshot.imports.length ||
+    mutation.requiredImports.some(
+      (source) =>
+        !snapshot.imports.some(
+          (imported) => canonicalLayoutJson(imported) === canonicalLayoutJson(source),
+        ),
+    )
+  )
+    throw new WorkspaceLayoutRefusal("import_manifest_mismatch");
+  assertClientSources(
+    mutation.requiredClientImports ?? [],
+    (snapshot.clientImports ?? []).map((input) => input.source),
+  );
+  snapshot.stamp.phase = "active";
+  return;
+}
+
+function importLayoutClient(
+  snapshot: WorkspaceLayoutSnapshot,
+  mutation: Extract<WorkspaceLayoutMutation, { kind: "import-client" }>,
+) {
+  if (snapshot.stamp.phase !== "importing") throw new WorkspaceLayoutRefusal("import_closed");
+  const clients = snapshot.clientImports ?? [];
+  const prior = clients.find((input) => input.source.sourceId === mutation.input.source.sourceId);
+  if ((prior?.source.sourceSha256 ?? null) !== mutation.previousSourceSha256)
+    throw new WorkspaceLayoutRefusal("stale_client_import_source");
+  snapshot.clientImports = clients.filter(
+    (input) => input.source.sourceId !== mutation.input.source.sourceId,
+  );
+  snapshot.clientImports.push(mutation.input);
+  return;
+}
+
+function putNavigation(
+  snapshot: WorkspaceLayoutSnapshot,
+  mutation: Extract<WorkspaceLayoutMutation, { kind: "put-navigation" }>,
+) {
+  const prior = snapshot.navigation;
+  if ((prior?.revision ?? 0) !== mutation.expectedRevision)
+    throw new WorkspaceLayoutRefusal("stale_navigation_revision");
+  let resolution = prior;
+  if (snapshot.stamp.phase === "importing") {
+    if (!mutation.importResolution)
+      throw new WorkspaceLayoutRefusal("navigation_import_resolution_required");
+    assertClientSources(
+      mutation.importResolution.clientSources,
+      (snapshot.clientImports ?? []).map((input) => input.source),
+    );
+    resolution = {
+      revision: 0,
+      preferences: mutation.preferences,
+      ...mutation.importResolution,
+    };
+  } else if (!resolution || mutation.importResolution) {
+    throw new WorkspaceLayoutRefusal("navigation_import_closed");
+  }
+  snapshot.navigation = {
+    ...resolution,
+    revision: (prior?.revision ?? 0) + 1,
+    preferences: mutation.preferences,
+  };
+  return;
+}
+
+function assertClientSources(
+  expected: NonNullable<WorkspaceLayoutSnapshot["navigation"]>["clientSources"],
+  actual: NonNullable<WorkspaceLayoutSnapshot["navigation"]>["clientSources"],
+): void {
+  const byId = new Map(actual.map((source) => [source.sourceId, source]));
+  if (
+    byId.size !== actual.length ||
+    new Set(expected.map((source) => source.sourceId)).size !== expected.length ||
+    expected.length !== actual.length ||
+    expected.some(
+      (source) => canonicalLayoutJson(source) !== canonicalLayoutJson(byId.get(source.sourceId)),
+    )
+  )
+    throw new WorkspaceLayoutRefusal("client_import_manifest_mismatch");
 }
 
 function layoutSection(entry: WorkspaceLayoutEntry): string {
@@ -317,6 +405,44 @@ export function validateLayoutGraph(snapshot: WorkspaceLayoutSnapshot): void {
   }
   assertAcyclic(structural);
   assertAcyclic(navigation);
+  validateNavigation(snapshot, entries);
+}
+
+function validateNavigation(
+  snapshot: WorkspaceLayoutSnapshot,
+  entries: Map<string, WorkspaceLayoutEntry>,
+): void {
+  if (snapshot.stamp.phase === "active") {
+    if (!snapshot.navigation) throw new WorkspaceLayoutRefusal("navigation_not_resolved");
+    if (!snapshot.navigation.preferences.workspaceSort)
+      throw new WorkspaceLayoutRefusal("global_sort_not_resolved");
+    assertClientSources(
+      snapshot.navigation.clientSources,
+      (snapshot.clientImports ?? []).map((input) => input.source),
+    );
+  }
+  const unique = (keys: string[]) => {
+    if (new Set(keys).size !== keys.length)
+      throw new WorkspaceLayoutRefusal("duplicate_navigation_reference");
+  };
+  const validate = (
+    preferences: NonNullable<WorkspaceLayoutSnapshot["navigation"]>["preferences"],
+  ) => {
+    unique(preferences.projectOrder);
+    const orders = [
+      preferences.pinnedWorkspaceOrder,
+      preferences.superpinnedWorkspaceOrder,
+      ...Object.values(preferences.workspaceOrderByProject),
+    ];
+    for (const keys of orders) {
+      unique(keys);
+      for (const key of keys)
+        findParent(parseWorkspaceNavigationKey(key), entries, snapshot.stamp.phase);
+    }
+  };
+  if (snapshot.navigation) validate(snapshot.navigation.preferences);
+  // Retained client imports are provenance, including obsolete/dormant refs.
+  // Only explicitly resolved navigation and entry links affect the live view.
 }
 
 function structuralParent(
