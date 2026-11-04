@@ -234,6 +234,14 @@ export class InMemoryAgentTimelineStore {
     return state.projection.getLastItem(state.nextSeq - 1);
   }
 
+  getLastConversationItem(agentId: string): AgentTimelineItem | null {
+    return (
+      this.requireState(agentId).projection.findLastRow(
+        (row) => row.item.type === "user_message" || row.item.type === "assistant_message",
+      )?.item ?? null
+    );
+  }
+
   getLastAssistantMessageSegment(agentId: string): string | null {
     return this.requireState(agentId).projection.getLastAssistantMessageSegment();
   }

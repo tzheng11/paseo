@@ -1,0 +1,4776 @@
+interface IdentifierShape {
+  alphabetic: number;
+  wordCharacters: number;
+  wordRuns: number;
+  shortRuns: number;
+  longNaturalWord: boolean;
+  technical: boolean;
+  digitRuns: number;
+  doubleDigitRun: boolean;
+  naturalWords: number;
+}
+
+function isTechnicalRun(run: string, vowels: number, adjacentDigit: boolean): boolean {
+  const abbreviation =
+    adjacentDigit &&
+    run.length <= 4 &&
+    (/^[A-Z]+$/.test(run) || /^[A-Z][a-z]{1,3}$/.test(run) || run.length <= 3);
+  const syllabic =
+    /^[A-Z]?[a-z]+$/.test(run) &&
+    run.length >= 2 &&
+    vowels / run.length >= 0.15 &&
+    vowels / run.length <= 0.85;
+  return abbreviation || syllabic;
+}
+
+function observeWord(run: string, adjacentDigit: boolean, shape: IdentifierShape): void {
+  shape.alphabetic += run.length;
+  const vowels = run.match(/[aeiouy]/gi)?.length ?? 0;
+  const wordlike = run.length >= 3 && vowels > 0 && vowels / run.length <= 0.75;
+  if (wordlike) {
+    shape.wordCharacters += run.length;
+    shape.wordRuns += 1;
+  } else shape.shortRuns += 1;
+  const natural = /^[A-Z]?[a-z]+$/.test(run) && run.length >= 3 && vowels >= 2;
+  if (natural) {
+    shape.naturalWords += 1;
+    if (run.length >= 6) shape.longNaturalWord = true;
+  }
+  if (!isTechnicalRun(run, vowels, adjacentDigit)) shape.technical = false;
+}
+
+function measureIdentifier(runs: string[]): IdentifierShape {
+  const shape: IdentifierShape = {
+    alphabetic: 0,
+    wordCharacters: 0,
+    wordRuns: 0,
+    shortRuns: 0,
+    longNaturalWord: false,
+    technical: true,
+    digitRuns: 0,
+    doubleDigitRun: false,
+    naturalWords: 0,
+  };
+  for (const [index, run] of runs.entries()) {
+    if (/^\d+$/.test(run)) {
+      shape.digitRuns += 1;
+      if (run.length === 2) shape.doubleDigitRun = true;
+      if (run.length > 2) shape.technical = false;
+    } else if (/[A-Za-z]/.test(run)) {
+      const adjacentDigit =
+        /^\d+$/.test(runs[index - 1] ?? "") || /^\d+$/.test(runs[index + 1] ?? "");
+      observeWord(run, adjacentDigit, shape);
+    }
+  }
+  return shape;
+}
+
+function isSyllabicDigitWord(run: string, vowels: number): boolean {
+  return /^[A-Z]?[a-z]+$/.test(run) && run.length >= 2 && vowels > 0 && vowels / run.length <= 0.75;
+}
+
+function isCompactDigitAbbreviation(run: string): boolean {
+  return run.length <= 4 && (/^[A-Z]+$/.test(run) || /^[A-Z][a-z]{1,3}$/.test(run));
+}
+
+interface DigitWordShape {
+  alphabetic: number;
+  naturalLetters: number;
+  naturalWords: number;
+  longWord: boolean;
+  digits: number;
+  taggedDigits: boolean;
+  acronyms: number;
+  maxAcronym: number;
+}
+
+function hasStrongDigitWordShape(shape: DigitWordShape): boolean {
+  if (shape.digits > 2) return false;
+  const naturalRatio = shape.naturalLetters / shape.alphabetic;
+  if (naturalRatio >= 0.95 && shape.longWord) return true;
+  const compactTag =
+    shape.digits === 1 && shape.taggedDigits && shape.acronyms <= 1 && shape.maxAcronym <= 2;
+  const words = shape.naturalWords >= 3 || (shape.longWord && shape.naturalWords >= 2);
+  return compactTag && naturalRatio >= 0.8 && words;
+}
+
+function isNumericWordTag(runs: string[], index: number): boolean {
+  return (
+    index >= 2 &&
+    (runs[index]?.length ?? 0) <= 2 &&
+    /^[A-Z]{1,2}$/.test(runs[index - 1] ?? "") &&
+    /^[A-Z][a-z]+$/.test(runs[index + 1] ?? "")
+  );
+}
+
+function hasStructuredDigitWords(runs: string[]): boolean {
+  const shape: DigitWordShape = {
+    alphabetic: 0,
+    naturalLetters: 0,
+    naturalWords: 0,
+    longWord: false,
+    digits: 0,
+    taggedDigits: false,
+    acronyms: 0,
+    maxAcronym: 0,
+  };
+  for (const [index, run] of runs.entries()) {
+    if (/^\d+$/.test(run)) {
+      shape.digits += 1;
+      if (isNumericWordTag(runs, index)) shape.taggedDigits = true;
+      continue;
+    }
+    if (!/[A-Za-z]/.test(run)) continue;
+    shape.alphabetic += run.length;
+    const vowels = run.match(/[aeiouy]/gi)?.length ?? 0;
+    const previousDigit = /^\d+$/.test(runs[index - 1] ?? "");
+    if (previousDigit && /^[a-z]/.test(run)) return false;
+    if (isSyllabicDigitWord(run, vowels)) {
+      shape.naturalLetters += run.length;
+      if (run.length >= 3) shape.naturalWords += 1;
+      if (run.length >= 6 && vowels >= 2) shape.longWord = true;
+    } else {
+      const adjacentDigit = previousDigit || /^\d+$/.test(runs[index + 1] ?? "");
+      const initial = index === 0 && /^[A-Z]$/.test(run);
+      if (!(initial || (adjacentDigit && isCompactDigitAbbreviation(run)))) return false;
+      shape.acronyms += 1;
+      shape.maxAcronym = Math.max(shape.maxAcronym, run.length);
+    }
+  }
+  return hasStrongDigitWordShape(shape);
+}
+
+function hasCoherentLetterCase(runs: string[]): boolean {
+  let natural = 0;
+  for (const [index, run] of runs.entries()) {
+    if (/^[_$]+$/.test(run)) continue;
+    if (/^[A-Z]?[a-z]+$/.test(run) && run.length >= 2) natural += 1;
+    else if (/^[A-Z]{2,5}$/.test(run)) continue;
+    else {
+      const terminalUnit =
+        index === runs.length - 1 &&
+        /^[A-Z]$/.test(run) &&
+        /^[A-Z][a-z]$/.test(runs[index - 1] ?? "") &&
+        natural >= 3;
+      if (!terminalUnit) return false;
+    }
+  }
+  return natural >= 2;
+}
+
+function hasTechnicalNumericLayout(name: string): boolean {
+  // Dimension tags, standards numbers, dated model versions, and compact machine-size tags.
+  // Every route requires complete case-delimited words around the numeric notation.
+  const dimension = /^[A-Z][a-z]{3,}\d{1,2}[a-z]\d{1,2}(?:[A-Z][a-z]{2,}){2,}$/.test(name);
+  const standard = /^[a-z]\d{3}(?:[A-Z][a-z]{1,}){2,}\d{1,2}[A-Z][a-z]{3,}$/.test(name);
+  const machineTag =
+    /^[A-Z]{2,3}\d{1,2}(?:[A-Z][a-z]{3,}){2,}[A-Z]\d{1,2}[a-z]{2}[A-Z](?:[A-Z][a-z]{3,})+$/.test(
+      name,
+    );
+  const datedTag = /^[A-Z][a-z]{2,}\d[a-z][A-Z][a-z]{2,}(?:19|20)\d{6}[A-Z][a-z]{3,}$/.test(name);
+  return dimension || standard || machineTag || datedTag;
+}
+
+function hasStructuredNumericLayout(name: string): boolean {
+  const shortPrefix = /^[a-z]{1,2}[A-Z][a-z]{2,}\d{2}(?:[A-Z][a-z]{2,}){2,}$/.test(name);
+  const embeddedInitialism = /^[a-z]{6,}[A-Z][A-Z][a-z]{2,}\d{1,2}[A-Z][a-z]{5,}$/.test(name);
+  if (shortPrefix || embeddedInitialism) return true;
+  if (!/^[A-Za-z]\d{3}(?:[A-Z][a-z]{2,}){2,}$/.test(name)) return false;
+  const words = name.slice(4).match(/[A-Z][a-z]+/g) ?? [];
+  const letters = words.reduce((sum, word) => sum + word.length, 0);
+  return letters >= 12 && (words.length >= 3 || words.some((word) => word.length >= 8));
+}
+
+function hasWordlikeIdentifierShape(name: string, shape: IdentifierShape): boolean {
+  const minimumLetters = name.length < 16 ? 6 : 12;
+  if (shape.alphabetic < minimumLetters) return false;
+  const words =
+    shape.wordCharacters / shape.alphabetic >= 0.8 && shape.shortRuns <= 3 && shape.longNaturalWord;
+  const shortCamel =
+    name.length < 16 &&
+    shape.wordRuns >= 2 &&
+    shape.wordCharacters === shape.alphabetic &&
+    shape.shortRuns === 0;
+  const compactNumbers = shape.digitRuns === 1 || (shape.digitRuns === 2 && shape.doubleDigitRun);
+  const technical = shape.technical && compactNumbers && shape.naturalWords >= 1;
+  return words || shortCamel || technical;
+}
+
+/**
+ * Camel/acronym boundaries must form vowel-bearing word runs, rather than merely contain two
+ * chance capitalized fragments. Short digit-bearing encoding/type names use a separate structural
+ * route: one or two compact numeric tags surrounded entirely by syllabic words or adjacent acronyms.
+ * Long digit-bearing names require at most two numeric tags and complete syllabic case runs.
+ * The main route requires 95% syllabic letters and a six-letter run with two vowels; a single
+ * compact uppercase numeric tag surrounded by multiple complete words may use 80% syllabic letters.
+ * Explicit file extensions retain the ordinary filename treatment.
+ * This uses no vocabulary, source-name allowlist, or repository data at runtime.
+ */
+export function isWordlikeIdentifier(value: string): boolean {
+  const name = value.replace(/\.[A-Za-z]{1,8}$/, "");
+  if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name)) return false;
+  // Uppercase underscore-separated constants encode word boundaries explicitly.
+  if (/^[A-Z_$][A-Z0-9_$]*_[A-Z0-9_$]+$/.test(name)) return true;
+  if (hasTechnicalNumericLayout(name)) return true;
+  const runs = name.match(/[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\d|[_$]|$)|\d+|[_$]+/g);
+  if (!runs || runs.join("") !== name) return false;
+  if (!/\d/.test(name) && hasCoherentLetterCase(runs)) return true;
+  if (
+    name === value &&
+    name.length >= 16 &&
+    /\d/.test(name) &&
+    !hasStructuredDigitWords(runs) &&
+    !hasStructuredNumericLayout(name)
+  )
+    return false;
+  const shape = measureIdentifier(runs);
+  return hasWordlikeIdentifierShape(name, shape);
+}
+
+function isStrictNaturalIdentifierWord(run: string): boolean {
+  const vowelRatio = (run.match(/[aeiou]/gi)?.length ?? 0) / run.length;
+  return /^(?:[A-Z][a-z]{3,}|[a-z]{4,})$/.test(run) && vowelRatio >= 0.25 && vowelRatio <= 0.6;
+}
+
+function hasStrictIdentifierWordBalance(
+  digitRuns: number,
+  natural: number,
+  longNatural: number,
+  ratio: number,
+): boolean {
+  return digitRuns >= 1 && digitRuns <= 2 && natural >= 4 && longNatural >= 2 && ratio >= 0.8;
+}
+
+/** Narrow numeric-tag route for chat/source identifiers; neutral answers keep their stricter gate. */
+function isStrictWordlikeIdentifier(value: string): boolean {
+  if (isWordlikeIdentifier(value)) return true;
+  if (value.length < 32 || !/^[A-Za-z][A-Za-z0-9]*$/.test(value)) return false;
+  const runs = value.match(/[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\d|$)|\d+/g);
+  if (!runs || runs.join("") !== value) return false;
+  let digitRuns = 0;
+  let letters = 0;
+  let natural = 0;
+  let naturalLetters = 0;
+  let longNatural = 0;
+  for (const [index, run] of runs.entries()) {
+    if (/^\d+$/.test(run)) {
+      if (run.length > 3) return false;
+      digitRuns += 1;
+      continue;
+    }
+    letters += run.length;
+    if (isStrictNaturalIdentifierWord(run)) {
+      natural += 1;
+      naturalLetters += run.length;
+      if (run.length >= 6) longNatural += 1;
+      continue;
+    }
+    const adjacentDigit = /^\d/.test(runs[index - 1] ?? "") || /^\d/.test(runs[index + 1] ?? "");
+    if (!adjacentDigit || run.length > 4) return false;
+  }
+  return hasStrictIdentifierWordBalance(digitRuns, natural, longNatural, naturalLetters / letters);
+}
+
+const CASE_INSENSITIVE_CREDENTIAL_NOUN =
+  /\b(?:passwords?|passwds?|pwds?|passphrases?|pass[ ]?codes?|credentials?|pin (?:codes?|numbers?)|your pins?|2fa|otp|mfa|totp|one time codes?|(?:verification|recovery|backup|authenticator(?: app)?) codes?|codes? (?:from|in) (?:your |the )?authenticator(?: app)?|\d+ digit codes?|(?:api|secret|access|private|hmac|signing|encryption|ssh|service account) keys?|(?:api|access|auth(?:entication)?|bearer|refresh|session|ssh|secret) tokens?)\b/i;
+const UPPERCASE_PIN_NOUN = /\bPINs?\b/;
+const BARE_CREDENTIAL_ENDING = new RegExp(
+  `(?:${CASE_INSENSITIVE_CREDENTIAL_NOUN.source}|\\bPINs?\\b|\\bsecrets?\\b|\\bpass\\b)$`,
+  "i",
+);
+const CREDENTIAL_VALUE_VERB =
+  /^(?:please\s+)?(?:provide|enter|paste|send|share|give|type|supply|input|need|tell me)\b/i;
+const MODAL_CREDENTIAL_VALUE_VERB =
+  /^(?:can|could|would|will|may)\s+(?:you|i|we)\s+(?:please\s+)?(?:provide|enter|paste|send|share|give|type|supply|input|have|tell me)\b/i;
+const SECRET_NOUN_PREFIX =
+  /\b(?:the|your|my|our|their|his|her|its|a|an|webhook|signing|shared|app|jwt|client|api)\s*$/i;
+const SECRET_NOUN_FOLLOWER =
+  /^\s+(?:is|are|was|were|for|to|from|of|in|on|please|now|below|here|when|that|you|we|i)\b/i;
+
+function normalizeCredentialQuestion(context: string): string {
+  return context
+    .replace(/\bAPIKEY(S?)\b/gi, "API KEY$1")
+    .replace(/([A-Z])(?=[A-Z][a-z])/g, "$1 ")
+    .replace(/([a-z\d])([A-Z])/g, "$1 $2")
+    .replace(/[_-]+/g, " ")
+    .replace(/\bAPIKEY(S?)\b/gi, "API KEY$1")
+    .replace(/\b2 FA\b/gi, "2FA");
+}
+
+function credentialRequestSentences(context: string): string[] {
+  return context.split(/[.!?\n]+/).map((sentence) => sentence.trim());
+}
+
+function hasCredentialValueRequestSyntax(sentence: string): boolean {
+  if (CREDENTIAL_VALUE_VERB.test(sentence) || MODAL_CREDENTIAL_VALUE_VERB.test(sentence))
+    return true;
+  if (/^(?:i|we)\s+(?:really\s+)?need\b/i.test(sentence)) return true;
+  if (/^what(?:'s|\s+is|\s+are)\s+(?!a\s|an\s)/i.test(sentence)) return true;
+  if (/^what\s+.*\bshould i use\b/i.test(sentence)) return true;
+  return /[,;:]\s*(?:please\s+)?(?:provide|enter|paste|send|share|give|type|supply|input|need|tell me)\b/i.test(
+    sentence,
+  );
+}
+
+function hasStandaloneSecretNoun(context: string): boolean {
+  for (const sentence of credentialRequestSentences(context)) {
+    const asksForValue = hasCredentialValueRequestSyntax(sentence);
+    for (const match of sentence.matchAll(/\bsecrets?\b/gi)) {
+      const after = sentence.slice(
+        match.index + match[0].length,
+        match.index + match[0].length + 128,
+      );
+      // A following ordinary word makes "secret" an adjective (secret store/name/scanning, etc.).
+      if (/^\s+[A-Za-z]/.test(after) && !SECRET_NOUN_FOLLOWER.test(after)) continue;
+      const before = sentence.slice(Math.max(0, match.index - 128), match.index);
+      if (SECRET_NOUN_PREFIX.test(before) || match.index === 0 || asksForValue) return true;
+    }
+  }
+  return false;
+}
+
+function hasPassValueNoun(context: string): boolean {
+  if (/^\s*pass\s*[:?]?\s*$/i.test(context)) return true;
+  return credentialRequestSentences(context).some(
+    (sentence) => /\bpass\b/i.test(sentence) && hasCredentialValueRequestSyntax(sentence),
+  );
+}
+
+/** Structured questions use normalized credential nouns independently of request wording. */
+export function requestsCredential(context: string): boolean {
+  const normalized = normalizeCredentialQuestion(context);
+  return (
+    CASE_INSENSITIVE_CREDENTIAL_NOUN.test(normalized) ||
+    UPPERCASE_PIN_NOUN.test(normalized) ||
+    hasStandaloneSecretNoun(normalized) ||
+    hasPassValueNoun(normalized)
+  );
+}
+
+function isBareCredentialLabel(context: string): boolean {
+  const label = context
+    .trim()
+    .replace(/[?:.,;]+$/, "")
+    .replace(/\s*\(optional\)\s*$/i, "")
+    .replace(/\s+(?:optional|please)\s*$/i, "")
+    .replace(/[?:.,;]+$/, "")
+    .trim();
+  if (!label || label.split(/\s+/).length > 10) return false;
+  if (/\b(?:is|are|was|were|has|have|had|will|should|could|would|must|does|did|do)\b/i.test(label))
+    return false;
+  if (/^(?:i|we|they|he|she|it|done|fixed|updated|added|reset|rotate|check)\b/i.test(label))
+    return false;
+  const ending = label.replace(/\s+(?:for|of|on)\s+.*$/i, "");
+  if (
+    /\b(?:needed|required|validation|format|manager|management|reset|bug|code\s+changes?)$/i.test(
+      ending,
+    )
+  )
+    return false;
+  return BARE_CREDENTIAL_ENDING.test(ending) && requestsCredential(ending);
+}
+
+/** Chat needs an actual value request sentence or a final credential field label. */
+export function endsWithCredentialRequest(context: string): boolean {
+  const normalized = normalizeCredentialQuestion(context);
+  for (const sentence of credentialRequestSentences(normalized)) {
+    if (requestsCredential(sentence) && hasCredentialValueRequestSyntax(sentence)) return true;
+  }
+  const lastLine = normalized.trim().split(/\n/).at(-1) ?? "";
+  return isBareCredentialLabel(lastLine);
+}
+
+/** The entire answer is withheld so a matched prefix cannot leave a secret's suffix behind. */
+export const SECRET_ANSWER_NOTICE =
+  "[redacted:secret] This answer was withheld because it may contain a secret. Use a secret store instead.";
+
+const MAX_NORMALIZATION_PASSES = 16;
+
+const LITERAL_PATTERNS: readonly RegExp[] = [
+  /\bGOOG[0-9A-Z]{12,}\b/,
+  /\b(?:AKIA|ASIA)[0-9A-Z]{12,}\b/,
+  /\bya29\.[A-Za-z0-9._-]{20,}/,
+  /\bsk-ant-[A-Za-z0-9._-]{20,}/,
+  /(?<![A-Za-z0-9])sk-(?:(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,512}|(?:[A-Za-z0-9]{1,16}-(?=[A-Za-z0-9_-]{40}))?[A-Za-z0-9]{20,512}[A-Za-z0-9_-]{0,512})/,
+  /(?<![A-Za-z0-9])impr_(?:mcp|oat)_[A-Za-z0-9_-]{16,512}/,
+  /\b(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,})\b/,
+  /\bdtn_[A-Za-z0-9]{16,}\b/,
+  /\bxox[baprs]-[A-Za-z0-9-]{16,}/,
+  /\b(?:sk_(?:live|test)_|rk_(?:(?:live|test)_)?)[A-Za-z0-9_]{16,}/,
+  /\bnpm_[A-Za-z0-9]{16,}/,
+  /\bAIza[A-Za-z0-9_-]{30,}/,
+  /\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}/,
+  /\b(?:re_|sntrys_|sntryu_)[A-Za-z0-9_]{16,}/,
+  /(?<![A-Za-z0-9_])[a-z]+_[\da-fA-F]{32,}(?![A-Za-z0-9_])/,
+  /\bglpat-[A-Za-z0-9_-]{16,}/,
+  /\bhf_[A-Za-z0-9_-]{16,}/,
+  /https:\/\/hooks\.slack\.com\/services\/T[A-Z0-9]{6,}\/B[A-Z0-9]{6,}\/[A-Za-z0-9_-]{16,}/,
+];
+
+const JWT_PATTERN =
+  /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,4096}\.(?:[A-Za-z0-9_-]{1,4096}|(?=\.[A-Za-z0-9_-]{1}))(?:\.[A-Za-z0-9_-]{0,4096}){0,3}/;
+
+// The same authorization schemes can be pasted without their HTTP header name.
+
+const HEX_LENGTHS = new Set([7, 8, 12, 32, 40, 64, 96, 128]);
+
+const UUID_PATTERN = /^[\da-f]{8}-(?:[\da-f]{4}-){3}[\da-f]{12}$/i;
+
+const ENCODED_CHARACTER_PATTERN =
+  /%((?:25)*[\da-f]{2})|\\u([\da-f]{4})|\\x([\da-f]{2})|&#x([\da-f]{1,6});?|&#(\d{1,7});?|&(colon|equals|quot|apos);|\\([\\"'/nrt_*~-])/gi;
+export interface SecretPromptSpan {
+  start: number;
+  end: number;
+}
+interface DetectionView {
+  text: string;
+  starts?: number[];
+  ends?: number[];
+}
+
+function decodeView(value: string): string {
+  return value.replace(
+    ENCODED_CHARACTER_PATTERN,
+    (
+      match,
+      percent: string | undefined,
+      unicode: string | undefined,
+      hexadecimal: string | undefined,
+      entityHex: string | undefined,
+      entityDecimal: string | undefined,
+      entityName: string | undefined,
+      escaped: string | undefined,
+    ) => {
+      const hex = percent ?? unicode ?? hexadecimal ?? entityHex;
+      if (hex !== undefined) {
+        const digits = percent === undefined ? hex : percent.slice(-2);
+        return String.fromCharCode(Number.parseInt(digits, 16));
+      }
+      if (entityDecimal !== undefined) {
+        return String.fromCharCode(Number.parseInt(entityDecimal, 10));
+      }
+      switch (entityName?.toLowerCase()) {
+        case "colon":
+          return ":";
+        case "equals":
+          return "=";
+        case "quot":
+          return '"';
+        case "apos":
+          return "'";
+      }
+      switch (escaped) {
+        case "n":
+        case "r":
+        case "t":
+          return " ";
+        case undefined:
+          return match;
+        default:
+          return escaped;
+      }
+    },
+  );
+}
+
+function decodeMappedView(view: DetectionView): DetectionView {
+  const matches = [...view.text.matchAll(ENCODED_CHARACTER_PATTERN)];
+  if (matches.length === 0) return view;
+  const chunks: string[] = [];
+  const starts: number[] = [];
+  const ends: number[] = [];
+  let cursor = 0;
+  function appendPlain(end: number): void {
+    chunks.push(view.text.slice(cursor, end));
+    for (; cursor < end; cursor += 1) {
+      starts.push(view.starts?.[cursor] ?? cursor);
+      ends.push(view.ends?.[cursor] ?? cursor + 1);
+    }
+  }
+  for (const match of matches) {
+    appendPlain(match.index);
+    const decoded = decodeView(match[0]);
+    const end = match.index + match[0].length;
+    chunks.push(decoded);
+    for (let index = 0; index < decoded.length; index += 1) {
+      starts.push(view.starts?.[match.index] ?? match.index);
+      ends.push(view.ends?.[end - 1] ?? end);
+    }
+    cursor = end;
+  }
+  appendPlain(view.text.length);
+  return { text: chunks.join(""), starts, ends };
+}
+
+function detectionView(text: string): DetectionView {
+  let view: DetectionView = { text };
+  for (let pass = 0; pass < MAX_NORMALIZATION_PASSES; pass += 1) {
+    const decoded = decodeMappedView(view);
+    if (decoded === view) break;
+    view = decoded;
+  }
+  return view;
+}
+
+function isOpaqueCharacter(character: string): boolean {
+  return /^[A-Za-z0-9+/=_.%~-]$/.test(character);
+}
+
+function isLiteralCharacter(view: DetectionView | undefined, index: number): boolean {
+  const start = view?.starts?.[index];
+  const end = view?.ends?.[index];
+  return start === undefined || end === start + 1;
+}
+
+function endOfOpaqueValue(text: string, start: number, view?: DetectionView): number {
+  let end = start;
+  while (end < text.length && (isOpaqueCharacter(text[end]!) || !isLiteralCharacter(view, end)))
+    end += 1;
+  while (end > start && text[end - 1] === ".") end -= 1;
+  return end;
+}
+
+function literalSpans(text: string, pattern: RegExp, view?: DetectionView): SecretPromptSpan[] {
+  const spans: SecretPromptSpan[] = [];
+  const scanner = new RegExp(pattern.source, "g" + (pattern.ignoreCase ? "i" : ""));
+  let match: RegExpExecArray | null;
+  while ((match = scanner.exec(text)) !== null) {
+    let end = endOfOpaqueValue(text, match.index + match[0].length, view);
+    while (end > match.index && text[end - 1] === ".") end -= 1;
+    spans.push({ start: match.index, end });
+    scanner.lastIndex = end;
+  }
+  return spans;
+}
+
+function tokenCharacter(character: string | undefined): boolean {
+  return character !== undefined && /[A-Za-z0-9._/+=-]/.test(character);
+}
+
+/**
+ * Match a known literal whose opaque value continues over exactly one LF/CRLF.
+ * Every byte on the continuation line must belong to the token alphabet. The
+ * result uses offsets in the supplied text, including the removed line ending.
+ */
+function wrappedMatchStart(joined: string, firstLength: number, scanners: RegExp[]): number | null {
+  let selectedStart: number | null = null;
+  for (const scanner of scanners) {
+    scanner.lastIndex = 0;
+    for (let match = scanner.exec(joined); match; match = scanner.exec(joined)) {
+      if (match.index >= firstLength) break;
+      if (match[0].length === 0) {
+        scanner.lastIndex += 1;
+        continue;
+      }
+      let end = match.index + match[0].length;
+      // A fixed-width provider pattern can finish before the physical wrap;
+      // extend only through the same opaque token, never through prose.
+      while (tokenCharacter(joined[end])) end += 1;
+      scanner.lastIndex = Math.max(scanner.lastIndex, end);
+      if (end !== joined.length) continue;
+      selectedStart = selectedStart === null ? match.index : Math.min(selectedStart, match.index);
+    }
+  }
+  return selectedStart;
+}
+
+function isWrappedTokenLine(text: string, start: number, end: number): boolean {
+  if (start >= end) return false;
+  for (let index = start; index < end; index += 1) {
+    if (!tokenCharacter(text[index])) return false;
+  }
+  return true;
+}
+
+function continuedWrappedTokenEnd(text: string, start: number): number {
+  let end = start;
+  while (end < text.length && (text[end] === "\r" || text[end] === "\n")) {
+    let nextStart = end;
+    if (text[nextStart] === "\r") nextStart += 1;
+    if (text[nextStart] === "\n") nextStart += 1;
+    let nextEnd = nextStart;
+    while (nextEnd < text.length && tokenCharacter(text[nextEnd])) nextEnd += 1;
+    if (
+      nextEnd === nextStart ||
+      (nextEnd < text.length && text[nextEnd] !== "\n" && text[nextEnd] !== "\r")
+    )
+      break;
+    end = nextEnd;
+  }
+  return end;
+}
+
+function wrappedLiteralPair(
+  text: string,
+  firstStart: number,
+  firstEnd: number,
+  secondStart: number,
+  secondEnd: number,
+  scanners: RegExp[],
+): SecretPromptSpan | null {
+  if (firstStart >= firstEnd || !isWrappedTokenLine(text, secondStart, secondEnd)) return null;
+  // Known prefixes are short; inspect only the suffix adjacent to this wrap.
+  // A continuation may be arbitrarily long, but its alphabet was checked once.
+  const boundedFirstStart = Math.max(firstStart, firstEnd - 4096);
+  const first = text.slice(boundedFirstStart, firstEnd);
+  const joined = first + text.slice(secondStart, Math.min(secondEnd, secondStart + 4096));
+  const selectedStart = wrappedMatchStart(joined, first.length, scanners);
+  if (selectedStart === null) return null;
+  return { start: boundedFirstStart + selectedStart, end: secondEnd };
+}
+
+function wrappedLiteralSpans(text: string, patterns: readonly RegExp[]): SecretPromptSpan[] {
+  const scanners = patterns.map(
+    // A terminal word boundary after a provider's maximum width must not make
+    // an opaque continuation disappear (for example GOOG{12,60} followed by
+    // more token bytes). Prefix boundaries remain intact.
+    (pattern) =>
+      new RegExp(pattern.source.replace(/\\b$/, ""), pattern.flags.replace(/[gy]/g, "") + "g"),
+  );
+  const spans: SecretPromptSpan[] = [];
+  let firstStart = 0;
+  let continuedEnd = 0;
+  while (firstStart < text.length) {
+    const newline = text.indexOf("\n", firstStart);
+    if (newline < 0) break;
+    const firstEnd = text[newline - 1] === "\r" ? newline - 1 : newline;
+    const secondStart = newline + 1;
+    const nextNewline = text.indexOf("\n", secondStart);
+    const rawSecondEnd = nextNewline < 0 ? text.length : nextNewline;
+    const secondEnd = text[rawSecondEnd - 1] === "\r" ? rawSecondEnd - 1 : rawSecondEnd;
+    const span = wrappedLiteralPair(text, firstStart, firstEnd, secondStart, secondEnd, scanners);
+    if (span) {
+      // Later pairs in the same token-only chain have the same final boundary.
+      if (span.end > continuedEnd) continuedEnd = continuedWrappedTokenEnd(text, span.end);
+      spans.push({ start: span.start, end: continuedEnd });
+    }
+    firstStart = secondStart;
+  }
+  return spans;
+}
+
+function privateKeySpans(text: string): SecretPromptSpan[] {
+  const spans: SecretPromptSpan[] = [];
+  const markers = /-----(BEGIN|END) [A-Z ]*PRIVATE KEY-----/g;
+  let opening: RegExpExecArray | undefined;
+  for (const marker of text.matchAll(markers)) {
+    if (marker[1] === "BEGIN") opening ??= marker;
+    else if (opening) {
+      spans.push({
+        start: opening.index,
+        end: marker.index + marker[0].length,
+      });
+      opening = undefined;
+    }
+  }
+  if (opening) {
+    const before = text.slice(text.lastIndexOf("\n", opening.index - 1) + 1, opening.index);
+    const after = text.slice(opening.index + opening[0].length);
+    const ownLine = /^\s{0,16}$/.test(before) && /^[ \t]{0,16}(?:\r?\n|$)/.test(after);
+    const keyBody = /^\s*[A-Za-z0-9+/=]{16}/.test(after);
+    if (ownLine || keyBody) {
+      spans.push({ start: opening.index, end: text.length });
+    }
+  }
+  return spans;
+}
+
+function entropyOf(value: string): number {
+  const frequencies = new Map<string, number>();
+  for (const character of value) frequencies.set(character, (frequencies.get(character) ?? 0) + 1);
+  let entropy = 0;
+  for (const count of frequencies.values()) {
+    const proportion = count / value.length;
+    entropy -= proportion * Math.log2(proportion);
+  }
+  return entropy;
+}
+
+function isKnownIdentifier(value: string): boolean {
+  return (
+    UUID_PATTERN.test(value) ||
+    /^\d{8}T\d{4}(?:\d{2})?Z$/.test(value) ||
+    /^(?:[A-Za-z]+)?[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}(?:[A-Za-z]+)?$/i.test(
+      value,
+    ) ||
+    (HEX_LENGTHS.has(value.length) && /^[\da-f]+$/i.test(value)) ||
+    /^[a-z]+_[\da-fA-F]{1,24}$/.test(value)
+  );
+}
+
+function isOrdinaryAnswerIdentifier(value: string): boolean {
+  if (isStrictWordlikeIdentifier(value)) return true;
+  return (
+    /^[a-z][a-z0-9]*(?:[-_.](?:[a-z][a-z0-9]*|\d+)){1,}$/.test(value) ||
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})$/.test(value) ||
+    /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/.test(value)
+  );
+}
+
+function isDelimitedIdentifier(value: string): boolean {
+  const parts = value.split(/[-_]/);
+  return (
+    parts.length >= 2 &&
+    parts.some((part) => /^[A-Za-z]{3,}$/.test(part)) &&
+    parts.every(
+      (part) =>
+        /^[A-Za-z]+$/.test(part) ||
+        /^[a-z0-9]+$/.test(part) ||
+        /^\d+$/.test(part) ||
+        isKnownIdentifier(part) ||
+        isWordlikeIdentifier(part) ||
+        /^[A-Za-z]{1,3}\d{1,6}$/.test(part),
+    )
+  );
+}
+
+function isWordlikePath(value: string): boolean {
+  if (isFortyCharacterBase64(value)) return false;
+  if (!value.includes("/")) return false;
+  const parts = value.split("/").filter((part) => part !== "");
+  const readableDirectory = /^(?:[a-z][a-z0-9_.-]*|[A-Z][a-z]{1,23})$/.test(parts[0] ?? "");
+  const filename = /\.[A-Za-z][A-Za-z0-9]{0,7}(?::\d+(?:-\d+)?)*$/.test(
+    parts[parts.length - 1] ?? "",
+  );
+  if (parts.every(isWordlikePathSegment)) return true;
+  if (!readableDirectory && !filename) return false;
+  // Two readable directories establish a local path even when generated filenames are opaque.
+  return (
+    filename &&
+    parts.length >= 3 &&
+    isWordlikePathSegment(parts[0]!) &&
+    isWordlikePathSegment(parts[1]!) &&
+    parts.every((part) => !/[+=]/.test(part))
+  );
+}
+
+function isSimpleLetterPath(value: string): boolean {
+  return (
+    !/[+\d]/.test(value) &&
+    value.includes("/") &&
+    value.split("/").every((part) => /^[A-Z]?[a-z]+$/.test(part))
+  );
+}
+
+function isFortyCharacterBase64(value: string): boolean {
+  return (
+    value.length === 40 &&
+    /[+/]/.test(value) &&
+    /^[A-Za-z0-9+/=]+$/.test(value) &&
+    /[A-Z]/.test(value) &&
+    /[a-z]/.test(value) &&
+    !isSimpleLetterPath(value)
+  );
+}
+
+function isWordlikePathSegment(part: string): boolean {
+  return (
+    /^@[a-z][a-z0-9._-]*$/.test(part) ||
+    isStrictWordlikeIdentifier(part) ||
+    /^[A-Z][a-z]{2,}\d{1,3}$/.test(part) ||
+    isDelimitedIdentifier(part) ||
+    isKnownIdentifier(part) ||
+    /^[A-Za-z]{1,24}$/.test(part) ||
+    /^[a-z0-9_.-]+$/.test(part) ||
+    /^[a-z][a-z0-9]*(?:-[a-z][a-z0-9]*){1,}-[A-Za-z0-9]+$/.test(part)
+  );
+}
+
+/** Merge a fixed number of sorted detector streams without sorting input-sized results. */
+function mergeSpans(streams: SecretPromptSpan[][]): SecretPromptSpan[] {
+  const indexes = streams.map(() => 0);
+  const merged: SecretPromptSpan[] = [];
+  while (true) {
+    let selected = -1;
+    let next: SecretPromptSpan | undefined;
+    for (const [index, stream] of streams.entries()) {
+      const span = stream[indexes[index]!];
+      if (span && (!next || span.start < next.start)) {
+        selected = index;
+        next = span;
+      }
+    }
+    if (!next) return merged;
+    indexes[selected]! += 1;
+    const previous = merged[merged.length - 1];
+    if (previous && next.start <= previous.end) previous.end = Math.max(previous.end, next.end);
+    else merged.push({ ...next });
+  }
+}
+
+function unwrapNeutralAnswer(text: string): string {
+  let start = 0;
+  let end = text.length;
+  while (start < end) {
+    while (start < end && /\s/.test(text[start]!)) start += 1;
+    while (end > start && /[\s.,;:!?]/.test(text[end - 1]!)) end -= 1;
+    const first = text[start];
+    const last = text[end - 1];
+    const quotes = first === "'" || first === '"' || first?.charCodeAt(0) === 96;
+    if ((quotes && first === last) || (first === "(" && last === ")")) {
+      start += 1;
+      end -= 1;
+    } else break;
+  }
+  return text.slice(start, end);
+}
+
+interface LabelledValue {
+  start: number;
+  end: number;
+  value: string;
+  tier: "password" | "credential";
+  copula: boolean;
+  comparison: boolean;
+  quoted: boolean;
+  openQuote: number | null;
+  mode: LabelValueMode;
+  quoteWidth: number;
+}
+
+type QuoteMayClose = (openIndex: number, closeIndex: number) => boolean;
+type LiteralDelimiter = (index: number) => boolean;
+type QuoteClass = (index: number) => number;
+
+const allQuotesMayClose: QuoteMayClose = () => true;
+const allLiteralDelimiters: LiteralDelimiter = () => true;
+const identityQuoteClass: QuoteClass = () => 1;
+type LabelValueMode = "label" | "shell" | "query" | "table";
+
+interface LabelOperator {
+  end: number;
+  comparison: boolean;
+  copula: boolean;
+  mode: LabelValueMode;
+}
+
+interface LocalCredentialValue {
+  start: number;
+  end: number;
+  next: number;
+  quoted: boolean;
+  closed: boolean;
+  value: string;
+  openQuote: number | null;
+  quoteWidth: number;
+}
+
+const LABEL_LOOKAHEAD_LIMIT = 4_096;
+const LABEL_PREFIX_WINDOW = 256;
+const LABEL_CANDIDATE = /[:=?!+|>\-(,]|\b(?:is|was|are|were)\b/gi;
+const LABEL_OPERATORS = new Set([
+  ":",
+  "=",
+  ":=",
+  "::",
+  "=>",
+  "->",
+  "?=",
+  "+=",
+  "||=",
+  "??=",
+  "==",
+  "===",
+  "!=",
+  "!==",
+]);
+const LABEL_COMPARISONS = new Set(["==", "===", "!=", "!=="]);
+const NON_CREDENTIAL_KEY_WORD =
+  /\b(?:storage|idempotency|cache|primary|foreign|public|sort|partition)\b/i;
+const VALUE_GROUP_OPENING = new Map([
+  ["\u0029", "("],
+  ["]", "["],
+  ["}", "{"],
+]);
+
+function labelWords(label: string): string[] {
+  return (
+    label
+      .replace(/([A-Z])(?=[A-Z][a-z])/g, "$1 ")
+      .replace(/([a-z\d])([A-Z])/g, "$1 $2")
+      .replace(/[_-]+/g, " ")
+      .replace(/\bAPIKEY(S?)\b/gi, "API KEY$1")
+      .toLowerCase()
+      .match(/[a-z]+|\d+/g) ?? []
+  );
+}
+
+function credentialWordsWithoutEnvironmentSuffix(words: string[]): string[] {
+  return /^(?:prod|production|dev|development|staging|test|local|base)$/.test(words.at(-1) ?? "")
+    ? words.slice(0, -1)
+    : words;
+}
+
+function isPasswordLabel(words: string[]): boolean {
+  const compact = credentialWordsWithoutEnvironmentSuffix(words).join("");
+  if (/(?:password|passwd|passphrase|passcode|pwd)\d*$/.test(compact)) return true;
+  if (
+    /^(?:login|security|admin|user|account|device|auth|authentication|access|customer|bank|card|atm|sim)pin(?:code|number)?\d*$/.test(
+      compact,
+    )
+  )
+    return true;
+  if (/^pin(?:code|number)$/.test(compact)) return true;
+  return /^(?:mac|wifi|vpn|ssh|db|root|sudo|laptop|my|the|user|admin|account|login|email)pass\d*$/.test(
+    compact,
+  );
+}
+
+function isErrorPasswordLabel(words: string[]): boolean {
+  const label = credentialWordsWithoutEnvironmentSuffix(words);
+  const error = /^(?:incorrect|invalid|wrong|bad|missing)$/;
+  const passwordWordPattern = /^(?:password|passwd|passphrase|passcode|pwd)$/;
+  const ending = label.at(-1) ?? "";
+  return (
+    (error.test(ending) || passwordWordPattern.test(ending)) &&
+    label.some((word) => error.test(word)) &&
+    label.some((word) => passwordWordPattern.test(word))
+  );
+}
+
+function isCredentialKeyLabel(words: string[]): boolean {
+  const joined = credentialWordsWithoutEnvironmentSuffix(words).join(" ");
+  const compact = joined.replaceAll(" ", "");
+  if (/(?:service|storage)accountkey$/.test(compact)) return true;
+  if (NON_CREDENTIAL_KEY_WORD.test(joined)) return false;
+  return /(?:api|secret|access|private|hmac|signing|encryption|ssh|aws|google|gcp|azure|github|gitlab|stripe|openai|anthropic|resend|sendgrid|sentry|slack|npm|docker|cloudflare|supabase|firebase|database|db|oauth|auth|jwt|session|webhook|relay)key$/.test(
+    compact,
+  );
+}
+
+function credentialTier(label: string): LabelledValue["tier"] | null {
+  const words = labelWords(label);
+  const compact = words.join("");
+  if (/^(?:cookie|setcookie|authorization)$/.test(compact)) return null;
+  if (isErrorPasswordLabel(words)) return "credential";
+  if (isPasswordLabel(words)) return "password";
+  if (compact === "pass") return "credential";
+  if (/(?:tokens?|secrets?|credentials?)\d*$/.test(compact)) return "credential";
+  const ending = words.at(-1) ?? "";
+  if (/^(?:jwt|auth|dsn)$/.test(ending) || (words.length > 1 && ending === "cookie"))
+    return "credential";
+  return isCredentialKeyLabel(words) ? "credential" : null;
+}
+
+function labelPrefix(text: string, index: number): string {
+  const prefix = text.slice(Math.max(0, index - LABEL_PREFIX_WINDOW), index);
+  return prefix.slice(Math.max(prefix.lastIndexOf("\n"), prefix.lastIndexOf("\r")) + 1);
+}
+
+function stripLabelClosers(prefix: string): string {
+  return prefix
+    .replace(/<[^>\r\n]{0,128}>/g, "")
+    .replace(/\[\d*\]\s*$/, "")
+    .replace(/[\s\]\\"'`’”*_]+$/, "");
+}
+
+function quickCredentialLabel(text: string, index: number): boolean {
+  let end = index;
+  const floor = Math.max(0, index - LABEL_PREFIX_WINDOW);
+  while (end > floor && /[\s\]\\"'`’”*_]/.test(text[end - 1]!)) end -= 1;
+  if (/[\d[]/.test(text[end - 1] ?? "")) {
+    const indexed = /\[\d*\][\s"'`’”*_]*$/.exec(text.slice(floor, index));
+    if (indexed) end = floor + indexed.index;
+  }
+  let start = end;
+  while (start > floor && /[A-Za-z0-9_$.-]/.test(text[start - 1]!)) start -= 1;
+  const identifier = text.slice(start, end);
+  if (
+    /^(?:cookie|set[-_]?cookie|authorization|secret[-_]?name|credentials?[-_]?file|secretary)$/i.test(
+      identifier,
+    )
+  )
+    return false;
+  if (
+    /^(?:code|number)$/i.test(identifier) &&
+    /\bPIN[ \t]+(?:code|number)$/i.test(text.slice(Math.max(0, start - 8), end))
+  )
+    return true;
+  return /password|passwd|passphrase|passcode|pwd|pass|pin|token|secret|credential|key|cookie|auth|dsn|jwt/i.test(
+    identifier,
+  );
+}
+
+function spacedLabelTier(
+  prefix: string,
+  last: string,
+  previous: string,
+): LabelledValue["tier"] | null {
+  const lower = last.toLowerCase();
+  if (/^(?:password|passwd|passphrase|passcode|pwd)$/.test(lower)) {
+    return /^(?:incorrect|invalid|wrong|bad|missing)$/i.test(previous) ? "credential" : "password";
+  }
+  if (/^(?:pass|pin|code|number)$/.test(lower)) {
+    return isPasswordLabel(labelWords(`${previous} ${last}`)) ? "password" : credentialTier(last);
+  }
+  if (!/^(?:key|token|secret|credential|credentials)$/i.test(last)) return null;
+  const phrase = /([A-Za-z]+(?:[ \t]+[A-Za-z]+){0,3})$/.exec(prefix.slice(-128))?.[0] ?? "";
+  return credentialTier(phrase);
+}
+
+const PASS_QUALIFIER =
+  /^(?:mac|wifi|vpn|ssh|db|root|sudo|laptop|my|the|user|admin|account|login|email)$/i;
+
+function isPassFamilyIdentifier(identifier: string): boolean {
+  if (
+    !/pass(?:[_-]?(?:prod|production|dev|development|staging|test|local|base))?\d*$/i.test(
+      identifier,
+    )
+  )
+    return false;
+  const words = credentialWordsWithoutEnvironmentSuffix(labelWords(identifier));
+  const compact = words.join("");
+  return (
+    compact === "pass" ||
+    /^(?:mac|wifi|vpn|ssh|db|root|sudo|laptop|my|the|user|admin|account|login|email)pass\d*$/.test(
+      compact,
+    )
+  );
+}
+
+function passLabelStart(prefix: string, start: number): number {
+  for (let count = 0; count < 8; count += 1) {
+    const previous = /([A-Za-z]+)[ \t]+$/.exec(prefix.slice(0, start));
+    if (!previous || !PASS_QUALIFIER.test(previous[1]!)) break;
+    const owner = prefix.slice(0, previous.index).trimEnd();
+    if (owner.endsWith("=") || /\b(?:user(?:name)?|login|db|database)[ \t]*:$/.test(owner)) break;
+    start = previous.index;
+  }
+  return start;
+}
+
+function passFieldPrefix(prefix: string): boolean {
+  const before = prefix.replace(/[ \t"'`*_\\]+$/, "");
+  if (before === "" || /[,{[(;:|]$/.test(before)) return true;
+  if (/^\s*(?:[-*+]|>[ \t]*[-*+]?)$/.test(before)) return true;
+  if (
+    /^\s*(?:(?:export|default|declare|const|let|var|readonly|public|private|protected|static|final)[ \t]*)+$/.test(
+      before,
+    )
+  )
+    return true;
+  return (
+    /\b(?:user(?:name)?|login|db|database)[ \t]*(?::|=)?[ \t]*[A-Za-z0-9_.-]+[,;]?$/.test(before) ||
+    /\b[A-Za-z_][A-Za-z0-9_]*=(?:[^ \t]+)$/.test(before)
+  );
+}
+
+function passTierAt(
+  prefix: string,
+  last: RegExpExecArray,
+): LabelledValue["tier"] | null | undefined {
+  const member = last[0].slice(last[0].lastIndexOf(".") + 1);
+  if (!isPassFamilyIdentifier(member)) return undefined;
+  const start = passLabelStart(prefix, last.index);
+  if (!last[0].includes(".") && !passFieldPrefix(prefix.slice(0, start))) return null;
+  if (member.toLowerCase() !== "pass" && credentialTier(member) === "password") return "password";
+  return start < last.index ? "password" : "credential";
+}
+
+interface LabelTierCache {
+  symbolic: Map<string, LabelledValue["tier"] | null>;
+  copula: Map<string, LabelledValue["tier"] | null>;
+}
+
+function labelTierAt(
+  text: string,
+  index: number,
+  copula: boolean,
+  cache: LabelTierCache,
+): LabelledValue["tier"] | null {
+  const prefix = labelPrefix(text, index);
+  const entries = copula ? cache.copula : cache.symbolic;
+  const existing = entries.get(prefix);
+  if (existing !== undefined) return existing;
+  const tier = classifyLabelTier(text, index, copula, prefix);
+  if (entries.size < 1024) entries.set(prefix, tier);
+  return tier;
+}
+
+function classifyLabelTier(
+  text: string,
+  index: number,
+  copula: boolean,
+  rawPrefix: string,
+): LabelledValue["tier"] | null {
+  if (!copula && !quickCredentialLabel(text, index)) return null;
+  let prefix = stripLabelClosers(rawPrefix);
+  if (copula) prefix = prefix.replace(/\s+for\s+[^:;=]{1,256}$/i, "");
+  if (
+    copula &&
+    !quickCredentialLabel(prefix, prefix.length) &&
+    !/PIN[ \t]+(?:code|number)$/i.test(prefix.slice(-24))
+  )
+    return null;
+  const last = /[A-Za-z_$][A-Za-z0-9_$.-]*$/.exec(prefix);
+  if (!last) return null;
+  const passTier = passTierAt(prefix, last);
+  if (passTier !== undefined) return passTier;
+  const previous = /([A-Za-z]+)[ \t]+$/.exec(prefix.slice(0, last.index))?.[1] ?? "";
+  // Qualifiers belong to the adjacent label, not to nearby prose.
+  return spacedLabelTier(prefix, last[0], previous) ?? credentialTier(last[0]);
+}
+
+function symbolicOperator(text: string, index: number): LabelOperator | null {
+  let symbols = "";
+  let cursor = index;
+  let result: LabelOperator | null = null;
+  for (let count = 0; count < 3; count += 1) {
+    if (count > 0) while (text[cursor] === " " || text[cursor] === "\t") cursor += 1;
+    const character = text[cursor] ?? "";
+    if (!/[:=?!+|>-]/.test(character)) break;
+    symbols += character;
+    cursor += 1;
+    if (LABEL_OPERATORS.has(symbols)) {
+      result = {
+        end: cursor,
+        comparison: LABEL_COMPARISONS.has(symbols),
+        copula: false,
+        mode:
+          symbols === "=" && !/\s/.test(text[index - 1] ?? "") && !/\s/.test(text[cursor] ?? "")
+            ? "shell"
+            : "label",
+      };
+    }
+  }
+  return result;
+}
+
+function operatorAt(text: string, index: number, token: string): LabelOperator | null {
+  if (/^(?:is|was|are|were)$/i.test(token)) {
+    let end = index + token.length;
+    while (text[end] === " " || text[end] === "\t") end += 1;
+    if (text[end] === ":") end += 1;
+    return { end, comparison: false, copula: true, mode: "label" };
+  }
+  if (token === "(") {
+    const identifier = /([A-Za-z_$][\w$]*)\s*$/.exec(labelPrefix(text, index))?.[1] ?? "";
+    if (labelWords(identifier)[0] !== "set") return null;
+    return { end: index + 1, comparison: false, copula: false, mode: "label" };
+  }
+  if (token === ",") {
+    const prefix = labelPrefix(text, index);
+    const define = /\bdefine\s*\(\s*\\*["'`“‘][^\r\n]{1,512}["'`”’]\\*\s*$/i.test(prefix);
+    const tuple = /(?:^|[^A-Za-z0-9_$])[[(]\s*\\*["'`“‘][^"'`“”‘’\r\n]{1,512}["'`”’]\\*\s*$/.test(
+      prefix,
+    );
+    if (!define && !tuple) return null;
+    return { end: index + 1, comparison: false, copula: false, mode: "label" };
+  }
+  const symbolic = symbolicOperator(text, index);
+  if (symbolic) return symbolic;
+  if (token === "|" && isSpacedTableOperator(text, index)) {
+    return { end: index + 1, comparison: false, copula: false, mode: "table" };
+  }
+  return null;
+}
+
+function isSpacedTableOperator(text: string, index: number): boolean {
+  if (!/[ \t]/.test(text[index - 1] ?? "") || !/[ \t]/.test(text[index + 1] ?? "")) return false;
+  const prefix = labelPrefix(text, index);
+  return /^\s*\|[ \t]/.test(prefix) && /\|[ \t]+[^|]+[ \t]+$/.test(prefix);
+}
+
+function skipValuePrefix(
+  text: string,
+  index: number,
+  isLiteralDelimiter: LiteralDelimiter,
+  quoteIndex?: LocalQuoteIndex,
+): number {
+  const limit = Math.min(text.length, index + LABEL_LOOKAHEAD_LIMIT);
+  if (quoteIndex?.indexed) {
+    const runs = lexicalIndex(text, quoteIndex, isLiteralDelimiter).spaces;
+    return Math.min(runEndAt(runs, index), limit);
+  }
+  let cursor = index;
+  while (cursor < limit && isLiteralDelimiter(cursor) && /[ \t]/.test(text[cursor]!)) cursor += 1;
+  return cursor;
+}
+
+function closingQuote(opening: string): string | null {
+  if (opening === '"' || opening === "'" || opening === "`") return opening;
+  if (opening === "“") return "”";
+  if (opening === "‘") return "’";
+  return null;
+}
+
+function slashRunEnd(
+  text: string,
+  index: number,
+  isLiteralDelimiter: LiteralDelimiter = allLiteralDelimiters,
+  quoteIndex?: LocalQuoteIndex,
+): number {
+  if (quoteIndex?.indexed)
+    return runEndAt(lexicalIndex(text, quoteIndex, isLiteralDelimiter).slashes, index);
+  let cursor = index;
+  while (text[cursor] === "\\" && isLiteralDelimiter(cursor)) cursor += 1;
+  return cursor;
+}
+
+interface LexicalRuns {
+  starts: number[];
+  ends: number[];
+}
+
+interface IndexedQuotes {
+  single: number[];
+  triple: number[];
+}
+
+interface LocalLexicalIndex {
+  spaces: LexicalRuns;
+  letters: LexicalRuns;
+  slashes: LexicalRuns;
+  literalLines: number[];
+  literalAngles: number[];
+  bracketEnds: Map<number, number>;
+  quotes: Map<string, Map<number, Map<number, IndexedQuotes>>>;
+}
+
+interface LocalQuoteIndex {
+  positions: Map<string, number[]> | null;
+  indexed?: boolean;
+  quoteClass?: QuoteClass;
+  lexical?: LocalLexicalIndex;
+}
+
+function createLocalValueIndex(quoteClass?: QuoteClass): LocalQuoteIndex {
+  return { positions: null, indexed: true, quoteClass };
+}
+
+function addRun(runs: LexicalRuns, position: number): void {
+  const last = runs.ends.length - 1;
+  if (last >= 0 && runs.ends[last] === position) runs.ends[last] = position + 1;
+  else {
+    runs.starts.push(position);
+    runs.ends.push(position + 1);
+  }
+}
+
+function runEndAt(runs: LexicalRuns, position: number): number {
+  const index = firstPositionAtOrAfter(runs.ends, position + 1);
+  return (runs.starts[index] ?? Infinity) <= position ? runs.ends[index]! : position;
+}
+
+function indexQuote(
+  index: LocalLexicalIndex,
+  text: string,
+  position: number,
+  slashDepth: number,
+  quoteClass: QuoteClass,
+): void {
+  const character = text[position]!;
+  let classes = index.quotes.get(character);
+  if (!classes) index.quotes.set(character, (classes = new Map()));
+  const kind = quoteClass(position);
+  let depths = classes.get(kind);
+  if (!depths) classes.set(kind, (depths = new Map()));
+  // A closing slash depth s accepts opening depth d exactly when
+  // (s+1)/(d+1) is an odd integer. Enumerating its divisors adds at most
+  // s+1 entries; slash runs are disjoint, so the complete index is linear.
+  let odd = slashDepth + 1;
+  let powerOfTwo = 1;
+  while (odd % 2 === 0) {
+    odd /= 2;
+    powerOfTwo *= 2;
+  }
+  const triple =
+    /["'`]/.test(character) && text[position + 1] === character && text[position + 2] === character;
+  const addDepth = (depth: number) => {
+    let positions = depths!.get(depth);
+    if (!positions) depths!.set(depth, (positions = { single: [], triple: [] }));
+    positions.single.push(position);
+    if (triple) positions.triple.push(position);
+  };
+  for (let divisor = 1; divisor * divisor <= odd; divisor += 1) {
+    if (odd % divisor !== 0) continue;
+    addDepth(powerOfTwo * divisor - 1);
+    if (divisor * divisor !== odd) addDepth(powerOfTwo * (odd / divisor) - 1);
+  }
+}
+
+function indexLexicalRuns(
+  index: LocalLexicalIndex,
+  text: string,
+  position: number,
+  isLiteralDelimiter: LiteralDelimiter,
+): void {
+  const character = text[position]!;
+  const code = text.charCodeAt(position);
+  if ((code >= 65 && code <= 90) || (code >= 97 && code <= 122)) addRun(index.letters, position);
+  if ((character === " " || character === "\t") && isLiteralDelimiter(position))
+    addRun(index.spaces, position);
+  if (character === "\\" && isLiteralDelimiter(position)) addRun(index.slashes, position);
+}
+
+function indexLiteralEvents(
+  index: LocalLexicalIndex,
+  text: string,
+  position: number,
+  isLiteralDelimiter: LiteralDelimiter,
+): void {
+  const character = text[position]!;
+  const newline = character === "\n" || character === "\r";
+  if (!newline && character !== "<" && character !== ">") return;
+  if (!isLiteralDelimiter(position)) return;
+  index.literalAngles.push(position);
+  if (newline) index.literalLines.push(position);
+}
+
+function indexSubstitutionGroup(
+  index: LocalLexicalIndex,
+  groups: number[],
+  text: string,
+  position: number,
+): void {
+  const character = text[position]!;
+  if (character === "\n" || character === "\r") {
+    groups.length = 0;
+    return;
+  }
+  if (character === "(" || character === "[" || character === "{") {
+    groups.push(position);
+    return;
+  }
+  const opening = VALUE_GROUP_OPENING.get(character);
+  if (opening === undefined) return;
+  const group = groups.pop();
+  if (group === undefined || text[group] !== opening) {
+    groups.length = 0;
+    return;
+  }
+  if (text[group - 1] === "$") index.bracketEnds.set(group, position + 1);
+}
+
+function lexicalIndex(
+  text: string,
+  cache: LocalQuoteIndex,
+  isLiteralDelimiter: LiteralDelimiter,
+): LocalLexicalIndex {
+  if (cache.lexical) return cache.lexical;
+  const index: LocalLexicalIndex = {
+    spaces: { starts: [], ends: [] },
+    letters: { starts: [], ends: [] },
+    slashes: { starts: [], ends: [] },
+    literalLines: [],
+    literalAngles: [],
+    bracketEnds: new Map(),
+    quotes: new Map(),
+  };
+  const groups: number[] = [];
+  let slashDepth = 0;
+  for (let position = 0; position < text.length; position += 1) {
+    const character = text[position]!;
+    indexLexicalRuns(index, text, position, isLiteralDelimiter);
+    indexLiteralEvents(index, text, position, isLiteralDelimiter);
+    if (cache.quoteClass && /["'`“”‘’]/.test(character))
+      indexQuote(index, text, position, slashDepth, cache.quoteClass);
+    if (slashDepth % 2 === 0) indexSubstitutionGroup(index, groups, text, position);
+    slashDepth = character === "\\" ? slashDepth + 1 : 0;
+  }
+  cache.lexical = index;
+  return index;
+}
+
+function quotePositions(text: string, index: LocalQuoteIndex, character: string): number[] {
+  if (index.positions === null) {
+    index.positions = new Map();
+    for (let cursor = 0; cursor < text.length; cursor += 1) {
+      const current = text[cursor]!;
+      if (!/["'`“”‘’\r\n(){}]/.test(current)) continue;
+      const positions = index.positions.get(current);
+      if (positions) positions.push(cursor);
+      else index.positions.set(current, [cursor]);
+    }
+  }
+  return index.positions.get(character) ?? [];
+}
+
+function firstPositionAtOrAfter(positions: number[], start: number): number {
+  let low = 0;
+  let high = positions.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (positions[middle]! < start) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+function shellTerminator(
+  text: string,
+  index: number,
+  quoteIndex?: LocalQuoteIndex,
+  isLiteralDelimiter: LiteralDelimiter = allLiteralDelimiters,
+): boolean {
+  let width = 0;
+  if (text.startsWith("&&", index)) width = 2;
+  else if (/[;|]/.test(text[index] ?? "")) width = 1;
+  if (width === 0) return false;
+  let cursor = index + width;
+  const limit = Math.min(text.length, cursor + LABEL_LOOKAHEAD_LIMIT);
+  if (cursor === text.length || /\s/.test(text[cursor]!)) return true;
+  if (quoteIndex?.indexed)
+    cursor = Math.min(
+      runEndAt(lexicalIndex(text, quoteIndex, isLiteralDelimiter).letters, cursor),
+      limit,
+    );
+  else while (cursor < limit && /[A-Za-z]/.test(text[cursor]!)) cursor += 1;
+  return cursor > index + width && (cursor === text.length || /\s/.test(text[cursor]!));
+}
+
+function unquotedTerminator(
+  text: string,
+  index: number,
+  mode: LabelValueMode,
+  quoteIndex: LocalQuoteIndex,
+  isLiteralDelimiter: LiteralDelimiter,
+): boolean {
+  const character = text[index]!;
+  if (/\s/.test(character)) return true;
+  if (mode === "query") return /[&#]/.test(character);
+  if (mode === "table") return character === "|";
+  return mode === "shell" && shellTerminator(text, index, quoteIndex, isLiteralDelimiter);
+}
+
+function possibleSubstitutionClose(
+  text: string,
+  start: number,
+  limit: number,
+  quoteIndex: LocalQuoteIndex,
+): boolean {
+  const close = text[start + 1] === "(" ? ")" : "}";
+  if (!quoteIndex.indexed) return text.slice(start + 2, limit).includes(close);
+  const positions = quotePositions(text, quoteIndex, close);
+  return (positions[firstPositionAtOrAfter(positions, start + 2)] ?? limit) < limit;
+}
+
+function substitutionEnd(
+  text: string,
+  start: number,
+  quoteIndex: LocalQuoteIndex,
+  isLiteralDelimiter: LiteralDelimiter,
+): number | null {
+  if (text[start] !== "$" || !/[({]/.test(text[start + 1] ?? "")) return null;
+  const limit = Math.min(text.length, start + LABEL_LOOKAHEAD_LIMIT);
+  if (quoteIndex.indexed) {
+    const end = lexicalIndex(text, quoteIndex, isLiteralDelimiter).bracketEnds.get(start + 1);
+    return end !== undefined && end <= limit ? end : null;
+  }
+  if (!possibleSubstitutionClose(text, start, limit, quoteIndex)) return null;
+  const groups: string[] = [text[start + 1]!];
+  for (let cursor = start + 2; cursor < limit; cursor += 1) {
+    const character = text[cursor]!;
+    if (/[\r\n]/.test(character)) return null;
+    if (character === "\\") {
+      cursor += 1;
+      continue;
+    }
+    if (/[([{]/.test(character)) groups.push(character);
+    const opening = VALUE_GROUP_OPENING.get(character);
+    if (opening === undefined) continue;
+    if (groups.pop() !== opening) return null;
+    if (groups.length === 0) return cursor + 1;
+  }
+  return null;
+}
+
+function trailingBareEnd(
+  text: string,
+  start: number,
+  end: number,
+  unmatched: Set<number>,
+  isLiteralDelimiter: LiteralDelimiter,
+): number {
+  while (
+    end > start &&
+    isLiteralDelimiter(end - 1) &&
+    (/[,;]/.test(text[end - 1]!) || unmatched.has(end - 1))
+  )
+    end -= 1;
+  return end;
+}
+
+function outsideValueQuote(text: string, index: number): boolean {
+  return text[index + 1] === undefined || /[\s),;\]}|&]/.test(text[index + 1]!);
+}
+
+function escapedBareEnd(
+  text: string,
+  index: number,
+  isLiteralDelimiter: LiteralDelimiter,
+  quoteIndex: LocalQuoteIndex,
+): number | null {
+  const slashEnd = slashRunEnd(text, index, isLiteralDelimiter, quoteIndex);
+  if (/[nrt]/.test(text[slashEnd] ?? "")) return null;
+  if (/["'`“”‘’]/.test(text[slashEnd] ?? "") && outsideValueQuote(text, slashEnd)) return null;
+  return slashEnd < text.length ? slashEnd + 1 : slashEnd;
+}
+
+function unquotedEnd(
+  text: string,
+  start: number,
+  mode: LabelValueMode,
+  isLiteralDelimiter: LiteralDelimiter,
+  quoteMayClose: QuoteMayClose,
+  quoteIndex: LocalQuoteIndex,
+): number {
+  let end = start;
+  const groups: string[] = [];
+  const unmatched = new Set<number>();
+  while (end < text.length) {
+    const character = text[end]!;
+    if (!isLiteralDelimiter(end)) {
+      end += 1;
+      continue;
+    }
+    if (unquotedTerminator(text, end, mode, quoteIndex, isLiteralDelimiter)) break;
+    if (/["'`“”‘’]/.test(character)) {
+      if (groups.length === 0 && outsideValueQuote(text, end)) break;
+      if (groups.length > 0) {
+        const quote = quotedEnd(text, end, 0, quoteMayClose, quoteIndex, isLiteralDelimiter);
+        if (quote !== null) {
+          end = quote.next;
+          continue;
+        }
+      }
+    }
+    const substitution =
+      character === "$" ? substitutionEnd(text, end, quoteIndex, isLiteralDelimiter) : null;
+    if (substitution !== null) {
+      end = substitution;
+      continue;
+    }
+    if (character === "\\") {
+      const next = escapedBareEnd(text, end, isLiteralDelimiter, quoteIndex);
+      if (next === null) break;
+      end = next;
+      continue;
+    }
+    if (/[([{]/.test(character)) groups.push(character);
+    const opening = VALUE_GROUP_OPENING.get(character);
+    if (opening !== undefined) {
+      if (groups.at(-1) === opening) groups.pop();
+      else unmatched.add(end);
+    }
+    end += 1;
+  }
+  return trailingBareEnd(text, start, end, unmatched, isLiteralDelimiter);
+}
+
+function quoteRunWidth(text: string, opening: number): number {
+  const character = text[opening];
+  return /["'`]/.test(character ?? "") &&
+    text[opening + 1] === character &&
+    text[opening + 2] === character
+    ? 3
+    : 1;
+}
+
+function escapedQuoteEnd(text: string, cursor: number, openingDepth: number): number | null {
+  let slashStart = cursor;
+  while (slashStart > 0 && text[slashStart - 1] === "\\") slashStart -= 1;
+  const depth = cursor - slashStart;
+  return depth >= openingDepth && (depth - openingDepth) % (2 * (openingDepth + 1)) === 0
+    ? cursor - openingDepth
+    : null;
+}
+
+function boundedQuotedEnd(
+  text: string,
+  opening: number,
+  openingDepth: number,
+  quoteMayClose: QuoteMayClose,
+  isLiteralDelimiter: LiteralDelimiter,
+): { end: number; next: number } | null {
+  const close = closingQuote(text[opening] ?? "");
+  if (close === null) return null;
+  const width = quoteRunWidth(text, opening);
+  const limit = Math.min(text.length, opening + LABEL_LOOKAHEAD_LIMIT);
+  for (let cursor = opening + width; cursor < limit; cursor += 1) {
+    if (/[\r\n]/.test(text[cursor]!) && isLiteralDelimiter(cursor)) break;
+    if (
+      text[cursor] !== close ||
+      (width === 3 && text.slice(cursor, cursor + 3) !== close.repeat(3))
+    )
+      continue;
+    const end = escapedQuoteEnd(text, cursor, openingDepth);
+    if (end !== null && quoteMayClose(opening, cursor)) return { end, next: cursor + width };
+  }
+  return null;
+}
+
+function cachedQuotedEnd(
+  text: string,
+  opening: number,
+  openingDepth: number,
+  quoteIndex: LocalQuoteIndex,
+  isLiteralDelimiter: LiteralDelimiter,
+  quoteClass: QuoteClass,
+): { end: number; next: number } | null {
+  const close = closingQuote(text[opening] ?? "");
+  if (close === null) return null;
+  const width = quoteRunWidth(text, opening);
+  const start = opening + width;
+  const lexical = lexicalIndex(text, quoteIndex, isLiteralDelimiter);
+  const positions = lexical.quotes.get(close)?.get(quoteClass(opening))?.get(openingDepth)?.[
+    width === 3 ? "triple" : "single"
+  ];
+  if (!positions) return null;
+  const newline =
+    lexical.literalLines[firstPositionAtOrAfter(lexical.literalLines, start)] ?? text.length;
+  const limit = Math.min(text.length, opening + LABEL_LOOKAHEAD_LIMIT, newline);
+  const cursor = positions[firstPositionAtOrAfter(positions, start)];
+  return cursor !== undefined && cursor < limit
+    ? { end: cursor - openingDepth, next: cursor + width }
+    : null;
+}
+
+function quotedEnd(
+  text: string,
+  opening: number,
+  openingDepth: number,
+  quoteMayClose: QuoteMayClose,
+  quoteIndex: LocalQuoteIndex,
+  isLiteralDelimiter: LiteralDelimiter,
+): { end: number; next: number } | null {
+  if (!quoteIndex.indexed)
+    return boundedQuotedEnd(text, opening, openingDepth, quoteMayClose, isLiteralDelimiter);
+  if (quoteIndex.quoteClass)
+    return cachedQuotedEnd(
+      text,
+      opening,
+      openingDepth,
+      quoteIndex,
+      isLiteralDelimiter,
+      quoteIndex.quoteClass,
+    );
+  const close = closingQuote(text[opening] ?? "");
+  if (!close) return null;
+  const width = quoteRunWidth(text, opening);
+  const start = opening + width;
+  let limit = Math.min(text.length, opening + LABEL_LOOKAHEAD_LIMIT);
+  for (const newline of ["\n", "\r"]) {
+    const positions = quotePositions(text, quoteIndex, newline);
+    for (
+      let index = firstPositionAtOrAfter(positions, start);
+      index < positions.length;
+      index += 1
+    ) {
+      const position = positions[index]!;
+      if (position >= limit) break;
+      if (isLiteralDelimiter(position)) {
+        limit = position;
+        break;
+      }
+    }
+  }
+  const positions = quotePositions(text, quoteIndex, close);
+  for (let index = firstPositionAtOrAfter(positions, start); index < positions.length; index += 1) {
+    const cursor = positions[index]!;
+    if (cursor >= limit) break;
+    if (width === 3 && text.slice(cursor, cursor + 3) !== close.repeat(3)) continue;
+    const end = escapedQuoteEnd(text, cursor, openingDepth);
+    if (end !== null && quoteMayClose(opening, cursor)) return { end, next: cursor + width };
+  }
+  return null;
+}
+
+/** Starts before the optional value-opening quote; offsets refer to the original input. */
+function readLocalCredentialValue(
+  text: string,
+  index: number,
+  quoteMayClose: QuoteMayClose = allQuotesMayClose,
+  mode: LabelValueMode = "label",
+  isLiteralDelimiter: LiteralDelimiter = allLiteralDelimiters,
+  quoteIndex: LocalQuoteIndex = { positions: null },
+): LocalCredentialValue {
+  index = skipValuePrefix(text, index, isLiteralDelimiter, quoteIndex);
+  const placeholderEnd = closedAnglePlaceholderEnd(text, index, isLiteralDelimiter, quoteIndex);
+  if (placeholderEnd !== null)
+    return {
+      start: index,
+      end: placeholderEnd,
+      next: placeholderEnd,
+      value: text.slice(index, placeholderEnd),
+      quoted: false,
+      closed: true,
+      openQuote: null,
+      quoteWidth: 0,
+    };
+  const opening = slashRunEnd(text, index, isLiteralDelimiter, quoteIndex);
+  const openingDepth = opening - index;
+  const quoted = closingQuote(text[opening] ?? "") !== null;
+  const width = quoted ? quoteRunWidth(text, opening) : 0;
+  const start = quoted ? opening + width : index;
+  const quote = quoted
+    ? quotedEnd(text, opening, openingDepth, quoteMayClose, quoteIndex, isLiteralDelimiter)
+    : null;
+  const end =
+    quote?.end ?? unquotedEnd(text, start, mode, isLiteralDelimiter, quoteMayClose, quoteIndex);
+  return {
+    start,
+    end,
+    next: quote?.next ?? end,
+    quoted,
+    closed: quote !== null,
+    value: text.slice(start, end),
+    openQuote: quoted ? opening : null,
+    quoteWidth: width,
+  };
+}
+
+function closedAnglePlaceholderEnd(
+  text: string,
+  index: number,
+  isLiteralDelimiter: LiteralDelimiter,
+  quoteIndex?: LocalQuoteIndex,
+): number | null {
+  if (text[index] !== "<" || !isLiteralDelimiter(index)) return null;
+  let end = index + 1;
+  const limit = Math.min(text.length, index + LABEL_LOOKAHEAD_LIMIT);
+  if (quoteIndex?.indexed) {
+    const positions = lexicalIndex(text, quoteIndex, isLiteralDelimiter).literalAngles;
+    const candidate = positions[firstPositionAtOrAfter(positions, end)];
+    return candidate !== undefined && candidate < limit && text[candidate] === ">"
+      ? candidate + 1
+      : null;
+  }
+  while (end < limit) {
+    if (isLiteralDelimiter(end)) {
+      if (text[end] === ">") return end + 1;
+      if (/[<\n\r]/.test(text[end]!)) return null;
+    }
+    end += 1;
+  }
+  return null;
+}
+
+function valueModeAt(text: string, operatorIndex: number, mode: LabelValueMode): LabelValueMode {
+  if (mode !== "shell") return mode;
+  const prefix = labelPrefix(text, operatorIndex);
+  if (/\b(?:const|let|var)\s+[A-Za-z_$][\w$]*$/.test(prefix)) return "label";
+  return /(?:^|[^&])[?&#][^\s?&#=]*$/.test(prefix) ? "query" : mode;
+}
+
+function quotedLabelClosingAt(
+  text: string,
+  operatorIndex: number,
+  operatorEnd: number,
+  quoteMayClose: QuoteMayClose,
+): number | null {
+  const prefixStart = Math.max(0, operatorIndex - LABEL_PREFIX_WINDOW);
+  const prefix = text.slice(prefixStart, operatorIndex);
+  const label = /(?:^|[^A-Za-z0-9])(["'`“‘])[*_]*[A-Za-z_$][A-Za-z0-9_$ .-]{0,256}$/.exec(prefix);
+  if (!label) return null;
+  const opening = prefixStart + label.index + label[0].indexOf(label[1]!);
+  const closing = operatorEnd;
+  return text[closing] === closingQuote(label[1]!) && quoteMayClose(opening, closing)
+    ? closing
+    : null;
+}
+
+function setterNamedArgumentStart(text: string, start: number): number {
+  let cursor = start;
+  const limit = Math.min(text.length, start + 256);
+  if (!/[A-Za-z_$]/.test(text[cursor] ?? "")) return start;
+  while (cursor < limit && /[A-Za-z0-9_$]/.test(text[cursor] ?? "")) cursor += 1;
+  while (cursor < limit && /[ \t]/.test(text[cursor] ?? "")) cursor += 1;
+  if (text[cursor] !== ":") return start;
+  return cursor + 1;
+}
+
+function resolveLocalValueIndex(
+  index: LocalQuoteIndex | undefined,
+  quoteMayClose: QuoteMayClose,
+  quoteClass: QuoteClass | undefined,
+): LocalQuoteIndex {
+  return (
+    index ??
+    createLocalValueIndex(
+      quoteClass ?? (quoteMayClose === allQuotesMayClose ? identityQuoteClass : undefined),
+    )
+  );
+}
+
+/** Reads local labelled values only. Policy and redaction remain at the caller. */
+function labelledValues(
+  text: string,
+  quoteMayClose: QuoteMayClose = allQuotesMayClose,
+  isLiteralDelimiter: LiteralDelimiter = allLiteralDelimiters,
+  quoteClass?: QuoteClass,
+  quoteIndex?: LocalQuoteIndex,
+): LabelledValue[] {
+  quoteIndex = resolveLocalValueIndex(quoteIndex, quoteMayClose, quoteClass);
+  const values: LabelledValue[] = [];
+  const tiers: LabelTierCache = { symbolic: new Map(), copula: new Map() };
+  const scanner = new RegExp(LABEL_CANDIDATE.source, "gi");
+  let match: RegExpExecArray | null;
+  while ((match = scanner.exec(text)) !== null) {
+    const copula = /^(?:is|was|are|were)$/i.test(match[0]);
+    const operator = operatorAt(text, match.index, match[0]);
+    if (!operator) continue;
+    const tier = labelTierAt(text, match.index, copula, tiers);
+    if (!tier) continue;
+    scanner.lastIndex = operator.end;
+    if (operator.comparison && tier !== "password") continue;
+    const labelClosing =
+      match[0] === "(" || match[0] === ","
+        ? null
+        : quotedLabelClosingAt(text, match.index, operator.end, quoteMayClose);
+    if (labelClosing !== null) {
+      scanner.lastIndex = labelClosing + 1;
+      continue;
+    }
+    let index = operator.end;
+    // Markdown delimiters that close a colon-bearing label belong to the label.
+    if (/[*_]/.test(text[index] ?? "") && /[*_]/.test(labelPrefix(text, match.index))) {
+      while (text[index] === "*" || text[index] === "_") index += 1;
+    }
+    index = skipValuePrefix(text, index, isLiteralDelimiter, quoteIndex);
+    const mode = valueModeAt(text, match.index, operator.mode);
+    if (match[0] === "(") index = setterNamedArgumentStart(text, index);
+    const value = readLocalCredentialValue(
+      text,
+      index,
+      quoteMayClose,
+      mode,
+      isLiteralDelimiter,
+      quoteIndex,
+    );
+    if (value.end <= value.start) continue;
+    values.push({
+      start: value.start,
+      end: value.end,
+      value: value.value,
+      tier,
+      copula: operator.copula,
+      comparison: operator.comparison,
+      quoted: value.quoted,
+      openQuote: value.openQuote,
+      mode,
+      quoteWidth: value.quoteWidth,
+    });
+    scanner.lastIndex = Math.max(scanner.lastIndex, value.next);
+  }
+  return values;
+}
+
+type CredentialWordName = (name: string) => boolean;
+
+const CREDENTIAL_LOOKAHEAD_LIMIT = 4096;
+
+interface Token {
+  kind: "word" | "number" | "string" | "regex" | "punct" | "end";
+  text: string;
+  start: number;
+  end: number;
+  nodes?: [ExpressionNode | null, ExpressionNode | null];
+}
+
+function defaultWordName(name: string): boolean {
+  return (
+    /^[a-z_]+$/.test(name) ||
+    /^[A-Z_]+$/.test(name) ||
+    /^[A-Z][a-z]{0,5}$/.test(name) ||
+    isCompactCamelCodeName(name) ||
+    isEmbeddedAcronymReference(name) ||
+    isNaturalCodeWords(name) ||
+    (/\d/.test(name) ? isCredentialNumericCodeName(name) : isCredentialWordOnlyName(name))
+  );
+}
+
+function quotedTokenEnd(text: string, start: number): { end: number; closed: boolean } {
+  const quote = text[start];
+  let end = start + 1;
+  while (end < text.length) {
+    if (text[end] === "\\") end += 2;
+    else if (text[end] === quote) return { end: end + 1, closed: true };
+    else if (text[end] === "\n" || text[end] === "\r") break;
+    else end += 1;
+  }
+  return { end, closed: false };
+}
+
+function regexTokenEnd(text: string, start: number): number | null {
+  let bracket = false;
+  for (let cursor = start + 1; cursor < text.length; cursor += 1) {
+    const character = text[cursor]!;
+    if (character === "\\") cursor += 1;
+    else if (character === "\n" || character === "\r") return null;
+    else if (character === "[") bracket = true;
+    else if (character === "]") bracket = false;
+    else if (character === "/" && !bracket) {
+      cursor += 1;
+      while (/[a-z]/i.test(text[cursor] ?? "")) cursor += 1;
+      return cursor;
+    }
+  }
+  return null;
+}
+
+function credentialWordToken(text: string, start: number): Token | null {
+  const character = text[start]!;
+  let end = start + 1;
+  if (
+    /[A-Za-z_$]/.test(character) &&
+    !text.startsWith("${", start) &&
+    !text.startsWith("$(", start)
+  ) {
+    while (/[A-Za-z0-9_$]/.test(text[end] ?? "")) end += 1;
+    return { kind: "word", text: text.slice(start, end), start, end };
+  }
+  if (!/\d/.test(character)) return null;
+  const number =
+    /(?:0[xX][\da-fA-F]+|0[bB][01]+|0[oO][0-7]+|\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)(?:n)?/y;
+  number.lastIndex = start;
+  end = start + (number.exec(text)?.[0].length ?? 1);
+  return { kind: "number", text: text.slice(start, end), start, end };
+}
+
+function credentialPunctuationEnd(text: string, start: number): number {
+  for (const operator of [
+    "===",
+    "!==",
+    "...",
+    "**",
+    "?.",
+    "&&",
+    "||",
+    "??",
+    "=>",
+    "==",
+    "!=",
+    "${",
+    "$(",
+  ]) {
+    if (text.startsWith(operator, start)) return start + operator.length;
+  }
+  return start + 1;
+}
+
+class CredentialLexer {
+  position: number;
+  readonly text: string;
+  private cached: Token | null = null;
+  private readonly context?: CredentialParseContext;
+  constructor(text: string, start: number, context?: CredentialParseContext) {
+    this.text = text;
+    this.position = start;
+    this.context = context;
+  }
+  reset(position: number): void {
+    this.position = position;
+    this.cached = null;
+  }
+  peek(): Token {
+    if (this.cached) return this.cached;
+    if (this.context) return (this.cached = this.context.token(this.position, this.text.length));
+    let start = this.position;
+    while (/[^\S\r\n]/.test(this.text[start] ?? "") && start < this.text.length) start += 1;
+    if (start === this.text.length || /[\r\n]/.test(this.text[start] ?? ""))
+      return (this.cached = { kind: "end", text: "", start, end: start });
+    const character = this.text[start]!;
+    let end = start + 1;
+    let kind: Token["kind"] = "punct";
+    const word = credentialWordToken(this.text, start);
+    if (word) return (this.cached = word);
+    const regexEnd = character === "/" ? regexTokenEnd(this.text, start) : null;
+    if (regexEnd !== null) {
+      kind = "regex";
+      end = regexEnd;
+    } else if (character === "'" || character === '"') {
+      const quoted = quotedTokenEnd(this.text, start);
+      end = quoted.end;
+      kind = quoted.closed ? "string" : "punct";
+    } else end = credentialPunctuationEnd(this.text, start);
+    return (this.cached = { kind, text: this.text.slice(start, end), start, end });
+  }
+  take(): Token {
+    const token = this.peek();
+    this.position = token.end;
+    this.cached = null;
+    return token;
+  }
+}
+
+interface FlatCredentialRun {
+  atoms: Token[];
+  operators: Token[];
+  facts?: Map<CredentialWordName, [FlatCredentialFacts, FlatCredentialFacts]>;
+  typeFacts?: Map<CredentialWordName, FlatCredentialTypeFacts>;
+  conditionalDepth?: number[] | null;
+  conditionalMinimum?: CredentialRangeIndex;
+  conditional?: FlatCredentialConditional;
+}
+
+interface FlatCredentialConditional {
+  depth: number[];
+  minimum: CredentialRangeIndex;
+  killers: number[];
+}
+
+interface FlatCredentialTypeFacts {
+  invalid: number[];
+  nonWord: number[];
+  arrows: number[];
+}
+
+interface FlatCredentialFacts {
+  invalid: number[];
+  depends: number[];
+  literal: number[];
+  badOperator: number[];
+  arrows: number[];
+  comparisons: number[];
+  conditional?: FlatCredentialConditional;
+  survivor?: CredentialRangeIndex;
+}
+
+interface FlatCredentialPosition {
+  run: FlatCredentialRun;
+  index: number;
+}
+
+/** Stream numeric offsets so large messages never retain a vector of match objects. */
+function credentialMatchOffsets(text: string, scanner: RegExp, ends?: number[]): number[] {
+  const starts: number[] = [];
+  let match: RegExpExecArray | null;
+  while ((match = scanner.exec(text)) !== null) {
+    starts.push(match.index);
+    if (ends) ends.push(match.index + match[0].length);
+  }
+  return starts;
+}
+
+/** All caches belong to one normalized human-message scan. */
+class CredentialParseContext {
+  private readonly tokens = new Map<number, Token>();
+  private readonly positions = new Map<number, FlatCredentialPosition>();
+  private readonly typePositions = new Map<number, FlatCredentialPosition>();
+  private readonly compoundAtoms = new Map<number, Token>();
+  private readonly wordCaches = new Map<CredentialWordName, CredentialWordName>();
+  private readonly lineBreaks: number[];
+  private readonly specialPositions: number[];
+  private readonly wordStarts: number[];
+  private readonly wordEnds: number[];
+  private readonly closingPositions = new Map<string, number[]>();
+  readonly text: string;
+  constructor(text: string) {
+    this.text = text;
+    this.lineBreaks = credentialMatchOffsets(text, /[\r\n]/g);
+    this.specialPositions = credentialMatchOffsets(text, /\$[({]|[()[\]'"`;|&<>\r\n]/g);
+    this.wordEnds = [];
+    this.wordStarts = credentialMatchOffsets(text, /\S+/g, this.wordEnds);
+    for (const closing of [")", "]", "}"]) this.closingPositions.set(closing, []);
+    for (const match of text.matchAll(/[)\]}]/g))
+      this.closingPositions.get(match[0])!.push(match.index);
+  }
+  hasClosing(opening: string, start: number, limit: number): boolean {
+    let closing = "}";
+    if (opening === "(") closing = ")";
+    else if (opening === "[") closing = "]";
+    const positions = this.closingPositions.get(closing)!;
+    return (positions[lowerCredentialOffset(positions, start)] ?? Infinity) < limit;
+  }
+  words(predicate: CredentialWordName): CredentialWordName {
+    const known = this.wordCaches.get(predicate);
+    if (known) return known;
+    const decisions = new Map<string, boolean>();
+    const memoized = (word: string): boolean => {
+      const existing = decisions.get(word);
+      if (existing !== undefined) return existing;
+      const result = predicate(word);
+      decisions.set(word, result);
+      return result;
+    };
+    this.wordCaches.set(predicate, memoized);
+    this.wordCaches.set(memoized, memoized);
+    return memoized;
+  }
+  limit(start: number): number {
+    const next = lowerCredentialOffset(this.lineBreaks, start);
+    return Math.min(
+      this.text.length,
+      start + CREDENTIAL_LOOKAHEAD_LIMIT,
+      this.lineBreaks[next] ?? this.text.length,
+    );
+  }
+  token(position: number, limit: number): Token {
+    let token = this.tokens.get(position);
+    if (!token) {
+      token = new CredentialLexer(this.text, position).peek();
+      this.tokens.set(position, token);
+    }
+    if (token.start >= limit) return { kind: "end", text: "", start: limit, end: limit };
+    if (token.end <= limit) return token;
+    return new CredentialLexer(this.text.slice(0, limit), position).peek();
+  }
+  private atom(start: number, limit: number): Token | null {
+    const first = this.token(start, limit);
+    if (isInvalidCredentialPrimary(first)) {
+      const known = this.compoundAtoms.get(first.start);
+      if (known && known.end === first.end && known.text === first.text) return known;
+      const failed: Token = { ...first, nodes: [null, null] };
+      if (limit >= this.limit(first.start)) this.compoundAtoms.set(first.start, failed);
+      return failed;
+    }
+    const next = this.token(first.end, limit);
+    if (isFlatCredentialAtom(first) && !requiresCredentialPostfix(next)) return first;
+    const known = this.compoundAtoms.get(first.start);
+    if (known !== undefined && known.end <= limit) return known;
+    const bounded = this.text.slice(0, Math.min(limit, this.limit(first.start)));
+    const normal = parseCredentialExpression(
+      bounded,
+      first.start,
+      false,
+      defaultWordName,
+      this,
+      true,
+      false,
+    );
+    const arrow = parseCredentialExpression(
+      bounded,
+      first.start,
+      false,
+      defaultWordName,
+      this,
+      true,
+      true,
+    );
+    if (normal && arrow && normal.end !== arrow.end) return null;
+    const end = (normal ?? arrow)?.end ?? Math.min(limit, this.limit(first.start));
+    const token: Token = {
+      kind: "punct",
+      text: this.text.slice(first.start, end),
+      start: first.start,
+      end,
+      nodes: [normal, arrow],
+    };
+    if (limit >= this.limit(first.start)) this.compoundAtoms.set(first.start, token);
+    return token;
+  }
+  private run(start: number, type = false): FlatCredentialPosition | null {
+    const positions = type ? this.typePositions : this.positions;
+    const existing = positions.get(start);
+    if (existing) return existing;
+    const first = type ? this.token(start, this.text.length) : this.atom(start, this.text.length);
+    if (!first) return null;
+    const aligned = positions.get(first.start);
+    if (aligned) return aligned;
+    const isAtom = type ? isFlatCredentialTypeAtom : isFlatCredentialAtom;
+    if (!isAtom(first)) return null;
+    const run: FlatCredentialRun = {
+      atoms: [first],
+      operators: [],
+    };
+    let atom = first;
+    while (atom.kind !== "end" && !isFailedCredentialAtom(atom)) {
+      const operator = this.token(atom.end, this.text.length);
+      if (!isFlatCredentialOperator(operator, type)) break;
+      const next = type
+        ? this.token(operator.end, this.text.length)
+        : this.atom(operator.end, this.text.length);
+      if (!next || !isAtom(next)) break;
+      run.operators.push(operator);
+      run.atoms.push(next);
+      atom = next;
+    }
+    if (run.atoms.length > 1) {
+      for (const [index, value] of run.atoms.entries()) positions.set(value.start, { run, index });
+    }
+
+    return { run, index: 0 };
+  }
+  private hasImplicitTemplate(start: number, limit: number): boolean {
+    const special = this.specialPositions[lowerCredentialOffset(this.specialPositions, start)];
+    if (special === undefined || special >= limit || this.text[special] !== "$") return false;
+    let word = lowerCredentialOffset(this.wordStarts, start);
+    if (word > 0 && this.wordEnds[word - 1]! > start) word -= 1;
+    return special < Math.min(limit, this.wordEnds[word + 1] ?? this.text.length);
+  }
+  type(
+    text: string,
+    start: number,
+    predicate: CredentialWordName,
+  ): CredentialTypeNode | null | undefined {
+    if (text !== this.text) return undefined;
+    const position = this.run(start, true);
+    if (!position) return undefined;
+    const { run, index: first } = position;
+    const limit = this.limit(start);
+    const last = lastCredentialAtomBefore(run.atoms, limit);
+    if (last < first) return undefined;
+    const finalAtom = this.token(run.atoms[last]!.start, limit);
+    if (!isFlatCredentialTypeAtom(finalAtom)) return undefined;
+    const boundary = this.token(finalAtom.end, limit);
+    if (isFlatCredentialOperator(boundary, true) && this.token(boundary.end, limit).kind !== "end")
+      return undefined;
+    const ending = flatCredentialTypeBoundary(boundary, finalAtom.end);
+    if (ending === undefined) return undefined;
+    if (!ending) return null;
+    const predicateMemo = this.words(predicate);
+    if (first === last) return flatCredentialTypeAtom(finalAtom, predicateMemo);
+    const facts = flatCredentialTypeFacts(run, predicateMemo);
+    return flatCredentialTypeResult(facts, first, last, finalAtom, predicateMemo);
+  }
+  expression(
+    text: string,
+    start: number,
+    predicate: CredentialWordName,
+  ): ExpressionNode | null | undefined {
+    if (text !== this.text || predicate !== defaultWordName) return undefined;
+
+    const limit = this.limit(start);
+    if (this.hasImplicitTemplate(start, limit)) return undefined;
+    const position = this.run(start);
+    if (!position) return undefined;
+    const { run, index: first } = position;
+    const last = lastCredentialAtomBefore(run.atoms, limit);
+    if (last < first) return undefined;
+    const finalAtom = this.atom(run.atoms[last]!.start, limit);
+    if (!finalAtom) return null;
+    if (!isFlatCredentialAtom(finalAtom)) return undefined;
+    const boundary = this.token(finalAtom.end, limit);
+    if (expressionPrecedence(boundary.text) >= 0 && this.token(boundary.end, limit).kind !== "end")
+      return undefined;
+    const ending = flatCredentialBoundary(boundary, finalAtom.end);
+    if (ending === undefined) return undefined;
+
+    if (!ending) return null;
+    if (first === last) return flatCredentialNode(finalAtom, this.words(predicate), false);
+    if (!flatCredentialConditionalValid(run, first, last)) return null;
+    const facts = flatCredentialFacts(run, this.words(predicate));
+    return flatCredentialResult(facts, first, last, finalAtom, this.words(predicate));
+  }
+}
+
+function createCredentialParseContext(text: string): CredentialParseContext {
+  return new CredentialParseContext(text);
+}
+
+function lowerCredentialOffset(offsets: number[], target: number): number {
+  let low = 0;
+  let high = offsets.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (offsets[middle]! < target) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+function lastCredentialAtomBefore(atoms: Token[], limit: number): number {
+  let low = 0;
+  let high = atoms.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (atoms[middle]!.start < limit) low = middle + 1;
+    else high = middle;
+  }
+  return low - 1;
+}
+
+function isFlatCredentialAtom(token: Token): boolean {
+  if (token.nodes) return true;
+  if (token.kind === "word") return !token.text.startsWith("$") && !expressionPrefix(token);
+  return token.kind === "number" || token.kind === "string" || token.kind === "regex";
+}
+
+/** These lexical tokens cannot enter the existing primary grammar in either context. */
+function isInvalidCredentialPrimary(token: Token): boolean {
+  if (token.kind !== "punct") return false;
+  if (expressionPrefix(token) || openingExpression(token.text)) return false;
+  return token.text !== "`" && token.text !== "${" && token.text !== "$(" && token.text !== "%";
+}
+
+function isFailedCredentialAtom(atom: Token): boolean {
+  return !!atom.nodes && atom.nodes[0] === null && atom.nodes[1] === null;
+}
+
+function requiresCredentialPostfix(token: Token): boolean {
+  return token.text === "." || token.text === "?." || /^[([<!]$/.test(token.text);
+}
+
+function flatCredentialNode(
+  token: Token,
+  predicate: CredentialWordName,
+  arrow: boolean,
+): ExpressionNode | null {
+  if (token.nodes) return token.nodes[Number(arrow)]!;
+  if (expressionLiteral(token)) return literalExpressionNode(token);
+  const valid = predicate(token.text);
+  return {
+    depends: valid,
+    structured: false,
+    bare: true,
+    word: valid,
+    callee: token.text,
+    end: token.end,
+  };
+}
+
+function isFlatCredentialTypeAtom(token: Token): boolean {
+  if (token.kind === "word") return token.text !== "typeof" && token.text !== "readonly";
+  return token.kind === "number" || token.kind === "string";
+}
+
+function isFlatCredentialOperator(token: Token, type: boolean): boolean {
+  if (type) return token.text === "|" || token.text === "&" || token.text === "=>";
+  return token.text === ":" || expressionPrecedence(token.text) >= 0;
+}
+
+function flatCredentialTypeBoundary(token: Token, previousEnd: number): boolean | undefined {
+  if (/^[.[(<:]$/.test(token.text)) return undefined;
+  if (token.kind === "end" || /^[,;)}\]]$/.test(token.text)) return true;
+  if (isFlatCredentialOperator(token, true)) return false;
+  return token.start > previousEnd;
+}
+
+function flatCredentialTypeAtom(token: Token, predicate: CredentialWordName): CredentialTypeNode {
+  const type = token.kind === "word" && credentialTypeName(token.text, predicate);
+  return {
+    valid: token.kind !== "word" || type,
+    type,
+    wordOnly: !/\d/.test(token.text),
+    end: token.end,
+  };
+}
+
+function flatCredentialTypeFacts(
+  run: FlatCredentialRun,
+  predicate: CredentialWordName,
+): FlatCredentialTypeFacts {
+  const known = run.typeFacts?.get(predicate);
+  if (known) return known;
+  const facts: FlatCredentialTypeFacts = { invalid: [0], nonWord: [0], arrows: [0] };
+  for (const [index, token] of run.atoms.entries()) {
+    const atom = flatCredentialTypeAtom(token, predicate);
+    facts.invalid.push(facts.invalid[index]! + Number(!atom.valid));
+    facts.nonWord.push(facts.nonWord[index]! + Number(!atom.wordOnly));
+    const operator = run.operators[index];
+    if (operator) facts.arrows.push(facts.arrows[index]! + Number(operator.text === "=>"));
+  }
+  (run.typeFacts ??= new Map()).set(predicate, facts);
+  return facts;
+}
+
+function flatCredentialTypeResult(
+  facts: FlatCredentialTypeFacts,
+  first: number,
+  last: number,
+  finalAtom: Token,
+  predicate: CredentialWordName,
+): CredentialTypeNode | null {
+  const atom = flatCredentialTypeAtom(finalAtom, predicate);
+  if (first === last) return atom;
+  if (!atom.valid || !atom.wordOnly || facts.invalid[last]! !== facts.invalid[first]!) return null;
+  if (
+    facts.nonWord[last]! !== facts.nonWord[first]! ||
+    facts.arrows[last]! !== facts.arrows[first]!
+  )
+    return null;
+  return { valid: true, type: true, wordOnly: true, end: finalAtom.end };
+}
+
+function flatCredentialBoundary(token: Token, previousEnd: number): boolean | undefined {
+  if (/^(?:[.[(<!]|\?\.|\$[({]?|`)$/.test(token.text)) return undefined;
+  if (token.kind === "end" || /^[,;)}\]]$/.test(token.text)) return true;
+  if (isFlatCredentialOperator(token, false)) return false;
+  return token.start > previousEnd;
+}
+
+class CredentialRangeIndex {
+  private readonly tree: number[];
+  private readonly size: number;
+  constructor(values: number[], privateMaximum: boolean) {
+    let size = 1;
+    while (size < values.length) size *= 2;
+    this.size = size;
+    const empty = privateMaximum ? -Infinity : Infinity;
+    this.tree = Array.from({ length: size * 2 }, () => empty);
+    for (const [index, value] of values.entries()) this.tree[size + index] = value;
+    for (let index = size - 1; index > 0; index -= 1)
+      this.tree[index] = privateMaximum
+        ? Math.max(this.tree[index * 2]!, this.tree[index * 2 + 1]!)
+        : Math.min(this.tree[index * 2]!, this.tree[index * 2 + 1]!);
+  }
+  query(first: number, end: number, maximum: boolean): number {
+    let result = maximum ? -Infinity : Infinity;
+    let left = this.size + first;
+    let right = this.size + end;
+    while (left < right) {
+      if (left % 2) {
+        result = maximum ? Math.max(result, this.tree[left]!) : Math.min(result, this.tree[left]!);
+        left += 1;
+      }
+      if (right % 2) {
+        right -= 1;
+        result = maximum
+          ? Math.max(result, this.tree[right]!)
+          : Math.min(result, this.tree[right]!);
+      }
+      left >>>= 1;
+      right >>>= 1;
+    }
+    return result;
+  }
+}
+
+function flatCredentialConditionalDepth(run: FlatCredentialRun): number[] | null {
+  if (run.conditionalDepth !== undefined) return run.conditionalDepth;
+  if (!run.operators.some((operator) => operator.text === "?" || operator.text === ":"))
+    return (run.conditionalDepth = null);
+  const depth = [0];
+  for (const operator of run.operators)
+    depth.push(
+      depth[depth.length - 1]! + Number(operator.text === "?") - Number(operator.text === ":"),
+    );
+  return (run.conditionalDepth = depth);
+}
+
+function flatCredentialConditionalValid(
+  run: FlatCredentialRun,
+  first: number,
+  last: number,
+): boolean {
+  const depth = flatCredentialConditionalDepth(run);
+  if (!depth) return true;
+  if (depth[first] !== depth[last]) return false;
+  const minimum = (run.conditionalMinimum ??= new CredentialRangeIndex(depth, false));
+  return minimum.query(first + 1, last + 1, false) >= depth[first]!;
+}
+
+function flatCredentialConditional(run: FlatCredentialRun): FlatCredentialConditional | undefined {
+  if (run.conditional) return run.conditional;
+  const depth = flatCredentialConditionalDepth(run);
+  if (!depth) return undefined;
+  const killers = Array.from({ length: run.atoms.length }, () => Infinity);
+  const arrows: number[] = [];
+  const arrowDepths: number[] = [];
+  for (let index = run.atoms.length - 1; index >= 0; index -= 1) {
+    if (run.operators[index]?.text === "=>") {
+      while (arrowDepths.length && arrowDepths[arrowDepths.length - 1]! >= depth[index]!) {
+        arrowDepths.pop();
+        arrows.pop();
+      }
+      arrows.push(index);
+      arrowDepths.push(depth[index]!);
+    }
+    const selected = lowerCredentialOffset(arrowDepths, depth[index]! + 1) - 1;
+    if (selected >= 0) killers[index] = arrows[selected]!;
+  }
+  return (run.conditional = {
+    depth,
+    killers,
+    minimum: (run.conditionalMinimum ??= new CredentialRangeIndex(depth, false)),
+  });
+}
+
+function flatCredentialFacts(
+  run: FlatCredentialRun,
+  predicate: CredentialWordName,
+): [FlatCredentialFacts, FlatCredentialFacts] {
+  const existing = run.facts?.get(predicate);
+  if (existing) return existing;
+  const facts: [FlatCredentialFacts, FlatCredentialFacts] = [
+    buildFlatCredentialFacts(run, predicate, false),
+    buildFlatCredentialFacts(run, predicate, true),
+  ];
+  (run.facts ??= new Map()).set(predicate, facts);
+  return facts;
+}
+
+function buildFlatCredentialFacts(
+  run: FlatCredentialRun,
+  predicate: CredentialWordName,
+  arrow: boolean,
+): FlatCredentialFacts {
+  const facts: FlatCredentialFacts = {
+    invalid: [0],
+    depends: [0],
+    literal: [0],
+    badOperator: [0],
+    arrows: [],
+    comparisons: [],
+  };
+  for (const [index, atom] of run.atoms.entries()) {
+    const node = flatCredentialNode(atom, predicate, arrow);
+    facts.invalid.push(facts.invalid[index]! + Number(!node || isInvalidExpressionOperand(node)));
+    facts.depends.push(facts.depends[index]! + Number(!!node?.depends));
+    facts.literal.push(facts.literal[index]! + Number(!!node?.hasLiteral));
+    const operator = run.operators[index];
+    if (!operator) continue;
+    const precedence = expressionPrecedence(operator.text);
+    const bad = invalidFlatCredentialOperator(operator.text, precedence, node, arrow);
+    facts.badOperator.push(facts.badOperator[index]! + Number(bad));
+    if (operator.text === "=>") facts.arrows.push(index);
+    if (precedence === 4) facts.comparisons.push(index);
+  }
+  const conditional = flatCredentialConditional(run);
+  if (conditional) {
+    facts.conditional = conditional;
+    facts.survivor = new CredentialRangeIndex(
+      run.atoms.map((_atom, index) =>
+        facts.depends[index + 1]! > facts.depends[index]! ? conditional.killers[index]! : -Infinity,
+      ),
+      true,
+    );
+  }
+  return facts;
+}
+
+function invalidFlatCredentialOperator(
+  operator: string,
+  precedence: number,
+  node: ExpressionNode | null,
+  arrow: boolean,
+): boolean {
+  const parameters = node?.operatorParameters ?? node?.parameters;
+  const bare = node?.operatorBare ?? node?.bare;
+  return (
+    precedence >= 5 ||
+    (operator === "=>" && !(parameters || bare)) ||
+    (precedence === 4 && !arrow && !node?.structured)
+  );
+}
+
+function flatCredentialRange(
+  facts: [FlatCredentialFacts, FlatCredentialFacts],
+  field: "invalid" | "depends" | "literal" | "badOperator",
+  first: number,
+  end: number,
+  split: number,
+): number {
+  const middle = Math.max(first, Math.min(end, split));
+  return (
+    facts[0][field][middle]! -
+    facts[0][field][first]! +
+    facts[1][field][end]! -
+    facts[1][field][middle]!
+  );
+}
+
+function flatCredentialResult(
+  facts: [FlatCredentialFacts, FlatCredentialFacts],
+  first: number,
+  last: number,
+  finalAtom: Token,
+  predicate: CredentialWordName,
+): ExpressionNode | null {
+  const arrows = facts[0].arrows;
+  const firstArrow = arrows[lowerCredentialOffset(arrows, first)] ?? Infinity;
+  const split = firstArrow + 1;
+  const conditional = facts[0].conditional;
+  const finalNode = flatCredentialNode(finalAtom, predicate, firstArrow < last);
+  if (first === last) return finalNode;
+  if (
+    !finalNode ||
+    isInvalidExpressionOperand(finalNode) ||
+    flatCredentialRange(facts, "invalid", first, last, split)
+  )
+    return null;
+  if (flatCredentialRange(facts, "badOperator", first, last, split)) return null;
+  const arrowIndex = lowerCredentialOffset(arrows, last) - 1;
+  const lastArrow = arrows[arrowIndex] ?? -1;
+  const dependencyStart = lastArrow >= first ? lastArrow + 1 : first;
+  const depends = conditional
+    ? conditionalCredentialDepends(facts, first, last, split) || finalNode.depends
+    : flatCredentialRange(facts, "depends", dependencyStart, last, split) > 0 || finalNode.depends;
+  return {
+    depends,
+    structured: true,
+    bare: false,
+    word: true,
+    hasLiteral:
+      flatCredentialRange(facts, "literal", first, last, split) > 0 || !!finalNode.hasLiteral,
+    end: finalAtom.end,
+  };
+}
+
+function conditionalCredentialDepends(
+  facts: [FlatCredentialFacts, FlatCredentialFacts],
+  first: number,
+  last: number,
+  split: number,
+): boolean {
+  const middle = Math.max(first, Math.min(last, split));
+  return (
+    Math.max(
+      facts[0].survivor!.query(first, middle, true),
+      facts[1].survivor!.query(middle, last, true),
+    ) >= last
+  );
+}
+
+interface ExpressionNode {
+  depends: boolean;
+  structured: boolean;
+  bare: boolean;
+  word: boolean;
+  end: number;
+  parameters?: boolean;
+  container?: boolean;
+  containerReference?: boolean;
+  operatorBare?: boolean;
+  operatorParameters?: boolean;
+  literal?: "string" | "number" | "keyword" | "regex";
+  safeLiteral?: boolean;
+  hasLiteral?: boolean;
+  callee?: string;
+  method?: boolean;
+}
+
+interface ExpressionOperator {
+  name: string;
+  precedence: number;
+  unary?: boolean;
+}
+
+interface ExpressionFrame {
+  kind: "root" | "group" | "array" | "object" | "index" | "call" | "interpolation";
+  close: string;
+  values: ExpressionNode[];
+  operators: ExpressionOperator[];
+  elements: ExpressionNode[];
+  operand: boolean;
+  owner?: ExpressionNode;
+  codeContext: boolean;
+  arrowContext: boolean;
+  arrowBody: boolean;
+}
+
+interface TemplateFrame {
+  kind: "template";
+  implicit: boolean;
+  depends: boolean;
+  expansion: boolean;
+  end: number;
+}
+
+type ParseFrame = ExpressionFrame | TemplateFrame;
+
+function expressionFrame(
+  kind: ExpressionFrame["kind"],
+  close = "",
+  owner?: ExpressionNode,
+  parent?: ExpressionFrame,
+): ExpressionFrame {
+  return {
+    kind,
+    close,
+    owner,
+    values: [],
+    operators: [],
+    elements: [],
+    operand: true,
+    codeContext: kind === "call" || !!parent?.codeContext,
+    arrowContext: !!parent?.arrowContext || !!parent?.arrowBody,
+    arrowBody: false,
+  };
+}
+
+function reduceExpression(frame: ExpressionFrame): boolean {
+  const operator = frame.operators.pop();
+  if (!operator || operator.name === "?") return false;
+  const right = frame.values.pop();
+  if (!right || isInvalidExpressionOperand(right)) return false;
+  if (operator.unary) {
+    frame.values.push({ ...right, structured: true, bare: false });
+    return true;
+  }
+  const middle = operator.name === "?:" ? frame.values.pop() : undefined;
+  const left = frame.values.pop();
+  if (
+    !left ||
+    (operator.name === "?:" && !middle) ||
+    isInvalidExpressionOperand(left) ||
+    isInvalidExpressionOperand(middle)
+  )
+    return false;
+  frame.values.push({
+    depends:
+      operator.name === "=>" ? right.depends : left.depends || right.depends || !!middle?.depends,
+    structured: true,
+    bare: false,
+    word: true,
+    end: right.end,
+    hasLiteral: left.hasLiteral || right.hasLiteral || middle?.hasLiteral,
+  });
+  return true;
+}
+
+function isInvalidExpressionOperand(node: ExpressionNode | undefined): boolean {
+  return !!node?.bare && !node.word;
+}
+
+function finishExpression(frame: ExpressionFrame): ExpressionNode | null {
+  if (frame.operand) return null;
+  while (frame.operators.length > 0) if (!reduceExpression(frame)) return null;
+  return frame.values.length === 1 ? frame.values[0]! : null;
+}
+
+function deliverExpression(frame: ExpressionFrame, node: ExpressionNode): void {
+  frame.values.push(node);
+  frame.operand = false;
+}
+
+function unescapeCredentialLiteral(text: string): string {
+  return text
+    .replace(/\\(?:x([\da-f]{2})|u([\da-f]{4}))/gi, (_, hex: string, unicode: string) =>
+      String.fromCharCode(Number.parseInt(hex ?? unicode, 16)),
+    )
+    .replace(/\\([nrtbfv0])/g, () => " ")
+    .replace(/\\(.)/g, "$1");
+}
+
+function literalExpressionNode(token: Token): ExpressionNode {
+  let literal: ExpressionNode["literal"] = "keyword";
+  if (token.kind === "string") literal = "string";
+  else if (token.kind === "number") literal = "number";
+  else if (token.kind === "regex") literal = "regex";
+  const value =
+    literal === "string" ? unescapeCredentialLiteral(token.text.slice(1, -1)) : token.text;
+  const safeLiteral =
+    literal !== "string" ||
+    value === "" ||
+    /^[A-Za-z]+(?:[_\-.][A-Za-z]+)*$/.test(value) ||
+    /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$/.test(value) ||
+    (value.length <= 3 && !/[A-Za-z\d]/.test(value));
+  return {
+    depends: false,
+    structured: false,
+    bare: false,
+    word: literal === "regex",
+    end: token.end,
+    literal,
+    safeLiteral,
+    hasLiteral: true,
+  };
+}
+
+function credentialNameSegments(name: string): number {
+  return name
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z])([A-Z][a-z])/g, "$1 $2")
+    .split(/[._\s-]+/)
+    .filter(Boolean).length;
+}
+
+function callArgumentAllowed(argument: ExpressionNode, owner: ExpressionNode): boolean {
+  if (argument.literal === "number")
+    return !!owner.method || credentialNameSegments(owner.callee ?? "") >= 2;
+  if (argument.literal) return !!argument.safeLiteral;
+  return argument.depends;
+}
+
+function calledExpressionNode(
+  owner: ExpressionNode,
+  argumentsList: ExpressionNode[],
+  normal: ExpressionNode,
+): ExpressionNode | null {
+  if (
+    /(?:^|\.)String(?:\.|$)/.test(owner.callee ?? "") &&
+    argumentsList.some((argument) => argument.hasLiteral)
+  )
+    return null;
+  if (!argumentsList.every((argument) => callArgumentAllowed(argument, owner))) return null;
+  return {
+    ...normal,
+    depends: owner.bare ? owner.word : owner.depends || owner.literal === "regex",
+    callee: owner.callee,
+    method: true,
+  };
+}
+
+/** Commands in $(...) use shell syntax rather than the expression grammar. */
+function shellSubstitutionEnd(text: string, start: number): number | null {
+  return credentialSubstitutionEnd(text, start, "(", ")");
+}
+
+function credentialSubstitutionEnd(
+  text: string,
+  start: number,
+  open: string,
+  close: string,
+): number | null {
+  let depth = 1;
+  let quote = "";
+  for (let cursor = start + 2; cursor < text.length; cursor += 1) {
+    const character = text[cursor]!;
+    if (character === "\\") cursor += 1;
+    else if (quote) {
+      if (character === quote) quote = "";
+    } else if (character === "'" || character === '"' || character === "`") quote = character;
+    else if (character === open) depth += 1;
+    else if (character === close) {
+      depth -= 1;
+      if (depth === 0) return cursor > start + 2 ? cursor + 1 : null;
+    }
+  }
+  return null;
+}
+
+/** Top-level formatting references; call arguments and quoted strings are excluded. */
+function implicitTemplateStart(text: string, start: number, full: boolean): number | null {
+  let words = 0;
+  let inWord = false;
+  for (let cursor = start; cursor < text.length; cursor += 1) {
+    const character = text[cursor]!;
+    if (character === "$" && (text[cursor + 1] === "{" || text[cursor + 1] === "(")) return cursor;
+    if (/[()[\]'"`;|&<>\r\n]/.test(character)) return null;
+    if (/\s/.test(character)) {
+      if (inWord) words += 1;
+      inWord = false;
+      if (!full && words > 1) return null;
+    } else inWord = true;
+  }
+  return null;
+}
+
+interface ExpressionState {
+  text: string;
+  full: boolean;
+  wordName: CredentialWordName;
+  lexer: CredentialLexer;
+  stack: ParseFrame[];
+  lastEnd: number;
+  atomOnly?: boolean;
+}
+
+type ExpressionStep = ExpressionNode | null | undefined;
+
+function credentialWordCharacter(character: string | undefined): boolean {
+  if (character === undefined) return false;
+  const code = character.charCodeAt(0);
+  return (
+    (code >= 65 && code <= 90) ||
+    (code >= 97 && code <= 122) ||
+    (code >= 48 && code <= 57) ||
+    character === "_" ||
+    character === "$"
+  );
+}
+
+function credentialOpeningAt(text: string, start: number): string | null {
+  if (text[start] === "$" && (text[start + 1] === "(" || text[start + 1] === "{"))
+    return text[start + 1]!;
+  if (text[start] === "(" || text[start] === "[" || text[start] === "{") return text[start]!;
+  let cursor = start;
+  while (credentialWordCharacter(text[cursor])) cursor += 1;
+  while (text[cursor] === "." || text.startsWith("?.", cursor)) {
+    cursor += text[cursor] === "." ? 1 : 2;
+    const member = cursor;
+    while (credentialWordCharacter(text[cursor])) cursor += 1;
+    if (cursor === member) return null;
+  }
+  return text[cursor] === "(" || text[cursor] === "[" || text[cursor] === "{"
+    ? text[cursor]!
+    : null;
+}
+
+function hasCredentialClosingDelimiter(
+  text: string,
+  start: number,
+  context?: CredentialParseContext,
+): boolean {
+  const opening = credentialOpeningAt(text, start);
+  if (!opening) return true;
+  if (context) return context.hasClosing(opening, start + 1, text.length);
+  let close = "}";
+  if (opening === "(") close = ")";
+  else if (opening === "[") close = "]";
+  return text.indexOf(close, start + 1) !== -1;
+}
+
+function boundedCredentialSource(text: string, start: number): string {
+  const bounded = text.slice(0, start + CREDENTIAL_LOOKAHEAD_LIMIT);
+  const newline = bounded.indexOf("\n", start);
+  const carriage = bounded.indexOf("\r", start);
+  let end = bounded.length;
+  if (newline !== -1) end = newline;
+  if (carriage !== -1) end = Math.min(end, carriage);
+  return bounded.slice(0, end);
+}
+
+function templateBoundary(top: TemplateFrame, character: string, full: boolean): boolean {
+  if (!top.implicit) return character === "`";
+  if (/[;'"`,|&<>\r\n]/.test(character)) return true;
+  return !full && /\s/.test(character);
+}
+
+function readTemplateChunk(
+  state: ExpressionState,
+  top: TemplateFrame,
+): "nested" | "closed" | "invalid" {
+  let cursor = state.lexer.position;
+  while (cursor < state.text.length) {
+    const character = state.text[cursor]!;
+    if (character === "\\") {
+      cursor += 2;
+      continue;
+    }
+    if (character === "$" && state.text[cursor + 1] === "(") {
+      const end = shellSubstitutionEnd(state.text, cursor);
+      if (end === null) return "invalid";
+      top.depends = true;
+      top.expansion = true;
+      cursor = end;
+      top.end = end;
+      continue;
+    }
+    if (character === "$" && state.text[cursor + 1] === "{") {
+      const end = credentialSubstitutionEnd(state.text, cursor, "{", "}");
+      if (end === null) return "invalid";
+      top.depends = true;
+      top.expansion = true;
+      cursor = end;
+      top.end = end;
+      continue;
+    }
+    if (templateBoundary(top, character, state.full)) break;
+    cursor += 1;
+    top.end = cursor;
+  }
+  state.lexer.reset(cursor);
+  return "closed";
+}
+
+function stepTemplate(state: ExpressionState, top: TemplateFrame): ExpressionStep {
+  const chunk = readTemplateChunk(state, top);
+  if (chunk === "invalid") return null;
+  if (chunk === "nested") return undefined;
+  const cursor = state.lexer.position;
+  if (!top.implicit && state.text[cursor] !== "`") return null;
+  const end = top.implicit ? cursor : cursor + 1;
+  const node: ExpressionNode = {
+    depends: top.depends,
+    structured: top.expansion,
+    bare: false,
+    word: true,
+    end,
+  };
+  state.stack.pop();
+  state.lexer.reset(end);
+  if (state.stack.length === 0) return node;
+  const parent = state.stack[state.stack.length - 1]!;
+  if (parent.kind === "template") return null;
+  deliverExpression(parent, node);
+  state.lastEnd = end;
+  return undefined;
+}
+
+function closedExpressionNode(
+  state: ExpressionState,
+  top: ExpressionFrame,
+  elements: ExpressionNode[],
+  current: ExpressionNode | null,
+  end: number,
+): ExpressionNode | null {
+  const references = elements.some((element) => element.depends);
+  const normal: ExpressionNode = {
+    depends: references,
+    structured: true,
+    bare: false,
+    word: true,
+    end,
+    hasLiteral: elements.some((element) => element.hasLiteral),
+  };
+  if (top.kind === "call") return calledExpressionNode(top.owner!, elements, normal);
+  if (top.kind === "index")
+    return elements.length === 0
+      ? null
+      : {
+          ...normal,
+          depends: top.owner!.depends || references,
+          callee: top.owner!.callee,
+          method: true,
+        };
+  if (top.kind === "array" || top.kind === "object") {
+    const literalObject =
+      top.kind === "object" && elements.every((element) => callArgumentAllowed(element, normal));
+    const containerReference = elements.some(
+      (element) =>
+        element.containerReference || (element.structured && element.depends && !element.container),
+    );
+    return {
+      ...normal,
+      depends: normal.depends || literalObject,
+      container: true,
+      containerReference: containerReference || literalObject,
+    };
+  }
+  if (top.kind === "interpolation")
+    return current ? { ...current, structured: true, bare: false, end } : null;
+  const last = elements[elements.length - 1];
+  if (last) return { ...last, end, parameters: true };
+  if (state.lexer.peek().text !== "=>") return null;
+  return { depends: false, structured: false, bare: false, word: true, end, parameters: true };
+}
+
+function stepExpressionClose(
+  state: ExpressionState,
+  top: ExpressionFrame,
+  token: Token,
+): ExpressionStep {
+  const current =
+    top.operand && top.values.length === 0 && top.elements.length === 0
+      ? null
+      : finishExpression(top);
+  const empty = top.operand && top.values.length === 0 && top.operators.length === 0;
+  if (!current && !empty) return null;
+  const elements = current ? [...top.elements, current] : top.elements;
+  state.lexer.take();
+  const node = closedExpressionNode(state, top, elements, current, token.end);
+  if (!node) return null;
+  state.stack.pop();
+  const parent = state.stack[state.stack.length - 1];
+  if (!parent) return null;
+  if (parent.kind === "template") {
+    parent.depends ||= node.depends;
+    parent.end = token.end;
+  } else deliverExpression(parent, node);
+  state.lastEnd = token.end;
+  return undefined;
+}
+
+function pushExpressionAccess(
+  state: ExpressionState,
+  top: ExpressionFrame,
+  owner: ExpressionNode,
+  opening: string,
+): ExpressionStep {
+  if (!owner.word) return null;
+  state.lexer.take();
+  top.values.pop();
+  state.stack.push(
+    expressionFrame(opening === "(" ? "call" : "index", opening === "(" ? ")" : "]", owner, top),
+  );
+  return undefined;
+}
+
+function stepGenericExpression(
+  state: ExpressionState,
+  top: ExpressionFrame,
+  owner: ExpressionNode,
+  token: Token,
+): ExpressionStep {
+  if (!owner.word) return null;
+  const argumentsNode = parseCredentialType(state.text, token.start, state.wordName, true);
+  if (!argumentsNode?.valid) return null;
+  state.lexer.reset(argumentsNode.end);
+  if (state.lexer.peek().text !== "(") return null;
+  return pushExpressionAccess(state, top, owner, "(");
+}
+
+function stepExpressionMember(
+  state: ExpressionState,
+  top: ExpressionFrame,
+  owner: ExpressionNode,
+  token: Token,
+): ExpressionStep {
+  state.lexer.take();
+  const member = state.lexer.peek();
+  if (token.text === "?." && (member.text === "(" || member.text === "["))
+    return pushExpressionAccess(state, top, owner, member.text);
+  const environmentMember =
+    /^(?:process\.env|os\.environ)$/.test(owner.callee ?? "") &&
+    /^[A-Z][A-Z0-9_]*$/.test(member.text);
+  if (member.kind !== "word" || (!state.wordName(member.text) && !environmentMember) || !owner.word)
+    return null;
+  state.lexer.take();
+  top.values[top.values.length - 1] = {
+    ...owner,
+    structured: true,
+    bare: false,
+    callee: owner.callee ? `${owner.callee}.${member.text}` : member.text,
+    method: true,
+    end: member.end,
+  };
+  state.lastEnd = member.end;
+  return undefined;
+}
+
+function stepExpressionComma(state: ExpressionState, top: ExpressionFrame): ExpressionStep {
+  const element = finishExpression(top);
+  if (!element) return null;
+  top.elements.push(element);
+  top.values = [];
+  top.operators = [];
+  top.operand = true;
+  state.lexer.take();
+  return undefined;
+}
+
+function arrowAnnotationEnd(state: ExpressionState, start: number): number | null {
+  const lexer = new CredentialLexer(state.text, start);
+  const first = lexer.take();
+  let typeStart = first.start;
+  if (first.kind === "word" && state.wordName(first.text) && lexer.peek().text === "is") {
+    lexer.take();
+    typeStart = lexer.peek().start;
+  }
+  const type = parseCredentialType(state.text, typeStart, state.wordName, false, true);
+  if (!type?.valid || !type.type) return null;
+  lexer.reset(type.end);
+  return lexer.peek().text === "=>" ? type.end : null;
+}
+
+function stepArrowAnnotation(state: ExpressionState, top: ExpressionFrame): boolean {
+  const owner = top.values[top.values.length - 1];
+  if (!owner?.parameters || top.operators.some((operator) => operator.name === "?")) return false;
+  const end = arrowAnnotationEnd(state, state.lexer.peek().end);
+  if (end === null) return false;
+  state.lexer.reset(end);
+  top.values[top.values.length - 1] = { ...owner, end };
+  state.lastEnd = end;
+  return true;
+}
+
+function stepExpressionColon(state: ExpressionState, top: ExpressionFrame): ExpressionStep {
+  if (stepArrowAnnotation(state, top)) return undefined;
+  if (top.kind === "object" && top.values.length === 1 && top.operators.length === 0) {
+    top.values.pop();
+  } else {
+    while (top.operators.length && top.operators[top.operators.length - 1]!.name !== "?") {
+      if (!reduceExpression(top)) return null;
+    }
+    if (top.operators.pop()?.name !== "?") return null;
+    top.operators.push({ name: "?:", precedence: 1 });
+  }
+  top.operand = true;
+  state.lexer.take();
+  return undefined;
+}
+
+function expressionPrecedence(operator: string): number {
+  switch (operator) {
+    case "=>":
+      return 0;
+    case "?":
+      return 1;
+    case "||":
+    case "??":
+      return 2;
+    case "&&":
+      return 3;
+    case "==":
+    case "===":
+    case "!=":
+    case "!==":
+      return 4;
+    case "+":
+    case "-":
+      return 5;
+    case "*":
+    case "/":
+    case "%":
+      return 6;
+    case "**":
+      return 7;
+    default:
+      return -1;
+  }
+}
+
+function stepExpressionOperator(
+  state: ExpressionState,
+  top: ExpressionFrame,
+  owner: ExpressionNode,
+  token: Token,
+  precedence: number,
+): ExpressionStep {
+  if (precedence >= 5 && !top.codeContext) return null;
+  if (
+    precedence === 4 &&
+    !owner.structured &&
+    !top.arrowContext &&
+    !top.arrowBody &&
+    !top.operators.some((operator) => operator.unary)
+  )
+    return null;
+  if (token.text === "=>" && !(owner.parameters || owner.bare)) return null;
+  while (
+    top.operators.length &&
+    top.operators[top.operators.length - 1]!.name !== "?" &&
+    top.operators[top.operators.length - 1]!.precedence >= precedence
+  ) {
+    if (!reduceExpression(top)) return null;
+  }
+  top.operators.push({ name: token.text, precedence });
+  if (token.text === "=>") top.arrowBody = true;
+  top.operand = true;
+  state.lexer.take();
+  return undefined;
+}
+
+function rootExpressionBoundary(
+  state: ExpressionState,
+  top: ExpressionFrame,
+  token: Token,
+): boolean {
+  return (
+    top.kind === "root" &&
+    state.stack.length === 1 &&
+    (token.start > state.lastEnd || /^[,;)}\]]$/.test(token.text))
+  );
+}
+
+function isCredentialAtomBoundary(
+  state: ExpressionState,
+  top: ExpressionFrame,
+  token: Token,
+): boolean {
+  return (
+    !!state.atomOnly &&
+    top.kind === "root" &&
+    state.stack.length === 1 &&
+    (token.text === ":" || expressionPrecedence(token.text) >= 0)
+  );
+}
+
+function finishedCredentialAtom(top: ExpressionFrame, owner: ExpressionNode): ExpressionStep {
+  const node = finishExpression(top);
+  return node ? { ...node, operatorBare: owner.bare, operatorParameters: owner.parameters } : null;
+}
+
+function stepCredentialAtomAnnotation(
+  state: ExpressionState,
+  top: ExpressionFrame,
+  token: Token,
+): boolean {
+  return (
+    !!state.atomOnly && top.kind === "root" && token.text === ":" && stepArrowAnnotation(state, top)
+  );
+}
+
+function stepExpressionPostfix(
+  state: ExpressionState,
+  top: ExpressionFrame,
+  token: Token,
+): ExpressionStep {
+  const owner = top.values[top.values.length - 1]!;
+  if (stepCredentialAtomAnnotation(state, top, token)) return undefined;
+  if (isCredentialAtomBoundary(state, top, token)) return finishedCredentialAtom(top, owner);
+  if (token.text === "<") return stepGenericExpression(state, top, owner, token);
+  if (token.text === "." || token.text === "?.")
+    return stepExpressionMember(state, top, owner, token);
+  if (token.text === "(" || token.text === "[")
+    return pushExpressionAccess(state, top, owner, token.text);
+  if (token.text === "!") {
+    if (
+      !owner.structured &&
+      !isUnquotedCredentialName(owner.callee ?? "") &&
+      !isCredentialType(owner.callee ?? "")
+    )
+      return null;
+    state.lexer.take();
+    top.values[top.values.length - 1] = { ...owner, structured: true, end: token.end };
+    state.lastEnd = token.end;
+    return undefined;
+  }
+  if (token.text === "," && top.kind !== "root") return stepExpressionComma(state, top);
+  if (token.text === ":") return stepExpressionColon(state, top);
+  const precedence = expressionPrecedence(token.text);
+  if (precedence >= 0) return stepExpressionOperator(state, top, owner, token, precedence);
+  return rootExpressionBoundary(state, top, token) ? finishExpression(top) : null;
+}
+
+function openingExpression(token: string): [ExpressionFrame["kind"], string] | null {
+  switch (token) {
+    case "(":
+      return ["group", ")"];
+    case "[":
+      return ["array", "]"];
+    case "{":
+      return ["object", "}"];
+    default:
+      return null;
+  }
+}
+
+function expressionPrefix(token: Token): boolean {
+  return (
+    token.text === "!" ||
+    token.text === "..." ||
+    (token.kind === "word" && /^(?:typeof|new|await|readonly)$/.test(token.text))
+  );
+}
+
+function expressionLiteral(token: Token): boolean {
+  return (
+    token.kind === "string" ||
+    token.kind === "number" ||
+    token.kind === "regex" ||
+    (token.kind === "word" && /^(?:true|false|null|undefined)$/.test(token.text))
+  );
+}
+
+/** Dollar references have the closed name forms agreed for human answers. */
+function environmentReferenceEnd(text: string, start: number): number | null {
+  if (text[start] !== "$" && text[start] !== "%") return null;
+  const reference =
+    /(?:%[A-Za-z_][A-Za-z0-9_]*%|\$env:[A-Za-z_][A-Za-z0-9_]*|\$[A-Za-z_][A-Za-z0-9_]*|\$\d+)/iy;
+  reference.lastIndex = start;
+  const match = reference.exec(text)?.[0];
+  if (!match) return null;
+  if (/^(?:%|\$env:|\$\d+$)/i.test(match)) return reference.lastIndex;
+  const name = match.slice(1);
+  return /^(?:[a-z]+(?:[A-Z][a-z]+)*|[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*)$/.test(name)
+    ? reference.lastIndex
+    : null;
+}
+
+function stepExpressionPrimary(
+  state: ExpressionState,
+  top: ExpressionFrame,
+  token: Token,
+): ExpressionStep {
+  if (expressionPrefix(token)) {
+    top.operators.push({ name: token.text, precedence: 9, unary: true });
+    state.lexer.take();
+    return undefined;
+  }
+  if (token.text === "`") {
+    state.lexer.take();
+    state.stack.push({
+      kind: "template",
+      implicit: false,
+      depends: false,
+      expansion: false,
+      end: token.end,
+    });
+    return undefined;
+  }
+  if (token.text === "${") {
+    const end = credentialSubstitutionEnd(state.text, token.start, "{", "}");
+    if (end === null) return null;
+    state.lexer.reset(end);
+    deliverExpression(top, { depends: true, structured: true, bare: false, word: true, end });
+    state.lastEnd = end;
+    return undefined;
+  }
+  if (token.text === "$(") {
+    const end = shellSubstitutionEnd(state.text, token.start);
+    if (end === null) return null;
+    state.lexer.reset(end);
+    deliverExpression(top, { depends: true, structured: true, bare: false, word: true, end });
+    state.lastEnd = end;
+    return undefined;
+  }
+  const environmentEnd = environmentReferenceEnd(state.text, token.start);
+  if (environmentEnd !== null) {
+    state.lexer.reset(environmentEnd);
+    deliverExpression(top, {
+      depends: true,
+      structured: true,
+      bare: false,
+      word: true,
+      end: environmentEnd,
+    });
+    state.lastEnd = environmentEnd;
+    return undefined;
+  }
+  const opening = openingExpression(token.text);
+  if (opening) {
+    state.lexer.take();
+    state.stack.push(expressionFrame(opening[0], opening[1], undefined, top));
+    return undefined;
+  }
+  if (expressionLiteral(token)) {
+    state.lexer.take();
+    deliverExpression(top, literalExpressionNode(token));
+  } else if (token.kind === "word") {
+    if (token.text.startsWith("$")) return null;
+    state.lexer.take();
+    const valid = state.wordName(token.text);
+    deliverExpression(top, {
+      depends: valid,
+      structured: false,
+      bare: true,
+      word: valid,
+      callee: token.text,
+      end: token.end,
+    });
+  } else return null;
+  state.lastEnd = token.end;
+  return undefined;
+}
+
+function advanceExpression(state: ExpressionState): ExpressionStep {
+  const top = state.stack[state.stack.length - 1]!;
+  if (top.kind === "template") return stepTemplate(state, top);
+  const token = state.lexer.peek();
+  if (top.close && token.text === top.close) return stepExpressionClose(state, top, token);
+  if (token.kind === "end")
+    return top.kind === "root" && state.stack.length === 1 ? finishExpression(top) : null;
+  return top.operand
+    ? stepExpressionPrimary(state, top, token)
+    : stepExpressionPostfix(state, top, token);
+}
+
+function parseCredentialExpression(
+  text: string,
+  start: number,
+  full: boolean,
+  wordName: CredentialWordName,
+  context?: CredentialParseContext,
+  atomOnly = false,
+  arrowContext = false,
+): ExpressionNode | null {
+  if (context && !atomOnly) {
+    const flat = context.expression(text, start, wordName);
+    if (flat !== undefined) return flat;
+
+    wordName = context.words(wordName);
+  }
+  if (context) wordName = context.words(wordName);
+  text = boundedCredentialSource(text, start);
+  if (!hasCredentialClosingDelimiter(text, start, context)) return null;
+  const lexer = new CredentialLexer(text, start, context);
+  const implicit = atomOnly ? null : implicitTemplateStart(text, start, full);
+  const stack: ParseFrame[] =
+    implicit === null
+      ? [expressionFrame("root")]
+      : [{ kind: "template", implicit: true, depends: false, expansion: false, end: implicit }];
+  if (implicit !== null) lexer.reset(implicit);
+  if (stack[0]?.kind !== "template") stack[0]!.arrowContext = arrowContext;
+  const state: ExpressionState = { text, full, wordName, lexer, stack, lastEnd: start, atomOnly };
+  while (state.stack.length > 0) {
+    const result = advanceExpression(state);
+    if (result !== undefined) return result;
+  }
+  return null;
+}
+
+function readCredentialExpressionEnd(
+  text: string,
+  start: number,
+  wordName: CredentialWordName = defaultWordName,
+  context?: CredentialParseContext,
+): number | null {
+  const node = parseCredentialExpression(text, start, false, wordName, context);
+  if (!node?.structured) return null;
+  if (
+    node.container &&
+    !node.containerReference &&
+    !isCredentialTemplateName(text.slice(start, node.end))
+  )
+    return null;
+  return node.depends || node.container ? node.end : null;
+}
+
+function isCredentialExpression(
+  value: string,
+  wordName: CredentialWordName = defaultWordName,
+): boolean {
+  const text = value.trim();
+  if (text.length > CREDENTIAL_LOOKAHEAD_LIMIT) return false;
+  if (isCredentialTemplateName(text)) return true;
+  const node = parseCredentialExpression(text, 0, true, wordName);
+  return (
+    !!node?.structured &&
+    node.depends &&
+    (!node.container || !!node.containerReference) &&
+    node.end === text.length
+  );
+}
+
+function isCredentialTemplateName(
+  value: string,
+  wordName: CredentialWordName = defaultWordName,
+): boolean {
+  const match =
+    /^(?:\{\{\s*([A-Za-z_]+)\s*\}\}|\{\s*([A-Za-z_]+)\s*\}|\[\s*([A-Za-z_]+)\s*\])$/.exec(value);
+  const name = match?.[1] ?? match?.[2] ?? match?.[3];
+  return !!name && wordName(name);
+}
+
+/** A quoted password can preserve only one complete substitution, never its inner syntax. */
+function isCredentialSubstitution(value: string): boolean {
+  if (value.length > CREDENTIAL_LOOKAHEAD_LIMIT || /[\r\n]/.test(value)) return false;
+  if (value.startsWith("${")) return credentialSubstitutionEnd(value, 0, "{", "}") === value.length;
+  if (value.startsWith("$(")) return shellSubstitutionEnd(value, 0) === value.length;
+  return value.startsWith("$") && environmentReferenceEnd(value, 0) === value.length;
+}
+
+/** The unquoted-name exception requires a real word boundary and no numeric suffix. */
+function isUnquotedCredentialName(
+  value: string,
+  wordName: CredentialWordName = defaultWordName,
+): boolean {
+  if (!/^[A-Za-z_]+$/.test(value) || !wordName(value)) return false;
+  if (!isCredentialWordOnlyName(value) && !isEmbeddedAcronymReference(value)) return false;
+  return /[a-z][A-Z]/.test(value) || /^[A-Za-z]+(?:_[A-Za-z]+)+$/.test(value);
+}
+
+function isCredentialNumericCodeName(value: string): boolean {
+  const terminalTag = /^([a-z]{3,}(?:[A-Z][a-z]{2,})+)[A-Z]?\d{1,5}$/.exec(value)?.[1];
+  if (terminalTag !== undefined && isCredentialWordOnlyName(terminalTag)) return true;
+  if (/^[A-Z]{2,}\d{0,5}(?:_[A-Z]{2,}\d{0,5})+$/.test(value)) return true;
+  if (value.length >= 16 && isStrictWordlikeIdentifier(value)) return true;
+  return (
+    isTierTwoCredentialType(value) ||
+    /^(?:(?:Uint|Int)(?:8|16|32)|Big(?:Uint|Int)64|Float(?:32|64))Array$/.test(value)
+  );
+}
+
+function isNaturalCodeWords(value: string): boolean {
+  if (!/^[A-Za-z]+$/.test(value)) return false;
+  const runs = value.match(/[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|$)/g);
+  if (!runs || runs.join("") !== value || runs.length < 2) return false;
+  let natural = 0;
+  for (const [index, run] of runs.entries()) {
+    if (run.length >= 2 && /[aeiouy]/i.test(run)) natural += 1;
+    else if (index !== 0 || run.length > 3) return false;
+  }
+  return natural >= 2 || (natural === 1 && runs[runs.length - 1]!.length >= 6);
+}
+
+function isCompactCamelCodeName(value: string): boolean {
+  if (value.length >= 12) return false;
+  const match = /^([a-z]{1,3})([A-Z][a-z]{3,})$/.exec(value);
+  return !!match && /[aeiouy]/i.test(match[1]!) && /[aeiouy]/i.test(match[2]!);
+}
+
+function isEmbeddedAcronymReference(value: string): boolean {
+  if (!/^[a-z]{5,}[A-Z][bcdfghjklmnpqrstvwxz]{2}(?:[A-Z][a-z]{3,}){2,}$/.test(value)) return false;
+  const runs = value.match(/[A-Z]?[a-z]+/g) ?? [];
+  return runs.every((run) => run.length === 3 || /[aeiouy]/i.test(run));
+}
+
+/** Credential names keep the stricter word-run measure used before source identifier exemptions. */
+function isCredentialWordOnlyName(value: string): boolean {
+  if (/^[a-z]+$/.test(value) || /^[A-Z]+$/.test(value)) return true;
+  if (/^[a-z]+(?:[-_./][a-z]+)+$/.test(value)) return true;
+  if (!/^[A-Za-z_]+$/.test(value)) return false;
+  const runs = value.match(/[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|_|$)|_+/g);
+  if (!runs || runs.join("") !== value) return false;
+  return hasWordlikeIdentifierShape(value, measureIdentifier(runs));
+}
+
+function isTierTwoCredentialType(
+  value: string,
+  wordName: CredentialWordName = defaultWordName,
+): boolean {
+  if (
+    !/^[A-Z][A-Za-z\d]*(?:Credentials?|Token|Key|Secret|Config|Options|Digest|Signature|Provider|Client|Type|Schema)$/.test(
+      value,
+    )
+  )
+    return false;
+  const digitRuns = value.match(/\d+/g) ?? [];
+  return (
+    digitRuns.length > 0 &&
+    digitRuns.length <= 2 &&
+    digitRuns.every((run) => run.length <= 5) &&
+    wordName(value.replace(/\d+/g, ""))
+  );
+}
+
+/** Only a wordlike callee may establish an unfinished second-tier code expression. */
+function isTierTwoExpressionPrefix(
+  value: string,
+  wordName: CredentialWordName = defaultWordName,
+): boolean {
+  if (value.length > CREDENTIAL_LOOKAHEAD_LIMIT || /[\r\n]/.test(value)) return false;
+  const chain = /^([A-Za-z_$][\w$]*(?:(?:\.|\?\.)[A-Za-z_$][\w$]*)*)\s*[(<[{]/.exec(value)?.[1];
+  if (!chain) return false;
+  const names = chain.split(/\?\.|\./);
+  return (
+    names.some((name) => name.length >= 3) &&
+    names.every((name) => wordName(name)) &&
+    hasUnclosedCredentialDelimiter(value)
+  );
+}
+
+function hasUnclosedCredentialDelimiter(value: string): boolean {
+  const stack: string[] = [];
+  let quote = "";
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index]!;
+    if (character === "\\") index += 1;
+    else if (quote) {
+      if (character === quote) quote = "";
+    } else if (character === '"' || character === "'" || character === "`") quote = character;
+    else if (character === "(" || character === "[" || character === "{" || character === "<")
+      stack.push(character);
+    else if (character === ")" || character === "]" || character === "}" || character === ">")
+      stack.pop();
+  }
+  return stack.length > 0;
+}
+
+interface CredentialTypeNode {
+  valid: boolean;
+  type: boolean;
+  end: number;
+  name?: string;
+  parameters?: boolean;
+  wordOnly?: boolean;
+}
+
+interface CredentialTypeFrame {
+  kind: "root" | "group" | "tuple" | "arguments";
+  close: string;
+  owner?: CredentialTypeNode;
+  values: CredentialTypeNode[];
+  operators: string[];
+  elements: CredentialTypeNode[];
+  operand: boolean;
+  parameter: boolean;
+}
+
+function typeFrame(
+  kind: CredentialTypeFrame["kind"],
+  close = "",
+  owner?: CredentialTypeNode,
+): CredentialTypeFrame {
+  return {
+    kind,
+    close,
+    owner,
+    values: [],
+    operators: [],
+    elements: [],
+    operand: true,
+    parameter: false,
+  };
+}
+
+function credentialTypeName(name: string, wordName: CredentialWordName): boolean {
+  return (
+    /^(?:string|number|boolean|bigint|symbol|unknown|never|object|any|void|undefined|null|str|bytes|byte|bool|char|list|dict|set|tuple|[ui](?:8|16|32|64|128|size)|f(?:32|64))$/.test(
+      name,
+    ) ||
+    /^(?:String|Number|Boolean|Object|Array|ReadonlyArray|Map|Set|Record|Promise|Partial|Required|Readonly|Pick|Omit|Optional|Option|Vec|None)$/.test(
+      name,
+    ) ||
+    (/^[A-Z][A-Za-z]*$/.test(name) && wordName(name) && isCredentialWordOnlyName(name)) ||
+    (name.length < 16 &&
+      /^(?:(?:Uint|Int)(?:8|16|32)|Big(?:Uint|Int)64|Float(?:32|64))Array$/.test(name))
+  );
+}
+
+function reduceType(frame: CredentialTypeFrame): boolean {
+  const operator = frame.operators.pop();
+  const right = frame.values.pop();
+  const left = frame.values.pop();
+  if (!operator || !right || !left) return false;
+  if (operator === "=>") {
+    if (!left.parameters || !right.type) return false;
+  } else if (!left.valid || !right.valid || !left.wordOnly || !right.wordOnly) return false;
+  frame.values.push({
+    valid: true,
+    type: true,
+    end: right.end,
+    wordOnly: left.wordOnly && right.wordOnly,
+  });
+  return true;
+}
+
+function finishType(frame: CredentialTypeFrame): CredentialTypeNode | null {
+  if (frame.operand) return null;
+  while (frame.operators.length) if (!reduceType(frame)) return null;
+  return frame.values.length === 1 ? frame.values[0]! : null;
+}
+
+function deliverType(frame: CredentialTypeFrame, node: CredentialTypeNode): void {
+  frame.values.push(node);
+  frame.operand = false;
+}
+
+interface CredentialTypeState {
+  text: string;
+  wordName: CredentialWordName;
+  lexer: CredentialLexer;
+  stack: CredentialTypeFrame[];
+  lastEnd: number;
+  stopAtArrow: boolean;
+}
+
+type CredentialTypeStep = CredentialTypeNode | null | undefined;
+
+function closedTypeNode(
+  state: CredentialTypeState,
+  top: CredentialTypeFrame,
+  elements: CredentialTypeNode[],
+  end: number,
+): CredentialTypeNode {
+  if (top.kind === "group") {
+    const arrow = state.lexer.peek().text === "=>";
+    const validParameters = elements.every(
+      (element) => element.type || (!!element.name && state.wordName(element.name)),
+    );
+    return {
+      valid: arrow ? validParameters : elements.length === 1 && elements[0]!.valid,
+      type: !arrow && elements.length === 1 && elements[0]!.type,
+      parameters: arrow && validParameters,
+      wordOnly: elements.every((element) => element.wordOnly),
+      end,
+    };
+  }
+  if (top.kind === "tuple")
+    return {
+      valid: elements.every((element) => element.valid),
+      type: elements.every((element) => element.type),
+      wordOnly: elements.every((element) => element.wordOnly),
+      end,
+    };
+  const valid =
+    !!top.owner?.valid && elements.length > 0 && elements.every((element) => element.valid);
+  return {
+    valid,
+    type: !!top.owner?.type && valid,
+    end,
+    wordOnly: !!top.owner?.wordOnly && elements.every((element) => element.wordOnly),
+  };
+}
+
+function stepTypeClose(
+  state: CredentialTypeState,
+  top: CredentialTypeFrame,
+  token: Token,
+): CredentialTypeStep {
+  const current = top.operand && top.values.length === 0 ? null : finishType(top);
+  const empty = top.operand && top.values.length === 0 && top.operators.length === 0;
+  if (!current && !empty) return null;
+  const elements = current ? [...top.elements, current] : top.elements;
+  state.lexer.take();
+  const node = closedTypeNode(state, top, elements, token.end);
+  state.stack.pop();
+  if (state.stack.length === 0) return node;
+  deliverType(state.stack[state.stack.length - 1]!, node);
+  state.lastEnd = token.end;
+  return undefined;
+}
+
+function typeParameterPosition(
+  state: CredentialTypeState,
+  top: CredentialTypeFrame,
+  owner: CredentialTypeNode,
+  token: Token,
+): boolean {
+  return (
+    token.text === ":" &&
+    top.kind === "group" &&
+    top.values.length === 1 &&
+    top.operators.length === 0 &&
+    !!owner.name &&
+    state.wordName(owner.name)
+  );
+}
+
+function stepTypeParameter(
+  state: CredentialTypeState,
+  top: CredentialTypeFrame,
+): CredentialTypeStep {
+  top.values.pop();
+  top.parameter = true;
+  top.operand = true;
+  state.lexer.take();
+  return undefined;
+}
+
+function stepTypeMember(
+  state: CredentialTypeState,
+  top: CredentialTypeFrame,
+  owner: CredentialTypeNode,
+): CredentialTypeStep {
+  if (!owner.name || !state.wordName(owner.name)) return null;
+  state.lexer.take();
+  const member = state.lexer.take();
+  if (member.kind !== "word" || !state.wordName(member.text)) return null;
+  const valid = credentialTypeName(member.text, state.wordName);
+  top.values[top.values.length - 1] = {
+    valid,
+    type: valid,
+    name: member.text,
+    end: member.end,
+    wordOnly: !/\d/.test(member.text),
+  };
+  state.lastEnd = member.end;
+  return undefined;
+}
+
+function stepTypeArguments(
+  state: CredentialTypeState,
+  top: CredentialTypeFrame,
+  owner: CredentialTypeNode,
+  token: Token,
+): CredentialTypeStep {
+  if (!owner.type) return null;
+  state.lexer.take();
+  if (token.text === "[" && state.lexer.peek().text === "]") {
+    const closing = state.lexer.take();
+    top.values[top.values.length - 1] = {
+      valid: true,
+      type: true,
+      end: closing.end,
+      wordOnly: owner.wordOnly,
+    };
+    state.lastEnd = closing.end;
+  } else {
+    top.values.pop();
+    state.stack.push(typeFrame("arguments", token.text === "<" ? ">" : "]", owner));
+  }
+  return undefined;
+}
+
+function stepTypeComma(state: CredentialTypeState, top: CredentialTypeFrame): CredentialTypeStep {
+  const element = finishType(top);
+  if (!element) return null;
+  top.elements.push(element);
+  top.values = [];
+  top.operators = [];
+  top.operand = true;
+  state.lexer.take();
+  return undefined;
+}
+
+function stepTypeOperator(
+  state: CredentialTypeState,
+  top: CredentialTypeFrame,
+  token: Token,
+): CredentialTypeStep {
+  const owner = top.values[top.values.length - 1];
+  if (token.text === "=>" ? !owner?.parameters : !owner?.valid || !owner.wordOnly) return null;
+  while (top.operators.length && token.text !== "=>") {
+    if (!reduceType(top)) return null;
+  }
+  top.operators.push(token.text);
+  top.operand = true;
+  state.lexer.take();
+  return undefined;
+}
+
+function rootTypeBoundary(
+  state: CredentialTypeState,
+  top: CredentialTypeFrame,
+  token: Token,
+): boolean {
+  return (
+    top.kind === "root" &&
+    state.stack.length === 1 &&
+    (token.start > state.lastEnd || /^[,;)}\]]$/.test(token.text))
+  );
+}
+
+function stepTypePostfix(
+  state: CredentialTypeState,
+  top: CredentialTypeFrame,
+  token: Token,
+): CredentialTypeStep {
+  const owner = top.values[top.values.length - 1]!;
+  if (state.stopAtArrow && top.kind === "root" && token.text === "=>") return finishType(top);
+  if (typeParameterPosition(state, top, owner, token)) return stepTypeParameter(state, top);
+  if (token.text === ".") return stepTypeMember(state, top, owner);
+  if (token.text === "<" || token.text === "[") return stepTypeArguments(state, top, owner, token);
+  if (token.text === "," && top.kind !== "root") return stepTypeComma(state, top);
+  if (["|", "&", "=>"].includes(token.text)) return stepTypeOperator(state, top, token);
+  return rootTypeBoundary(state, top, token) ? finishType(top) : null;
+}
+
+function stepTypeQuery(state: CredentialTypeState, top: CredentialTypeFrame): CredentialTypeStep {
+  state.lexer.take();
+  let name = state.lexer.take();
+  if (name.kind !== "word" || !state.wordName(name.text)) return null;
+  while (state.lexer.peek().text === ".") {
+    state.lexer.take();
+    name = state.lexer.take();
+    if (name.kind !== "word" || !state.wordName(name.text)) return null;
+  }
+  deliverType(top, { valid: true, type: true, end: name.end, wordOnly: !/\d/.test(name.text) });
+  state.lastEnd = name.end;
+  return undefined;
+}
+
+function stepTypePrimary(
+  state: CredentialTypeState,
+  top: CredentialTypeFrame,
+  token: Token,
+): CredentialTypeStep {
+  if (token.text === "readonly") {
+    state.lexer.take();
+    return undefined;
+  }
+  if (token.text === "typeof") return stepTypeQuery(state, top);
+  if (token.text === "(") {
+    state.lexer.take();
+    state.stack.push(typeFrame("group", ")"));
+    return undefined;
+  }
+  if (token.text === "[") {
+    state.lexer.take();
+    if (state.lexer.peek().text === "]") state.lexer.take();
+    else state.stack.push(typeFrame("tuple", "]"));
+    return undefined;
+  }
+  if (token.kind === "word") {
+    state.lexer.take();
+    const valid = credentialTypeName(token.text, state.wordName);
+    deliverType(top, {
+      valid,
+      type: valid,
+      name: token.text,
+      end: token.end,
+      wordOnly: !/\d/.test(token.text),
+    });
+  } else if (token.kind === "string" || token.kind === "number") {
+    state.lexer.take();
+    deliverType(top, {
+      valid: true,
+      type: false,
+      end: token.end,
+      wordOnly: token.kind === "string" && !/\d/.test(token.text),
+    });
+  } else return null;
+  state.lastEnd = token.end;
+  return undefined;
+}
+
+function advanceType(state: CredentialTypeState): CredentialTypeStep {
+  const top = state.stack[state.stack.length - 1]!;
+  const token = state.lexer.peek();
+  if (top.close && token.text === top.close) return stepTypeClose(state, top, token);
+  if (token.kind === "end") return state.stack.length === 1 ? finishType(top) : null;
+  return top.operand ? stepTypePrimary(state, top, token) : stepTypePostfix(state, top, token);
+}
+
+/** Same lexer and delimiter discipline as expressions, with type productions. */
+function parseCredentialType(
+  text: string,
+  start: number,
+  wordName: CredentialWordName,
+  initialArguments = false,
+  stopAtArrow = false,
+  context?: CredentialParseContext,
+): CredentialTypeNode | null {
+  if (context && !initialArguments && !stopAtArrow) {
+    const flat = context.type(text, start, wordName);
+    if (flat !== undefined) return flat;
+  }
+  text = boundedCredentialSource(text, start);
+  if (!hasCredentialClosingDelimiter(text, start, context)) return null;
+  const lexer = new CredentialLexer(text, start, context);
+  if (context) wordName = context.words(wordName);
+  const stack: CredentialTypeFrame[] = initialArguments
+    ? [typeFrame("arguments", ">", { valid: true, type: true, end: start })]
+    : [typeFrame("root")];
+  if (initialArguments && lexer.take().text !== "<") return null;
+  const state: CredentialTypeState = { text, wordName, lexer, stack, lastEnd: start, stopAtArrow };
+  while (state.stack.length > 0) {
+    const result = advanceType(state);
+    if (result !== undefined) return result;
+  }
+  return null;
+}
+
+function readCredentialTypeEnd(
+  text: string,
+  start: number,
+  wordName: CredentialWordName = defaultWordName,
+  context?: CredentialParseContext,
+): number | null {
+  const node = parseCredentialType(text, start, wordName, false, false, context);
+  return node?.valid && node.type ? node.end : null;
+}
+
+function isCredentialType(value: string, wordName: CredentialWordName = defaultWordName): boolean {
+  const text = value.trim();
+  if (text.length > CREDENTIAL_LOOKAHEAD_LIMIT) return false;
+  const node = parseCredentialType(text, 0, wordName);
+  return !!node?.valid && node.type && node.end === text.length;
+}
+
+interface ScanSpan {
+  start: number;
+  end: number;
+}
+
+interface UrlExtent {
+  end: number;
+  at: number;
+}
+
+function urlSchemeStart(text: string, separator: number): number | null {
+  let start = separator;
+  while (start > 0 && /[A-Za-z0-9+.-]/.test(text[start - 1]!)) start -= 1;
+  return /[A-Za-z]/.test(text[start] ?? "") ? start : null;
+}
+
+function urlUserinfoAt(text: string, authorityStart: number, end: number, at: number): number {
+  // Userinfo requires a username/password colon before the first boundary.
+  // Without one, an at-sign belongs to the host/path; with one, the last wins.
+  const colon = text.indexOf(":", authorityStart);
+  let firstBoundary = authorityStart;
+  while (firstBoundary < end && !/[/?#]/.test(text[firstBoundary]!)) firstBoundary += 1;
+  if (colon < authorityStart || colon >= firstBoundary) at = -1;
+  else {
+    const authorityHead = text.slice(authorityStart, firstBoundary);
+    // A numeric password before #/? or / is not a port. Recognize ports only
+    // on an unambiguous host; true userinfo always ends at the final at-sign.
+    const hostPort =
+      /^(?:localhost|(?:[a-z0-9-]+\.)+[a-z]{2,}|(?:\d{1,3}\.){3}\d{1,3}|\[[a-f0-9:]+\]):\d+$/i;
+    if (hostPort.test(authorityHead)) at = -1;
+  }
+  return at;
+}
+
+function urlExtent(
+  text: string,
+  view: DetectionView,
+  original: string,
+  schemeStart: number,
+  authorityStart: number,
+): UrlExtent {
+  let end = authorityStart;
+  let at = -1;
+  let firstCloser = -1;
+  let closerAfterAt = -1;
+  while (end < text.length) {
+    if (/[\s"'`<>]/.test(text[end]!) && isValueDelimiter(view, original, end)) break;
+    if (/[})]/.test(text[end]!) && isValueDelimiter(view, original, end)) {
+      if (firstCloser < 0) firstCloser = end;
+      if (closerAfterAt < 0) closerAfterAt = end;
+    }
+    if (
+      /["'`]/.test(text[end]!) &&
+      text[schemeStart - 1] === text[end] &&
+      mappedQuoteMayClose(view, schemeStart - 1, end)
+    )
+      break;
+    if (text[end] === "@") {
+      at = end;
+      closerAfterAt = -1;
+    }
+    end += 1;
+  }
+  at = urlUserinfoAt(text, authorityStart, end, at);
+  const closing = at < 0 ? firstCloser : closerAfterAt;
+  return { end: closing >= 0 ? closing : end, at };
+}
+
+function urlPasswordSpan(
+  text: string,
+  view: DetectionView,
+  original: string,
+  authorityStart: number,
+  at: number,
+): ScanSpan | null {
+  if (at < authorityStart) return null;
+  const colon = text.indexOf(":", authorityStart);
+  if (colon < authorityStart || colon >= at) return null;
+  const start = colon + 1;
+  const value = decodedCredentialValue(text, view, original, start, at);
+  return credentialValueShape(value, 8, credentialRawLength(view, start, at))
+    ? { start, end: at }
+    : null;
+}
+
+/** URL-owned host/path bytes only; query and neighbouring JSON values still scan. */
+function urlParts(
+  text: string,
+  view: DetectionView,
+  original: string,
+): { excluded: ScanSpan[]; passwords: ScanSpan[] } {
+  const excluded: ScanSpan[] = [];
+  const passwords: ScanSpan[] = [];
+  const scanner = /:\/\//g;
+  let match: RegExpExecArray | null;
+  while ((match = scanner.exec(text)) !== null) {
+    const schemeStart = urlSchemeStart(text, match.index);
+    if (schemeStart === null) continue;
+    const authorityStart = match.index + match[0].length;
+    const { end, at } = urlExtent(text, view, original, schemeStart, authorityStart);
+    const hostStart = at < 0 ? authorityStart : at + 1;
+    let query = hostStart;
+    while (query < end && text[query] !== "?" && text[query] !== "#") query += 1;
+    excluded.push({ start: schemeStart, end: query });
+    const password = urlPasswordSpan(text, view, original, authorityStart, at);
+    if (password) passwords.push(password);
+    scanner.lastIndex = end;
+  }
+  return { excluded, passwords };
+}
+
+function dataUriSpans(text: string): ScanSpan[] {
+  const spans: ScanSpan[] = [];
+  const scanner = /\bdata:/gi;
+  let match: RegExpExecArray | null;
+  while ((match = scanner.exec(text)) !== null) {
+    // A bounded, anchored MIME header rejects data:data:data... in constant time.
+    const header = /^data:[a-z0-9.+-]+\/[a-z0-9.+-]+(?:;[a-z0-9=.+-]+)*,/i.exec(
+      text.slice(match.index, match.index + 512),
+    );
+    if (!header) continue;
+    let end = match.index + header[0].length;
+    while (end < text.length && !/[\s"'<>)}]/.test(text[end]!)) end += 1;
+    spans.push({ start: match.index, end });
+    scanner.lastIndex = end;
+  }
+  return spans;
+}
+
+function isIntegrityCandidate(value: string): boolean {
+  return (
+    /^sha(?:1|224|256|384|512)-/i.test(value) ||
+    /^SHA(?:-?(?:1|224|256|384|512))?[a-f0-9]{32,}$/i.test(value)
+  );
+}
+
+function entropyCandidateSpans(value: string, start: number): ScanSpan[] {
+  if (isIntegrityCandidate(value) || isKnownIdentifier(value)) return [];
+  if (isFortyCharacterBase64(value)) return [{ start, end: start + value.length }];
+  const parts = value.split(/[-/]/).filter((part) => part !== "");
+  // Separators inside a wholly opaque encoding belong to that value. Readable
+  // neighbouring segments still get independent spans rather than being eaten.
+  if (
+    parts.length > 1 &&
+    parts.every((part) => !isWordlikePathSegment(part)) &&
+    isEntropyValue(value)
+  )
+    return [{ start, end: start + value.length }];
+  // Delimiters establish actual identifier/path segments. Entropy in one
+  // segment is independent of the number of readable neighbouring words.
+  const spans: ScanSpan[] = [];
+  const segments = /[^/-]+/g;
+  for (const match of value.matchAll(segments)) {
+    if (isEntropyValue(match[0]))
+      spans.push({ start: start + match.index, end: start + match.index + match[0].length });
+  }
+  return spans;
+}
+
+function entropySpans(text: string, exclusions: ScanSpan[]): ScanSpan[] {
+  const spans: ScanSpan[] = [];
+  let excluded = 0;
+  const candidates = /[A-Za-z0-9+/_-]{32,}={0,2}/g;
+  let match: RegExpExecArray | null;
+  while ((match = candidates.exec(text)) !== null) {
+    const start = match.index;
+    while (exclusions[excluded] && exclusions[excluded]!.end <= start) excluded += 1;
+    const range = exclusions[excluded];
+    if (range && range.start <= start) {
+      candidates.lastIndex = Math.max(candidates.lastIndex, range.end);
+      continue;
+    }
+    const value = match[0];
+    const suffix = text.slice(start + value.length, start + value.length + 32);
+    if (
+      /^\.[A-Za-z][A-Za-z0-9]{0,7}(?=[:\s"'`,;)}\]]|$)/.test(suffix) &&
+      isWordlikePath(value + suffix.split(/[\s"'`,;)}\]]/, 1)[0])
+    )
+      continue;
+    spans.push(...entropyCandidateSpans(value, start));
+  }
+  return spans;
+}
+
+function cookieLineEnd(text: string, view: DetectionView, original: string, start: number): number {
+  let end = start;
+  while (end < text.length && !(text[end] === "\n" && isValueDelimiter(view, original, end)))
+    end += 1;
+  return end;
+}
+
+function cookieValueEnd(
+  text: string,
+  view: DetectionView,
+  original: string,
+  start: number,
+  lineEnd: number,
+  opening: number,
+  quote: string | undefined,
+): number {
+  let end = start;
+  while (end < lineEnd) {
+    if (/[;\s]/.test(text[end]!) && isValueDelimiter(view, original, end)) break;
+    if (text[end] === quote && mappedQuoteMayClose(view, opening, end)) break;
+    end += 1;
+  }
+  return end;
+}
+
+interface CookieField {
+  next: number;
+  span: ScanSpan | null;
+}
+
+function readCookieField(
+  text: string,
+  view: DetectionView,
+  original: string,
+  fieldStart: number,
+  lineEnd: number,
+  field: CookieField,
+): void {
+  field.span = null;
+  let cursor = fieldStart;
+  while (cursor < lineEnd && text[cursor] !== "=" && text[cursor] !== ";") cursor += 1;
+  if (text[cursor] !== "=") {
+    field.next = cursor + 1;
+    return;
+  }
+  const key = text.slice(fieldStart, cursor).trim();
+  cursor += 1;
+  while (text[cursor] === " " || text[cursor] === "\t") cursor += 1;
+  const opening = cursor;
+  const quote = text[cursor] === '"' || text[cursor] === "'" ? text[cursor++] : undefined;
+  const start = cursor;
+  const end = cookieValueEnd(text, view, original, start, lineEnd, opening, quote);
+  cursor = end;
+  field.span =
+    /^[A-Za-z0-9_-]+$/.test(key) &&
+    credentialValueShape(
+      decodedCredentialValue(text, view, original, start, end),
+      12,
+      credentialRawLength(view, start, end),
+    )
+      ? { start, end }
+      : null;
+  if (text[cursor] === quote) cursor += 1;
+  while (cursor < lineEnd && text[cursor] !== ";") cursor += 1;
+  field.next = cursor + 1;
+}
+
+function cookieSpans(text: string, view: DetectionView, original: string): ScanSpan[] {
+  const spans: ScanSpan[] = [];
+  const scanner = /\b(?:Cookie|Set-Cookie):[ \t]*/gi;
+  let header: RegExpExecArray | null;
+  while ((header = scanner.exec(text)) !== null) {
+    let cursor = header.index + header[0].length;
+    const lineEnd = cookieLineEnd(text, view, original, cursor);
+    const field: CookieField = { next: cursor, span: null };
+    while (cursor < lineEnd) {
+      readCookieField(text, view, original, cursor, lineEnd, field);
+      if (field.span) spans.push(field.span);
+      cursor = field.next;
+    }
+    scanner.lastIndex = lineEnd;
+  }
+  return spans;
+}
+
+function isClosedPlaceholder(value: string): boolean {
+  if (value === "" || /^(?:\*{3,}|x{4,}|\.{3}|…|N\/A)$/i.test(value)) return true;
+  const template =
+    /^(?:\[[A-Za-z _.-]+\]|\{\{\s*[A-Za-z _.-]+\s*\}\}|\{[A-Za-z _.-]+\}|<(?:[A-Za-z _.-]+|\.{3})>)$/.exec(
+      value,
+    );
+  return template !== null;
+}
+
+function isStrictVersion(value: string): boolean {
+  return (
+    value === "*" ||
+    /^(?:[v~^]?\d+(?:\.(?:\d+|x|\*))+|(?:>=?|<=?)\d+(?:\.\d+)*(?: +<(?:=)?\d+(?:\.\d+)*)?|workspace:\*|npm:[a-z0-9@/_-]+@\d+(?:\.\d+)+)$/i.test(
+      value,
+    )
+  );
+}
+
+function isWordOnlyName(value: string): boolean {
+  return isCredentialWordOnlyName(value);
+}
+
+function credentialValueShape(value: string, minimum = 12, rawLength = value.length): boolean {
+  if (isFortyCharacterBase64(value)) return true;
+  const numericTypeLiteral = /^[A-Za-z]+[&|]\d+$/.test(value);
+  if (
+    (!numericTypeLiteral && rawLength < minimum) ||
+    /\s/.test(value) ||
+    isClosedPlaceholder(value) ||
+    isCredentialSubstitution(value) ||
+    isStrictVersion(value)
+  )
+    return false;
+  if (/^[a-f0-9]{32,}$/i.test(value)) return true;
+  if (isWordOnlyName(value)) return false;
+  const location = value.replace(/%5c/gi, "\\");
+  if (
+    /\.[A-Za-z][A-Za-z0-9]{0,7}(?::\d+(?:-\d+)?)?$/.test(location) &&
+    (isWordlikePath(location) || /^(?:[A-Za-z]:\\|\\)/.test(location))
+  )
+    return false;
+  const classes =
+    Number(/[a-z]/.test(value)) +
+    Number(/[A-Z]/.test(value)) +
+    Number(/\d/.test(value)) +
+    Number(/[^A-Za-z0-9]/.test(value));
+  return classes >= 2;
+}
+
+function isEntropyValue(value: string): boolean {
+  if (isFortyCharacterBase64(value)) return true;
+  if (
+    value.length < 32 ||
+    isKnownIdentifier(value) ||
+    isWordlikePath(value) ||
+    isStrictWordlikeIdentifier(value) ||
+    isDelimitedIdentifier(value)
+  )
+    return false;
+  if (!/[A-Z]/.test(value) || !/[a-z]/.test(value)) return false;
+  return entropyOf(value) >= 3;
+}
+
+function mappedQuoteMayClose(view: DetectionView, opening: number, closing: number): boolean {
+  const width = (index: number) =>
+    (view.ends?.[index] ?? index + 1) - (view.starts?.[index] ?? index);
+  return width(opening) === width(closing);
+}
+
+function isValueDelimiter(view: DetectionView, original: string, index: number): boolean {
+  if (isLiteralCharacter(view, index)) return true;
+  const raw = original.slice(view.starts?.[index] ?? index, view.ends?.[index] ?? index + 1);
+  return /^\\+[nrt]$/.test(raw);
+}
+
+function decodedCredentialValue(
+  text: string,
+  view: DetectionView,
+  _original: string,
+  start: number,
+  end: number,
+): string {
+  if (view.starts === undefined) return text.slice(start, end);
+  const parts: string[] = [];
+  for (let index = start; index < end; index += 1) {
+    const character = text[index]!;
+    parts.push(
+      !isLiteralCharacter(view, index) && !isOpaqueCharacter(character)
+        ? `%${character.charCodeAt(0).toString(16)}`
+        : character,
+    );
+  }
+  return parts.join("");
+}
+
+function credentialRawLength(view: DetectionView, start: number, end: number): number {
+  return (view.ends?.[end - 1] ?? end) - (view.starts?.[start] ?? start);
+}
+
+interface CredentialPolicyIndex {
+  nextSpaceEnd: Uint32Array;
+  lines: number[];
+  closingBraces: number[];
+  boundaries: number[];
+}
+
+function credentialPolicyIndex(text: string): CredentialPolicyIndex {
+  const nextSpaceEnd = new Uint32Array(text.length + 1);
+  const lines: number[] = [];
+  const closingBraces: number[] = [];
+  const boundaries: number[] = [];
+  const scanner = /[{}\r\n]/g;
+  let match: RegExpExecArray | null;
+  while ((match = scanner.exec(text)) !== null) {
+    boundaries.push(match.index);
+    if (match[0] === "}") closingBraces.push(match.index);
+    else if (match[0] !== "{") lines.push(match.index);
+  }
+  nextSpaceEnd[text.length] = text.length;
+  for (let index = text.length - 1; index >= 0; index -= 1) {
+    const character = text[index];
+    nextSpaceEnd[index] =
+      character === " " || character === "\t" ? nextSpaceEnd[index + 1]! : index;
+  }
+  return { nextSpaceEnd, lines, closingBraces, boundaries };
+}
+
+function policyLineEnd(text: string, start: number, index: CredentialPolicyIndex): number {
+  return Math.min(
+    text.length,
+    start + 4096,
+    index.lines[firstPositionAtOrAfter(index.lines, start)] ?? text.length,
+  );
+}
+
+function lineEndsAfterValue(text: string, end: number, index: CredentialPolicyIndex): boolean {
+  end = Math.min(index.nextSpaceEnd[end]!, policyLineEnd(text, end, index));
+  return end === text.length || text[end] === "\n" || text[end] === "\r";
+}
+
+function isDestructuredCredentialName(
+  text: string,
+  start: number,
+  end: number,
+  value: string,
+  index: CredentialPolicyIndex,
+): boolean {
+  if (!/^[A-Za-z_$]+$/.test(value)) return false;
+  const opening = index.boundaries[firstPositionAtOrAfter(index.boundaries, start) - 1] ?? -1;
+  if (opening < Math.max(0, start - 256) || text[opening] !== "{") return false;
+  const maximum = policyLineEnd(text, end, index);
+  let closing =
+    index.closingBraces[firstPositionAtOrAfter(index.closingBraces, end)] ?? text.length;
+  if (closing > maximum || text[closing] !== "}") return false;
+  closing += 1;
+  if (closing < maximum) closing = Math.min(index.nextSpaceEnd[closing]!, maximum);
+  return text[closing] === "=" && text[closing + 1] !== "=";
+}
+
+function hasCredentialCodeExtent(
+  text: string,
+  candidate: LabelledValue,
+  context: CredentialParseContext,
+): boolean {
+  const { start, end, mode } = candidate;
+  const expressionEnd = readCredentialExpressionEnd(text, start, undefined, context);
+  if (expressionEnd !== null && expressionEnd >= end && (mode === "label" || expressionEnd === end))
+    return true;
+  const typeEnd = readCredentialTypeEnd(text, start, undefined, context);
+  if (typeEnd === null) return false;
+  if (typeEnd >= end) return mode === "label" || typeEnd === end;
+  return /^[)\]}]+:$/.test(text.slice(typeEnd, end));
+}
+
+interface CredentialValueFacts {
+  placeholder?: boolean;
+  substitution?: boolean;
+  benign?: boolean;
+  name?: boolean;
+  type?: boolean;
+  prefix?: boolean;
+  shape?: Map<number, boolean>;
+}
+
+function isBenignUnquotedCredential(
+  text: string,
+  candidate: LabelledValue,
+  value: string,
+  facts: CredentialValueFacts,
+  index: CredentialPolicyIndex,
+): boolean {
+  facts.benign ??=
+    isStrictVersion(value) || isCredentialType(value) || isCredentialExpression(value);
+  if (facts.benign) return true;
+  facts.name ??= isUnquotedCredentialName(value);
+  if (candidate.tier === "credential") {
+    facts.type ??= isTierTwoCredentialType(value);
+    facts.prefix ??= isTierTwoExpressionPrefix(value);
+    return facts.name || facts.type || facts.prefix;
+  }
+  if (
+    facts.name ||
+    isDestructuredCredentialName(text, candidate.start, candidate.end, value, index)
+  )
+    return true;
+  if (!lineEndsAfterValue(text, candidate.end, index)) return false;
+  facts.prefix ??= isTierTwoExpressionPrefix(value);
+  return /^[([{]$/.test(value) || (value.includes(".") && facts.prefix);
+}
+
+function passwordCopulaShape(value: string, rawLength: number): boolean {
+  if (rawLength < 6 || /\s/.test(value) || isWordlikePath(value)) return false;
+  return (
+    Number(/[a-z]/.test(value)) +
+      Number(/[A-Z]/.test(value)) +
+      Number(/\d/.test(value)) +
+      Number(/[^A-Za-z0-9]/.test(value)) >=
+    2
+  );
+}
+
+function isCredentialTypeofComparison(text: string, candidate: LabelledValue): boolean {
+  if (!candidate.comparison) return false;
+  const prefix = text.slice(Math.max(0, candidate.start - 256), candidate.start);
+  const left =
+    /\b(typeof\s+[A-Za-z_$][\w$]*(?:\??\.[A-Za-z_$][\w$]*)*)\s*[!=]={1,2}\s*["'`“‘]*$/.exec(
+      prefix,
+    )?.[1];
+  return left !== undefined && isCredentialExpression(left);
+}
+
+function shouldRedactCredential(
+  text: string,
+  candidate: LabelledValue,
+  value: string,
+  rawLength: number,
+  facts: CredentialValueFacts,
+  index: CredentialPolicyIndex,
+  context: CredentialParseContext,
+): boolean {
+  if (isCredentialTypeofComparison(text, candidate)) return false;
+  facts.placeholder ??= isClosedPlaceholder(value);
+  facts.substitution ??= isCredentialSubstitution(value);
+  if (facts.placeholder || facts.substitution) return false;
+  if (candidate.copula && candidate.tier === "password")
+    return passwordCopulaShape(value, rawLength);
+  if (candidate.tier === "credential") {
+    facts.shape ??= new Map();
+    let shaped = facts.shape.get(rawLength);
+    if (shaped === undefined) {
+      shaped = credentialValueShape(value, 12, rawLength);
+      facts.shape.set(rawLength, shaped);
+    }
+    if (!shaped) return false;
+  }
+  if (candidate.quoted) {
+    if (candidate.tier === "password") return true;
+    if (!/\d/.test(value) && /\{\{[A-Za-z_]+\}\}/.test(value)) return false;
+  } else if (
+    hasCredentialCodeExtent(text, candidate, context) ||
+    isBenignUnquotedCredential(text, candidate, value, facts, index)
+  )
+    return false;
+  return true;
+}
+
+function assignmentSpans(
+  text: string,
+  view: DetectionView,
+  original: string,
+  localIndex: LocalQuoteIndex,
+): SecretPromptSpan[] {
+  const spans: SecretPromptSpan[] = [];
+  let policyIndex: CredentialPolicyIndex | undefined;
+  const context = createCredentialParseContext(text);
+  const values = new Map<string, CredentialValueFacts>();
+  for (const candidate of labelledValues(
+    text,
+    (opening, closing) => mappedQuoteMayClose(view, opening, closing),
+    (index) => isValueDelimiter(view, original, index),
+    undefined,
+    localIndex,
+  )) {
+    const { start, end } = candidate;
+    const value = decodedCredentialValue(text, view, original, start, end);
+    if (start === end || text.startsWith(SECRET_ANSWER_NOTICE, start)) continue;
+    let facts = values.get(value);
+    if (!facts) {
+      facts = {};
+      values.set(value, facts);
+    }
+    policyIndex ??= credentialPolicyIndex(text);
+    if (
+      shouldRedactCredential(
+        text,
+        candidate,
+        value,
+        credentialRawLength(view, start, end),
+        facts,
+        policyIndex,
+        context,
+      )
+    )
+      spans.push({ start, end });
+  }
+  return spans;
+}
+
+function isAuthorizationProse(value: string): boolean {
+  if (/\d/.test(value) || !/[a-z]/.test(value) || !/[/-]/.test(value)) return false;
+  return value.split(/[/_.-]/).every((part) => /^[A-Z]+$|^[a-z]+$|^[A-Z][a-z]{2,}$/.test(part));
+}
+
+function authorizationWordEnd(
+  text: string,
+  matchStart: number,
+  start: number,
+  end: number,
+): number {
+  const prefix = text.slice(Math.max(0, matchStart - 256), matchStart);
+  if (prefix.lastIndexOf("[") <= prefix.lastIndexOf("]")) return end;
+  const value = text.slice(start, Math.min(end, start + 4096));
+  const closing = value.indexOf("](");
+  if (closing < 0 || !/^\]\((?:[A-Za-z][A-Za-z0-9+.-]*:|\/|#)/.test(value.slice(closing)))
+    return end;
+  return start + closing;
+}
+
+function authorizationSpans(
+  text: string,
+  view: DetectionView,
+  original: string,
+  localIndex: LocalQuoteIndex,
+): SecretPromptSpan[] {
+  const spans: SecretPromptSpan[] = [];
+  const scanner = /\b(?:Bearer|Basic|Token)[ \t]+/gi;
+  let match: RegExpExecArray | null;
+  while ((match = scanner.exec(text)) !== null) {
+    const value = readLocalCredentialValue(
+      text,
+      match.index + match[0].length,
+      (opening, closing) => mappedQuoteMayClose(view, opening, closing),
+      "label",
+      (index) => isValueDelimiter(view, original, index),
+      localIndex,
+    );
+    value.end = authorizationWordEnd(text, match.index, value.start, value.end);
+    value.value = decodedCredentialValue(text, view, original, value.start, value.end);
+    const proseOpener = !value.quoted && /^[([{]/.test(value.value);
+    const header = /\bauthorization["']?\s{0,16}:\s{0,16}["']?\s*$/i.test(
+      text.slice(Math.max(0, match.index - 96), match.index),
+    );
+    if (
+      !proseOpener &&
+      !isAuthorizationProse(value.value) &&
+      (credentialValueShape(value.value, 12, credentialRawLength(view, value.start, value.end)) ||
+        (header &&
+          value.value.length >= 12 &&
+          /^[A-Z0-9_-]+$/.test(value.value) &&
+          !isClosedPlaceholder(value.value)))
+    )
+      spans.push({ start: value.start, end: value.end });
+    scanner.lastIndex = Math.max(scanner.lastIndex, value.end);
+  }
+  return spans;
+}
+
+function flagSpans(
+  text: string,
+  view: DetectionView,
+  original: string,
+  localIndex: LocalQuoteIndex,
+): SecretPromptSpan[] {
+  const spans: SecretPromptSpan[] = [];
+  const scanner = /--(password|passwd|passphrase|token|api[-_]key|secret)(?:=|[ \t]+)/g;
+  let match: RegExpExecArray | null;
+  while ((match = scanner.exec(text)) !== null) {
+    const value = readLocalCredentialValue(
+      text,
+      match.index + match[0].length,
+      (opening, closing) => mappedQuoteMayClose(view, opening, closing),
+      "label",
+      (index) => isValueDelimiter(view, original, index),
+      localIndex,
+    );
+    value.value = decodedCredentialValue(text, view, original, value.start, value.end);
+    const password = /^(?:password|passwd|passphrase)$/.test(match[1]!);
+    if (
+      value.end > value.start &&
+      !isClosedPlaceholder(value.value) &&
+      (value.quoted || !isCredentialExpression(value.value)) &&
+      credentialValueShape(
+        value.value,
+        password ? 8 : 12,
+        credentialRawLength(view, value.start, value.end),
+      )
+    )
+      spans.push({ start: value.start, end: value.end });
+    scanner.lastIndex = Math.max(scanner.lastIndex, value.end);
+  }
+  return spans;
+}
+
+function curlUserSpans(
+  text: string,
+  view: DetectionView,
+  original: string,
+  localIndex: LocalQuoteIndex,
+): SecretPromptSpan[] {
+  const spans: SecretPromptSpan[] = [];
+  const scanner = /(?:^|\s)(?:-u|--user)(?:=|[ \t]+)/g;
+  let match: RegExpExecArray | null;
+  while ((match = scanner.exec(text)) !== null) {
+    const value = readLocalCredentialValue(
+      text,
+      match.index + match[0].length,
+      (opening, closing) => mappedQuoteMayClose(view, opening, closing),
+      "label",
+      (index) => isValueDelimiter(view, original, index),
+      localIndex,
+    );
+    value.value = decodedCredentialValue(text, view, original, value.start, value.end);
+    const colon = value.value.indexOf(":");
+    if (colon >= 0 && credentialValueShape(value.value.slice(colon + 1), 8))
+      spans.push({ start: value.start + colon + 1, end: value.end });
+    scanner.lastIndex = Math.max(scanner.lastIndex, value.end);
+  }
+  return spans;
+}
+
+function scanSecretSpans(text: string, includeEntropy: boolean): SecretPromptSpan[] {
+  const view = detectionView(text);
+  const urls = urlParts(view.text, view, text);
+  const streams = [...LITERAL_PATTERNS, JWT_PATTERN].map((pattern) =>
+    literalSpans(view.text, pattern, view),
+  );
+  const literalCoverage = mergeSpans(streams);
+  if (
+    literalCoverage.length === 1 &&
+    literalCoverage[0]!.start === 0 &&
+    literalCoverage[0]!.end === view.text.length
+  ) {
+    return [
+      { start: view.starts?.[0] ?? 0, end: view.ends?.[view.text.length - 1] ?? view.text.length },
+    ];
+  }
+  const localIndex = createLocalValueIndex(
+    (index) => (view.ends?.[index] ?? index + 1) - (view.starts?.[index] ?? index),
+  );
+  streams.push(
+    wrappedLiteralSpans(view.text, LITERAL_PATTERNS),
+    privateKeySpans(view.text),
+    assignmentSpans(view.text, view, text, localIndex),
+    authorizationSpans(view.text, view, text, localIndex),
+    urls.passwords,
+    flagSpans(view.text, view, text, localIndex),
+    curlUserSpans(view.text, view, text, localIndex),
+    cookieSpans(view.text, view, text),
+  );
+  if (includeEntropy)
+    streams.push(
+      entropySpans(
+        view.text,
+        mergeSpans([urls.excluded, dataUriSpans(view.text), literalCoverage]),
+      ),
+    );
+  return mergeSpans(streams).map((span) => ({
+    start: view.starts?.[span.start] ?? span.start,
+    end: view.ends?.[span.end - 1] ?? span.end,
+  }));
+}
+
+export function secretPromptSpans(text: string, context?: string): SecretPromptSpan[] {
+  if (text === "" || text === SECRET_ANSWER_NOTICE) return [];
+  if (
+    context !== undefined &&
+    !/^\/[a-z]+(?:\s|$)/.test(text) &&
+    !/^(?:yes|no)$/i.test(text) &&
+    /^\S+$/.test(text) &&
+    endsWithCredentialRequest(detectionView(context).text)
+  )
+    return [{ start: 0, end: text.length }];
+  return scanSecretSpans(text, true);
+}
+
+export function redactSecretKey(text: string): string {
+  if (text === "" || text === SECRET_ANSWER_NOTICE) return text;
+  return scanSecretSpans(text, false).length > 0 ? SECRET_ANSWER_NOTICE : text;
+}
+
+export function redactSecretPrompt(text: string, context?: string): string {
+  const spans = secretPromptSpans(text, context);
+  if (spans.length === 0) return text;
+  const chunks: string[] = [];
+  let start = 0;
+  for (const span of spans) {
+    chunks.push(text.slice(start, span.start), SECRET_ANSWER_NOTICE);
+    start = span.end;
+  }
+  chunks.push(text.slice(start));
+  return chunks.join("");
+}
+
+export function redactSecretAnswer(text: string, context?: string): string {
+  if (text === "" || text === SECRET_ANSWER_NOTICE || /^(?:yes|no)$/i.test(text)) return text;
+  if (context !== undefined && requestsCredential(detectionView(context).text))
+    return SECRET_ANSWER_NOTICE;
+  const redacted = redactSecretPrompt(text);
+  if (redacted !== text) return redacted;
+  const value = unwrapNeutralAnswer(text);
+  const neutralSecret =
+    /^[A-Za-z0-9+/_!#$%~-]{16,}={0,2}$/.test(value) &&
+    /[A-Za-z]/.test(value) &&
+    (/[\d+/]/.test(value) || (/[A-Z]/.test(value) && /[a-z]/.test(value))) &&
+    !isKnownIdentifier(value) &&
+    !isDelimitedIdentifier(value) &&
+    !isOrdinaryAnswerIdentifier(value) &&
+    !isCredentialExpression(value) &&
+    !isWordlikePath(value) &&
+    !/^(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/|data:|sha(?:1|224|256|384|512)-)/i.test(value);
+  return neutralSecret ? SECRET_ANSWER_NOTICE : text;
+}

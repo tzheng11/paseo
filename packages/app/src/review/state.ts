@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { redactSecretPrompt } from "@getpaseo/protocol/secret-answer";
 
 export type ReviewDraftMode = "uncommitted" | "base" | "all";
 export type ReviewDraftSide = "old" | "new";
@@ -110,7 +111,12 @@ export function serializeReviewDraftState(
   state: ReviewDraftStoreState,
 ): SerializedReviewDraftState {
   return {
-    drafts: state.drafts,
+    drafts: Object.fromEntries(
+      Object.entries(state.drafts).map(([key, comments]) => [
+        key,
+        comments.map((comment) => ({ ...comment, body: redactSecretPrompt(comment.body) })),
+      ]),
+    ),
   };
 }
 

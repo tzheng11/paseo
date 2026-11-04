@@ -14,13 +14,112 @@ import { join } from "node:path";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { AgentManager } from "./agent-manager.js";
-import { waitForAgentRunStartWithTimeout } from "./agent-prompt.js";
+import {
+  startAgentRun,
+  waitForAgentRunStartWithTimeout,
+  type AgentRunController,
+} from "./agent-prompt.js";
+import type { ManagedAgent } from "./agent-manager.js";
 import type {
   AgentClient,
   AgentRunResult,
   AgentSession,
   AgentStreamEvent,
 } from "./agent-sdk-types.js";
+
+test.each(["interrupt", "steer"] as const)(
+  "a second send prepared while idle can dispatch after the first admitted send (%s)",
+  async (behavior) => {
+    let releaseFirst!: () => void;
+    let releaseSecond!: () => void;
+    const firstReady = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const secondReady = new Promise<void>((resolve) => {
+      releaseSecond = resolve;
+    });
+    let identity: string | null = null;
+    const prompts: string[] = [];
+    const replacements: string[] = [];
+    const steers: string[] = [];
+    const manager: AgentRunController = {
+      getAgent: () => null,
+      getAnswerTurnIdentity: () => identity,
+      prepareAnswerPrompt: async (_agentId, prompt) => {
+        await (prompt === "first" ? firstReady : secondReady);
+        return prompt;
+      },
+      tryRunOutOfBand: () => false,
+      hasInFlightRun: () => identity !== null,
+      streamAgent: (_agentId, prompt) => {
+        identity = "first-run";
+        prompts.push(String(prompt));
+        return (async function* empty() {})();
+      },
+      replaceAgentRun: async (_agentId, prompt) => {
+        replacements.push(String(prompt));
+        return (async function* empty() {})();
+      },
+      steerOrReplaceActiveTurn: async (_agentId, prompt) => {
+        if (identity === null) return { status: "inactive" };
+        steers.push(String(prompt));
+        return { status: "steered" };
+      },
+      reloadStalePluginSession: async () => false,
+      reloadAgentSession: async () => undefined,
+    };
+    const first = startAgentRun(manager, "agent", "first", createTestLogger(), {
+      replaceRunning: true,
+      activeTurnBehavior: behavior,
+    });
+    const second = startAgentRun(manager, "agent", "second", createTestLogger(), {
+      replaceRunning: true,
+      activeTurnBehavior: behavior,
+    });
+    releaseFirst();
+    await expect(first).resolves.toEqual({ disposition: "turn_started" });
+    releaseSecond();
+    await expect(second).resolves.toEqual({
+      disposition: behavior === "steer" ? "steered" : "turn_started",
+    });
+    expect(prompts).toEqual(["first"]);
+    expect(replacements).toEqual(behavior === "interrupt" ? ["second"] : []);
+    expect(steers).toEqual(behavior === "steer" ? ["second"] : []);
+  },
+);
+
+test("answer preparation accepts pending-to-active progress within the same run", async () => {
+  const agent: ManagedAgent = Object.create(null);
+  Reflect.set(agent, "activeForegroundTurnId", null);
+  Reflect.set(agent, "activeTurnId", null);
+  const steers: string[] = [];
+  const manager: AgentRunController = {
+    getAgent: () => agent,
+    getAnswerTurnIdentity: () => "same-run",
+    prepareAnswerPrompt: async (_agentId, prompt) => {
+      Reflect.set(agent, "activeForegroundTurnId", "provider-turn");
+      Reflect.set(agent, "activeTurnId", "provider-turn");
+      return prompt;
+    },
+    tryRunOutOfBand: () => false,
+    hasInFlightRun: () => true,
+    streamAgent: () => (async function* empty() {})(),
+    replaceAgentRun: async () => (async function* empty() {})(),
+    steerOrReplaceActiveTurn: async (_agentId, prompt) => {
+      steers.push(String(prompt));
+      return { status: "steered" };
+    },
+    reloadStalePluginSession: async () => false,
+    reloadAgentSession: async () => undefined,
+  };
+  await expect(
+    startAgentRun(manager, "agent", "follow-up", createTestLogger(), {
+      replaceRunning: true,
+      activeTurnBehavior: "steer",
+    }),
+  ).resolves.toEqual({ disposition: "steered" });
+  expect(steers).toEqual(["follow-up"]);
+});
 
 test("isSystemInjectedEnvelope matches the envelope formatSystemNotificationPrompt produces", () => {
   expect(isSystemInjectedEnvelope(formatSystemNotificationPrompt("child finished"))).toBe(true);

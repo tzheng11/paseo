@@ -6,6 +6,7 @@ import type { AgentPromptInput, AgentRunOptions } from "./agent-sdk-types.js";
 import type { AgentManager, ManagedAgent } from "./agent-manager.js";
 import type { AgentStorage } from "./agent-storage.js";
 import { ensureAgentLoaded } from "./agent-loading.js";
+import { AgentSteerTurnChangedError } from "./steer-admission-error.js";
 import { isStaleProviderSessionError } from "./stale-provider-session-error.js";
 import type { ActiveTurnBehavior } from "@getpaseo/protocol/messages";
 
@@ -21,6 +22,8 @@ export type AgentRunController = Pick<
   | "steerOrReplaceActiveTurn"
   | "streamAgent"
 > & {
+  getAnswerTurnIdentity?(agentId: string): string | null;
+  prepareAnswerPrompt?(agentId: string, prompt: AgentPromptInput): Promise<AgentPromptInput>;
   reloadAgentSession(agentId: string): Promise<unknown>;
 };
 
@@ -89,6 +92,32 @@ async function drainAgentRunIterator(
   }
 }
 
+export async function prepareAnswerPromptForDispatch(
+  agentManager: AgentRunController,
+  agentId: string,
+  prompt: AgentPromptInput,
+): Promise<AgentPromptInput> {
+  if (agentManager.prepareAnswerPrompt) {
+    const before = agentManager.getAgent(agentId);
+    const expectedTurnId =
+      agentManager.getAnswerTurnIdentity?.(agentId) ??
+      before?.activeForegroundTurnId ??
+      before?.activeTurnId;
+    prompt = await agentManager.prepareAnswerPrompt(agentId, prompt);
+    const after = agentManager.getAgent(agentId);
+    const currentTurnId =
+      agentManager.getAnswerTurnIdentity?.(agentId) ??
+      after?.activeForegroundTurnId ??
+      after?.activeTurnId;
+    // An input submitted while idle still follows normal steer/replacement admission
+    // if another input starts first. Only an input already aimed at a turn owns a fence.
+    if (expectedTurnId && currentTurnId && currentTurnId !== expectedTurnId) {
+      throw new AgentSteerTurnChangedError();
+    }
+  }
+  return prompt;
+}
+
 export async function startAgentRun(
   agentManager: AgentRunController,
   agentId: string,
@@ -96,6 +125,7 @@ export async function startAgentRun(
   logger: Logger,
   options?: StartAgentRunOptions,
 ): Promise<{ disposition: PromptDispatchDisposition }> {
+  prompt = await prepareAnswerPromptForDispatch(agentManager, agentId, prompt);
   const snapshot = agentManager.getAgent(agentId);
   logger.trace(
     {

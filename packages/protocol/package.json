@@ -27,7 +27,7 @@
     "build:clean": "npm run clean && npm run build",
     "prepack": "npm run build:clean",
     "typecheck": "tsgo --noEmit",
-    "test": "vitest run",
+    "test": "vitest run --no-file-parallelism",
     "generate:validators": "node scripts/generate-validation-aot.mjs",
     "watch": "concurrently --kill-others --names validation,tsc --prefix-colors green,yellow \"node scripts/watch-validation-aot.mjs\" \"tsc -p tsconfig.json --watch --preserveWatchOutput\"",
     "prebuild": "npm run generate:validators",

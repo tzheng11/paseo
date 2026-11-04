@@ -23,6 +23,8 @@ import { normalizeClientMessageId, resolveClientMessageId } from "../../client-m
 import { resolveRequiredProviderModel, type ResolvedProviderModel } from "../mcp-shared.js";
 import { resolveCreateAgentIntent } from "./intent.js";
 import { ensureAgentLoaded } from "../agent-loading.js";
+import { redactSecretPrompt } from "@getpaseo/protocol/secret-answer";
+import { redactFirstAgentContext } from "../secret-answer.js";
 
 export interface CreateAgentCommandDependencies {
   finishSubscriptions?: FinishSubscriptions;
@@ -158,6 +160,25 @@ export async function createAgentCommand(
   dependencies: CreateAgentCommandDependencies,
   input: CreateAgentCommandInput,
 ): Promise<CreateAgentCommandResult> {
+  input = {
+    ...input,
+    initialPrompt:
+      input.initialPrompt === undefined ? undefined : redactSecretPrompt(input.initialPrompt),
+  };
+  if (input.kind === "session") {
+    const context = redactFirstAgentContext({
+      prompt: input.initialPrompt,
+      attachments: input.attachments,
+    });
+    input = {
+      ...input,
+      initialPrompt: context.prompt,
+      attachments: context.attachments,
+      firstAgentContext: redactFirstAgentContext(input.firstAgentContext),
+      provisionalTitle:
+        input.provisionalTitle === null ? null : redactSecretPrompt(input.provisionalTitle),
+    };
+  }
   const resolved =
     input.kind === "session"
       ? await resolveSessionCreateAgent(dependencies, input)

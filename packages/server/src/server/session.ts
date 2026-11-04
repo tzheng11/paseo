@@ -70,6 +70,7 @@ import {
 import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "./agent/agent-loading.js";
 import {
   sendPromptToAgent,
+  prepareAnswerPromptForDispatch,
   waitForAgentRunStartWithTimeout,
   unarchiveAgentState,
 } from "./agent/agent-prompt.js";
@@ -78,6 +79,8 @@ import {
   resolveFirstAgentPromptTitle,
 } from "./agent/create-agent-title.js";
 import { respondToAgentPermission } from "./agent/permission-response.js";
+import { redactSecretPrompt } from "@getpaseo/protocol/secret-answer";
+import { redactFirstAgentContext } from "./agent/secret-answer.js";
 import type { VoiceCallerContext, VoiceSpeakHandler } from "./voice-types.js";
 import type { ScriptHealthState } from "./script-health-monitor.js";
 import { spawnWorkspaceScript } from "./worktree-bootstrap.js";
@@ -143,6 +146,7 @@ import {
   getAgentStreamEventTurnId,
   type AgentPersistenceHandle,
   type AgentPermissionResponse,
+  type AgentPromptInput,
   type AgentRunOptions,
   type AgentSessionConfig,
 } from "./agent/agent-sdk-types.js";
@@ -669,6 +673,21 @@ function hasInitialCreationPrompt(
     request &&
     buildAgentPrompt(request.initialPrompt?.trim() ?? "", request.images, request.attachments)
       .length,
+  );
+}
+
+function preparedMessageText(prompt: AgentPromptInput): string {
+  if (typeof prompt === "string") return prompt;
+  const text = prompt.find((block) => block.type === "text" && !("mimeType" in block));
+  return text?.type === "text" ? text.text : "";
+}
+
+function wrapSpokenPrompt(prompt: AgentPromptInput): AgentPromptInput {
+  if (typeof prompt === "string") return wrapSpokenInput(prompt);
+  return prompt.map((block) =>
+    block.type === "text" && !("mimeType" in block)
+      ? { ...block, text: wrapSpokenInput(block.text) }
+      : block,
   );
 }
 
@@ -4215,26 +4234,32 @@ export class Session {
     runOptions?: AgentRunOptions,
     options?: { spokenInput?: boolean },
   ): Promise<{ ok: true } | { ok: false; error: string }> {
-    this.sessionLogger.info(
-      {
-        agentId,
-        textPreview: text.substring(0, 50),
-        imageCount: images?.length ?? 0,
-        attachmentCount: attachments?.length ?? 0,
-      },
-      `Sending text to agent ${agentId}${
-        images && images.length > 0 ? ` with ${images.length} image attachment(s)` : ""
-      }${
-        attachments && attachments.length > 0
-          ? ` and ${attachments.length} structured attachment(s)`
-          : ""
-      }`,
-    );
-
-    const promptText = options?.spokenInput ? wrapSpokenInput(text) : text;
-    const prompt = buildAgentPrompt(promptText, images, attachments);
-
     try {
+      await this.loadAgentForMessage(agentId);
+      const prepared = await prepareAnswerPromptForDispatch(
+        this.agentManager,
+        agentId,
+        buildAgentPrompt(text, images, attachments),
+      );
+      text = preparedMessageText(prepared);
+      this.sessionLogger.info(
+        {
+          agentId,
+          textPreview: text.substring(0, 50),
+          imageCount: images?.length ?? 0,
+          attachmentCount: attachments?.length ?? 0,
+        },
+        `Sending text to agent ${agentId}${
+          images && images.length > 0 ? ` with ${images.length} image attachment(s)` : ""
+        }${
+          attachments && attachments.length > 0
+            ? ` and ${attachments.length} structured attachment(s)`
+            : ""
+        }`,
+      );
+
+      const prompt = options?.spokenInput ? wrapSpokenPrompt(prepared) : prepared;
+
       await sendPromptToAgent({
         agentManager: this.agentManager,
         agentStorage: this.agentStorage,
@@ -4329,6 +4354,11 @@ export class Session {
     request: AgentCreateRequest,
     observer?: (snapshot: CreationSnapshot) => void,
   ): Promise<CreationSnapshot> {
+    const context = redactFirstAgentContext({
+      prompt: request.initialPrompt,
+      attachments: request.attachments,
+    });
+    request = { ...request, initialPrompt: context.prompt, attachments: context.attachments };
     const { requestId, type: _type, subscribe: _subscribe, idempotencyKey, ...intent } = request;
     return this.creationService.create(
       {
@@ -4402,6 +4432,20 @@ export class Session {
     request: Extract<SessionInboundMessage, { type: "workspace.create.request" }>,
     source?: object,
   ): Promise<void> {
+    const agent = request.agent;
+    const context = agent
+      ? redactFirstAgentContext({ prompt: agent.initialPrompt, attachments: agent.attachments })
+      : undefined;
+    request = {
+      ...request,
+      agent:
+        agent && context
+          ? { ...agent, initialPrompt: context.prompt, attachments: context.attachments }
+          : undefined,
+      firstAgentContext: request.firstAgentContext
+        ? redactFirstAgentContext(request.firstAgentContext)
+        : undefined,
+    };
     const { requestId, subscribe, type: _type, idempotencyKey, ...intent } = request;
     const progress = subscribe
       ? this.delivery.operation(
@@ -4596,6 +4640,11 @@ export class Session {
     agentId?: string,
     onAgentReady?: (agent: AgentSnapshotPayload) => Promise<void>,
   ): Promise<CreatedAgent> {
+    const context = redactFirstAgentContext({
+      prompt: msg.initialPrompt,
+      attachments: msg.attachments,
+    });
+    msg = { ...msg, initialPrompt: context.prompt, attachments: context.attachments };
     const {
       config,
       worktreeName,
@@ -5463,7 +5512,7 @@ export class Session {
     response: AgentPermissionResponse,
   ): Promise<void> {
     try {
-      await respondToAgentPermission({
+      const resolution = await respondToAgentPermission({
         agentManager: this.agentManager,
         agentId,
         requestId,
@@ -5476,7 +5525,7 @@ export class Session {
       if (this.delivery.isModern(this.delivery.currentSource)) {
         this.delivery.reply({
           type: "agent_permission_resolved",
-          payload: { agentId, requestId, resolution: response },
+          payload: { agentId, requestId, resolution },
         });
       }
     } catch (error) {
@@ -7139,6 +7188,12 @@ export class Session {
     request: Extract<SessionInboundMessage, { type: "workspace.create.request" }>,
     workspaceId?: string,
   ): Promise<WorkspaceDescriptorPayload> {
+    request = {
+      ...request,
+      firstAgentContext: request.firstAgentContext
+        ? redactFirstAgentContext(request.firstAgentContext)
+        : undefined,
+    };
     if (request.source.kind !== "directory") {
       throw new Error("Unexpected workspace source");
     }
@@ -7197,6 +7252,12 @@ export class Session {
     request: Extract<SessionInboundMessage, { type: "workspace.create.request" }>,
     workspaceId?: string,
   ): Promise<WorkspaceDescriptorPayload> {
+    request = {
+      ...request,
+      firstAgentContext: request.firstAgentContext
+        ? redactFirstAgentContext(request.firstAgentContext)
+        : undefined,
+    };
     if (request.source.kind !== "worktree") {
       throw new Error("Unexpected workspace source");
     }
@@ -8639,6 +8700,7 @@ export class Session {
   }
 
   private async prepareAgentMessage(agentId: string, text: string): Promise<void> {
+    text = redactSecretPrompt(text);
     await ensureAgentLoaded(agentId, {
       agentManager: this.agentManager,
       agentStorage: this.agentStorage,
@@ -8651,9 +8713,35 @@ export class Session {
     }
   }
 
+  private async loadAgentForMessage(agentId: string): Promise<void> {
+    const record = await this.agentStorage.get(agentId);
+    let archivedAtToRestore: string | null = null;
+    if (
+      record?.archivedAt &&
+      (await unarchiveAgentState(this.agentStorage, this.agentManager, agentId))
+    ) {
+      archivedAtToRestore = record.archivedAt;
+    }
+    try {
+      await ensureAgentLoaded(agentId, {
+        agentManager: this.agentManager,
+        agentStorage: this.agentStorage,
+        logger: this.sessionLogger,
+      });
+    } catch (error) {
+      // Match sendPromptToAgent: interactive sends restore before resuming,
+      // and a failed load leaves an archived agent at its original timestamp.
+      if (archivedAtToRestore) {
+        await this.agentManager.archiveSnapshot(agentId, archivedAtToRestore);
+      }
+      throw error;
+    }
+  }
+
   private async handleSendAgentMessageRequest(
     msg: Extract<SessionInboundMessage, { type: "send_agent_message_request" }>,
   ): Promise<void> {
+    msg = { ...msg, text: redactSecretPrompt(msg.text) };
     const resolved = await this.resolveAgentIdentifier(msg.agentId);
     if (!resolved.ok) {
       this.emit({
@@ -8671,13 +8759,19 @@ export class Session {
     try {
       const agentId = resolved.agentId;
 
-      const prompt = buildAgentPrompt(msg.text, msg.images, msg.attachments);
+      await this.loadAgentForMessage(agentId);
+      const prompt = await prepareAnswerPromptForDispatch(
+        this.agentManager,
+        agentId,
+        buildAgentPrompt(msg.text, msg.images, msg.attachments),
+      );
+      const text = preparedMessageText(prompt);
       this.sessionLogger.trace(
         {
           agentId,
           messageId: msg.messageId,
           activeTurnBehavior: msg.activeTurnBehavior,
-          textPrefix: msg.text.slice(0, 80),
+          textPrefix: text.slice(0, 80),
         },
         "agent.session.send_agent_message",
       );
@@ -8741,7 +8835,7 @@ export class Session {
                 msg.activeTurnBehavior ?? (msg.sourceAgentId ? "steer" : "interrupt"),
             },
             prepare: async () => {
-              if (!msg.sourceAgentId) await this.prepareAgentMessage(agentId, msg.text);
+              if (!msg.sourceAgentId) await this.prepareAgentMessage(agentId, text);
             },
             send,
           })

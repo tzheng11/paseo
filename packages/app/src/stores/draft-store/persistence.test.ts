@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { PersistStorage, StorageValue } from "zustand/middleware";
+import { SECRET_ANSWER_NOTICE } from "@getpaseo/protocol/secret-answer";
 import {
   createDraftPersistStorage,
+  draftAnswerContext,
   DRAFT_PERSIST_INTERVAL_MS,
+  redactPersistedDrafts,
   type PersistenceScheduler,
 } from "./persistence";
+import type { DraftRecord, DraftStoreState } from "./state";
 
 interface DraftState {
   text: string;
@@ -105,5 +109,105 @@ describe("draft persistence", () => {
     await drafts.flush();
 
     expect(drafts.text()).toBe("pending checkpoint");
+  });
+
+  it("withholds synthetic secrets from durable draft checkpoints without changing the editor", async () => {
+    const syntheticSecret = "q1W2e3R4t5Y6u7I8o9P0a/S+d1F2g3H4j5K6l7Z8";
+    const record = (text: string): DraftRecord => ({
+      input: { text, attachments: [] },
+      lifecycle: "active",
+      updatedAt: 1,
+      version: 1,
+    });
+    const editorState: DraftStoreState = {
+      drafts: {
+        "agent:host:agent": record(syntheticSecret),
+        "agent:host:ordinary": record("Use the existing implementation."),
+      },
+      createModalDraft: record(`API_KEY=${syntheticSecret}`),
+    };
+    let saved: StorageValue<DraftStoreState> | null = null;
+    const storage: PersistStorage<DraftStoreState> = {
+      getItem: () => saved,
+      setItem: (_name, value) => {
+        saved = value;
+      },
+      removeItem: () => {
+        saved = null;
+      },
+    };
+    const drafts = createDraftPersistStorage(storage);
+    drafts.setItem("drafts", { state: redactPersistedDrafts(editorState) });
+    await drafts.flush();
+
+    const checkpoint = await storage.getItem("drafts");
+    expect(JSON.stringify(checkpoint)).not.toContain(syntheticSecret);
+    expect(checkpoint?.state.drafts["agent:host:agent"].input.text).toBe(SECRET_ANSWER_NOTICE);
+    expect(checkpoint?.state.createModalDraft?.input.text).toBe(`API_KEY=${SECRET_ANSWER_NOTICE}`);
+    expect(checkpoint?.state.drafts["agent:host:ordinary"].input.text).toBe(
+      "Use the existing implementation.",
+    );
+    expect(editorState.drafts["agent:host:agent"].input.text).toBe(syntheticSecret);
+  });
+
+  const checkpoint = (text: string, context = "") => {
+    const state: DraftStoreState = {
+      drafts: {
+        "agent:host:agent": {
+          input: { text, attachments: [] },
+          lifecycle: "active",
+          updatedAt: 1,
+          version: 1,
+        },
+      },
+      createModalDraft: null,
+    };
+    return redactPersistedDrafts(state, () => context).drafts["agent:host:agent"].input.text;
+  };
+
+  it("uses only the latest assistant message as draft context", () => {
+    expect(
+      draftAnswerContext({ latestMessage: { kind: "assistant_message", text: "Password:" } }),
+    ).toBe("Password:");
+    expect(draftAnswerContext({ latestMessage: { kind: "user_message", text: "Password:" } })).toBe(
+      "",
+    );
+    expect(draftAnswerContext({})).toBe("");
+  });
+
+  it("withholds single-token replies after a real credential request sentence", () => {
+    expect(checkpoint("x", "Please provide your password.")).toBe(SECRET_ANSWER_NOTICE);
+    expect(checkpoint("x", "Password:")).toBe(SECRET_ANSWER_NOTICE);
+    expect(checkpoint("x", "Please provide your password. Meanwhile, tests pass.")).toBe(
+      SECRET_ANSWER_NOTICE,
+    );
+    expect(checkpoint("yes go ahead", "Please provide your password.")).toBe("yes go ahead");
+    expect(checkpoint("yes", "Which key should I use for the React list?")).toBe("yes");
+    expect(checkpoint("x", "x".repeat(65_537))).toBe("x");
+  });
+
+  it("preserves text around synthetic keys in all durable drafts", () => {
+    const key = "q1W2e3R4t5Y6u7I8o9P0a/S+d1F2g3H4j5K6l7Z8";
+    expect(checkpoint(`  before\n${key}\nafter  `)).toBe(
+      `  before\n${SECRET_ANSWER_NOTICE}\nafter  `,
+    );
+    expect(checkpoint("log line without anything sensitive in it\n".repeat(1800))).toBe(
+      "log line without anything sensitive in it\n".repeat(1800),
+    );
+  });
+
+  it.each([
+    "The secret-scan: required check failed on this PR, please look.",
+    "Why does this fail? const client = new S3({ accessKeyId: process.env.KEY_ID })",
+    "Fix this yaml:\n  secretName: my-app-config\n  image: nginx",
+  ])("preserves ordinary draft bytes: %s", (text) => {
+    expect(checkpoint(text)).toBe(text);
+  });
+
+  it("uses the closed password-label exceptions for draft checkpoints", () => {
+    // Ruling 9 excludes required from the password placeholder exceptions.
+    expect(checkpoint("In the schema, password: required for local accounts only.")).toBe(
+      `In the schema, password: ${SECRET_ANSWER_NOTICE} for local accounts only.`,
+    );
   });
 });

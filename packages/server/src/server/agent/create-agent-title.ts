@@ -1,5 +1,6 @@
 import { MAX_EXPLICIT_AGENT_TITLE_CHARS } from "@getpaseo/protocol/agent-title-limits";
 import type { FirstAgentContext } from "@getpaseo/protocol/messages";
+import { redactSecretPrompt } from "@getpaseo/protocol/secret-answer";
 
 const MAX_INITIAL_AGENT_TITLE_CHARS = Math.min(60, MAX_EXPLICIT_AGENT_TITLE_CHARS);
 
@@ -27,7 +28,9 @@ export function resolveCreateAgentTitles(options: {
     typeof options.configTitle === "string" && options.configTitle.trim().length > 0
       ? options.configTitle.trim()
       : null;
-  const trimmedPrompt = options.initialPrompt?.trim();
+  const trimmedPrompt = options.initialPrompt
+    ? redactSecretPrompt(options.initialPrompt).trim()
+    : options.initialPrompt;
   const provisionalTitle =
     explicitTitle ?? (trimmedPrompt ? deriveInitialAgentTitle(trimmedPrompt) : null);
 

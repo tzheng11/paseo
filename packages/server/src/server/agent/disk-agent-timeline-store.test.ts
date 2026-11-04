@@ -390,3 +390,23 @@ it("decodes bounded projection edges and accounts for a huge unloaded middle", a
   expect(updated.totalBytes).toBeGreaterThan(before);
   expect(updated.tail[0].value).toMatchObject({ type: "assistant_message", text: "small suffix" });
 });
+
+it("keeps the latest conversational question through tool events until a user answers", () => {
+  const disk = createStore();
+  const memory = new InMemoryAgentTimelineStore();
+  for (const store of [disk, memory]) {
+    store.initialize("question");
+    store.append("question", { type: "assistant_message", text: "Your password:" });
+    store.append("question", tool("after-question", "completed"));
+    expect(store.getLastConversationItem("question")).toEqual({
+      type: "assistant_message",
+      text: "Your password:",
+    });
+    store.append("question", { type: "user_message", text: "ordinary answer" });
+    store.append("question", tool("after-answer", "completed"));
+    expect(store.getLastConversationItem("question")).toEqual({
+      type: "user_message",
+      text: "ordinary answer",
+    });
+  }
+});

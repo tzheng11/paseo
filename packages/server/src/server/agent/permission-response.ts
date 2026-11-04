@@ -1,9 +1,18 @@
 import type { Logger } from "pino";
 
-import type { AgentPermissionResponse, AgentPermissionResult } from "./agent-sdk-types.js";
+import type {
+  AgentPermissionRequest,
+  AgentPermissionResponse,
+  AgentPermissionResult,
+} from "./agent-sdk-types.js";
+import { redactPermissionResponse } from "./secret-answer.js";
 import { startAgentRun, type AgentRunController } from "./agent-prompt.js";
 
 export interface PermissionResponseAgentManager extends AgentRunController {
+  getPendingPermissionRequest?(
+    agentId: string,
+    requestId: string,
+  ): AgentPermissionRequest | undefined;
   respondToPermission(
     agentId: string,
     requestId: string,
@@ -21,14 +30,19 @@ export interface RespondToAgentPermissionParams {
 
 export async function respondToAgentPermission(
   params: RespondToAgentPermissionParams,
-): Promise<void> {
+): Promise<AgentPermissionResponse> {
   const { agentManager, agentId, requestId, response, logger } = params;
   logger.debug(
     { agentId, requestId },
     `Handling permission response for agent ${agentId}, request ${requestId}`,
   );
 
-  const result = await agentManager.respondToPermission(agentId, requestId, response);
+  const safeResponse = redactPermissionResponse(
+    response,
+    agentManager.getPendingPermissionRequest?.(agentId, requestId) ??
+      agentManager.getAgent(agentId)?.pendingPermissions.get(requestId),
+  );
+  const result = await agentManager.respondToPermission(agentId, requestId, safeResponse);
   logger.debug({ agentId }, `Permission response forwarded to agent ${agentId}`);
 
   if (result?.followUpPrompt) {
@@ -37,4 +51,5 @@ export async function respondToAgentPermission(
       replaceRunning: true,
     });
   }
+  return safeResponse;
 }

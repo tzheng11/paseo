@@ -19,7 +19,7 @@ const questionItem = {
   questions: [{ title: "Which color?", options: ["Blue", "Green"] }],
 };
 
-async function setup(metadata?: Record<string, unknown>, rejectSteer = false) {
+async function setup(metadata?: Record<string, unknown>, rejectSteer = false, item = questionItem) {
   const appServer = createFakeCodexAppServer({
     "turn/interrupt": () => ({}),
     "turn/steer": () => {
@@ -45,7 +45,7 @@ async function setup(metadata?: Record<string, unknown>, rejectSteer = false) {
     appServer.child.stdout.write(
       JSON.stringify({
         method: "item/completed",
-        params: { threadId: "thread-1", turnId: "native-turn", item: questionItem },
+        params: { threadId: "thread-1", turnId: "native-turn", item },
       }) + "\n",
     );
     await shown;
@@ -440,4 +440,82 @@ test("lists only native item identifiers for retention without reading timeline 
   const { CodexAsyncQuestions } = await import("./codex/async-questions.js");
   const questions = new CodexAsyncQuestions([{ item: questionItem }]);
   expect(questions.historyItemIds()).toEqual([questionItem.id]);
+});
+
+for (const active of [true, false]) {
+  test.each([
+    ["Which color?", "sk-proj-" + "SYNTHETIC".repeat(8), true],
+    ["Which one?", "q1W2e3R4t5Y6u7I8o9P0a/S+d1F2g3H4j5K6l7Z8", true],
+    ["Which one?", "aB3dE7gH9kLmN2pQ5rT8", true],
+    ["Which one?", "postgres://admin:s3cr3tPass99@db.internal:5432/app", true],
+    ["Which one?", "41c4e4c0bd7709490212ac97f0beda98ae2812ad", false],
+    ["Which one?", "bc299fea-5481-48e4-bb5f-31fc299789a1", false],
+    ["Which one?", "https://example.test/issue/123456789", false],
+    ["Enter your Mac password", "tiny", true],
+    ["Which color?", "Green", false],
+  ])(
+    "secret answer protection for async question %s (active=" + active + ")",
+    async (title, value, withheld) => {
+      const item = { ...questionItem, questions: [{ title, options: ["Blue", "Green"] }] };
+      const { session, appServer, events, ask, finish } = await setup(undefined, false, item);
+      const { manager, agent } = await manage(session);
+      try {
+        await ask();
+        if (!active) await finish();
+        const [permission] = session.getPendingPermissions();
+        const result = await manager.respondToPermission(agent.id, permission.id, {
+          behavior: "allow",
+          updatedInput: { answers: { "Question 1": value } },
+        });
+        await manager.flush();
+        const stored = JSON.stringify(manager.getAgent(agent.id)?.persistence);
+        const forwarded = active
+          ? JSON.stringify(
+              appServer.requests().filter((request) => request.method === "turn/steer"),
+            )
+          : JSON.stringify(result);
+        const published = JSON.stringify(events);
+        if (withheld) {
+          expect(stored).not.toContain(value);
+          expect(forwarded).not.toContain(value);
+          expect(published).not.toContain(value);
+          expect(stored).toContain("withheld");
+          expect(forwarded).toContain("secret store");
+          expect(published).toContain("withheld");
+        } else {
+          expect(stored).toContain(value);
+          expect(forwarded).toContain(value);
+        }
+        expect(manager.getAgent(agent.id)?.persistence?.metadata?.asyncQuestions).toMatchObject([
+          { resolution: [withheld ? expect.stringContaining("withheld") : value] },
+        ]);
+      } finally {
+        await manager.closeAgent(agent.id);
+      }
+    },
+  );
+}
+
+test("an offered synthetic credential-shaped choice reaches Codex and persistence unchanged", async () => {
+  const value = "sk-proj-" + "Synthetic1".repeat(8);
+  const item = { ...questionItem, questions: [{ title: "Enter your password", options: [value] }] };
+  const { session, appServer, ask } = await setup(undefined, false, item);
+  const { manager, agent } = await manage(session);
+  try {
+    await ask();
+    const [permission] = session.getPendingPermissions();
+    await manager.respondToPermission(agent.id, permission.id, {
+      behavior: "allow",
+      updatedInput: { answers: { "Question 1": value } },
+    });
+    await manager.flush();
+    expect(manager.getAgent(agent.id)?.persistence?.metadata?.asyncQuestions).toMatchObject([
+      { resolution: [value] },
+    ]);
+    expect(
+      JSON.stringify(appServer.requests().filter((request) => request.method === "turn/steer")),
+    ).toContain(value);
+  } finally {
+    await manager.closeAgent(agent.id);
+  }
 });
