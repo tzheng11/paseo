@@ -775,4 +775,16 @@ Every entry covers `previous stable release → release source`: first beta, lat
 
 The Impower Desktop package sets `paseoDistribution.updates` to `manual`. Its update adapter does not check or download the upstream feed, and neither the manual install entry point nor quit-time installation may install a cached upstream update. Missing distribution policy also leaves automatic updates disabled; an upstream feed requires an explicit build-time `upstream` policy. This prevents an official update from replacing the custom fixes and rewriting fork-only state. Updates use the separately verified fleet rollout.
 
-Both the official and custom stable packages report `0.14.0`. Desktop only restarts its daemon for a version-string mismatch, so a custom rollout must explicitly stop the old daemon, prove it is down, and verify the started runtime against the custom artifact/source digests. A matching version or App filename does not prove that the custom server is running. This release rule grants no live action or waiver.
+The earlier official and custom stable packages both reported `0.14.0`. The new
+distribution uses `0.15.0-impower` plus the [immutable runtime identity](runtime-provenance.md).
+Desktop's version-string comparison still cannot prove which bytes run. A custom
+rollout must prove the old daemon is down and verify the started runtime against
+the sealed artifact/source digests. This rule grants no live action or waiver.
+
+Expo evaluates native configuration for web and Desktop renderer exports too.
+`getNativeConfigVersion` maps an exact `X.Y.Z-impower` package to the numeric
+`X.Y.Z` container config only when root `paseoDistribution` declares matching
+Impower/upstream-version/commit bindings. The package and daemon keep their custom
+identity. This mapping does not define a separate native-store release or qualify
+a container installation; the native release/F-Droid helpers still accept only
+their existing stable and beta release formats.

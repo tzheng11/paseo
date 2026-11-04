@@ -15,6 +15,15 @@ interface ManifestEntry {
 
 const originalFdroidFlag = process.env.PASEO_FDROID_BUILD;
 
+it("loads actual Expo config for the pinned Impower distribution while retaining its package identity", async () => {
+  const pkg = require("./package.json");
+  const distribution = require("../../package.json").paseoDistribution;
+  const { exp } = await getPrebuildConfigAsync(__dirname, { platforms: [] });
+  expect(pkg.version).toBe(`${distribution.upstreamVersion}-impower`);
+  expect(exp.version).toBe(distribution.upstreamVersion);
+  expect(distribution.upstreamCommit).toMatch(/^[a-f0-9]{40}$/);
+});
+
 async function resolveAndroidManifest() {
   const { exp } = await getPrebuildConfigAsync(__dirname, { platforms: ["android"] });
   await compileModsAsync(exp, {

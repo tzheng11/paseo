@@ -48,6 +48,22 @@ function getNativeReleaseVersion(version) {
   };
 }
 
+// Expo also evaluates native config for web/renderer exports. Its numeric
+// container version is separate from the fork's package/runtime identity.
+function getNativeConfigVersion(version, distribution) {
+  if (!version.endsWith("-impower")) return getNativeReleaseVersion(version);
+  const upstreamVersion = distribution?.upstreamVersion;
+  if (
+    distribution?.name !== "impower" ||
+    !/^\d+\.\d+\.\d+$/.test(upstreamVersion ?? "") ||
+    version !== `${upstreamVersion}-impower` ||
+    !/^[a-f0-9]{40}$/.test(distribution?.upstreamCommit ?? "")
+  ) {
+    throw new Error("Impower native config requires a matching pinned upstream distribution");
+  }
+  return getNativeReleaseVersion(upstreamVersion);
+}
+
 function getFdroidVersionCodes(version) {
   const { androidVersionCode } = getNativeReleaseVersion(version);
   return Object.entries(FDROID_ABI_VERSION_CODE_SUFFIXES).map(([abi, suffix]) => ({
@@ -60,4 +76,5 @@ module.exports = {
   FDROID_ABI_VERSION_CODE_SUFFIXES,
   getFdroidVersionCodes,
   getNativeReleaseVersion,
+  getNativeConfigVersion,
 };
