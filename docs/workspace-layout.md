@@ -1,0 +1,160 @@
+# Canonical workspace layout
+
+The Impower distribution can use one explicitly configured daemon as the layout
+authority. Main-host selection does not elect it. Execution, files, agents,
+histories, project names and workspace titles remain on their owning hosts.
+
+## Configuration and trust
+
+`config.json.workspaceLayout` contains `role` (`authority` or `replica`),
+`authorityServerId`, `authorityId`, `epoch` and `authorityKeySha256`. The last
+field is SHA256 of the **UTF-8 base64 text** `daemonPublicKeyB64`, not of its
+decoded bytes. IDs and epoch are explicit deployment inputs. A restart does not
+create a new epoch or substitute another authority.
+
+The authority role requires an existing supported bcrypt password verifier in
+`daemon.auth.password`. The deployment controller must set and verify password
+protection before enabling relay access. The source does not create or
+distribute a service password. Use a fresh application-only password, never a
+human, provider or SSH credential. Password possession is not a per-replica
+identity or allowlist.
+
+Authority mode always requires protected relay admission, even when the legacy
+`daemon.relay.requireProtectedSecurity` setting is absent or later disabled.
+Offers supplied to replicas must advertise protected mode; configure and verify
+the supported setting before creating the authority's registration offer.
+
+Replicas use daemon-owned ConnectedHosts registrations. The registration metadata
+contains `role: "layout-authority"`, `expectedServerId`, `authorityKeySha256`,
+`authorityId` and `epoch`. The actual relay offer must match the configured
+server/key, require protected relay encryption, and carry the service password.
+This is checked **before persistence or connection**, and again against the
+accepted server identity before a routed layout call. Metadata alone is not a
+pin. Plaintext, unpinned and password-free authority routes are refused.
+
+The password-bearing connection stays in private daemon `hosts.json` (mode
+0600). Host summaries omit it. Never copy it into a browser catalogue, web
+bootstrap, localStorage, source, logs or a public receipt. Web/native clients
+call their own daemon; its forwarding keeps the authority credential server-side.
+
+## Durable identity and transactions
+
+The authority owns `workspace-layout.json` relative to its qualified Paseo home.
+`workspace-layout-initialized.json` prevents an initialized but missing store
+from being recreated empty. A corrupt store, mismatched identity, stale epoch or
+abandoned writer lock requires recovery; none selects a fallback authority.
+
+Entity identity is `(serverId, workspaceId)`. Equal local IDs, paths, repository
+URLs and display names on different hosts never merge entities. Each entry holds
+ordinary/superpin timestamps, structural parent, structural sibling order,
+sidebar placement, archive observation, project membership and entry revision.
+Archived entries and both pin holds remain in snapshots. The structural parent
+is host-local; explicit sidebar parents can cross hosts. Both parent graphs
+are validated without recursively walking deep trees. A structurally nested pin
+whose parent is in another section retains its structural relationship and
+appears at the root of its own sidebar section, as before.
+
+`workspace.layout.commit.request` uses an expected authority identity, epoch,
+global revision and phase. Entry changes additionally compare the entry revision.
+One commit can change multiple entries. It fsyncs the file and directory before
+returning a receipt. An identical request ID and payload returns its durable
+receipt before checking the now-stale CAS. A reused ID with another payload is
+refused. Callers must retain the original request and reconcile an uncertain
+outcome; a new request ID is not recovery evidence.
+
+No delete/retirement mutation is exposed in this initial contract.
+
+## Bootstrap and import
+
+The RPCs and SDK methods are:
+
+| RPC                                   | SDK method                                     | Permission       |
+| ------------------------------------- | ---------------------------------------------- | ---------------- |
+| `workspace.layout.inspect.request`    | `getWorkspaceLayout`, `observeWorkspaceLayout` | `workspace.read` |
+| `workspace.layout.initialize.request` | `initializeWorkspaceLayout`                    | `daemon.manage`  |
+| `workspace.layout.commit.request`     | `commitWorkspaceLayout`                        | `daemon.manage`  |
+
+Initialize is explicit and creates an **importing** store. An ordinary read never
+initializes it. Import commits carry one host's complete entries, the exact source
+SHA256 and a resolution SHA256. Replacing a host import must also name its previous
+source hash and cannot drop an existing entry. Different source bytes require a
+new preview and explicit conflict resolution, not a latest-mtime or union rule.
+
+`pinnedAt` and `superpinnedAt` are required null/timestamp values in import entries.
+An absent legacy value is unresolved and cannot be presented as unpinned. Client
+order/layout sources require the same explicit preservation and conflict process.
+The deployment import preview must bind those rulings and all original source
+bytes; the store does not infer them from a hash supplied by a caller.
+
+Unresolved cross-host parents may be retained while importing. Activation names
+the exact complete import manifest, then refuses unknown parents, cycles,
+cross-project structural parents and invalid explicit sidebar sections. The
+controller must verify that manifest against the entire intended fleet and client
+source inventory; the store does not hardcode a host roster.
+
+During importing, legacy layout edits and new workspace creation are refused.
+Creation checks run before plugin creation hooks, project writes and worktree
+provisioning. A connection loss after that check may still leave a partial
+creation, whose existing causal receipt must be reconciled rather than replayed.
+Existing execution can continue, and unrelated local workspace metadata can be
+updated. Thus per-host runtime hops can fence layout writers without requiring
+one simultaneous stop of all agents on all machines. Read-only local observations
+during this phase are not canonical acceptance.
+
+## Replicas and existing writers
+
+The canonical registry routes legacy pin, superpin, placement, move, workspace
+creation and lifecycle updates through the same authority. Whole-record
+reconciliation preserves canonical layout fields instead of restoring stale
+copies. Directory publications project canonical values. A background owned
+subscription updates replicas; reconnect obtains a new identity-bound snapshot.
+
+`workspace-layout-replica.json` and pin fields in local `projects/workspaces.json`
+are protection/read replicas. They are never writable authorities. An unreachable
+authority permits stale reads and refuses layout writes. There is no offline
+mutation queue or fallback to local layout persistence. `server_info.workspaceLayout`
+reports configuration, last stamp and subscription synchronization; this is not
+proof of fleet acceptance or a retirement reservation.
+
+New workspace creation commits layout before writing its local execution record.
+If the local write then fails, the canonical identity is retained and creation
+requires reconciliation. It is not silently deleted or reused.
+
+## Destructive archival
+
+Canonical boot writes the sticky `workspace-layout-mode.json` marker:
+
+```json
+{
+  "schemaVersion": 1,
+  "role": "replica",
+  "authorityServerId": "<configured server>",
+  "authorityId": "<configured UUID>",
+  "epoch": "<configured UUID>",
+  "authorityKeySha256": "<configured SHA256>",
+  "destructiveRetirement": "refuse"
+}
+```
+
+Removing the config key does not remove this protection. Core workspace archive
+refuses before any teardown when the config declares `workspaceLayout` or the
+marker exists. A malformed/unreadable declaration or marker is a refusal, not
+evidence of a legacy home. Project removal follows the same refusal before it
+stops agents or terminals. Background reconciliation retains missing canonical
+workspaces and continues unrelated metadata inspection. External retirement tools
+must apply the same rule.
+
+This deliberately blocks destructive retirement until an authority reservation
+and its consuming filesystem operation are implemented. A recent file, explicit
+null pin or property-presence check cannot substitute for that reservation: another
+client can pin the workspace after a read. Archive never gets to decide that a
+stale protection copy is authoritative.
+
+## Recovery limits
+
+Keep the same current homes and authority store across runtime recovery. Do not
+restore an older home snapshot over writes made after switching. A source unit
+test, old 0.14 proof, version label or missing new optional config field does not
+qualify a 0.15 recovery reader. Runtime/terminal compatibility, installed Desktop
+behavior, exact artifact identity and current operation/work custody remain
+separate release requirements.

@@ -1,3 +1,8 @@
+import type {
+  WorkspaceLayoutIdentity,
+  WorkspaceLayoutCommit,
+  WorkspaceLayoutSnapshot,
+} from "@getpaseo/protocol/workspace-layout";
 import { supportsWorkspaceFields, WorkspaceFieldError } from "@getpaseo/protocol/workspace-fields";
 import type { MainHostSetInput, MainHostApplyInput } from "@getpaseo/protocol/fleet/main-host";
 import {
@@ -5831,6 +5836,53 @@ export class DaemonClient {
       requestId: options?.requestId,
       message: { type: "daemon.get_host_stats.request" },
       timeout: options?.timeout,
+    });
+  }
+
+  private requireWorkspaceLayout(): void {
+    if (!this.lastServerInfoMessage) throw new DaemonConnectionError("Transport not connected");
+    if (this.lastServerInfoMessage.features?.workspaceLayout !== true)
+      throw new Error("Update this host to use the canonical workspace layout.");
+  }
+
+  async getWorkspaceLayout(requestId?: string): Promise<WorkspaceLayoutSnapshot> {
+    this.requireWorkspaceLayout();
+    const result =
+      await this.sendNamespacedCorrelatedSessionRequest<"workspace.layout.inspect.response">({
+        requestId,
+        message: { type: "workspace.layout.inspect.request" },
+      });
+    return result.snapshot;
+  }
+
+  async initializeWorkspaceLayout(identity: WorkspaceLayoutIdentity, requestId?: string) {
+    this.requireWorkspaceLayout();
+    return this.sendNamespacedCorrelatedSessionRequest<"workspace.layout.initialize.response">({
+      requestId,
+      message: { type: "workspace.layout.initialize.request", identity },
+    });
+  }
+
+  async commitWorkspaceLayout(input: WorkspaceLayoutCommit) {
+    this.requireWorkspaceLayout();
+    const { requestId, ...fields } = input;
+    return this.sendNamespacedCorrelatedSessionRequest<"workspace.layout.commit.response">({
+      requestId,
+      message: { type: "workspace.layout.commit.request", ...fields },
+    });
+  }
+
+  observeWorkspaceLayout(): OwnedSubscription<WorkspaceLayoutSnapshot> {
+    this.requireWorkspaceLayout();
+    return this.owned.observe(async (accept) => {
+      const result = await this.sendCorrelatedSessionRequest({
+        message: { type: "workspace.layout.inspect.request", observe: true },
+        responseType: "workspace.layout.inspect.response",
+      });
+      if (!result.subscriptionId) throw new Error("Authority omitted layout subscription identity");
+      const snapshot = { ...result.snapshot, subscriptionId: result.subscriptionId };
+      accept(snapshot);
+      return snapshot;
     });
   }
 

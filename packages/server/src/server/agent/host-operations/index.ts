@@ -17,7 +17,7 @@ import {
 import type { DaemonTransportFactory } from "@getpaseo/client/internal/daemon-client-transport-types";
 import type { HostDirectory } from "@getpaseo/protocol/hosts";
 import { OWNER_PERMISSIONS } from "../../authorization/index.js";
-import type { ConnectedHosts } from "../../connected-hosts/index.js";
+import type { ConnectedHosts, HostIdentityBinding } from "../../connected-hosts/index.js";
 import { resolveRequiredProviderModel } from "../mcp-shared.js";
 import { selectAgentListItems } from "../agent-projections.js";
 import { summarizeAgentActivity } from "../activity-curator.js";
@@ -79,6 +79,7 @@ export interface ToolHosts {
     serverId: string,
     action: (client: DaemonClient) => Promise<T>,
     signal?: AbortSignal,
+    identityBinding?: HostIdentityBinding,
   ): Promise<T>;
 }
 
@@ -86,7 +87,7 @@ export interface ToolHosts {
 export function createToolHosts(hosts: ConnectedHosts): ToolHosts {
   return {
     directory: () => hosts.list(),
-    async use(serverId, action, signal) {
+    async use(serverId, action, signal, identityBinding) {
       const lifetime = new AbortController();
       let routeFailure: unknown;
       const transportFactory: DaemonTransportFactory = () => {
@@ -103,6 +104,7 @@ export function createToolHosts(hosts: ConnectedHosts): ToolHosts {
             sourceId: "mcp",
             originSessionId: "mcp",
             permissions: OWNER_PERMISSIONS,
+            identityBinding,
             signal: signal ? AbortSignal.any([lifetime.signal, signal]) : lifetime.signal,
             frame: (data) => {
               for (const listener of messages) listener(data, typeof data !== "string");

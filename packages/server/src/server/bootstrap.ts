@@ -1,7 +1,18 @@
+import {
+  CanonicalWorkspaceRegistry,
+  createWorkspaceRegistry,
+} from "./workspace-layout-registry.js";
+import {
+  prepareWorkspaceLayoutMode,
+  assertWorkspaceLayoutAuthorityKey,
+  requiresWorkspaceLayoutProtectedRelay,
+} from "./workspace-layout-mode.js";
+import { createWorkspaceLayoutService } from "./workspace-layout-service.js";
 import { configureHttpTransport } from "./http-transport.js";
 import { setWorkspacePinPlacement } from "./workspace-pin-placement.js";
 import { MessageReceipts } from "./message-receipts/index.js";
 import { MainHostStore } from "./fleet/main-host-store.js";
+import type { WorkspaceLayoutConfig } from "@getpaseo/protocol/workspace-layout";
 import { createRestartRecovery } from "./agent/restart-recovery/index.js";
 import { sendPromptToAgent } from "./agent/agent-prompt.js";
 import { createIdleRuntimeCleanup } from "./agent/idle-runtime-cleanup/index.js";
@@ -421,6 +432,7 @@ export type DaemonLifecycleIntent =
 export interface PaseoDaemonConfig {
   listen: string;
   paseoHome: string;
+  workspaceLayout?: WorkspaceLayoutConfig;
   daemonVersion?: string;
   desktopManaged?: boolean;
   worktreesRoot?: string;
@@ -643,6 +655,11 @@ export async function createPaseoDaemon(
   configureHttpTransport();
   configureGitProcessPolicy(config.git ?? resolveGitProcessPolicy({ env: process.env }));
   const logger = rootLogger.child({ module: "bootstrap" });
+  const workspaceLayoutMode = await prepareWorkspaceLayoutMode(
+    config.paseoHome,
+    config.workspaceLayout,
+    config.auth,
+  );
   const obsoleteTimelineDirectory = path.join(config.paseoHome, "agent-timelines");
   await rm(obsoleteTimelineDirectory, { recursive: true, force: true }).catch((error) => {
     logger.warn(
@@ -714,6 +731,7 @@ export async function createPaseoDaemon(
     );
   }
   const daemonKeyPair = await loadOrCreateDaemonKeyPair(config.paseoHome, logger);
+  assertWorkspaceLayoutAuthorityKey(workspaceLayoutMode, daemonKeyPair.publicKeyB64);
   const managedProcesses = createBootstrapManagedProcessRegistry(config, logger);
   // Reconcile the helper-process ledger in the background so it never blocks the
   // daemon from coming up; terminating a live leftover can take a few seconds.
@@ -774,6 +792,13 @@ export async function createPaseoDaemon(
     appBaseUrl = typeof value === "string" ? value : "https://app.paseo.sh";
   });
   let wsServer: VoiceAssistantWebSocketServer | null = null;
+  const workspaceLayoutService = await createWorkspaceLayoutService(
+    config.paseoHome,
+    serverId,
+    workspaceLayoutMode,
+    (error) =>
+      logger.error({ err: error }, "Workspace layout replication is unavailable; writes are held"),
+  );
   let serviceProxyListenTarget: ListenTarget | null = null;
   const scriptHealthMonitor = new ScriptHealthMonitor({
     serviceProxy,
@@ -970,9 +995,12 @@ export async function createPaseoDaemon(
     path.join(config.paseoHome, "projects", "projects.json"),
     logger,
   );
-  workspaceRegistry = new FileBackedWorkspaceRegistry(
-    path.join(config.paseoHome, "projects", "workspaces.json"),
+  const workspaceRegistryPath = path.join(config.paseoHome, "projects", "workspaces.json");
+  workspaceRegistry = createWorkspaceRegistry(
+    workspaceRegistryPath,
     logger,
+    workspaceLayoutService,
+    serverId,
   );
   const workspaceLabelService = createWorkspaceLabelService({
     paseoHome: config.paseoHome,
@@ -1888,6 +1916,7 @@ export async function createPaseoDaemon(
               {
                 getAllowedOrigins: () => allowedOrigins,
                 mainHostStore,
+                workspaceLayoutService,
                 getHostnames: () => configuredHostnames,
                 daemonStatusRpc: dependencies.serverFeatureOverrides?.daemonStatusRpc,
                 relayConfig: dependencies.serverFeatureOverrides?.relayConfig,
@@ -1938,8 +1967,10 @@ export async function createPaseoDaemon(
                     useTls: relayUseTls,
                     publicUseTls: relayPublicUseTls,
                   }),
-                  requireProtectedSecurity:
-                    daemonConfigStore.get().relay?.requireProtectedSecurity === true,
+                  requireProtectedSecurity: requiresWorkspaceLayoutProtectedRelay(
+                    workspaceLayoutMode,
+                    daemonConfigStore.get().relay?.requireProtectedSecurity,
+                  ),
                 }),
               },
               serviceProxyPublicBaseUrl,
@@ -1973,7 +2004,10 @@ export async function createPaseoDaemon(
                     daemonKeyPair: daemonKeyPair.keyPair,
                     logger: relaySecurityLogger,
                     requireProtectedMode: () =>
-                      daemonConfigStore.get().relay?.requireProtectedSecurity === true,
+                      requiresWorkspaceLayoutProtectedRelay(
+                        workspaceLayoutMode,
+                        daemonConfigStore.get().relay?.requireProtectedSecurity,
+                      ),
                   },
                   async (secured) => {
                     if (!wsServer) throw new Error("WebSocket server is not ready");
@@ -2080,6 +2114,7 @@ export async function createPaseoDaemon(
     await speechService.stop();
     await scheduleService.stop().catch(() => undefined);
     await relayRuntime?.stop().catch(() => undefined);
+    if (workspaceRegistry instanceof CanonicalWorkspaceRegistry) await workspaceRegistry.close();
     if (wsServer) {
       await wsServer.close();
     }

@@ -18,6 +18,7 @@ import type { AgentProfile } from "@getpaseo/protocol/messages";
 interface TestPaseoDaemonOptions {
   daemonVersion?: string;
   desktopManaged?: boolean;
+  workspaceLayout?: PaseoDaemonConfig["workspaceLayout"];
   downloadTokenTtlMs?: number;
   corsAllowedOrigins?: string[];
   listen?: string;
@@ -191,6 +192,7 @@ async function prepareTestDaemonConfig(
     paseoHome,
     daemonVersion: options.daemonVersion,
     desktopManaged: options.desktopManaged,
+    workspaceLayout: options.workspaceLayout,
     corsAllowedOrigins: options.corsAllowedOrigins ?? [],
     hostnames: true,
     mcpEnabled: options.mcpEnabled ?? true,

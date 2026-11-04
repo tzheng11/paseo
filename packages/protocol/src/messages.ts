@@ -1,3 +1,15 @@
+import {
+  WorkspaceLayoutInspectRequestSchema,
+  WorkspaceLayoutInitializeRequestSchema,
+  WorkspaceLayoutCommitRequestSchema,
+  WorkspaceLayoutInspectResponseSchema,
+  WorkspaceLayoutInitializeResponseSchema,
+  WorkspaceLayoutCommitResponseSchema,
+  WorkspaceLayoutChangedSchema,
+  WorkspaceLayoutStatusSchema,
+} from "./workspace-layout.js";
+import { WorkspacePinPlacementSchema } from "./workspace-layout.js";
+export { WorkspacePinPlacementSchema } from "./workspace-layout.js";
 import { AgentMessageSchema } from "./agent-message.js";
 import {
   HostsListRequestSchema,
@@ -1056,12 +1068,6 @@ export const WorkspaceSidebarPlacementSchema = z.object({
   parentWorkspaceKey: z.string().min(1).max(512).nullable(),
   siblingOrder: z.number().finite().optional(),
   section: WorkspaceSidebarSectionSchema,
-});
-
-export const WorkspacePinPlacementSchema = z.object({
-  parentWorkspaceKey: z.string().min(1).max(512).nullable(),
-  siblingOrder: z.number().finite(),
-  revision: z.number().int().nonnegative(),
 });
 
 export const WorkspacePinPlacementSetRequestSchema = z.object({
@@ -3442,6 +3448,9 @@ export const SubscriptionReleaseResponseSchema = z.object({
 });
 
 export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
+  WorkspaceLayoutInspectRequestSchema,
+  WorkspaceLayoutInitializeRequestSchema,
+  WorkspaceLayoutCommitRequestSchema,
   MainHostGetRequestSchema,
   MainHostSetRequestSchema,
   MainHostApplyRequestSchema,
@@ -3832,6 +3841,7 @@ export const ServerInfoStatusPayloadSchema = z
     status: z.literal("server_info"),
     // COMPAT(mainHost): added in v0.11.3; remove optional after 2027-04-18.
     mainHost: MainHostStateSchema.optional(),
+    workspaceLayout: WorkspaceLayoutStatusSchema.optional(),
     protocolVersion: z.number().int().optional(),
     // COMPAT(workspaceFields): added in v0.11.3; remove optional after 2027-04-14.
     workspaceFieldCatalogVersion: z.number().int().positive().optional(),
@@ -3850,6 +3860,7 @@ export const ServerInfoStatusPayloadSchema = z
       .object({
         // COMPAT(mainHost): added in v0.11.3; remove gate after 2027-04-18.
         mainHost: z.boolean().optional(),
+        workspaceLayout: z.boolean().optional(),
         // COMPAT(agentRequestReceipts): added in v0.8.0; remove gate after 2027-03-05.
         agentRequestReceipts: z.boolean().optional(),
         // COMPAT(workspaceRequestReceipts): added in v0.8.0; remove gate after 2027-03-07.
@@ -4103,6 +4114,7 @@ export const RpcErrorMessageSchema = z.object({
     error: z.string(),
     code: z.string().optional(),
     mainHost: MainHostStateSchema.optional(),
+    workspaceLayout: WorkspaceLayoutStatusSchema.optional(),
   }),
 });
 
@@ -7323,6 +7335,10 @@ export const AgentSkillsImportLegacySelectionResponseSchema = z.object({
 });
 
 export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
+  WorkspaceLayoutInspectResponseSchema,
+  WorkspaceLayoutInitializeResponseSchema,
+  WorkspaceLayoutCommitResponseSchema,
+  WorkspaceLayoutChangedSchema,
   MainHostGetResponseSchema,
   MainHostSetResponseSchema,
   MainHostApplyResponseSchema,

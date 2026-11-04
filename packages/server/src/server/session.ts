@@ -1,3 +1,5 @@
+import type { WorkspaceLayoutService } from "./workspace-layout-service.js";
+import { WorkspaceLayoutSession } from "./session/workspace-layout-session.js";
 import { WorkspaceFieldError } from "@getpaseo/protocol/workspace-fields";
 import { setWorkspaceFieldValue } from "./workspace-fields.js";
 import { type WorkspaceRuntimeStore } from "./workspace-runtime-store/index.js";
@@ -283,6 +285,7 @@ function resolveWorkspaceSetupRuntime(
   return runtime ?? new WorkspaceSetupRuntime();
 }
 import { WorktreeRequestError, toWorktreeWireError } from "./worktree-errors.js";
+import { assertWorkspaceRetirementAllowed } from "./workspace-layout-mode.js";
 import { parseGitRemoteLocation } from "@getpaseo/protocol/git-remote";
 import {
   createProjectDirectory,
@@ -455,6 +458,7 @@ const nodeSessionFileSystem: SessionFileSystem = {
 type AgentMcpTransportFactory = () => Promise<unknown>;
 
 export interface SessionOptions {
+  workspaceLayoutService?: WorkspaceLayoutService;
   mainHostStore?: MainHostStore;
   principalId?: string;
   clientType?: MainHostProvenance["clientType"];
@@ -857,6 +861,7 @@ export class Session {
   private readonly projectConfigSession: ProjectConfigSession;
   private readonly daemonSession: DaemonSession;
   private readonly fleetSession: FleetSession;
+  private readonly workspaceLayoutSession: WorkspaceLayoutSession;
   private readonly hubExecutionController: HubExecutionController | null;
   private readonly pinServerId: string | undefined;
   private readonly workspaceScripts: WorkspaceScriptsService;
@@ -960,6 +965,12 @@ export class Session {
       clientId: this.clientId,
       sessionId: this.sessionId,
     });
+    this.workspaceLayoutSession = new WorkspaceLayoutSession(
+      options.workspaceLayoutService,
+      this.delivery,
+      (message) => this.emit(message),
+      this.sessionLogger,
+    );
     this.workspaceFilesSession = new WorkspaceFilesSession({
       host: {
         emit: (msg, source) => this.emitForSource(msg, source),
@@ -2475,6 +2486,8 @@ export class Session {
     msg: SessionInboundMessage,
     source?: object,
   ): Promise<void> | undefined {
+    const layout = this.workspaceLayoutSession.dispatch(msg);
+    if (layout) return layout;
     const fleet = this.fleetSession.dispatch(msg);
     if (fleet) return fleet;
     if (msg.type === "workspace.setup.subscribe.request") return this.subscribeWorkspaceSetup(msg);
@@ -3865,6 +3878,7 @@ export class Session {
     this.sessionLogger.info({ projectId, requestId }, "session: project.remove.request");
 
     try {
+      await assertWorkspaceRetirementAllowed(this.paseoHome);
       const project = await this.projectRegistry.get(projectId);
       const resolvedProjectId = project?.projectId ?? projectId;
       const projectWorkspaces = (await this.workspaceRegistry.list()).filter(
@@ -3991,10 +4005,14 @@ export class Session {
   ): Promise<void> {
     const { workspaceId, requestId, parentWorkspaceId, beforeWorkspaceId } = request;
     try {
-      const workspace = await this.workspaceRegistry.move(workspaceId, {
-        parentWorkspaceId,
-        beforeWorkspaceId,
-      });
+      const workspace = await this.workspaceRegistry.move(
+        workspaceId,
+        {
+          parentWorkspaceId,
+          beforeWorkspaceId,
+        },
+        { requestId, layoutWrite: true },
+      );
       await this.emitWorkspaceUpdatesForWorkspaceIds([workspaceId]);
       this.emit({
         type: "workspace.move.response",
@@ -4145,12 +4163,16 @@ export class Session {
     try {
       const nextPinnedAt = pinned ? new Date().toISOString() : null;
       const updatedAt = new Date().toISOString();
-      const updated = await this.workspaceRegistry.update(workspaceId, (existing) => ({
-        ...existing,
-        pinnedAt: nextPinnedAt,
-        superpinnedAt: pinned ? existing.superpinnedAt : null,
-        updatedAt,
-      }));
+      const updated = await this.workspaceRegistry.update(
+        workspaceId,
+        (existing) => ({
+          ...existing,
+          pinnedAt: nextPinnedAt,
+          superpinnedAt: pinned ? existing.superpinnedAt : null,
+          updatedAt,
+        }),
+        { requestId, layoutWrite: true },
+      );
       if (!updated) {
         emitResponse(false, null, "Workspace not found");
         return;
@@ -4196,12 +4218,16 @@ export class Session {
     let updated: PersistedWorkspaceRecord | null;
     try {
       const timestamp = new Date().toISOString();
-      updated = await this.workspaceRegistry.update(workspaceId, (existing) => ({
-        ...existing,
-        pinnedAt: superpinned ? (existing.pinnedAt ?? timestamp) : existing.pinnedAt,
-        superpinnedAt: superpinned ? timestamp : null,
-        updatedAt: timestamp,
-      }));
+      updated = await this.workspaceRegistry.update(
+        workspaceId,
+        (existing) => ({
+          ...existing,
+          pinnedAt: superpinned ? (existing.pinnedAt ?? timestamp) : existing.pinnedAt,
+          superpinnedAt: superpinned ? timestamp : null,
+          updatedAt: timestamp,
+        }),
+        { requestId, layoutWrite: true },
+      );
     } catch (error) {
       this.sessionLogger.error(
         { ...logContext, err: error },
@@ -7210,6 +7236,7 @@ export class Session {
     request: Extract<SessionInboundMessage, { type: "workspace.create.request" }>,
     workspaceId?: string,
   ): Promise<WorkspaceDescriptorPayload> {
+    await this.workspaceProvisioning.assertCreationAllowed();
     if (request.internal)
       throw new Error(
         "Public internal workspaces were removed; use background workspace creation.",

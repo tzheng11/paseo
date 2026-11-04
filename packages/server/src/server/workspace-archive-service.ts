@@ -22,6 +22,7 @@ import { createRealpathAwarePathMatcher } from "../utils/path.js";
 import { runWithGitCommandPriority } from "../utils/run-git-command.js";
 import { WorkspaceAutomationBlockedError } from "./workspace-automation-gate.js";
 import { withTimeout } from "../utils/promise-timeout.js";
+import { assertWorkspaceRetirementAllowed } from "./workspace-layout-mode.js";
 
 const POST_ARCHIVE_SNAPSHOT_TIMEOUT_MS = 5_000;
 
@@ -140,6 +141,7 @@ export async function archiveByScope(
   dependencies: ArchiveDependencies,
   request: ArchiveByScopeRequest,
 ): Promise<ArchiveResult> {
+  if (dependencies.paseoHome) await assertWorkspaceRetirementAllowed(dependencies.paseoHome);
   return runWithGitCommandPriority("high", () => archiveByScopeWithPriority(dependencies, request));
 }
 

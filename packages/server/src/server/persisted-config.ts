@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { PluginRegistriesSchema } from "@getpaseo/protocol/plugin-registry";
+import { WorkspaceLayoutConfigSchema } from "@getpaseo/protocol/workspace-layout";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
@@ -339,6 +340,8 @@ export const PersistedConfigSchema = z
       })
       .strict()
       .optional(),
+
+    workspaceLayout: WorkspaceLayoutConfigSchema.strict().optional(),
 
     providers: ProvidersSchema.optional(),
     pluginRegistries: PluginRegistriesSchema.optional(),

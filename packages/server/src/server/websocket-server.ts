@@ -1,3 +1,4 @@
+import type { WorkspaceLayoutService } from "./workspace-layout-service.js";
 import { WORKSPACE_FIELD_CATALOG_VERSION } from "@getpaseo/protocol/workspace-fields";
 import type { MainHostStore } from "./fleet/main-host-store.js";
 import type { MainHostProvenance } from "@getpaseo/protocol/fleet/main-host";
@@ -182,6 +183,7 @@ interface WebSocketConnectionIdentity {
 }
 
 interface WebSocketServerConfig {
+  workspaceLayoutService?: WorkspaceLayoutService;
   mainHostStore?: MainHostStore;
   allowedOrigins?: Set<string>;
   hostnames?: HostnamesConfig;
@@ -568,7 +570,9 @@ function requireWebSocketServices(params: {
  */
 export class VoiceAssistantWebSocketServer {
   private readonly mainHostStore: MainHostStore | undefined;
+  private readonly workspaceLayoutService: WorkspaceLayoutService | undefined;
   private readonly releaseMainHost: (() => void) | undefined;
+  private readonly releaseWorkspaceLayout: (() => void) | undefined;
   private readonly logger: pino.Logger;
   private readonly wss: WebSocketServer;
   private readonly hostLinks = new Map<WebSocketLike, DaemonLinkEndpoint>();
@@ -715,6 +719,8 @@ export class VoiceAssistantWebSocketServer {
     workspaceLabelService?: WorkspaceLabelService,
   ) {
     this.mainHostStore = wsConfig.mainHostStore;
+    this.workspaceLayoutService = wsConfig.workspaceLayoutService;
+    this.releaseWorkspaceLayout = this.subscribeWorkspaceLayout();
     this.releaseMainHost = this.subscribeMainHost();
     this.logger = logger.child({ module: "websocket-server" });
     this.workspaceSetupRuntime = workspaceSetupRuntime;
@@ -782,7 +788,12 @@ export class VoiceAssistantWebSocketServer {
     this.workspaceAutoName = workspaceAutoName;
     this.downloadTokenStore = downloadTokenStore;
     this.paseoHome = paseoHome;
-    this.connectedHosts = new ConnectedHosts(paseoHome, { serverId, label: getHostName() });
+    this.connectedHosts = new ConnectedHosts(
+      paseoHome,
+      { serverId, label: getHostName() },
+      this.layoutAuthorityBinding(),
+    );
+    this.attachWorkspaceLayoutTransport();
     this.passwordHash = auth?.password;
     this.worktreesRoot = daemonRuntimeConfig?.worktreesRoot;
     this.daemonConfigStore = daemonConfigStore;
@@ -1161,14 +1172,48 @@ export class VoiceAssistantWebSocketServer {
     }
   }
 
+  private layoutAuthorityBinding() {
+    const authority = this.workspaceLayoutService?.options.config;
+    if (!authority || authority.role !== "replica") return undefined;
+    return {
+      expectedServerId: authority.authorityServerId,
+      authorityKeySha256: authority.authorityKeySha256,
+      authorityId: authority.authorityId,
+      epoch: authority.epoch,
+    };
+  }
+
+  private subscribeWorkspaceLayout(): (() => void) | undefined {
+    return this.workspaceLayoutService?.subscribe(() => this.broadcastCapabilitiesUpdate());
+  }
+
+  private attachWorkspaceLayoutTransport(): void {
+    if (this.workspaceLayoutService) {
+      const authority = this.workspaceLayoutService.options.config;
+      const hosts = createToolHosts(this.connectedHosts);
+      this.workspaceLayoutService.attachTransport({
+        changed: (listener) => this.connectedHosts.observe(listener),
+        use: (action, signal) =>
+          hosts.use(authority.authorityServerId, action, signal, {
+            expectedServerId: authority.authorityServerId,
+            authorityKeySha256: authority.authorityKeySha256,
+            authorityId: authority.authorityId,
+            epoch: authority.epoch,
+          }),
+      });
+    }
+  }
+
   private subscribeMainHost(): (() => void) | undefined {
     return this.mainHostStore?.subscribe(() => this.broadcastCapabilitiesUpdate());
   }
 
   public async close(): Promise<void> {
     this.releaseMainHost?.();
+    this.releaseWorkspaceLayout?.();
     this.prepareForShutdown();
     await this.agentMessages.close();
+    await this.workspaceLayoutService?.close();
     await this.connectedHosts.close();
     this.unsubscribeSpeechReadiness?.();
     this.unsubscribeSpeechReadiness = null;
@@ -1650,6 +1695,7 @@ export class VoiceAssistantWebSocketServer {
   private createSocketSession(options: SocketSessionOptions): Session {
     return new Session({
       mainHostStore: this.mainHostStore,
+      workspaceLayoutService: this.workspaceLayoutService,
       principalId: options.principalId,
       clientType: options.clientType,
       connectedHosts: this.connectedHosts,
@@ -2026,6 +2072,9 @@ export class VoiceAssistantWebSocketServer {
   private buildServerInfoStatusPayload(session: Session): ServerInfoStatusPayload {
     return {
       ...(this.mainHostStore ? { mainHost: this.mainHostStore.snapshot() } : {}),
+      ...(this.workspaceLayoutService
+        ? { workspaceLayout: this.workspaceLayoutService.status() }
+        : {}),
       status: "server_info",
       protocolVersion: WS_PROTOCOL_VERSION,
       serverId: this.serverId,
@@ -2040,6 +2089,7 @@ export class VoiceAssistantWebSocketServer {
       features: {
         // COMPAT(mainHost): added in v0.11.3; remove gate after 2027-04-18.
         mainHost: this.mainHostStore !== undefined,
+        workspaceLayout: this.workspaceLayoutService !== undefined,
         connectedHosts: true,
         hostMultiplexing: true,
         // COMPAT(relayProtectedSecurity): added in v0.13.0, remove gate after 2027-04-21.

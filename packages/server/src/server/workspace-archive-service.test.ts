@@ -195,6 +195,31 @@ function assertArchiveResult(
 }
 
 describe("archiveByScope", () => {
+  test("refuses canonical-mode retirement before any agent, terminal or worktree effect", async () => {
+    const home = mkdtempSync(path.join(tmpdir(), "canonical-archive-"));
+    cleanupPaths.push(home);
+    writeFileSync(
+      path.join(home, "config.json"),
+      JSON.stringify({ version: 1, workspaceLayout: {} }),
+    );
+    const deps = createArchiveDeps({
+      paseoHome: home,
+      activeWorkspaces: [{ workspaceId: "retained", cwd: home, kind: "local_checkout" }],
+    });
+    const archiveAgent = vi.spyOn(deps.agentManager, "archiveAgent");
+    const terminals = vi.spyOn(deps, "killTerminalsForWorkspace");
+    const records = vi.spyOn(deps, "archiveWorkspaceRecord");
+    await expect(
+      archiveByScope(deps, {
+        scope: { kind: "workspace", workspaceId: "retained" },
+        requestId: "central",
+      }),
+    ).rejects.toThrow("canonical_retirement_reservation_required");
+    expect(archiveAgent).not.toHaveBeenCalled();
+    expect(terminals).not.toHaveBeenCalled();
+    expect(records).not.toHaveBeenCalled();
+    expect(deps.activeWorkspaces).toHaveLength(1);
+  });
   test("failed agent teardown cannot report its workspace archived", async () => {
     const { tempDir, repoDir } = createGitRepo();
     const deps = createArchiveDeps({

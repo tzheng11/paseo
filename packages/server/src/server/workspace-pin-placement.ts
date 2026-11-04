@@ -117,7 +117,7 @@ export function setWorkspacePinPlacement(
   input: Pick<
     SetPlacement,
     "workspaceId" | "placement" | "expectedRevision" | "section" | "sectionState"
-  >,
+  > & { requestId?: string },
   serverId: string | undefined,
 ) {
   // Parent validation and the write share one owner queue, so simultaneous A→B and B→A cannot both pass.
@@ -138,7 +138,7 @@ async function commitWorkspacePinPlacement(
   input: Pick<
     SetPlacement,
     "workspaceId" | "placement" | "expectedRevision" | "section" | "sectionState"
-  >,
+  > & { requestId?: string },
   serverId: string | undefined,
 ) {
   if (
@@ -152,30 +152,34 @@ async function commitWorkspacePinPlacement(
     input.placement.parentWorkspaceKey,
     input.workspaceId,
   );
-  const updated = await registry.update(input.workspaceId, (workspace) => {
-    if (workspace.archivedAt) throw new Error("Workspace is archived.");
-    const current = workspace.pinPlacement;
-    // A lost acknowledgement is safe to retry without allocating another revision.
-    if (
-      current?.parentWorkspaceKey === input.placement.parentWorkspaceKey &&
-      current.siblingOrder === input.placement.siblingOrder &&
-      (input.section === undefined || workspaceSidebarSection(workspace) === input.section) &&
-      (!input.sectionState ||
-        (workspace.pinnedAt === input.sectionState.pinnedAt &&
-          workspace.superpinnedAt === input.sectionState.superpinnedAt))
-    )
-      return workspace;
-    if ((current?.revision ?? 0) !== input.expectedRevision)
-      throw new Error("This workspace moved in another client. Refresh and try again.");
-    return {
-      ...workspace,
-      ...(input.section === undefined
-        ? {}
-        : (input.sectionState ?? sectionFields(input.section, workspace))),
-      pinPlacement: { ...input.placement, revision: (current?.revision ?? 0) + 1 },
-      updatedAt: new Date().toISOString(),
-    };
-  });
+  const updated = await registry.update(
+    input.workspaceId,
+    (workspace) => {
+      if (workspace.archivedAt) throw new Error("Workspace is archived.");
+      const current = workspace.pinPlacement;
+      // A lost acknowledgement is safe to retry without allocating another revision.
+      if (
+        current?.parentWorkspaceKey === input.placement.parentWorkspaceKey &&
+        current.siblingOrder === input.placement.siblingOrder &&
+        (input.section === undefined || workspaceSidebarSection(workspace) === input.section) &&
+        (!input.sectionState ||
+          (workspace.pinnedAt === input.sectionState.pinnedAt &&
+            workspace.superpinnedAt === input.sectionState.superpinnedAt))
+      )
+        return workspace;
+      if ((current?.revision ?? 0) !== input.expectedRevision)
+        throw new Error("This workspace moved in another client. Refresh and try again.");
+      return {
+        ...workspace,
+        ...(input.section === undefined
+          ? {}
+          : (input.sectionState ?? sectionFields(input.section, workspace))),
+        pinPlacement: { ...input.placement, revision: (current?.revision ?? 0) + 1 },
+        updatedAt: new Date().toISOString(),
+      };
+    },
+    { requestId: input.requestId, layoutWrite: true },
+  );
   if (!updated?.pinPlacement) throw new Error("Workspace not found.");
   return updated.pinPlacement;
 }

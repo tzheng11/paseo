@@ -66,13 +66,15 @@ export interface AttemptFirstAgentBranchAutoNameResult {
 export interface CreatePaseoWorktreeDeps extends CreateWorktreeCoreDeps {
   lifecycle?: Pick<PluginLifecycle, "wait" | "before">;
   workspaceGitService: WorkspaceGitService;
-  workspaceProvisioning: Pick<WorkspaceProvisioningService, "createWorkspaceForWorktree">;
+  workspaceProvisioning: Pick<WorkspaceProvisioningService, "createWorkspaceForWorktree"> &
+    Partial<Pick<WorkspaceProvisioningService, "assertCreationAllowed">>;
 }
 
 export async function createPaseoWorktree(
   input: CreatePaseoWorktreeInput,
   deps: CreatePaseoWorktreeDeps,
 ): Promise<CreatePaseoWorktreeResult> {
+  await deps.workspaceProvisioning.assertCreationAllowed?.();
   return runWithGitCommandPriority("high", () => createPaseoWorktreeWithPriority(input, deps));
 }
 

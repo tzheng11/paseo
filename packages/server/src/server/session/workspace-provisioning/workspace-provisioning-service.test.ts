@@ -145,6 +145,32 @@ test("fresh non-git directory creates a directory workspace at the exact path", 
   expect(workspace.cwd).toBe(dir);
 });
 
+test("canonical import refusal precedes project and workspace provisioning but permits existing work", async () => {
+  const original = await provisioning.findOrCreateWorkspaceForDirectory(path.join(tmpDir, "old"));
+  const guard = async () => {
+    throw new Error("layout_importing");
+  };
+  const guarded = Object.assign(workspaceRegistry, { assertLayoutWriteAllowed: guard });
+  const before = await projectRegistry.list();
+  const current = createWorkspaceProvisioningService({
+    serverId: "test-host",
+    workspaceRegistry: guarded,
+    projectRegistry,
+    workspaceGitService: gitService(),
+    isDirectory,
+    logger,
+  });
+  await expect(current.createWorkspaceForDirectory(path.join(tmpDir, "new"))).rejects.toThrow(
+    "layout_importing",
+  );
+  await expect(current.findOrCreateProjectForDirectory(path.join(tmpDir, "new"))).rejects.toThrow(
+    "layout_importing",
+  );
+  expect(await projectRegistry.list()).toEqual(before);
+  expect(await workspaceRegistry.list()).toEqual([original]);
+  expect(await current.findOrCreateWorkspaceForDirectory(original.cwd)).toEqual(original);
+});
+
 test("background workspace creation preserves hooks, inheritance and durable visibility", async () => {
   const dir = path.join(tmpDir, "plain");
   const events: string[] = [];

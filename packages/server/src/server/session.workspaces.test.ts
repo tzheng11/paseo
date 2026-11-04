@@ -4017,6 +4017,32 @@ test("archiving the last workspace emits a remove carrying the now-empty project
   });
 });
 
+test("canonical project removal refuses before reading or stopping workspace resources", async () => {
+  const home = mkdtempSync(path.join(tmpdir(), "canonical-project-remove-"));
+  try {
+    writeFileSync(path.join(home, "config.json"), JSON.stringify({ workspaceLayout: {} }));
+    const emitted: SessionOutboundMessage[] = [];
+    const session = createSessionForWorkspaceTests({
+      paseoHome: home,
+      onMessage: (message) => emitted.push(message),
+    });
+    const getProject = vi.fn();
+    session.projectRegistry.get = getProject;
+    await session.handleMessage({
+      type: "project.remove.request",
+      projectId: "project",
+      requestId: "refused",
+    });
+    expect(getProject).not.toHaveBeenCalled();
+    expect(findByType(emitted, "project.remove.response")?.payload).toMatchObject({
+      accepted: false,
+      error: expect.stringContaining("canonical_retirement_reservation_required"),
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("project.remove.request archives active workspaces and removes the project record", async () => {
   const emitted: SessionOutboundMessage[] = [];
   const session = createSessionForWorkspaceTests({

@@ -27,6 +27,23 @@ import { deriveProjectKey } from "./project-key.js";
 
 const cleanupPaths: string[] = [];
 
+test("canonical refusal precedes worktree hooks, git and filesystem creation", async () => {
+  const deps = createDeps();
+  const checkout = vi.fn();
+  deps.workspaceGitService.getCheckout = checkout;
+  const guard = vi.fn(async () => {
+    throw new Error("layout_importing");
+  });
+  deps.workspaceProvisioning.assertCreationAllowed = guard;
+  await expect(
+    createPaseoWorktree({ cwd: "/not-read", paseoHome: "/not-written" }, deps),
+  ).rejects.toThrow("layout_importing");
+  expect(guard).toHaveBeenCalledOnce();
+  expect(checkout).not.toHaveBeenCalled();
+  expect(deps.workspaces.size).toBe(0);
+  expect(deps.projects.size).toBe(0);
+});
+
 afterEach(() => {
   for (const target of cleanupPaths.splice(0)) {
     rmSync(target, { recursive: true, force: true });

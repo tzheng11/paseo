@@ -65,6 +65,7 @@ export interface CreateWorktreeWorkspaceInput {
 }
 
 export interface WorkspaceProvisioningService {
+  assertCreationAllowed(): Promise<void>;
   runInImportWorkspace<T>(
     input: ImportWorkspaceInput,
     operation: (workspace: PersistedWorkspaceRecord) => Promise<T>,
@@ -120,6 +121,10 @@ export function createWorkspaceProvisioningService(deps: {
   lifecycle?: PluginLifecycle;
 }): WorkspaceProvisioningService {
   const { serverId, workspaceRegistry, projectRegistry, workspaceGitService, logger } = deps;
+
+  async function assertCreationAllowed(): Promise<void> {
+    await workspaceRegistry.assertLayoutWriteAllowed?.();
+  }
 
   /**
    * Placement facts at a workspace directory, or null when there is nothing
@@ -210,6 +215,7 @@ export function createWorkspaceProvisioningService(deps: {
   }
 
   async function findOrCreateProjectForDirectory(cwd: string): Promise<PersistedProjectRecord> {
+    await assertCreationAllowed();
     const rootPath = resolve(cwd);
     const checkout = await workspaceGitService.getCheckout(rootPath);
     const timestamp = new Date().toISOString();
@@ -261,6 +267,7 @@ export function createWorkspaceProvisioningService(deps: {
       sidebarPlacement?: WorkspaceSidebarPlacement;
     },
   ): Promise<PersistedWorkspaceRecord> {
+    await assertCreationAllowed();
     const normalizedCwd = resolve(cwd);
     const checkout = await workspaceGitService.getCheckout(normalizedCwd);
     projectId =
@@ -296,6 +303,7 @@ export function createWorkspaceProvisioningService(deps: {
   async function createWorkspaceForWorktree(
     input: CreateWorktreeWorkspaceInput,
   ): Promise<PersistedWorkspaceRecord> {
+    await assertCreationAllowed();
     const sourceCwd = resolve(input.sourceCwd);
     const repoRoot = resolve(input.repoRoot);
     const cwd = resolve(input.cwd);
@@ -538,6 +546,7 @@ export function createWorkspaceProvisioningService(deps: {
   }
 
   return {
+    assertCreationAllowed,
     runInImportWorkspace,
     findOrCreateWorkspaceForDirectory,
     resolveOrCreateWorkspaceIdForCreateAgent,

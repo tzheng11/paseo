@@ -303,6 +303,9 @@ export class WorkspaceReconciliationService {
       )
       .map(({ workspace }) => workspace);
     await mapBounded(missingWorkspaces, async (workspace) => {
+      // A missing directory cannot acquire a canonical retirement reservation.
+      // Continue metadata reconciliation instead of failing daemon bootstrap.
+      if (this.workspaceRegistry.destructiveRetirement === "refuse") return;
       const current = await this.workspaceRegistry.get(workspace.workspaceId);
       const project = await this.projectRegistry.get(workspace.projectId);
       if (

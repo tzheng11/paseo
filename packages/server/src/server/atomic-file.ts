@@ -74,3 +74,29 @@ export async function writeJsonFileAtomic(
 ): Promise<void> {
   await writeFileAtomic(filePath, JSON.stringify(value, null, 2), operations);
 }
+
+/** Use for acknowledged authority revisions; ordinary caches need only atomic replacement. */
+export async function writeFileDurably(filePath: string, contents: string): Promise<void> {
+  const temporary = `${filePath}.${randomUUID()}.tmp`;
+  const file = await fs.open(temporary, "wx", 0o600);
+  try {
+    await file.writeFile(contents, "utf8");
+    await file.sync();
+    await file.close();
+    await fs.rename(temporary, filePath);
+    // Windows cannot flush a directory opened for reading; file data is synced.
+    if (process.platform === "win32") return;
+    const directory = await fs.open(path.dirname(filePath), "r");
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
+    }
+  } finally {
+    try {
+      await file.close();
+    } finally {
+      await fs.rm(temporary, { force: true });
+    }
+  }
+}

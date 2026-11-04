@@ -627,6 +627,7 @@ export function resolveConfigFromPersisted(
     ...settings,
     listen: resolveListenAddress(env, cli, persisted),
     paseoHome,
+    workspaceLayout: persisted.workspaceLayout,
     desktopManaged: env.PASEO_DESKTOP_MANAGED === "1",
     worktreesRoot: resolveWorktreesRoot(paseoHome, persisted),
     pluginRegistries: persisted.pluginRegistries,

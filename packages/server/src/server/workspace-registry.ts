@@ -150,6 +150,9 @@ export interface WorkspaceMutation {
 
 export interface WorkspaceMutationContext {
   expectsInitialAgent?: boolean;
+  requestId?: string;
+  /** Explicit layout RPCs also need fresh validation when the cached value looks unchanged. */
+  layoutWrite?: true;
 }
 
 export interface WorkspaceArchiveContext {
@@ -191,14 +194,22 @@ export type WorkspaceMoveInput = Pick<
 >;
 
 export interface WorkspaceRegistry {
+  readonly destructiveRetirement?: "refuse";
+  /** Refuse creation before hooks, project writes or filesystem provisioning. */
+  assertLayoutWriteAllowed?(): Promise<void>;
   initialize(): Promise<void>;
   existsOnDisk(): Promise<boolean>;
   list(): Promise<PersistedWorkspaceRecord[]>;
   get(workspaceId: string): Promise<PersistedWorkspaceRecord | null>;
-  move(workspaceId: string, input: WorkspaceMoveInput): Promise<PersistedWorkspaceRecord>;
+  move(
+    workspaceId: string,
+    input: WorkspaceMoveInput,
+    context?: WorkspaceMutationContext,
+  ): Promise<PersistedWorkspaceRecord>;
   update(
     workspaceId: string,
     updater: (record: PersistedWorkspaceRecord) => PersistedWorkspaceRecord,
+    context?: WorkspaceMutationContext,
   ): Promise<PersistedWorkspaceRecord | null>;
   upsert(record: PersistedWorkspaceRecord, context?: WorkspaceMutationContext): Promise<void>;
   archive(
