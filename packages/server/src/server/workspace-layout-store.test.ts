@@ -15,6 +15,7 @@ import {
   writeLayoutFileDurably,
   validateLayoutGraph,
 } from "./workspace-layout-store.js";
+import { resolvePinnedWorkspaceTree } from "../../../app/src/components/sidebar/workspace-tree/pinned-layout.js";
 
 const identity: WorkspaceLayoutIdentity = {
   authorityServerId: "srv_hub",
@@ -52,6 +53,28 @@ function request(
   mutations: WorkspaceLayoutMutation[],
 ): WorkspaceLayoutCommit {
   return { requestId: randomUUID(), expected: snapshot.stamp, mutations };
+}
+
+function visibleParents(snapshot: WorkspaceLayoutSnapshot) {
+  function section(row: WorkspaceLayoutEntry) {
+    if (row.superpinnedAt) return "superpinned" as const;
+    return row.pinnedAt ? ("pinned" as const) : ("unpinned" as const);
+  }
+  const active = snapshot.entries.filter((row) => !row.archivedAt);
+  const workspaces = active.map((row) => ({
+    workspaceKey: `${row.ref.serverId}:${row.ref.workspaceId}`,
+    serverId: row.ref.serverId,
+    projectViewKey: row.projectId,
+    parentWorkspaceId: row.parent?.workspaceId ?? null,
+    siblingOrder: row.siblingOrder,
+    sidebarSection: section(row),
+  }));
+  const placements = Object.fromEntries(
+    active.flatMap((row) =>
+      row.pinPlacement ? [[`${row.ref.serverId}:${row.ref.workspaceId}`, row.pinPlacement]] : [],
+    ),
+  );
+  return resolvePinnedWorkspaceTree(workspaces, placements);
 }
 
 describe("canonical workspace layout authority", () => {
@@ -227,6 +250,84 @@ describe("canonical workspace layout authority", () => {
       pinnedAt: timestamp,
       pinPlacement: null,
     });
+  });
+
+  it("retains dormant stored placement and order through parent unpin/repin, child section changes and archived-parent return", async () => {
+    const parent = entry("srv_a", "parent");
+    const child = {
+      ...entry("srv_b", "child"),
+      superpinnedAt: timestamp,
+      pinPlacement: { parentWorkspaceKey: "srv_a:parent", siblingOrder: 17, revision: 2 },
+    };
+    let state = await seed([parent, child]);
+    const storedLink = structuredClone(child.pinPlacement);
+    const inspect = () => {
+      expect(state.entries.find((row) => row.ref.workspaceId === "child")?.pinPlacement).toEqual(
+        storedLink,
+      );
+      return visibleParents(state).get("srv_b:child")?.parentWorkspaceKey;
+    };
+    expect(inspect()).toBeNull();
+    const change = async (id: string, fields: Partial<WorkspaceLayoutEntry>) => {
+      const current = state.entries.find((row) => row.ref.workspaceId === id)!;
+      await store.commit(request(state, [{ kind: "put", entry: { ...current, ...fields } }]));
+      state = await store.inspect();
+    };
+    await change("child", { superpinnedAt: null });
+    expect(inspect()).toBe("srv_a:parent");
+    await change("parent", { pinnedAt: null });
+    expect(inspect()).toBeNull();
+    await change("parent", { pinnedAt: timestamp });
+    expect(inspect()).toBe("srv_a:parent");
+    await change("parent", { archivedAt: timestamp });
+    expect(inspect()).toBeNull();
+    await change("parent", { archivedAt: null });
+    expect(inspect()).toBe("srv_a:parent");
+    await change("child", { superpinnedAt: timestamp });
+    expect(inspect()).toBeNull();
+  });
+
+  it("imports a historical archived-parent placement without erasing the edge or permitting a new invalid assignment", async () => {
+    const parent = { ...entry("srv_a", "parent"), archivedAt: timestamp };
+    const child = {
+      ...entry("srv_b", "child"),
+      pinPlacement: { parentWorkspaceKey: "srv_a:parent", siblingOrder: 6, revision: 1 },
+    };
+    const state = await seed([parent, child, entry("srv_b", "other")]);
+    expect(state.entries.find((row) => row.ref.workspaceId === "child")?.pinPlacement).toEqual(
+      child.pinPlacement,
+    );
+    expect(visibleParents(state).get("srv_b:child")?.parentWorkspaceKey).toBeNull();
+    const other = state.entries.find((row) => row.ref.workspaceId === "other")!;
+    await expect(
+      store.commit(
+        request(state, [{ kind: "put", entry: { ...other, pinPlacement: child.pinPlacement } }]),
+      ),
+    ).rejects.toThrow("parent_section_mismatch");
+    expect(await store.inspect()).toEqual(state);
+  });
+
+  it("refuses cycles and missing references even when every stored edge is dormant", async () => {
+    const a = {
+      ...entry("srv_a", "a"),
+      archivedAt: timestamp,
+      pinPlacement: { parentWorkspaceKey: "srv_b:b", siblingOrder: 2, revision: 0 },
+    };
+    const b = {
+      ...entry("srv_b", "b"),
+      superpinnedAt: timestamp,
+      pinPlacement: { parentWorkspaceKey: "srv_a:a", siblingOrder: 9, revision: 0 },
+    };
+    const initial = await store.initialize(identity);
+    await expect(
+      store.commit(request(initial, [imported("srv_a", [a]), imported("srv_b", [b])])),
+    ).rejects.toThrow("workspace_cycle");
+    await store.commit(request(initial, [imported("srv_a", [a])]));
+    const partial = await store.inspect();
+    await expect(
+      store.commit(request(partial, [{ kind: "activate", requiredImports: partial.imports }])),
+    ).rejects.toThrow("unresolved_parent");
+    expect(await store.inspect()).toEqual(partial);
   });
 
   it("validates deep metadata without recursive stack growth or repeated ancestor scans", () => {

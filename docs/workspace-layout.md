@@ -52,7 +52,12 @@ Archived entries and both pin holds remain in snapshots. The structural parent
 is host-local; explicit sidebar parents can cross hosts. Both parent graphs
 are validated without recursively walking deep trees. A structurally nested pin
 whose parent is in another section retains its structural relationship and
-appears at the root of its own sidebar section, as before.
+appears at the root of its own sidebar section, as before. Explicit sidebar
+links also retain their stored parent and order when either workspace is archived
+or changes pin section. The visible projection lifts an ineligible child to its
+section root; returning both workspaces to the same section reactivates the link.
+All dormant links still participate in cycle and missing-reference validation.
+Creating a new explicit link requires an active parent in the same section.
 
 `workspace.layout.commit.request` uses an expected authority identity, epoch,
 global revision and phase. Entry changes additionally compare the entry revision.
@@ -101,7 +106,8 @@ bytes; the store does not infer them from a hash supplied by a caller.
 
 Unresolved cross-host parents may be retained while importing. Activation names
 the exact complete import manifest, then refuses unknown parents, cycles,
-cross-project structural parents and invalid explicit sidebar sections. The
+cross-project structural parents. Historical dormant sidebar links remain stored,
+without being treated as new cross-section assignments. The
 controller must verify that manifest against the entire intended fleet and client
 source inventory; the store does not hardcode a host roster.
 

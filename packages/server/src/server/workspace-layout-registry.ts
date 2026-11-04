@@ -100,7 +100,10 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
       }
       const localChanges = Object.fromEntries(
         Object.entries(changed).filter(
-          ([field]) => !LAYOUT_FIELDS.includes(field as (typeof LAYOUT_FIELDS)[number]),
+          ([field]) =>
+            field === "projectId" ||
+            field === "archivedAt" ||
+            !LAYOUT_FIELDS.includes(field as (typeof LAYOUT_FIELDS)[number]),
         ),
       );
       const result = await super.update(id, (latest) =>

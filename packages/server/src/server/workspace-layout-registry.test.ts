@@ -298,6 +298,35 @@ it("retains archived ordinary/superpin holds in the on-disk protection replica",
   await expect(value.remove()).rejects.toThrow("canonical_retirement_reservation_required");
 });
 
+it("persists host-owned unarchive and project observations while preserving canonical pin holds", async () => {
+  const archived = { ...row("returning"), archivedAt: at, pinnedAt: at, superpinnedAt: at };
+  await seed([archived]);
+  const { value, file } = await registry([archived]);
+  await value.update("returning", (record) => ({
+    ...record,
+    archivedAt: null,
+    projectId: "new-project",
+  }));
+  expect(await value.get("returning")).toMatchObject({
+    archivedAt: null,
+    projectId: "new-project",
+    pinnedAt: at,
+    superpinnedAt: at,
+  });
+  expect(JSON.parse(await readFile(file, "utf8"))[0]).toMatchObject({
+    archivedAt: null,
+    projectId: "new-project",
+    pinnedAt: at,
+    superpinnedAt: at,
+  });
+  expect((await service.inspect()).entries[0]).toMatchObject({
+    archivedAt: null,
+    projectId: "new-project",
+    pinnedAt: at,
+    superpinnedAt: at,
+  });
+});
+
 it("keeps missing canonical workspaces during reconciliation without preventing daemon bootstrap", async () => {
   const original = row("missing");
   await seed([original]);

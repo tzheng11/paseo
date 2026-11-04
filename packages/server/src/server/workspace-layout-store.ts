@@ -123,6 +123,7 @@ export class WorkspaceLayoutStore {
       const next = structuredClone(current);
       const revision = current.snapshot.stamp.revision + 1;
       for (const mutation of input.mutations) applyMutation(next.snapshot, mutation, revision);
+      validateNewNavigationParents(current.snapshot, next.snapshot, input.mutations);
       validateLayoutGraph(next.snapshot);
       next.snapshot.stamp.revision = revision;
       const receipt: WorkspaceLayoutReceipt = {
@@ -289,6 +290,7 @@ export function projectConfirmedLayout(
   const next = structuredClone(snapshot);
   const revision = snapshot.stamp.revision + 1;
   for (const mutation of input.mutations) applyMutation(next, mutation, revision);
+  validateNewNavigationParents(snapshot, next, input.mutations);
   next.stamp.revision = revision;
   validateLayoutGraph(next);
   if (canonicalLayoutJson(next.stamp) !== canonicalLayoutJson(receipt.stamp))
@@ -338,22 +340,41 @@ function navigationParent(
   phase: string,
 ) {
   if (!entry.pinPlacement) {
-    // The established UI lifts a structurally nested pin into its own section
-    // when its parent belongs to another section. Keep that structural link.
-    if (!structural || structural.archivedAt || layoutSection(structural) !== layoutSection(entry))
-      return null;
+    // Validate stored edges, including dormant ones, so later reactivation
+    // cannot reveal a cycle. Visible eligibility belongs to the UI projection.
     return structural;
   }
   const key = entry.pinPlacement.parentWorkspaceKey;
   if (key === null) return null;
   const parent = findParent(parseWorkspaceNavigationKey(key), entries, phase);
-  if (
-    parent &&
-    !entry.archivedAt &&
-    (parent.archivedAt || layoutSection(parent) !== layoutSection(entry))
-  )
-    throw new WorkspaceLayoutRefusal("parent_section_mismatch");
   return parent;
+}
+
+function validateNewNavigationParents(
+  previous: WorkspaceLayoutSnapshot,
+  next: WorkspaceLayoutSnapshot,
+  mutations: WorkspaceLayoutMutation[],
+): void {
+  const before = new Map(
+    previous.entries.map((entry) => [workspaceReferenceKey(entry.ref), entry]),
+  );
+  const after = new Map(next.entries.map((entry) => [workspaceReferenceKey(entry.ref), entry]));
+  for (const mutation of mutations) {
+    if (mutation.kind !== "put") continue;
+    const entry = mutation.entry;
+    const parentKey = entry.pinPlacement?.parentWorkspaceKey;
+    if (
+      parentKey == null ||
+      before.get(workspaceReferenceKey(entry.ref))?.pinPlacement?.parentWorkspaceKey === parentKey
+    )
+      continue;
+    const parent = findParent(parseWorkspaceNavigationKey(parentKey), after, next.stamp.phase);
+    if (
+      parent &&
+      (parent.archivedAt || entry.archivedAt || layoutSection(parent) !== layoutSection(entry))
+    )
+      throw new WorkspaceLayoutRefusal("parent_section_mismatch");
+  }
 }
 
 function findParent(
