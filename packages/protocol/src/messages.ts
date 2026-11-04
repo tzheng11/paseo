@@ -9,6 +9,7 @@ import {
   WorkspaceLayoutStatusSchema,
 } from "./workspace-layout.js";
 import { WorkspacePinPlacementSchema } from "./workspace-layout.js";
+import { RuntimeBuildIdentitySchema, RuntimeWriteIntentSchema } from "./runtime-build.js";
 export { WorkspacePinPlacementSchema } from "./workspace-layout.js";
 import { AgentMessageSchema } from "./agent-message.js";
 import {
@@ -3842,6 +3843,8 @@ export const ServerInfoStatusPayloadSchema = z
     // COMPAT(mainHost): added in v0.11.3; remove optional after 2027-04-18.
     mainHost: MainHostStateSchema.optional(),
     workspaceLayout: WorkspaceLayoutStatusSchema.optional(),
+    runtimeBuild: RuntimeBuildIdentitySchema.optional(),
+    runtimeWriteIntent: RuntimeWriteIntentSchema.optional(),
     protocolVersion: z.number().int().optional(),
     // COMPAT(workspaceFields): added in v0.11.3; remove optional after 2027-04-14.
     workspaceFieldCatalogVersion: z.number().int().positive().optional(),
@@ -5433,6 +5436,8 @@ export const DaemonGetStatusResponseSchema = z.object({
       requestId: z.string(),
       serverId: z.string(),
       version: z.string().nullable().optional(),
+      runtimeBuild: RuntimeBuildIdentitySchema.optional(),
+      runtimeWriteIntent: RuntimeWriteIntentSchema.optional(),
       pid: z.number(),
       nodePath: z.string(),
       startedAt: z.string().nullable().optional(),

@@ -2080,6 +2080,8 @@ export class VoiceAssistantWebSocketServer {
       serverId: this.serverId,
       hostname: getHostName(),
       version: this.daemonVersion,
+      runtimeBuild: this.daemonRuntimeConfig?.runtimeBuild,
+      runtimeWriteIntent: this.daemonRuntimeConfig?.runtimeWriteIntent,
       sourceId: session.getHostSourceId(),
       permissions: session.getPermissions(),
       workspaceFieldCatalogVersion: WORKSPACE_FIELD_CATALOG_VERSION,

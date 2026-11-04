@@ -8,6 +8,7 @@ import {
   requiresWorkspaceLayoutProtectedRelay,
 } from "./workspace-layout-mode.js";
 import { createWorkspaceLayoutService } from "./workspace-layout-service.js";
+import { prepareRuntimeProvenance } from "./runtime-write-intent.js";
 import { configureHttpTransport } from "./http-transport.js";
 import { setWorkspacePinPlacement } from "./workspace-pin-placement.js";
 import { MessageReceipts } from "./message-receipts/index.js";
@@ -655,6 +656,11 @@ export async function createPaseoDaemon(
   configureHttpTransport();
   configureGitProcessPolicy(config.git ?? resolveGitProcessPolicy({ env: process.env }));
   const logger = rootLogger.child({ module: "bootstrap" });
+  const daemonVersion = config.daemonVersion ?? resolveDaemonVersion(import.meta.url);
+  const { runtimeBuild, runtimeWriteIntent } = await prepareRuntimeProvenance(
+    config.paseoHome,
+    daemonVersion,
+  );
   const workspaceLayoutMode = await prepareWorkspaceLayoutMode(
     config.paseoHome,
     config.workspaceLayout,
@@ -669,7 +675,6 @@ export async function createPaseoDaemon(
   });
   const bootstrapStart = performance.now();
   const elapsed = () => `${(performance.now() - bootstrapStart).toFixed(0)}ms`;
-  const daemonVersion = config.daemonVersion ?? resolveDaemonVersion(import.meta.url);
   const initialMutableConfig = createInitialMutableDaemonConfig(config);
   const speechService = createSpeechService({
     logger,
@@ -1954,6 +1959,8 @@ export async function createPaseoDaemon(
               providerSnapshotManager,
               {
                 listen: formatListenTarget(boundListenTarget ?? listenTarget),
+                runtimeBuild,
+                runtimeWriteIntent,
                 worktreesRoot: config.worktreesRoot,
                 get appBaseUrl() {
                   return appBaseUrl;

@@ -152,6 +152,10 @@ stale protection copy is authoritative.
 
 ## Recovery limits
 
+The [runtime provenance and write-intent contract](runtime-provenance.md) records
+the conservative custom 0.15 write boundary. The canonical store retains its
+separate identity/epoch/revision; a host intent is not an authority transaction.
+
 Keep the same current homes and authority store across runtime recovery. Do not
 restore an older home snapshot over writes made after switching. A source unit
 test, old 0.14 proof, version label or missing new optional config field does not

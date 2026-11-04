@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { PluginRegistriesSchema } from "@getpaseo/protocol/plugin-registry";
 import { WorkspaceLayoutConfigSchema } from "@getpaseo/protocol/workspace-layout";
+import { ensureRuntimeWriteIntent, ensureRuntimeWriteIntentAsync } from "./runtime-write-intent.js";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
@@ -509,6 +510,7 @@ export function loadPersistedConfig(paseoHome: string, logger?: LoggerLike): Per
 
   if (!existsSync(configPath)) {
     try {
+      ensureRuntimeWriteIntent(paseoHome);
       writePrivateFileAtomicSync(
         configPath,
         JSON.stringify(DEFAULT_PERSISTED_CONFIG, null, 2) + "\n",
@@ -556,6 +558,7 @@ export async function loadPersistedConfigAsync(
     }
     try {
       raw = JSON.stringify(DEFAULT_PERSISTED_CONFIG, null, 2) + "\n";
+      await ensureRuntimeWriteIntentAsync(paseoHome);
       await writePrivateFileAtomic(configPath, raw);
       log?.info(`Initialized config file at ${configPath}`);
     } catch (initializationError) {
@@ -692,6 +695,7 @@ export function savePersistedConfig(
   const data = serializePersistedConfig(config);
 
   try {
+    ensureRuntimeWriteIntent(paseoHome);
     writePrivateFileAtomicSync(configPath, data);
     log?.info(`Saved to ${configPath}`);
   } catch (err) {
@@ -722,6 +726,7 @@ export async function savePersistedConfigAsync(
   const configPath = getConfigPath(paseoHome);
   const data = serializePersistedConfig(config);
   try {
+    await ensureRuntimeWriteIntentAsync(paseoHome);
     await writePrivateFileAtomic(configPath, data);
     getLogger(logger)?.info(`Saved to ${configPath}`);
   } catch (error) {

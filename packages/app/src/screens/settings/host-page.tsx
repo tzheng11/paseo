@@ -12,6 +12,7 @@ import {
   Trash2,
 } from "lucide-react-native";
 import type { TFunction } from "i18next";
+import { formatRuntimeVersionBadge } from "@/utils/runtime-version";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useLocalSearchParams } from "expo-router";
@@ -153,12 +154,6 @@ function formatActiveConnectionBadge(
   };
 }
 
-function formatDaemonVersionBadge(version: string | null): string | null {
-  const trimmed = version?.trim();
-  if (!trimmed) return null;
-  return trimmed.startsWith("v") ? trimmed : `v${trimmed}`;
-}
-
 function useHostProfile(serverId: string): HostProfile | null {
   const daemons = useHosts();
   return daemons.find((entry) => entry.serverId === serverId) ?? null;
@@ -182,6 +177,9 @@ function HostStatusBadges({ serverId }: { serverId: string }) {
   const daemonVersion = useSessionStore(
     (state) => state.sessions[serverId]?.serverInfo?.version ?? null,
   );
+  const runtimeBuild = useSessionStore(
+    (state) => state.sessions[serverId]?.serverInfo?.runtimeBuild,
+  );
 
   const connectionStatus = snapshot?.connectionStatus ?? "connecting";
   const activeConnection = snapshot?.activeConnection ?? null;
@@ -200,7 +198,7 @@ function HostStatusBadges({ serverId }: { serverId: string }) {
     statusDotColor = theme.colors.statusDotDanger;
   }
   const connectionBadge = formatActiveConnectionBadge(activeConnection, theme, t);
-  const versionBadgeText = formatDaemonVersionBadge(daemonVersion);
+  const versionBadgeText = formatRuntimeVersionBadge(daemonVersion, runtimeBuild);
   const statusDotStyle = useMemo(
     () => [styles.statusDot, { backgroundColor: statusDotColor }],
     [statusDotColor],

@@ -292,6 +292,9 @@ export interface DaemonServerInfo {
   serverId: string;
   hostname: string | null;
   version: string | null;
+  runtimeBuild?: ServerInfoStatusPayload["runtimeBuild"];
+  runtimeWriteIntent?: ServerInfoStatusPayload["runtimeWriteIntent"];
+  workspaceLayout?: ServerInfoStatusPayload["workspaceLayout"];
   desktopManaged?: boolean;
   capabilities?: ServerCapabilities;
   features?: ServerInfoStatusPayload["features"];
@@ -304,6 +307,9 @@ export function toDaemonServerInfo(serverInfo: ServerInfoStatusPayload): DaemonS
     serverId: serverInfo.serverId,
     hostname: serverInfo.hostname ?? null,
     version: serverInfo.version ?? null,
+    ...(serverInfo.runtimeBuild ? { runtimeBuild: serverInfo.runtimeBuild } : {}),
+    ...(serverInfo.runtimeWriteIntent ? { runtimeWriteIntent: serverInfo.runtimeWriteIntent } : {}),
+    ...(serverInfo.workspaceLayout ? { workspaceLayout: serverInfo.workspaceLayout } : {}),
     ...(serverInfo.desktopManaged !== undefined
       ? { desktopManaged: serverInfo.desktopManaged }
       : {}),

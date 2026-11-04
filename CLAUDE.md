@@ -73,6 +73,7 @@ At the start of non-trivial work, list `docs/` and skim anything relevant to the
 | [public-docs/hub/security.md](public-docs/hub/security.md)           | Public Hub guide — trust boundaries, untrusted triggers, provider controls, and output authority                               |
 | [docs/main-host.md](docs/main-host.md)                               | Main-host allocation, authenticated delivery, undo, and compatibility                                                          |
 | [docs/workspace-layout.md](docs/workspace-layout.md)                 | Impower canonical layout authority, import/CAS, replicas, authenticated routing and retirement holds                           |
+| [docs/runtime-provenance.md](docs/runtime-provenance.md)             | Impower immutable build identity, conservative home write generation and current-data recovery boundary                        |
 
 ### Writing docs
 

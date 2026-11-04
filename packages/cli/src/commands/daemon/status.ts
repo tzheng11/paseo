@@ -99,6 +99,8 @@ async function probeDaemonStatus(
       live = {
         ...live,
         daemonVersion: status.version,
+        runtimeBuild: status.runtimeBuild,
+        runtimeWriteIntent: status.runtimeWriteIntent,
         workerPid: status.pid,
         daemonNode: status.nodePath,
         providers: status.providers,

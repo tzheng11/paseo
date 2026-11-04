@@ -1,4 +1,5 @@
 import type pino from "pino";
+import type { RuntimeBuildIdentity, RuntimeWriteIntent } from "@getpaseo/protocol/runtime-build";
 import type { ProviderAvailability } from "../../agent/agent-manager.js";
 import type {
   AgentSnapshotPayload,
@@ -21,6 +22,8 @@ import type { HubRelationshipManagement } from "../../hub/relationship-controlle
 import type { DaemonConfigReloadResult } from "../../daemon-config-store.js";
 
 export interface DaemonRuntimeConfig {
+  runtimeBuild?: RuntimeBuildIdentity;
+  runtimeWriteIntent?: RuntimeWriteIntent;
   listen: string | null;
   worktreesRoot?: string;
   appBaseUrl?: string;
@@ -212,6 +215,8 @@ export class DaemonSession {
           requestId: msg.requestId,
           serverId: this.serverId ?? "",
           version: this.daemonVersion ?? null,
+          runtimeBuild: this.daemonRuntimeConfig?.runtimeBuild,
+          runtimeWriteIntent: this.daemonRuntimeConfig?.runtimeWriteIntent,
           pid: process.pid,
           nodePath: process.execPath,
           startedAt: pidInfo?.startedAt ?? null,
@@ -230,6 +235,8 @@ export class DaemonSession {
           requestId: msg.requestId,
           serverId: this.serverId ?? "",
           version: this.daemonVersion ?? null,
+          runtimeBuild: this.daemonRuntimeConfig?.runtimeBuild,
+          runtimeWriteIntent: this.daemonRuntimeConfig?.runtimeWriteIntent,
           pid: process.pid,
           nodePath: process.execPath,
           startedAt: null,
