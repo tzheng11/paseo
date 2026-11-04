@@ -279,6 +279,23 @@ function layoutSection(entry: WorkspaceLayoutEntry): string {
   return entry.pinnedAt ? "pinned" : "unpinned";
 }
 
+/** A durable receipt plus its exact CAS input can advance a known full snapshot without another read. */
+export function projectConfirmedLayout(
+  snapshot: WorkspaceLayoutSnapshot,
+  input: WorkspaceLayoutCommit,
+  receipt: WorkspaceLayoutReceipt,
+): WorkspaceLayoutSnapshot | null {
+  if (canonicalLayoutJson(snapshot.stamp) !== canonicalLayoutJson(input.expected)) return null;
+  const next = structuredClone(snapshot);
+  const revision = snapshot.stamp.revision + 1;
+  for (const mutation of input.mutations) applyMutation(next, mutation, revision);
+  next.stamp.revision = revision;
+  validateLayoutGraph(next);
+  if (canonicalLayoutJson(next.stamp) !== canonicalLayoutJson(receipt.stamp))
+    throw new WorkspaceLayoutRefusal("invalid_commit_receipt");
+  return next;
+}
+
 export function validateLayoutGraph(snapshot: WorkspaceLayoutSnapshot): void {
   const entries = new Map<string, WorkspaceLayoutEntry>();
   for (const entry of snapshot.entries) {

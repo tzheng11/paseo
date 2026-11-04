@@ -62,6 +62,19 @@ receipt before checking the now-stale CAS. A reused ID with another payload is
 refused. Callers must retain the original request and reconcile an uncertain
 outcome; a new request ID is not recovery evidence.
 
+Native registry intents re-inspect and re-run pure revision/intent guards after a
+definite `stale_revision` refusal, using at most three attempts and a distinct ID
+for each refused attempt. They never retry a timeout, lost acknowledgement,
+entry-revision conflict or another unknown outcome. Raw administrative commits
+remain explicit CAS operations; their callers retain and reconcile their request.
+
+A matching durable receipt is checked against the normalized request hash. It
+can advance a known complete snapshot without waiting for another read. Failure
+of the follow-up read or replica persistence does not relabel that mutation as
+failed; it leaves replication stale. Older read responses overtaken during the
+request cannot replace a newer snapshot. An actual regression below the revision
+known when the read started, or a same-revision fork, still refuses.
+
 No delete/retirement mutation is exposed in this initial contract.
 
 ## Bootstrap and import
@@ -115,6 +128,12 @@ authority permits stale reads and refuses layout writes. There is no offline
 mutation queue or fallback to local layout persistence. `server_info.workspaceLayout`
 reports configuration, last stamp and subscription synchronization; this is not
 proof of fleet acceptance or a retirement reservation.
+
+Failed observations retry with bounded exponential backoff while the host link
+stays online. Invalid caches are discarded as observations and replaced only
+from the pinned authority. A local record absent from an active canonical layout
+is retained with its holds, isolated from directory publication, and logged. A
+direct read or edit of that record refuses; other imported records remain usable.
 
 New workspace creation commits layout before writing its local execution record.
 If the local write then fails, the canonical identity is retained and creation

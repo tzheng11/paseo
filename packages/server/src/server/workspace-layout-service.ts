@@ -3,6 +3,7 @@ import path from "node:path";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import {
   WorkspaceLayoutSnapshotSchema,
+  WorkspaceLayoutCommitSchema,
   type WorkspaceLayoutConfig,
   type WorkspaceLayoutIdentity,
   type WorkspaceLayoutSnapshot,
@@ -14,6 +15,8 @@ import {
   WorkspaceLayoutStore,
   WorkspaceLayoutRefusal,
   canonicalLayoutJson,
+  hashLayoutValue,
+  projectConfirmedLayout,
 } from "./workspace-layout-store.js";
 
 export interface WorkspaceLayoutTransport {
@@ -41,6 +44,8 @@ export class WorkspaceLayoutService {
   private connected = false;
   private healthy = false;
   private observationRestartRequested = false;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private retryCount = 0;
 
   constructor(readonly options: LayoutServiceOptions) {
     this.store =
@@ -72,7 +77,12 @@ export class WorkspaceLayoutService {
       this.assertIdentity(snapshot.stamp);
       this.cache = snapshot;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+        this.options.failed(new WorkspaceLayoutRefusal("replica_cache_unreadable"));
+      // The authority is still identity-pinned. A damaged protection replica
+      // must not prevent obtaining a fresh snapshot or become an authority.
+      this.cache = null;
+      this.healthy = false;
     }
   }
 
@@ -104,12 +114,13 @@ export class WorkspaceLayoutService {
   }
 
   async inspect(): Promise<WorkspaceLayoutSnapshot> {
+    const knownRevision = this.cache?.stamp.revision ?? 0;
     try {
       const snapshot = this.store
         ? await this.store.inspect()
         : await this.remote((client) => client.getWorkspaceLayout());
-      await this.accept(snapshot);
-      return structuredClone(snapshot);
+      await this.accept(snapshot, knownRevision);
+      return structuredClone(this.cache ?? snapshot);
     } catch (error) {
       this.healthy = false;
       this.changed();
@@ -124,18 +135,31 @@ export class WorkspaceLayoutService {
     return snapshot;
   }
 
-  async commit(input: WorkspaceLayoutCommit): Promise<WorkspaceLayoutReceipt> {
+  async commit(raw: WorkspaceLayoutCommit): Promise<WorkspaceLayoutReceipt> {
+    const input = WorkspaceLayoutCommitSchema.parse(raw);
     this.assertIdentity(input.expected);
     let receipt: WorkspaceLayoutReceipt;
     if (this.store) receipt = await this.store.commit(input);
     else receipt = (await this.remote((client) => client.commitWorkspaceLayout(input))).receipt;
     this.assertIdentity(receipt.stamp);
-    await this.inspect();
+    if (receipt.requestId !== input.requestId || receipt.requestSha256 !== hashLayoutValue(input))
+      throw new WorkspaceLayoutRefusal("invalid_commit_receipt");
+    const confirmed = this.cache ? projectConfirmedLayout(this.cache, input, receipt) : null;
+    if (confirmed) await this.accept(confirmed, input.expected.revision);
+    try {
+      await this.inspect();
+    } catch (error) {
+      // The authority already acknowledged a durable receipt. Failure to refresh
+      // the protection replica is stale observation, not a failed mutation.
+      this.options.failed(error);
+    }
     return receipt;
   }
 
   async close(): Promise<void> {
     this.stopTransport?.();
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimer = null;
     this.lifetime.abort();
     await this.watching;
     await this.cacheQueue;
@@ -162,21 +186,40 @@ export class WorkspaceLayoutService {
       throw new WorkspaceLayoutRefusal("authority_identity_mismatch");
   }
 
-  private accept(raw: WorkspaceLayoutSnapshot): Promise<void> {
+  private accept(raw: WorkspaceLayoutSnapshot, readStartedAtRevision?: number): Promise<void> {
     const snapshot = WorkspaceLayoutSnapshotSchema.parse(raw);
     this.assertIdentity(snapshot.stamp);
     const result = this.cacheQueue.then(async () => {
-      if (this.cache && snapshot.stamp.revision < this.cache.stamp.revision)
+      if (this.cache && snapshot.stamp.revision < this.cache.stamp.revision) {
+        if (readStartedAtRevision !== undefined && snapshot.stamp.revision >= readStartedAtRevision)
+          return;
         throw new WorkspaceLayoutRefusal("authority_revision_regressed");
+      }
       if (this.cache && snapshot.stamp.revision === this.cache.stamp.revision) {
         if (canonicalLayoutJson(snapshot) !== canonicalLayoutJson(this.cache))
           throw new WorkspaceLayoutRefusal("authority_revision_fork");
+        if (!this.store && !this.healthy) {
+          try {
+            await writeJsonFileAtomic(this.cachePath(), snapshot);
+          } catch (error) {
+            this.options.failed(error);
+            return;
+          }
+        }
         this.healthy = true;
         return undefined;
       }
-      if (!this.store) await writeJsonFileAtomic(this.cachePath(), snapshot);
+      let persisted = true;
+      if (!this.store) {
+        try {
+          await writeJsonFileAtomic(this.cachePath(), snapshot);
+        } catch (error) {
+          persisted = false;
+          this.options.failed(error);
+        }
+      }
       this.cache = structuredClone(snapshot);
-      this.healthy = true;
+      this.healthy = persisted;
       this.changed();
       return undefined;
     });
@@ -193,6 +236,8 @@ export class WorkspaceLayoutService {
 
   private startObservation(): void {
     if (!this.transport || this.lifetime.signal.aborted) return;
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimer = null;
     if (this.watching) {
       this.observationRestartRequested = true;
       return;
@@ -208,7 +253,17 @@ export class WorkspaceLayoutService {
         const restart = this.observationRestartRequested;
         this.observationRestartRequested = false;
         if (restart) this.startObservation();
+        else if (!this.lifetime.signal.aborted) this.scheduleObservationRetry();
       });
+  }
+
+  private scheduleObservationRetry(): void {
+    const delay = Math.min(250 * 2 ** Math.min(this.retryCount++, 7), 30000);
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      this.startObservation();
+    }, delay);
+    this.retryTimer.unref();
   }
 
   private async observe(): Promise<void> {
@@ -238,6 +293,7 @@ export class WorkspaceLayoutService {
         const snapshot = await Promise.race([observation.ready, ended]);
         await this.accept(snapshot);
         this.connected = true;
+        this.retryCount = 0;
         this.changed();
         if (this.lifetime.signal.aborted) abort();
         await ended;

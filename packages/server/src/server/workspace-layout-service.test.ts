@@ -3,9 +3,13 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
-import type { WorkspaceLayoutSnapshot } from "@getpaseo/protocol/workspace-layout";
+import type {
+  WorkspaceLayoutSnapshot,
+  WorkspaceLayoutCommit,
+} from "@getpaseo/protocol/workspace-layout";
 import { createStub } from "./test-utils/class-mocks.js";
 import { WorkspaceLayoutService } from "./workspace-layout-service.js";
+import { hashLayoutValue } from "./workspace-layout-store.js";
 
 const config = {
   role: "replica" as const,
@@ -128,4 +132,147 @@ it("does not lose a route-online change delivered while an older connection atte
   rejectFirst(new Error("previous route offline"));
   await expect.poll(() => attempts).toBe(2);
   await value.close();
+});
+
+it("ignores an older response overtaken during the read without mistaking it for an authority rollback", async () => {
+  const value = service();
+  let resolveOlder!: (snapshot: WorkspaceLayoutSnapshot) => void;
+  const older = new Promise<WorkspaceLayoutSnapshot>((resolve) => {
+    resolveOlder = resolve;
+  });
+  let reads = 0;
+  attach(value, async () => {
+    if (++reads === 1) return snapshot(8);
+    return reads === 2 ? older : snapshot(9);
+  });
+  await value.inspect();
+  const pending = value.inspect();
+  expect(await value.inspect()).toEqual(snapshot(9));
+  resolveOlder(snapshot(8));
+  expect(await pending).toEqual(snapshot(9));
+  expect(value.cached().snapshot).toEqual(snapshot(9));
+});
+
+it("returns a known durable commit receipt even when its following read fails, with no mutation replay", async () => {
+  const value = service();
+  let firstRead = true;
+  const client = attach(value, async () => {
+    if (firstRead) {
+      firstRead = false;
+      return snapshot(8);
+    }
+    throw new Error("read disconnected after durable commit");
+  });
+  await value.inspect();
+  const input: WorkspaceLayoutCommit = {
+    requestId: "once",
+    expected: snapshot(8).stamp,
+    mutations: [
+      {
+        kind: "put",
+        entry: {
+          ref: { serverId: "srv_replica", workspaceId: "one" },
+          projectId: "project",
+          pinnedAt: null,
+          superpinnedAt: null,
+          parent: null,
+          siblingOrder: 0,
+          pinPlacement: null,
+          archivedAt: null,
+          revision: 0,
+        },
+      },
+    ],
+  };
+  const receipt = {
+    requestId: "once",
+    requestSha256: hashLayoutValue(input),
+    stamp: snapshot(9).stamp,
+  };
+  client.commitWorkspaceLayout = vi.fn(async () => ({ requestId: "once", receipt }));
+  expect(await value.commit(structuredClone(input))).toEqual(receipt);
+  expect(client.commitWorkspaceLayout).toHaveBeenCalledOnce();
+  expect(value.cached().snapshot?.entries[0]).toMatchObject({
+    ref: input.mutations[0].entry.ref,
+    revision: 9,
+  });
+  expect(value.cached().fresh).toBe(false);
+});
+
+it("retries an uninitialized authority observation with backoff even when the connected-host link stays online", async () => {
+  const value = service();
+  let attempts = 0;
+  let releases = 0;
+  const client = createStub<DaemonClient>({
+    observeWorkspaceLayout: () => ({
+      subscriptionId: null,
+      ready:
+        ++attempts === 1
+          ? Promise.reject(new Error("not_initialized"))
+          : Promise.resolve(snapshot(4)),
+      subscribe: () => () => {},
+      release: async () => {
+        releases++;
+      },
+    }),
+    subscribeConnectionStatus: () => () => {},
+  });
+  value.attachTransport({ changed: () => () => {}, use: async (action) => action(client) });
+  await expect.poll(() => value.cached().fresh).toBe(true);
+  expect(attempts).toBe(2);
+  expect(value.cached().snapshot).toEqual(snapshot(4));
+  await value.close();
+  expect(releases).toBe(2);
+});
+
+it("recovers a corrupt cache only from the pinned authority rather than failing boot or inventing an authority", async () => {
+  const file = path.join(home, "workspace-layout-replica.json");
+  await writeFile(file, "{broken");
+  const value = service();
+  await value.load();
+  expect(value.cached()).toEqual({ snapshot: null, fresh: false });
+  expect(await readFile(file, "utf8")).toBe("{broken");
+  attach(value, async () => snapshot(7));
+  expect(await value.inspect()).toEqual(snapshot(7));
+  await expect(readFile(path.join(home, "workspace-layout.json"))).rejects.toMatchObject({
+    code: "ENOENT",
+  });
+});
+
+it("refuses a receipt for another payload without replaying the mutation or advancing its snapshot", async () => {
+  const value = service();
+  const client = attach(value, async () => snapshot(8));
+  await value.inspect();
+  client.commitWorkspaceLayout = vi.fn(async () => ({
+    requestId: "once",
+    receipt: {
+      requestId: "once",
+      requestSha256: "b".repeat(64),
+      stamp: snapshot(9).stamp,
+    },
+  }));
+  await expect(
+    value.commit({
+      requestId: "once",
+      expected: snapshot(8).stamp,
+      mutations: [
+        {
+          kind: "put",
+          entry: {
+            ref: { serverId: "srv_replica", workspaceId: "one" },
+            projectId: "project",
+            pinnedAt: null,
+            superpinnedAt: null,
+            parent: null,
+            siblingOrder: 0,
+            pinPlacement: null,
+            archivedAt: null,
+            revision: 0,
+          },
+        },
+      ],
+    }),
+  ).rejects.toThrow("invalid_commit_receipt");
+  expect(client.commitWorkspaceLayout).toHaveBeenCalledOnce();
+  expect(value.cached().snapshot).toEqual(snapshot(8));
 });

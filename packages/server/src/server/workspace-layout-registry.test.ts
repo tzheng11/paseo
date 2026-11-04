@@ -101,11 +101,11 @@ async function seed(records: PersistedWorkspaceRecord[], activate = true) {
       mutations: [{ kind: "activate", requiredImports: imported.imports }],
     });
 }
-async function registry(records: PersistedWorkspaceRecord[], name = "a") {
+async function registry(records: PersistedWorkspaceRecord[], name = "a", serverId = "srv_a") {
   const file = path.join(home, name, "workspaces.json");
   const old = new FileBackedWorkspaceRegistry(file, createTestLogger());
   for (const record of records) await old.upsert(record);
-  const value = new CanonicalWorkspaceRegistry(file, createTestLogger(), service, "srv_a");
+  const value = new CanonicalWorkspaceRegistry(file, createTestLogger(), service, serverId);
   registries.push(value);
   await value.initialize();
   return { value, file };
@@ -125,6 +125,141 @@ it("routes ordinary pin and superpin writes through one durable authority across
   expect(after.stamp.revision).toBe(before.stamp.revision + 1);
   expect(after.entries[0]).toMatchObject({ pinnedAt: at, superpinnedAt: at });
   expect((await b.value.get("one"))?.cwd).toBe(original.cwd);
+});
+
+it.each(["pin", "creation"])(
+  "re-inspects a definite global CAS refusal caused by another host's concurrent %s write",
+  async (kind) => {
+    const original = row("one");
+    await seed([original], false);
+    const importing = await service.inspect();
+    await service.commit({
+      requestId: "import-b",
+      expected: importing.stamp,
+      mutations: [
+        {
+          kind: "import-host",
+          previousSourceSha256: null,
+          source: {
+            serverId: "srv_b",
+            sourceSha256: "c".repeat(64),
+            resolutionSha256: "d".repeat(64),
+          },
+          entries: [canonical(row("two"), "srv_b")],
+        },
+      ],
+    });
+    const imported = await service.inspect();
+    await service.commit({
+      requestId: "activate-both",
+      expected: imported.stamp,
+      mutations: [{ kind: "activate", requiredImports: imported.imports }],
+    });
+    const a = await registry([original], "host-a");
+    const b = await registry([row("two")], "host-b", "srv_b");
+    const commit = service.commit.bind(service);
+    let interleaved = false;
+    const attempts: string[] = [];
+    const spy = vi.spyOn(service, "commit").mockImplementation(async (input) => {
+      if (
+        input.mutations.some(
+          (mutation) => mutation.kind === "put" && mutation.entry.ref.serverId === "srv_a",
+        )
+      ) {
+        attempts.push(input.requestId);
+        if (!interleaved) {
+          interleaved = true;
+          await b.value.update("two", (record) => ({ ...record, pinnedAt: at }), {
+            requestId: "other-host",
+            layoutWrite: true,
+          });
+        }
+      }
+      return commit(input);
+    });
+    try {
+      if (kind === "pin")
+        await a.value.update("one", (record) => ({ ...record, pinnedAt: at }), {
+          requestId: "my-intent",
+          layoutWrite: true,
+        });
+      else await a.value.upsert(row("created"), { requestId: "my-intent" });
+      expect(attempts).toHaveLength(2);
+      expect(attempts[0]).toBe("my-intent");
+      expect(attempts[1]).not.toBe(attempts[0]);
+      expect((await b.value.get("two"))?.pinnedAt).toBe(at);
+      expect(await a.value.get(kind === "pin" ? "one" : "created")).not.toBeNull();
+    } finally {
+      spy.mockRestore();
+    }
+  },
+);
+
+it("never retries a mutation with an unknown transport outcome", async () => {
+  const original = row("one");
+  await seed([original]);
+  const { value } = await registry([original]);
+  const before = await service.inspect();
+  const spy = vi
+    .spyOn(service, "commit")
+    .mockRejectedValue(
+      Object.assign(new Error("lost acknowledgement"), { code: "DAEMON_CONNECTION_LOST" }),
+    );
+  try {
+    await expect(
+      value.update("one", (record) => ({ ...record, pinnedAt: at }), {
+        requestId: "once",
+        layoutWrite: true,
+      }),
+    ).rejects.toThrow("lost acknowledgement");
+    expect(spy).toHaveBeenCalledOnce();
+    expect(await service.inspect()).toEqual(before);
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+it("bounds definite CAS retries and never writes a local record when contention does not settle", async () => {
+  await seed([row("one")]);
+  const { value } = await registry([row("one")]);
+  const spy = vi
+    .spyOn(service, "commit")
+    .mockRejectedValue(Object.assign(new Error("contention"), { code: "stale_revision" }));
+  try {
+    await expect(value.upsert(row("not-created"))).rejects.toThrow("contention");
+    expect(spy).toHaveBeenCalledTimes(3);
+    expect(new Set(spy.mock.calls.map(([input]) => input.requestId)).size).toBe(3);
+    expect(await value.get("not-created")).toBeNull();
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+it("quarantines an unimported record without losing its local holds or breaking reads of imported workspaces", async () => {
+  const known = row("known");
+  const unknown = { ...row("unimported"), pinnedAt: at, superpinnedAt: at };
+  await seed([known]);
+  const { value, file } = await registry([known, unknown]);
+  expect((await value.list()).map((record) => record.workspaceId)).toEqual(["known"]);
+  expect(await value.get("known")).not.toBeNull();
+  await expect(value.get("unimported")).rejects.toThrow("workspace_not_imported");
+  const retained = JSON.parse(await readFile(file, "utf8")).find(
+    (record: PersistedWorkspaceRecord) => record.workspaceId === "unimported",
+  );
+  expect(retained).toMatchObject({ pinnedAt: at, superpinnedAt: at });
+});
+
+it("keeps the local creation protection copy equal to the committed canonical order", async () => {
+  await seed([row("one")]);
+  const { value, file } = await registry([row("one")]);
+  await value.upsert(row("new"));
+  const canonicalRow = (await service.inspect()).entries.find(
+    (entry) => entry.ref.workspaceId === "new",
+  );
+  const local = JSON.parse(await readFile(file, "utf8")).find(
+    (record: PersistedWorkspaceRecord) => record.workspaceId === "new",
+  );
+  expect(local.siblingOrder).toBe(canonicalRow?.siblingOrder);
 });
 
 it("never lets a stale whole-record reconciliation overwrite layout or host-local identity", async () => {

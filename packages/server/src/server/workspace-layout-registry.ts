@@ -57,7 +57,10 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
   }
 
   override async list(): Promise<PersistedWorkspaceRecord[]> {
-    return (await super.list()).map((record) => this.project(record));
+    return (await super.list()).flatMap((record) => {
+      const projected = this.projectOrQuarantine(record);
+      return projected ? [projected] : [];
+    });
   }
   override async get(id: string): Promise<PersistedWorkspaceRecord | null> {
     const record = await super.get(id);
@@ -73,7 +76,7 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
     updater: (record: PersistedWorkspaceRecord) => PersistedWorkspaceRecord,
     context?: WorkspaceMutationContext,
   ): Promise<PersistedWorkspaceRecord | null> {
-    return this.serial(async () => {
+    return this.serial(async (requestId) => {
       const raw = await super.get(id);
       if (!raw) return null;
       const snapshot = context?.layoutWrite ? await this.freshActive() : undefined;
@@ -93,7 +96,7 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
         const intent = Object.fromEntries(layoutChanged.map((field) => [field, next[field]]));
         projected = Object.assign({}, fresh, intent);
         if (layoutChanged.length)
-          await this.put(active, [this.asEntry(projected, active)], context?.requestId);
+          await this.put(active, [this.asEntry(projected, active)], requestId);
       }
       const localChanges = Object.fromEntries(
         Object.entries(changed).filter(
@@ -104,14 +107,14 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
         Object.assign({}, latest, localChanges, this.protectionFields(projected)),
       );
       return result ? this.project(result) : null;
-    });
+    }, context?.requestId);
   }
 
   override upsert(
     record: PersistedWorkspaceRecord,
     context?: WorkspaceMutationContext,
   ): Promise<void> {
-    return this.serial(async () => {
+    return this.serial(async (requestId) => {
       const previous = await super.get(record.workspaceId);
       if (previous) {
         // Reconciliation passes whole records, often from an older read. It is
@@ -135,9 +138,14 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
         ...record,
         siblingOrder: record.siblingOrder ?? this.nextOrder(snapshot, record),
       };
-      await this.put(snapshot, [this.asEntry(initial, snapshot)], context?.requestId);
+      await this.put(snapshot, [this.asEntry(initial, snapshot)], requestId);
       await super.upsert(initial, context);
-    });
+      // The legacy registry may allocate a rank while inserting. The local
+      // protection copy must retain the authority's already-committed rank.
+      await super.update(initial.workspaceId, (latest) =>
+        Object.assign({}, latest, this.protectionFields(initial)),
+      );
+    }, context?.requestId);
   }
 
   override move(
@@ -145,7 +153,7 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
     input: WorkspaceMoveInput,
     context?: WorkspaceMutationContext,
   ): Promise<PersistedWorkspaceRecord> {
-    return this.serial(async () => {
+    return this.serial(async (requestId) => {
       const snapshot = await this.freshActive();
       const raw = await super.get(id);
       if (!raw || raw.archivedAt) throw new WorkspaceLayoutRefusal("workspace_not_active");
@@ -184,13 +192,13 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
       }
       const next = { ...current, parentWorkspaceId: input.parentWorkspaceId, siblingOrder };
       changes.push(this.asEntry(next, snapshot));
-      await this.put(snapshot, changes, context?.requestId);
+      await this.put(snapshot, changes, requestId);
       const updated = await super.update(id, (latest) =>
         Object.assign({}, latest, this.protectionFields(next)),
       );
       if (!updated) throw new WorkspaceLayoutRefusal("local_projection_failed");
       return this.project(updated);
-    });
+    }, context?.requestId);
   }
 
   override async archive(): Promise<boolean> {
@@ -206,13 +214,37 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
     await this.projection;
   }
 
-  private serial<T>(run: () => Promise<T>): Promise<T> {
-    const result = this.queue.then(run);
+  private serial<T>(
+    run: (requestId: string) => Promise<T>,
+    originalRequestId: string = randomUUID(),
+  ): Promise<T> {
+    const result = this.queue.then(() => this.retryGlobalCas(run, originalRequestId, 0));
     this.queue = result.then(
       () => undefined,
       () => undefined,
     );
     return result;
+  }
+
+  private async retryGlobalCas<T>(
+    run: (requestId: string) => Promise<T>,
+    requestId: string,
+    attempt: number,
+  ): Promise<T> {
+    try {
+      return await run(requestId);
+    } catch (error) {
+      if (
+        attempt >= 2 ||
+        !(error instanceof Error) ||
+        !("code" in error) ||
+        error.code !== "stale_revision"
+      )
+        throw error;
+      // A definite refusal applied nothing. Re-run pure intent/revision guards;
+      // unknown outcomes and entry conflicts never enter this bounded path.
+      return this.retryGlobalCas(run, randomUUID(), attempt + 1);
+    }
   }
 
   private async freshActive(): Promise<WorkspaceLayoutSnapshot> {
@@ -304,11 +336,29 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
     };
   }
 
+  private projectOrQuarantine(
+    record: PersistedWorkspaceRecord,
+    snapshot = this.layout.cached().snapshot,
+  ) {
+    try {
+      return this.project(record, snapshot);
+    } catch (error) {
+      if (!(error instanceof WorkspaceLayoutRefusal) || error.code !== "workspace_not_imported")
+        throw error;
+      this.logger.error(
+        { workspaceId: record.workspaceId, code: error.code },
+        "Workspace absent from canonical layout; retained locally and isolated from directory publication",
+      );
+      return null;
+    }
+  }
+
   private async syncProtectionProjection(): Promise<void> {
     const snapshot = this.layout.cached().snapshot;
     if (!snapshot || snapshot.stamp.phase !== "active") return;
     for (const raw of await super.list()) {
-      const next = this.project(raw, snapshot);
+      const next = this.projectOrQuarantine(raw, snapshot);
+      if (!next) continue;
       if (!isDeepStrictEqual(this.protectionFields(raw), this.protectionFields(next)))
         await super.update(raw.workspaceId, (latest) =>
           Object.assign({}, latest, this.protectionFields(next)),
