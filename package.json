@@ -1,6 +1,6 @@
 {
   "name": "paseo",
-  "version": "0.14.0",
+  "version": "0.15.0-impower",
   "private": true,
   "description": "Paseo: voice-controlled development environment for local AI coding agents",
   "keywords": [
@@ -157,5 +157,10 @@
     "react-native-gesture-handler": "~2.32.0",
     "react-native-reanimated": "4.5.5",
     "react-native-worklets": "0.10.4"
+  },
+  "paseoDistribution": {
+    "name": "impower",
+    "upstreamVersion": "0.15.0",
+    "upstreamCommit": "8938fde3c713143f12eacbdd60c11fdfc0be0fb1"
   }
 }

@@ -340,7 +340,7 @@ export class TimelineProjection {
     this.sourceRanges.sort((a, b) => a.startSeq - b.startSeq);
   }
 
-  append(row: AgentTimelineRow): void {
+  append(row: AgentTimelineRow): ProjectedTimelineRow {
     const rowIndex = this.appendProjected(row);
     const last = this.sourceRanges.at(-1);
     if (last && last.rowIndex === rowIndex && last.endSeq + 1 === row.seq) {
@@ -348,6 +348,7 @@ export class TimelineProjection {
     } else {
       this.sourceRanges.push({ startSeq: row.seq, endSeq: row.seq, rowIndex });
     }
+    return { ...this.rows[rowIndex] };
   }
 
   private appendProjected(row: AgentTimelineRow): number {

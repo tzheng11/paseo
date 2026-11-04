@@ -37,10 +37,25 @@ interface JsonRpcNotification {
 }
 
 interface PendingRequest {
+  method: string;
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
 }
+
+/** A response past the provider line cap. Only its request fails; the session stays up. */
+export class CodexAppServerResponseTooLargeError extends Error {
+  constructor(
+    readonly method: string,
+    readonly limitBytes: number,
+  ) {
+    super(`Codex app-server response to ${method} exceeds ${limitBytes} bytes`);
+    this.name = "CodexAppServerResponseTooLargeError";
+  }
+}
+
+// Codex serializes a response with `id` first, so its head names the request.
+const OVERSIZED_RESPONSE_HEAD = /^\{"id":(\d+),"result":/;
 
 export class CodexAppServerRpcError extends Error {
   constructor(
@@ -198,13 +213,18 @@ export class CodexAppServerClient {
   ) {
     this.frameDecoder = new JsonlFrameDecoder({
       providerLineBytes: CODEX_PROVIDER_LINE_BYTES,
+      recoverOversizedLines: true,
       frame: (frame) => {
         void this.handleFrame(frame).catch((error) => {
           this.logger.warn({ error }, "Failed to handle Codex app-server stdout frame");
         });
       },
       problem: (problem, detail) => {
-        if (detail instanceof JsonlFrameSizeError || detail instanceof ProviderStreamLimitError) {
+        if (detail instanceof ProviderStreamLimitError) {
+          this.handleStreamLimit(detail);
+          return;
+        }
+        if (detail instanceof JsonlFrameSizeError) {
           this.handleUnexpectedTermination(detail);
           void this.dispose().catch((error) => {
             this.logger.error({ error }, "Failed to stop oversized Codex app-server response");
@@ -268,7 +288,7 @@ export class CodexAppServerClient {
         this.pending.delete(id);
         reject(new Error(`Codex app-server request timed out for ${method}`));
       }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { method, resolve, reject, timer });
     });
   }
 
@@ -311,6 +331,28 @@ export class CodexAppServerClient {
     if (result === "kill-timeout") {
       throw new Error("Codex app-server did not report exit after SIGKILL");
     }
+  }
+
+  private handleStreamLimit(failure: ProviderStreamLimitError): void {
+    const responseId = OVERSIZED_RESPONSE_HEAD.exec(failure.lineHead)?.[1];
+    const pending = responseId === undefined ? undefined : this.pending.get(Number(responseId));
+    if (pending) {
+      clearTimeout(pending.timer);
+      this.pending.delete(Number(responseId));
+      this.logger.warn(
+        { method: pending.method, limitBytes: failure.limitBytes },
+        "Codex app-server response exceeded the line cap",
+      );
+      pending.reject(new CodexAppServerResponseTooLargeError(pending.method, failure.limitBytes));
+      return;
+    }
+    // A lost notification or server request cannot be replayed. Fail the session,
+    // including live turns with no pending RPC, rather than dropping a stream unit.
+    this.frameDecoder.close();
+    this.handleUnexpectedTermination(failure);
+    void this.dispose().catch((err) => {
+      this.logger.warn({ err }, "Failed to terminate oversized Codex stdout producer");
+    });
   }
 
   private handleUnexpectedTermination(error: Error): void {

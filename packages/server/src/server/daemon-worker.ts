@@ -2,6 +2,8 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { getHeapStatistics } from "node:v8";
 import { startWorkerWithMaintenance } from "./maintenance-boot.js";
+import { initializeEnvironmentProxy } from "./network/index.js";
+import { configureHttpTransport } from "./http-transport.js";
 import { loadConfig } from "./config.js";
 import { resolvePaseoHome } from "./paseo-home.js";
 import { createRootLogger } from "./logger.js";
@@ -13,12 +15,14 @@ process.title = "Paseo Daemon";
 
 // Before bootstrap there are no runtime owners to drain. After bootstrap begins,
 // supervisor requests use the normal daemon shutdown path.
-let supervisorShutdownHandler: (reason: string) => void = () => process.exit(0);
+let supervisorShutdownHandler: (reason: string, keepTerminals: boolean) => void = () =>
+  process.exit(0);
 
 type SupervisorLifecycleMessage =
   | {
       type: "paseo:shutdown";
       reason: string;
+      keepTerminals: boolean;
     }
   | {
       type: "paseo:ready";
@@ -28,6 +32,7 @@ type SupervisorLifecycleMessage =
   | {
       type: "paseo:restart";
       reason?: string;
+      keepTerminals: boolean;
     };
 
 interface BootstrapResult {
@@ -173,9 +178,10 @@ function installSupervisorLivenessGuard(paseoHome: string): void {
       return;
     }
     if (type === "paseo:graceful-shutdown") {
-      const reason = (message as { reason?: unknown }).reason;
+      const { reason, keepTerminals } = message as { reason?: unknown; keepTerminals?: unknown };
       supervisorShutdownHandler(
         typeof reason === "string" ? reason : "supervisor_requested_shutdown",
+        keepTerminals === true,
       );
     }
   });
@@ -204,7 +210,7 @@ function installSupervisorLivenessGuard(paseoHome: string): void {
 async function main() {
   // Maintenance boot must not even construct bootstrap's autonomous producers.
   const { createPaseoDaemon, formatListenTarget } = await import("./bootstrap.js");
-  const { logger, config } = bootstrapFromEnvironment();
+  const { paseoHome, logger, config } = bootstrapFromEnvironment();
   logger.info(
     workerHeapDiagnostics({
       execArgv: process.execArgv,
@@ -212,6 +218,12 @@ async function main() {
     }),
     "Daemon worker heap configuration",
   );
+  configureHttpTransport();
+  for (const variable of initializeEnvironmentProxy()) {
+    writeWorkerLifecycleLog(paseoHome, "Ignoring invalid or unsupported HTTP proxy variable", {
+      variable,
+    });
+  }
   let daemon: Awaited<ReturnType<typeof createPaseoDaemon>> | null = null;
   let shutdownPromise: Promise<number> | null = null;
   let exitHookInstalled = false;
@@ -233,12 +245,15 @@ async function main() {
     options?: {
       reason?: string;
       successExitCode?: number;
+      keepTerminals?: boolean;
     },
   ) => {
     const reason = options?.reason ?? `worker_received_${signal}`;
+    // Signals mean "stop and close terminals"; only an explicit keep request keeps them.
+    const keepTerminals = options?.keepTerminals === true;
     if (!shutdownPromise) {
       logger.info(
-        { signal, reason, ...getProcessDiagnostics() },
+        { signal, reason, keepTerminals, ...getProcessDiagnostics() },
         `${signal} received, shutting down gracefully...`,
       );
 
@@ -257,7 +272,7 @@ async function main() {
             clearTimeout(forceExit);
             return 1;
           }
-          await daemon.stop();
+          await daemon.stop({ keepTerminals });
           clearTimeout(forceExit);
           logger.info("Server closed");
           return options?.successExitCode ?? 0;
@@ -277,7 +292,8 @@ async function main() {
     installExitHook();
   };
 
-  supervisorShutdownHandler = (reason) => beginShutdown("Supervisor shutdown request", { reason });
+  supervisorShutdownHandler = (reason, keepTerminals) =>
+    beginShutdown("Supervisor shutdown request", { reason, keepTerminals });
 
   const sendSupervisorLifecycleMessage = (message: SupervisorLifecycleMessage): boolean => {
     if (typeof process.send !== "function") {
@@ -293,34 +309,51 @@ async function main() {
   };
 
   const handleLifecycleIntent = (intent: DaemonLifecycleIntent) => {
+    const fields = {
+      clientId: intent.clientId,
+      requestId: intent.requestId,
+      reason: intent.reason,
+      keepTerminals: intent.keepTerminals,
+    };
     if (intent.type === "shutdown") {
-      logger.warn(
-        { clientId: intent.clientId, requestId: intent.requestId, reason: intent.reason },
-        "Shutdown requested via websocket",
-      );
-      if (sendSupervisorLifecycleMessage({ type: "paseo:shutdown", reason: intent.reason })) {
+      logger.warn(fields, "Shutdown requested via websocket");
+      const sent = sendSupervisorLifecycleMessage({
+        type: "paseo:shutdown",
+        reason: intent.reason,
+        keepTerminals: intent.keepTerminals,
+      });
+      recordLifecycleIntentDispatched(intent.type, fields);
+      if (sent) {
         return;
       }
-      beginShutdown("shutdown lifecycle intent", { reason: intent.reason });
+      beginShutdown("shutdown lifecycle intent", {
+        reason: intent.reason,
+        keepTerminals: intent.keepTerminals,
+      });
       return;
     }
 
-    logger.warn(
-      { clientId: intent.clientId, requestId: intent.requestId, reason: intent.reason },
-      "Restart requested via websocket",
-    );
-    if (
-      sendSupervisorLifecycleMessage({
-        type: "paseo:restart",
-        ...(intent.reason ? { reason: intent.reason } : {}),
-      })
-    ) {
+    logger.warn(fields, "Restart requested via websocket");
+    const sent = sendSupervisorLifecycleMessage({
+      type: "paseo:restart",
+      ...(intent.reason ? { reason: intent.reason } : {}),
+      keepTerminals: intent.keepTerminals,
+    });
+    recordLifecycleIntentDispatched(intent.type, fields);
+    if (sent) {
       return;
     }
     beginShutdown("restart lifecycle intent", {
       reason: intent.reason,
       successExitCode: 0,
+      keepTerminals: intent.keepTerminals,
     });
+  };
+
+  // Written straight to daemon.log: the pino stream goes through the supervisor's pipe, which
+  // a paused or busy supervisor does not drain. Tests synchronize on this line.
+  const recordLifecycleIntentDispatched = (type: string, fields: Record<string, unknown>) => {
+    writeWorkerLifecycleLog(paseoHome, "Lifecycle intent dispatched", { type, ...fields });
   };
 
   try {

@@ -107,18 +107,27 @@ JavaScript objects. Metadata events do not load timelines for hooks. Slow refres
 count normalized UTF-8 replay bytes once, excluding raw provider buffers and repeated spool reads.
 A request waiting on another caller's load can report zero. Transcript content is never logged.
 
+Pagination bounds each read, not total resident history. Active and idle agents retain their
+projected transcript; archive releases it and later history reads rebuild it from the provider.
+Streaming overhead must remain proportional to the retained transcript. Cumulative text snapshots
+must be released after their deltas have been consumed.
+
 The invariants are:
 
 > A continuously subscribed client applies every committed row in order. Opening or resuming an
 > agent establishes the daemon's current tail in one complete-turn request, with older history reachable
 > through backward pagination.
 
-Tool output is bounded before it enters either delivery path. Canonical shell tool output is sliced
-to 64 KiB. Plain-text content and string values nested in unknown structured tool inputs/results
-have the same display limit with a truncation notice. The same bounded item is used for runtime
-timeline rows and live stream events; native provider transcripts and permission requests are unchanged.
-Provider history hydration applies the same rule so reopening an agent cannot restore an oversized
-tool payload.
+Every item is bounded before it enters either delivery path, because a timeline page is one
+WebSocket message and the daemon closes a socket whose outbound buffer passes 64 MiB. Tool calls get
+64 KiB and other items 256 KiB. Over budget, the largest strings are cut to a shared length with a
+`…[truncated 12.3 MB]` marker, and an oversized `data:` URL is replaced by the marker. Strings up
+to 1 KiB stay whole, so ids and paths survive. Arrays drop their trailing elements without a marker
+element, so typed arrays still match the wire schema. Limiting an item twice gives the same item. The
+budget does not bound wide objects or multi-byte text. The same
+bounded item is used for runtime timeline rows and live stream events. Provider history hydration
+applies the same rule so reopening an agent cannot restore an oversized payload. Fetches apply it
+again to assistant and reasoning rows the projection merges from many chunks.
 
 ## Presence is not delivery
 
