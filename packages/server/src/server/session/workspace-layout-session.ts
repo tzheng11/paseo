@@ -10,7 +10,8 @@ type LayoutRequest = Extract<
     type:
       | "workspace.layout.inspect.request"
       | "workspace.layout.initialize.request"
-      | "workspace.layout.commit.request";
+      | "workspace.layout.commit.request"
+      | "workspace.layout.receipt.request";
   }
 >;
 
@@ -27,6 +28,7 @@ export class WorkspaceLayoutSession {
       case "workspace.layout.inspect.request":
       case "workspace.layout.initialize.request":
       case "workspace.layout.commit.request":
+      case "workspace.layout.receipt.request":
         return this.handle(message);
       default:
         return undefined;
@@ -36,7 +38,15 @@ export class WorkspaceLayoutSession {
   private async handle(message: LayoutRequest): Promise<void> {
     try {
       if (!this.service) throw new WorkspaceLayoutRefusal("canonical_layout_not_configured");
-      if (message.type === "workspace.layout.initialize.request") {
+      if (message.type === "workspace.layout.receipt.request") {
+        this.emit({
+          type: "workspace.layout.receipt.response",
+          payload: {
+            requestId: message.requestId,
+            receipt: await this.service.findReceipt(message.mutationRequestId),
+          },
+        });
+      } else if (message.type === "workspace.layout.initialize.request") {
         const snapshot = await this.service.initialize(message.identity);
         this.emit({
           type: "workspace.layout.initialize.response",

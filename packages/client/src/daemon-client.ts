@@ -5855,6 +5855,16 @@ export class DaemonClient {
     return result.snapshot;
   }
 
+  async getWorkspaceLayoutReceipt(mutationRequestId: string, requestId?: string) {
+    this.requireWorkspaceLayout();
+    const result =
+      await this.sendNamespacedCorrelatedSessionRequest<"workspace.layout.receipt.response">({
+        requestId,
+        message: { type: "workspace.layout.receipt.request", mutationRequestId },
+      });
+    return result.receipt;
+  }
+
   async initializeWorkspaceLayout(identity: WorkspaceLayoutIdentity, requestId?: string) {
     this.requireWorkspaceLayout();
     return this.sendNamespacedCorrelatedSessionRequest<"workspace.layout.initialize.response">({

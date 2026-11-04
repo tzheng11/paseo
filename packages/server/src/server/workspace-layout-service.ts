@@ -4,6 +4,7 @@ import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import {
   WorkspaceLayoutSnapshotSchema,
   WorkspaceLayoutCommitSchema,
+  WorkspaceLayoutReceiptSchema,
   type WorkspaceLayoutConfig,
   type WorkspaceLayoutIdentity,
   type WorkspaceLayoutSnapshot,
@@ -133,6 +134,18 @@ export class WorkspaceLayoutService {
     const snapshot = await this.store.initialize(identity);
     await this.accept(snapshot);
     return snapshot;
+  }
+
+  async findReceipt(mutationRequestId: string): Promise<WorkspaceLayoutReceipt | null> {
+    const result = this.store
+      ? await this.store.findReceipt(mutationRequestId)
+      : await this.remote((client) => client.getWorkspaceLayoutReceipt(mutationRequestId));
+    if (result === null) return null;
+    const receipt = WorkspaceLayoutReceiptSchema.parse(result);
+    this.assertIdentity(receipt.stamp);
+    if (receipt.requestId !== mutationRequestId)
+      throw new WorkspaceLayoutRefusal("invalid_commit_receipt");
+    return receipt;
   }
 
   async commit(raw: WorkspaceLayoutCommit): Promise<WorkspaceLayoutReceipt> {

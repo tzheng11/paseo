@@ -7,7 +7,9 @@ import {
   WorkspaceLayoutCommitSchema,
   WorkspaceLayoutIdentitySchema,
   WorkspaceLayoutReceiptSchema,
+  WorkspaceLayoutReceiptRequestSchema,
   WorkspaceLayoutSnapshotSchema,
+  canonicalLayoutJson,
   parseWorkspaceNavigationKey,
   workspaceReferenceKey,
   type WorkspaceLayoutCommit,
@@ -17,11 +19,12 @@ import {
   type WorkspaceLayoutReceipt,
   type WorkspaceLayoutSnapshot,
 } from "@getpaseo/protocol/workspace-layout";
+export { canonicalLayoutJson } from "@getpaseo/protocol/workspace-layout";
 
 const StoreSchema = z.strictObject({
-  schemaVersion: z.literal(2),
+  schemaVersion: z.literal(3),
   snapshot: WorkspaceLayoutSnapshotSchema,
-  receipts: z.record(z.string(), WorkspaceLayoutReceiptSchema),
+  receipts: z.record(z.string().regex(/^[a-f0-9]{64}$/), WorkspaceLayoutReceiptSchema),
 });
 type StoreFile = z.infer<typeof StoreSchema>;
 const GuardSchema = WorkspaceLayoutIdentitySchema.extend({
@@ -70,6 +73,17 @@ export class WorkspaceLayoutStore {
     return this.exclusive(async () => structuredClone((await this.read()).snapshot));
   }
 
+  async findReceipt(mutationRequestId: string): Promise<WorkspaceLayoutReceipt | null> {
+    const id = WorkspaceLayoutReceiptRequestSchema.shape.mutationRequestId.parse(mutationRequestId);
+    return this.exclusive(async () => {
+      const current = await this.read();
+      const receipt = current.receipts[receiptKey(id)];
+      if (receipt && receipt.requestId !== id)
+        throw new WorkspaceLayoutRefusal("invalid_commit_receipt");
+      return receipt ? structuredClone(receipt) : null;
+    });
+  }
+
   async initialize(identity: WorkspaceLayoutIdentity): Promise<WorkspaceLayoutSnapshot> {
     this.requireIdentity(identity);
     return this.exclusive(async () => {
@@ -89,7 +103,7 @@ export class WorkspaceLayoutStore {
         initialized: false,
       });
       const file: StoreFile = {
-        schemaVersion: 2,
+        schemaVersion: 3,
         snapshot: {
           stamp: { ...this.identity, revision: 0, phase: "importing" },
           entries: [],
@@ -111,11 +125,11 @@ export class WorkspaceLayoutStore {
     const hash = hashLayoutValue(input);
     return this.exclusive(async () => {
       const current = await this.read();
-      const prior = Object.hasOwn(current.receipts, input.requestId)
-        ? current.receipts[input.requestId]
-        : undefined;
+      const key = receiptKey(input.requestId);
+      const prior = current.receipts[key];
       if (prior) {
-        if (prior.requestSha256 !== hash) throw new WorkspaceLayoutRefusal("request_id_conflict");
+        if (prior.requestId !== input.requestId || prior.requestSha256 !== hash)
+          throw new WorkspaceLayoutRefusal("request_id_conflict");
         return structuredClone(prior);
       }
       if (canonicalLayoutJson(input.expected) !== canonicalLayoutJson(current.snapshot.stamp))
@@ -133,7 +147,7 @@ export class WorkspaceLayoutStore {
         requestSha256: hash,
         stamp: structuredClone(next.snapshot.stamp),
       };
-      next.receipts[input.requestId] = receipt;
+      next.receipts[key] = receipt;
       await this.write(this.filePath, StoreSchema.parse(next));
       // The idempotent receipt is durable even if publication fails afterwards.
       for (const listener of this.listeners) listener();
@@ -527,20 +541,12 @@ function assertAcyclic(parents: Map<string, string | null>): void {
   }
 }
 
-function compareKeys(a: string, b: string): number {
-  if (a === b) return 0;
-  return a < b ? -1 : 1;
-}
-
-export function canonicalLayoutJson(value: unknown): string {
-  return JSON.stringify(value, (_key, item: unknown) =>
-    item && typeof item === "object" && !Array.isArray(item)
-      ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => compareKeys(a, b)))
-      : item,
-  );
-}
 export function hashLayoutValue(value: unknown): string {
   return createHash("sha256").update(canonicalLayoutJson(value)).digest("hex");
+}
+
+function receiptKey(requestId: string): string {
+  return createHash("sha256").update(requestId).digest("hex");
 }
 function isMissing(error: unknown): boolean {
   return error instanceof Error && "code" in error && error.code === "ENOENT";

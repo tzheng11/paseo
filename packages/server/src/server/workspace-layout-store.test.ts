@@ -539,6 +539,22 @@ describe("canonical workspace layout authority", () => {
     ).rejects.toThrow("stale_entry_revision");
   });
 
+  it("reads durable receipts without replay and treats object-property names as ordinary request IDs", async () => {
+    let state = await seed();
+    const before = await readFile(path.join(home, "workspace-layout.json"), "utf8");
+    expect(await store.findReceipt("never-dispatched")).toBeNull();
+    expect(await store.findReceipt("__proto__")).toBeNull();
+    expect(await readFile(path.join(home, "workspace-layout.json"), "utf8")).toBe(before);
+    for (const requestId of ["__proto__", "constructor", "toString"]) {
+      const input = { ...request(state, [{ kind: "put", entry: state.entries[0] }]), requestId };
+      const receipt = await store.commit(input);
+      const reader = new WorkspaceLayoutStore({ paseoHome: home, identity, serverId: "srv_hub" });
+      expect(await reader.findReceipt(requestId)).toEqual(receipt);
+      expect(await reader.commit(input)).toEqual(receipt);
+      state = await reader.inspect();
+    }
+  });
+
   it("refuses import replacement without its previous source and never drops an archived row", async () => {
     await store.commit(request(await store.initialize(identity), [imported("srv_a", [entry()])]));
     const current = await store.inspect();

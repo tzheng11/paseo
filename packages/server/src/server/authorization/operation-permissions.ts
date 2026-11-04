@@ -7,6 +7,7 @@ export type PermissionRequirement = DaemonPermission | readonly DaemonPermission
 
 const INBOUND_PERMISSION = {
   "workspace.layout.inspect.request": "workspace.read",
+  "workspace.layout.receipt.request": "workspace.read",
   "workspace.layout.initialize.request": "daemon.manage",
   "workspace.layout.commit.request": "daemon.manage",
   "fleet.main_host.get.request": "daemon.read",
@@ -242,6 +243,7 @@ const INBOUND_PERMISSION = {
 
 const OUTBOUND_PERMISSION = {
   "workspace.layout.inspect.response": "workspace.read",
+  "workspace.layout.receipt.response": "workspace.read",
   "workspace.layout.changed": "workspace.read",
   "workspace.layout.initialize.response": "daemon.manage",
   "workspace.layout.commit.response": "daemon.manage",

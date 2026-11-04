@@ -113,6 +113,27 @@ it("cleans up a replication observation whose first snapshot never arrives", asy
   expect(value.cached().fresh).toBe(false);
 });
 
+it("forwards receipt inspection to the authority and refuses a different request or epoch", async () => {
+  const value = service();
+  const client = attach(value, async () => snapshot());
+  const receipt = {
+    requestId: "lost-ack",
+    requestSha256: "b".repeat(64),
+    stamp: snapshot(8).stamp,
+  };
+  const lookup = vi.fn(async () => receipt);
+  client.getWorkspaceLayoutReceipt = lookup;
+  expect(await value.findReceipt("lost-ack")).toEqual(receipt);
+  expect(value.cached().snapshot).toBeNull();
+  lookup.mockResolvedValueOnce({ ...receipt, requestId: "other-operation" });
+  await expect(value.findReceipt("lost-ack")).rejects.toThrow("invalid_commit_receipt");
+  lookup.mockResolvedValueOnce({
+    ...receipt,
+    stamp: { ...receipt.stamp, epoch: "00000000-0000-4000-8000-000000000003" },
+  });
+  await expect(value.findReceipt("lost-ack")).rejects.toThrow("authority_identity_mismatch");
+});
+
 it("does not lose a route-online change delivered while an older connection attempt is settling", async () => {
   const value = service();
   let routeChanged!: () => void;

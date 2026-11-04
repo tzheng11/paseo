@@ -150,6 +150,15 @@ export const WorkspaceLayoutInspectRequestSchema = z.object({
   requestId: z.string(),
   observe: z.boolean().optional(),
 });
+export const WorkspaceLayoutReceiptRequestSchema = z.object({
+  type: z.literal("workspace.layout.receipt.request"),
+  requestId: z.string(),
+  mutationRequestId: z.string().min(1).max(256),
+});
+export const WorkspaceLayoutReceiptResponseSchema = z.object({
+  type: z.literal("workspace.layout.receipt.response"),
+  payload: z.object({ requestId: z.string(), receipt: WorkspaceLayoutReceiptSchema.nullable() }),
+});
 export const WorkspaceLayoutInitializeRequestSchema = z.object({
   type: z.literal("workspace.layout.initialize.request"),
   requestId: z.string(),
@@ -206,6 +215,20 @@ export function emptyWorkspaceNavigationPreferences(): WorkspaceNavigationPrefer
 
 export function workspaceReferenceKey(ref: WorkspaceReference): string {
   return JSON.stringify([ref.serverId, ref.workspaceId]);
+}
+
+/** Stable input for request digests on every client/runtime. */
+export function canonicalLayoutJson(value: unknown): string {
+  return JSON.stringify(value, (_key, item: unknown) =>
+    item && typeof item === "object" && !Array.isArray(item)
+      ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => compareLayoutKeys(a, b)))
+      : item,
+  );
+}
+
+function compareLayoutKeys(a: string, b: string): number {
+  if (a === b) return 0;
+  return a < b ? -1 : 1;
 }
 
 export function parseWorkspaceNavigationKey(key: string): WorkspaceReference {

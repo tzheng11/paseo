@@ -161,6 +161,8 @@ test("password admission protects actual layout RPCs; two authenticated clients 
       { kind: "put", entry: { ...baseline.entries[0], pinnedAt: at, superpinnedAt: at } },
     ],
   });
+  expect(await b.getWorkspaceLayoutReceipt("pin")).toEqual(receipt.receipt);
+  expect(await b.getWorkspaceLayoutReceipt("never-dispatched")).toBeNull();
   await expect.poll(() => revisions.includes(receipt.receipt.stamp.revision)).toBe(true);
   const pinned = await b.getWorkspaceLayout();
   await a.commitWorkspaceLayout({

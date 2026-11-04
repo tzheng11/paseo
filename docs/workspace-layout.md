@@ -40,7 +40,7 @@ call their own daemon; its forwarding keeps the authority credential server-side
 ## Durable identity and transactions
 
 The authority owns `workspace-layout.json` relative to its qualified Paseo home.
-The store format is version 2; earlier experimental 0.15 readers must refuse it,
+The store format is version 3; earlier experimental 0.15 readers must refuse it,
 not strip shared-view fields during recovery. The version label alone never
 qualifies a recovery reader.
 `workspace-layout-initialized.json` prevents an initialized but missing store
@@ -73,6 +73,17 @@ returning a receipt. An identical request ID and payload returns its durable
 receipt before checking the now-stale CAS. A reused ID with another payload is
 refused. Callers must retain the original request and reconcile an uncertain
 outcome; a new request ID is not recovery evidence.
+
+`workspace.layout.receipt.request` / SDK `getWorkspaceLayoutReceipt` reads the
+authority's retained receipt by `mutationRequestId`, without replaying the write.
+Verify its request ID, normalized request SHA256 and authority stamp against the
+original input; `canonicalLayoutJson` supplies the shared digest encoding. A null
+result means no receipt was found at that observation. It never proves that an
+uncertain operation is safe to retry. Replicas forward this query to the pinned
+authority and do not synthesize receipts from their cache.
+The store indexes receipts by a digest of the request ID and retains the original
+ID in the receipt. This avoids losing IDs such as `__proto__` through JSON object
+parsing. Earlier experimental raw-key receipt stores are refused by format.
 
 Native registry intents re-inspect and re-run pure revision/intent guards after a
 definite `stale_revision` refusal, using at most three attempts and a distinct ID

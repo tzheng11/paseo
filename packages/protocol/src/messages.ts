@@ -7,6 +7,8 @@ import {
   WorkspaceLayoutCommitResponseSchema,
   WorkspaceLayoutChangedSchema,
   WorkspaceLayoutStatusSchema,
+  WorkspaceLayoutReceiptRequestSchema,
+  WorkspaceLayoutReceiptResponseSchema,
 } from "./workspace-layout.js";
 import { WorkspacePinPlacementSchema } from "./workspace-layout.js";
 import { RuntimeBuildIdentitySchema, RuntimeWriteIntentSchema } from "./runtime-build.js";
@@ -3452,6 +3454,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceLayoutInspectRequestSchema,
   WorkspaceLayoutInitializeRequestSchema,
   WorkspaceLayoutCommitRequestSchema,
+  WorkspaceLayoutReceiptRequestSchema,
   MainHostGetRequestSchema,
   MainHostSetRequestSchema,
   MainHostApplyRequestSchema,
@@ -7343,6 +7346,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceLayoutInspectResponseSchema,
   WorkspaceLayoutInitializeResponseSchema,
   WorkspaceLayoutCommitResponseSchema,
+  WorkspaceLayoutReceiptResponseSchema,
   WorkspaceLayoutChangedSchema,
   MainHostGetResponseSchema,
   MainHostSetResponseSchema,
