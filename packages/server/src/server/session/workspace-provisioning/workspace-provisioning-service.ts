@@ -457,20 +457,6 @@ export function createWorkspaceProvisioningService(deps: {
         : null;
     const autoArchivedChangeRequestUrl =
       await resolveRestoredAutoArchiveChangeRequestUrl(workspace);
-    let next: PersistedWorkspaceRecord | null = null;
-    if (workspace.archivedAt) {
-      const placementUpdate = reconcileWorkspacePlacement({
-        workspace,
-        checkout,
-        updatedAt: timestamp,
-      });
-      next = {
-        ...(placementUpdate?.workspace ?? workspace),
-        archivedAt: null,
-        autoArchivedChangeRequestUrl,
-        updatedAt: timestamp,
-      };
-    }
     if (project.archivedAt || workspace.archivedAt) {
       const projectCheckout =
         checkout && areEquivalentPaths(project.rootPath, workspace.cwd)
@@ -494,8 +480,28 @@ export function createWorkspaceProvisioningService(deps: {
         });
       }
     }
-    if (!next) return workspace;
-    await workspaceRegistry.upsert(next);
+    if (!workspace.archivedAt) return workspace;
+    // Restoration is an explicit lifecycle intent, not a whole-record
+    // reconciliation. Apply it to the fresh registry record so an old snapshot
+    // cannot overwrite pin/hierarchy changes made while checkout was inspected.
+    const next = await workspaceRegistry.update(
+      workspace.workspaceId,
+      (current) => {
+        const placement = reconcileWorkspacePlacement({
+          workspace: current,
+          checkout,
+          updatedAt: timestamp,
+        });
+        return {
+          ...(placement?.workspace ?? current),
+          archivedAt: null,
+          autoArchivedChangeRequestUrl,
+          updatedAt: timestamp,
+        };
+      },
+      { layoutWrite: true },
+    );
+    if (!next) throw new Error("Workspace disappeared while restoring its archive state");
     return next;
   }
 

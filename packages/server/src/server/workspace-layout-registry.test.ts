@@ -18,6 +18,8 @@ import { WorkspaceLayoutService } from "./workspace-layout-service.js";
 import { setWorkspacePinPlacement } from "./workspace-pin-placement.js";
 import { WorkspaceReconciliationService } from "./workspace-reconciliation-service.js";
 import { createTestRegistries } from "./test-fixtures/reconciliation-registries.js";
+import { createWorkspaceProvisioningService } from "./session/workspace-provisioning/workspace-provisioning-service.js";
+import { createNoopWorkspaceGitService } from "./test-utils/workspace-git-service-stub.js";
 
 const at = "2026-11-04T10:00:00.000Z";
 const config = {
@@ -361,6 +363,50 @@ it("persists host-owned unarchive and project observations while preserving cano
     archivedAt: null,
     projectId: "new-project",
     pinnedAt: at,
+    superpinnedAt: at,
+  });
+});
+
+it("restores an imported archived workspace through the actual provisioning path without overwriting a newer layout", async () => {
+  const archived = { ...row("restored"), cwd: home, archivedAt: at, pinnedAt: at };
+  await seed([archived]);
+  const { value, file } = await registry([archived]);
+  const { projectRegistry, projects } = createTestRegistries();
+  projects.set("project", {
+    projectId: "project",
+    rootPath: home,
+    kind: "non_git",
+    displayName: "fixture",
+    createdAt: at,
+    updatedAt: at,
+    archivedAt: null,
+    customName: null,
+    projectKey: null,
+  });
+  const stale = await value.get("restored");
+  await value.update("restored", (current) => ({ ...current, superpinnedAt: at }));
+  const provisioning = createWorkspaceProvisioningService({
+    serverId: "srv_a",
+    workspaceRegistry: value,
+    projectRegistry,
+    workspaceGitService: createNoopWorkspaceGitService(),
+    isDirectory: async () => true,
+    logger: createTestLogger(),
+  });
+  const restored = await provisioning.ensureWorkspaceRecordUnarchived(stale!);
+  expect(restored).toMatchObject({
+    workspaceId: "restored",
+    archivedAt: null,
+    pinnedAt: at,
+    superpinnedAt: at,
+  });
+  expect(await value.get("restored")).toMatchObject({ archivedAt: null, superpinnedAt: at });
+  expect(JSON.parse(await readFile(file, "utf8"))[0]).toMatchObject({
+    archivedAt: null,
+    superpinnedAt: at,
+  });
+  expect((await service.inspect()).entries[0]).toMatchObject({
+    archivedAt: null,
     superpinnedAt: at,
   });
 });

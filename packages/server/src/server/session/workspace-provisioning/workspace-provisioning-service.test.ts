@@ -401,6 +401,7 @@ test("uses one workspace snapshot when reopening an archived workspace", async (
     list: async () => (reads++ === 0 ? archived : []),
     get: (workspaceId) => workspaceRegistry.get(workspaceId),
     upsert: (workspace) => workspaceRegistry.upsert(workspace),
+    update: (workspaceId, updater) => workspaceRegistry.update(workspaceId, updater),
     archive: (workspaceId, archivedAt) => workspaceRegistry.archive(workspaceId, archivedAt),
     remove: (workspaceId) => workspaceRegistry.remove(workspaceId),
   };
