@@ -291,32 +291,37 @@ test("POSIX mixed-case names do not override standard proxy names", async () => 
   expect(recorder.tunnels).toEqual(["vendor.invalid:443"]);
 });
 
-test("proxy credentials stay on CONNECT and do not reach the HTTP origin", async () => {
-  let originAuthorization: string | undefined;
-  const origin = createServer((request, response) => {
-    originAuthorization = request.headers["proxy-authorization"];
-    response.end("through proxy");
-  });
-  const originAddress = new URL(`http://${await listen(origin)}`);
-  const authorizations: (string | undefined)[] = [];
-  const server = createServer();
-  server.on("connect", (request, socket, head) => {
-    authorizations.push(request.headers["proxy-authorization"]);
-    const upstream = connect(Number(originAddress.port), "127.0.0.1", () => {
-      socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-      if (head.length) upstream.write(head);
-      socket.pipe(upstream).pipe(socket);
+test.each(["", "user:@", ":secret@", "user:secret@"])(
+  "proxy credentials %s stay on CONNECT and do not reach the HTTP origin",
+  async (credentials) => {
+    let originAuthorization: string | undefined;
+    const origin = createServer((request, response) => {
+      originAuthorization = request.headers["proxy-authorization"];
+      response.end("through proxy");
     });
-    socket.on("error", () => upstream.destroy());
-    upstream.on("error", () => socket.destroy());
-    socket.on("close", () => upstream.destroy());
-  });
-  initializeEnvironmentProxy({ HTTP_PROXY: `http://user:@${await listen(server)}` });
-  const response = await fetch("http://vendor.invalid", { signal: AbortSignal.timeout(3000) });
-  expect(await response.text()).toBe("through proxy");
-  expect(authorizations).toEqual([`Basic ${Buffer.from("user:").toString("base64")}`]);
-  expect(originAuthorization).toBeUndefined();
-});
+    const originAddress = new URL(`http://${await listen(origin)}`);
+    const authorizations: (string | undefined)[] = [];
+    const server = createServer();
+    server.on("connect", (request, socket, head) => {
+      authorizations.push(request.headers["proxy-authorization"]);
+      const upstream = connect(Number(originAddress.port), "127.0.0.1", () => {
+        socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+        if (head.length) upstream.write(head);
+        socket.pipe(upstream).pipe(socket);
+      });
+      socket.on("error", () => upstream.destroy());
+      upstream.on("error", () => socket.destroy());
+      socket.on("close", () => upstream.destroy());
+    });
+    initializeEnvironmentProxy({ HTTP_PROXY: `http://${credentials}${await listen(server)}` });
+    const response = await fetch("http://vendor.invalid", { signal: AbortSignal.timeout(3000) });
+    expect(await response.text()).toBe("through proxy");
+    expect(authorizations).toEqual([
+      credentials ? `Basic ${Buffer.from(credentials.slice(0, -1)).toString("base64")}` : undefined,
+    ]);
+    expect(originAuthorization).toBeUndefined();
+  },
+);
 
 test.each(["user:@", ":secret@", "user:secret@"])(
   "fetch and WebSockets authenticate proxy credentials %s",
