@@ -39,6 +39,7 @@ const owner: MainHostProvenance = {
 
 beforeEach(async () => {
   temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "paseo-main-process-"));
+  await mkdir(path.join(temporaryRoot, "os-home"));
 });
 
 afterEach(async () => {
@@ -53,6 +54,8 @@ function isolatedEnvironment(home: string): NodeJS.ProcessEnv {
     PATH: process.env.PATH,
     SystemRoot: process.env.SystemRoot,
     ComSpec: process.env.ComSpec,
+    HOME: path.join(temporaryRoot, "os-home"),
+    USERPROFILE: path.join(temporaryRoot, "os-home"),
     TEMP: temporaryRoot,
     TMP: temporaryRoot,
     TMPDIR: temporaryRoot,
@@ -310,12 +313,27 @@ async function extractBaseline(): Promise<string> {
   return baseline;
 }
 
-async function waitForDaemon(child: ChildProcess, port: number, home: string): Promise<void> {
+function captureChildOutput(child: ChildProcess): () => string {
+  let output = "";
+  const retain = (chunk: Buffer) => {
+    output = (output + chunk.toString()).slice(-32_768);
+  };
+  child.stdout?.on("data", retain);
+  child.stderr?.on("data", retain);
+  return () => output;
+}
+
+async function waitForDaemon(
+  child: ChildProcess,
+  port: number,
+  home: string,
+  recentOutput: () => string,
+): Promise<void> {
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
     if (child.exitCode !== null || child.signalCode !== null)
       throw new Error(
-        `Baseline daemon exited before listening (${child.exitCode}, ${child.signalCode})`,
+        `Baseline daemon exited before listening (${child.exitCode}, ${child.signalCode})\n${recentOutput()}`,
       );
     // HTTP binds before plugin startup finishes. The supervisor publishes its
     // listen receipt only after daemon.start() has enabled WebSocket acceptance.
@@ -329,9 +347,7 @@ async function waitForDaemon(child: ChildProcess, port: number, home: string): P
     }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  throw new Error(
-    "Baseline daemon did not listen within 60 seconds; inspect only its temporary home",
-  );
+  throw new Error(`Baseline daemon did not listen within 60 seconds\n${recentOutput()}`);
 }
 
 async function connectCurrentDaemon(home: string): Promise<{
@@ -350,11 +366,11 @@ async function connectCurrentDaemon(home: string): Promise<{
         PASEO_NODE_ENV: "development",
       },
       detached: process.platform !== "win32",
-      stdio: ["ignore", "ignore", "ignore"],
+      stdio: ["ignore", "pipe", "pipe"],
     },
   );
   children.set(child, true);
-  await waitForDaemon(child, port, home);
+  await waitForDaemon(child, port, home, captureChildOutput(child));
   const client = new DaemonClient({
     url: `ws://127.0.0.1:${port}/ws`,
     clientId: "main-startup-process-test",
@@ -500,11 +516,11 @@ describe("DOTS2-114 · real process interruption and rollback", () => {
           PASEO_NODE_ENV: "development",
         },
         detached: process.platform !== "win32",
-        stdio: ["ignore", "ignore", "ignore"],
+        stdio: ["ignore", "pipe", "pipe"],
       },
     );
     children.set(child, true);
-    await waitForDaemon(child, port, home);
+    await waitForDaemon(child, port, home, captureChildOutput(child));
     const client = new DaemonClient({
       url: `ws://127.0.0.1:${port}/ws`,
       clientId: "rollback-process-test",

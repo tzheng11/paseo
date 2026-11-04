@@ -391,8 +391,8 @@ it("decodes bounded projection edges and accounts for a huge unloaded middle", a
   expect(updated.tail[0].value).toMatchObject({ type: "assistant_message", text: "small suffix" });
 });
 
-it("keeps the latest conversational question through tool events until a user answers", () => {
-  const disk = createStore();
+it("keeps the latest conversational question through tool events until a user answers", async () => {
+  const disk = await createStore();
   const memory = new InMemoryAgentTimelineStore();
   for (const store of [disk, memory]) {
     store.initialize("question");

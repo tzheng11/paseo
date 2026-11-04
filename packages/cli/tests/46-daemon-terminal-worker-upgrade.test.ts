@@ -28,6 +28,7 @@ import {
   readdirSync,
   readFileSync,
   renameSync,
+  rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -104,6 +105,13 @@ function createInstallation(name: string, version: string): Installation {
     cpSync(join(repoRoot, "packages/server/dist", part), join(serverDir, "dist", part), {
       recursive: true,
     });
+  }
+  // These installations deliberately report synthetic versions. They are not
+  // the source build, so copied immutable provenance would be a false claim.
+  for (const entry of ["server/server", "src/server"]) {
+    const identity = join(serverDir, "dist", entry, "impower-build.json");
+    rmSync(identity, { force: true });
+    assert.equal(existsSync(identity), false);
   }
   const cliDir = join(modules, "@getpaseo", "cli");
   mkdirSync(cliDir, { recursive: true });

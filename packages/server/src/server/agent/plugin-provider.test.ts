@@ -1205,7 +1205,7 @@ describe("PluginAgentClientRegistry", () => {
           turnId: "first-turn",
           state: "completed",
         });
-        await nextTurn();
+        await manager.flush();
         const [child] = manager.listProviderSubagents(agent.id);
         expect(child).toMatchObject({
           id: "reusable-child",
@@ -1219,7 +1219,7 @@ describe("PluginAgentClientRegistry", () => {
           turnId: "second-turn",
           state: "started",
         });
-        await nextTurn();
+        await manager.flush();
         expect(manager.listProviderSubagents(agent.id)).toMatchObject([
           { id: child.id, title: child.title, status: "running" },
         ]);
@@ -1230,7 +1230,7 @@ describe("PluginAgentClientRegistry", () => {
           turnId: "second-turn",
           state: outcome,
         });
-        await nextTurn();
+        await manager.flush();
         expect(manager.listProviderSubagents(agent.id)).toMatchObject([
           { id: child.id, title: child.title, status: outcome },
         ]);

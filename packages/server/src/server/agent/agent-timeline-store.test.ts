@@ -373,19 +373,22 @@ describe("projected payload selection", () => {
   it("pages an already projected history without inspecting unselected payloads", async () => {
     const store = new InMemoryAgentTimelineStore();
     store.initialize("a");
-    let payloadReads = 0;
+    const payloadReads = Array<number>(1000).fill(0);
     for (let i = 0; i < 1000; i++) {
       store.append("a", {
         get type() {
-          payloadReads++;
+          payloadReads[i]++;
           return "user_message" as const;
         },
         text: `message ${i}`,
       });
     }
-    payloadReads = 0;
+    payloadReads.fill(0);
     const result = store.fetch("a", { limit: 10 });
-    expect(payloadReads).toBe(0);
+    // Upstream bounds the selected page's content. The untouched history must
+    // still cost no payload reads, regardless of the number of stored rows.
+    expect(payloadReads.slice(0, 990)).toEqual(Array<number>(990).fill(0));
+    expect(payloadReads.slice(990).every((count) => count > 0)).toBe(true);
     expect(result.rows.map((row) => row.item)).toEqual(
       Array.from({ length: 10 }, (_, i) => ({ type: "user_message", text: `message ${990 + i}` })),
     );

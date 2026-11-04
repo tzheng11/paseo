@@ -152,6 +152,7 @@ function createHarness(input: {
       },
     }),
     workspaceRegistry: createStub<SessionOptions["workspaceRegistry"]>({
+      assertLayoutWriteAllowed: async () => {},
       subscribeToMutations: () => () => {},
       initialize: async () => {},
       existsOnDisk: async () => true,

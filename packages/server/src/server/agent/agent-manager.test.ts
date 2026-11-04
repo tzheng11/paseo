@@ -9511,14 +9511,14 @@ test.each<AgentStreamEvent>([
     expect(deliveredUsageEvents).toBe(100);
     expect(fullHistoryReads).toBe(0);
     expect(historyWindowReads).toBe(0);
-    expect(lifecycleEvents.filter((event) => event.name === "agent.turn_started")).toHaveLength(1);
+    expect(lifecycleEvents.filter((event) => event.name === "agent.turn.before")).toHaveLength(1);
     session.pushEvent(terminal);
     await manager.flush();
     expect(fullHistoryReads).toBe(0);
     expect(historyWindowReads).toBe(1);
-    expect(lifecycleEvents.filter((event) => event.name === "agent.turn_ended")).toEqual([
+    expect(lifecycleEvents.filter((event) => event.name === "agent.turn.after")).toEqual([
       {
-        name: "agent.turn_ended",
+        name: "agent.turn.after",
         payload: expect.objectContaining({
           timeline: store.getRows(agent.id).map((row) => row.item),
           outcome: expect.objectContaining({ kind: terminal.type.slice(5) }),
@@ -15843,9 +15843,9 @@ test.each([
       .toBe(1);
     expect(timelineStore.itemReads).toBe(readsBeforeDispatch);
     const expectedTimeline = manager.getTimeline(agent.id);
-    expect(events.filter(({ name }) => name === "agent.turn_ended")).toEqual([
+    expect(events.filter(({ name }) => name === "agent.turn.after")).toEqual([
       {
-        name: "agent.turn_ended",
+        name: "agent.turn.after",
         event: {
           agent: {
             id: agent.id,
@@ -16591,13 +16591,13 @@ test("secret answer stream and out-of-band prompts are redacted before providers
   );
   expect(session.received.at(-1)).toBe(SECRET_ANSWER_NOTICE);
   expect(
-    manager.tryRunOutOfBand(agent.id, `/command ${syntheticSecret}`, {
+    await manager.tryRunOutOfBand(agent.id, `/command ${syntheticSecret}`, {
       clientMessageId: "secret-command",
     }),
   ).toBe(true);
   expect(session.received.at(-1)).toBe(`/command ${SECRET_ANSWER_NOTICE}`);
   expect(
-    manager.tryRunOutOfBand(agent.id, "/ordinary", { clientMessageId: "ordinary-command" }),
+    await manager.tryRunOutOfBand(agent.id, "/ordinary", { clientMessageId: "ordinary-command" }),
   ).toBe(true);
   expect(session.received.at(-1)).toBe("/ordinary");
   await manager.flush();

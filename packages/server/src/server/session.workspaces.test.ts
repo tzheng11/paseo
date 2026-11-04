@@ -217,6 +217,22 @@ interface ListFetchResult {
 
 type TestSession = SessionTestAccess;
 
+function bindWorkspaceMapWrites(
+  session: TestSession,
+  workspaces: Map<string, PersistedWorkspaceRecord>,
+): void {
+  session.workspaceRegistry.upsert = async (record: PersistedWorkspaceRecord) => {
+    workspaces.set(record.workspaceId, record);
+  };
+  session.workspaceRegistry.update = async (id, updater) => {
+    const current = workspaces.get(id);
+    if (!current) return null;
+    const next = updater(current);
+    workspaces.set(id, next);
+    return next;
+  };
+}
+
 function asTestSession(session: Session | TestSession): TestSession {
   return asSessionInternals<TestSession>(session);
 }
@@ -4291,11 +4307,7 @@ test("create paseo worktree response preserves an explicit non-Git project", asy
   session.workspaceRegistry.get = async (lookupWorkspaceId: string) =>
     workspaces.get(lookupWorkspaceId) ?? null;
   session.workspaceRegistry.list = async () => Array.from(workspaces.values());
-  session.workspaceRegistry.upsert = async (
-    record: ReturnType<typeof createPersistedWorkspaceRecord>,
-  ) => {
-    workspaces.set(record.workspaceId, record);
-  };
+  bindWorkspaceMapWrites(session, workspaces);
   session.projectRegistry.get = async (projectId: string) => projects.get(projectId) ?? null;
   session.projectRegistry.list = async () => Array.from(projects.values());
   session.projectRegistry.getOrCreateActiveByRoot = async (input) => {
@@ -4465,11 +4477,7 @@ test("open_project_request registers a workspace before any agent exists", async
   };
   session.workspaceRegistry.get = async (lookupWorkspaceId: string) =>
     workspaces.get(lookupWorkspaceId) ?? null;
-  session.workspaceRegistry.upsert = async (
-    record: ReturnType<typeof createPersistedWorkspaceRecord>,
-  ) => {
-    workspaces.set(record.workspaceId, record);
-  };
+  bindWorkspaceMapWrites(session, workspaces);
   session.projectRegistry.list = async () => Array.from(projects.values());
   session.workspaceRegistry.list = async () => Array.from(workspaces.values());
   session.buildProjectPlacement = async (cwd: string) => ({
@@ -4520,11 +4528,7 @@ test("import_agent_request registers a workspace for a never-seen cwd", async ()
   };
   session.workspaceRegistry.get = async (lookupWorkspaceId: string) =>
     workspaces.get(lookupWorkspaceId) ?? null;
-  session.workspaceRegistry.upsert = async (
-    record: ReturnType<typeof createPersistedWorkspaceRecord>,
-  ) => {
-    workspaces.set(record.workspaceId, record);
-  };
+  bindWorkspaceMapWrites(session, workspaces);
   session.projectRegistry.list = async () => Array.from(projects.values());
   session.workspaceRegistry.list = async () => Array.from(workspaces.values());
   session.buildProjectPlacement = async (cwd: string) => ({
@@ -4710,11 +4714,7 @@ test("open_project_response returns immediately even when the GitHub fetch is sl
   };
   session.workspaceRegistry.get = async (lookupWorkspaceId: string) =>
     workspaces.get(lookupWorkspaceId) ?? null;
-  session.workspaceRegistry.upsert = async (
-    record: ReturnType<typeof createPersistedWorkspaceRecord>,
-  ) => {
-    workspaces.set(record.workspaceId, record);
-  };
+  bindWorkspaceMapWrites(session, workspaces);
   session.projectRegistry.list = async () => Array.from(projects.values());
   session.workspaceRegistry.list = async () => Array.from(workspaces.values());
   session.workspaceGitService.getCheckout = async (requestedCwd: string) => ({
@@ -4786,11 +4786,7 @@ test("open_project_request emits a workspace_update with githubRuntime once the 
   };
   session.workspaceRegistry.get = async (lookupWorkspaceId: string) =>
     workspaces.get(lookupWorkspaceId) ?? null;
-  session.workspaceRegistry.upsert = async (
-    record: ReturnType<typeof createPersistedWorkspaceRecord>,
-  ) => {
-    workspaces.set(record.workspaceId, record);
-  };
+  bindWorkspaceMapWrites(session, workspaces);
   session.projectRegistry.list = async () => Array.from(projects.values());
   session.workspaceRegistry.list = async () => Array.from(workspaces.values());
   session.workspaceGitService.getCheckout = async (requestedCwd: string) => ({
@@ -4897,11 +4893,7 @@ test("open_project_request does not match a new child directory to an existing p
   };
   session.workspaceRegistry.get = async (lookupWorkspaceId: string) =>
     workspaces.get(lookupWorkspaceId) ?? null;
-  session.workspaceRegistry.upsert = async (
-    record: ReturnType<typeof createPersistedWorkspaceRecord>,
-  ) => {
-    workspaces.set(record.workspaceId, record);
-  };
+  bindWorkspaceMapWrites(session, workspaces);
   session.projectRegistry.list = async () => Array.from(projects.values());
   session.workspaceRegistry.list = async () => Array.from(workspaces.values());
 
@@ -4966,11 +4958,7 @@ test("open_project_request does not unarchive an archived parent workspace for a
   };
   session.workspaceRegistry.get = async (lookupWorkspaceId: string) =>
     workspaces.get(lookupWorkspaceId) ?? null;
-  session.workspaceRegistry.upsert = async (
-    record: ReturnType<typeof createPersistedWorkspaceRecord>,
-  ) => {
-    workspaces.set(record.workspaceId, record);
-  };
+  bindWorkspaceMapWrites(session, workspaces);
   session.projectRegistry.list = async () => Array.from(projects.values());
   session.workspaceRegistry.list = async () => Array.from(workspaces.values());
 
@@ -5041,11 +5029,7 @@ test("open_project_request reclassifies an archived directory workspace when git
   };
   session.workspaceRegistry.get = async (lookupWorkspaceId: string) =>
     workspaces.get(lookupWorkspaceId) ?? null;
-  session.workspaceRegistry.upsert = async (
-    record: ReturnType<typeof createPersistedWorkspaceRecord>,
-  ) => {
-    workspaces.set(record.workspaceId, record);
-  };
+  bindWorkspaceMapWrites(session, workspaces);
   session.projectRegistry.list = async () => Array.from(projects.values());
   session.workspaceRegistry.list = async () => Array.from(workspaces.values());
   session.workspaceGitService.getCheckout = async () => ({
@@ -5157,11 +5141,7 @@ test("open_project_request reclassifies an active directory workspace when git m
   };
   session.workspaceRegistry.get = async (lookupWorkspaceId: string) =>
     workspaces.get(lookupWorkspaceId) ?? null;
-  session.workspaceRegistry.upsert = async (
-    record: ReturnType<typeof createPersistedWorkspaceRecord>,
-  ) => {
-    workspaces.set(record.workspaceId, record);
-  };
+  bindWorkspaceMapWrites(session, workspaces);
   session.projectRegistry.list = async () => Array.from(projects.values());
   session.workspaceRegistry.list = async () => Array.from(workspaces.values());
   session.workspaceGitService.getCheckout = async (requestedCwd: string) => ({
@@ -5247,11 +5227,7 @@ test("open_project_request gives a plain git worktree its own exact-root project
   };
   session.workspaceRegistry.get = async (lookupWorkspaceId: string) =>
     workspaces.get(lookupWorkspaceId) ?? null;
-  session.workspaceRegistry.upsert = async (
-    record: ReturnType<typeof createPersistedWorkspaceRecord>,
-  ) => {
-    workspaces.set(record.workspaceId, record);
-  };
+  bindWorkspaceMapWrites(session, workspaces);
   session.projectRegistry.list = async () => Array.from(projects.values());
   session.workspaceRegistry.list = async () => Array.from(workspaces.values());
   session.workspaceGitService.getCheckout = async (requestedCwd: string) => ({
@@ -5336,11 +5312,7 @@ test("open_project_request keeps archived records and allocates a fresh workspac
   };
   session.workspaceRegistry.get = async (lookupWorkspaceId: string) =>
     workspaces.get(lookupWorkspaceId) ?? null;
-  session.workspaceRegistry.upsert = async (
-    record: ReturnType<typeof createPersistedWorkspaceRecord>,
-  ) => {
-    workspaces.set(record.workspaceId, record);
-  };
+  bindWorkspaceMapWrites(session, workspaces);
   session.projectRegistry.list = async () => Array.from(projects.values());
   session.workspaceRegistry.list = async () => Array.from(workspaces.values());
 
@@ -5391,11 +5363,7 @@ test("open_project_request does not repurpose an orphaned archived workspace", a
   };
   session.workspaceRegistry.get = async (lookupWorkspaceId: string) =>
     workspaces.get(lookupWorkspaceId) ?? null;
-  session.workspaceRegistry.upsert = async (
-    record: ReturnType<typeof createPersistedWorkspaceRecord>,
-  ) => {
-    workspaces.set(record.workspaceId, record);
-  };
+  bindWorkspaceMapWrites(session, workspaces);
   session.projectRegistry.list = async () => Array.from(projects.values());
   session.workspaceRegistry.list = async () => Array.from(workspaces.values());
 
@@ -5460,6 +5428,11 @@ test("workspace recovery stays accepted when git observer warming fails", async 
   session.workspaceRegistry.list = async () => [workspace];
   session.workspaceRegistry.upsert = async (record: PersistedWorkspaceRecord) => {
     workspace = record;
+  };
+  session.workspaceRegistry.update = async (id, updater) => {
+    if (id !== workspace.workspaceId) return null;
+    workspace = updater(workspace);
+    return workspace;
   };
   await session.handleMessage({
     type: "fetch_workspaces_request",
@@ -5542,11 +5515,7 @@ test("refresh_agent_request leaves workspace archival independent when its direc
   };
   session.workspaceRegistry.get = async (lookupWorkspaceId: string) =>
     workspaces.get(lookupWorkspaceId) ?? null;
-  session.workspaceRegistry.upsert = async (
-    record: ReturnType<typeof createPersistedWorkspaceRecord>,
-  ) => {
-    workspaces.set(record.workspaceId, record);
-  };
+  bindWorkspaceMapWrites(session, workspaces);
   session.projectRegistry.list = async () => Array.from(projects.values());
   session.workspaceRegistry.list = async () => Array.from(workspaces.values());
 
@@ -5640,11 +5609,7 @@ test("refresh_agent_request leaves workspace archival independent when its direc
   };
   session.workspaceRegistry.get = async (lookupWorkspaceId: string) =>
     workspaces.get(lookupWorkspaceId) ?? null;
-  session.workspaceRegistry.upsert = async (
-    record: ReturnType<typeof createPersistedWorkspaceRecord>,
-  ) => {
-    workspaces.set(record.workspaceId, record);
-  };
+  bindWorkspaceMapWrites(session, workspaces);
   session.projectRegistry.list = async () => Array.from(projects.values());
   session.workspaceRegistry.list = async () => Array.from(workspaces.values());
 
@@ -5731,11 +5696,7 @@ test("refresh_agent_request does not recreate or unarchive a deleted worktree", 
   };
   session.workspaceRegistry.get = async (lookupWorkspaceId: string) =>
     workspaces.get(lookupWorkspaceId) ?? null;
-  session.workspaceRegistry.upsert = async (
-    record: ReturnType<typeof createPersistedWorkspaceRecord>,
-  ) => {
-    workspaces.set(record.workspaceId, record);
-  };
+  bindWorkspaceMapWrites(session, workspaces);
   session.projectRegistry.list = async () => Array.from(projects.values());
   session.workspaceRegistry.list = async () => Array.from(workspaces.values());
 
@@ -5830,11 +5791,7 @@ test("refresh_agent_request does not inspect an archived worktree branch", async
   };
   session.workspaceRegistry.get = async (lookupWorkspaceId: string) =>
     workspaces.get(lookupWorkspaceId) ?? null;
-  session.workspaceRegistry.upsert = async (
-    record: ReturnType<typeof createPersistedWorkspaceRecord>,
-  ) => {
-    workspaces.set(record.workspaceId, record);
-  };
+  bindWorkspaceMapWrites(session, workspaces);
   session.projectRegistry.list = async () => Array.from(projects.values());
   session.workspaceRegistry.list = async () => Array.from(workspaces.values());
 
@@ -5960,11 +5917,7 @@ test("legacy refresh_agent_request restores a real deleted worktree", async () =
     projects.set(record.projectId, record);
   };
   session.workspaceRegistry.get = async (id: string) => workspaces.get(id) ?? null;
-  session.workspaceRegistry.upsert = async (
-    record: ReturnType<typeof createPersistedWorkspaceRecord>,
-  ) => {
-    workspaces.set(record.workspaceId, record);
-  };
+  bindWorkspaceMapWrites(session, workspaces);
   session.projectRegistry.list = async () => Array.from(projects.values());
   session.workspaceRegistry.list = async () => Array.from(workspaces.values());
   session.agentStorage.get = async (id: string) => (id === agentId ? storedAgent : null);
@@ -6018,11 +5971,7 @@ test.skip("open_project_request collapses a git subdirectory onto the repo root 
   };
   session.workspaceRegistry.get = async (lookupWorkspaceId: string) =>
     workspaces.get(lookupWorkspaceId) ?? null;
-  session.workspaceRegistry.upsert = async (
-    record: ReturnType<typeof createPersistedWorkspaceRecord>,
-  ) => {
-    workspaces.set(record.workspaceId, record);
-  };
+  bindWorkspaceMapWrites(session, workspaces);
   session.projectRegistry.list = async () => Array.from(projects.values());
   session.workspaceRegistry.list = async () => Array.from(workspaces.values());
   session.buildProjectPlacement = async (cwd: string) => ({
@@ -6287,11 +6236,7 @@ test.skip("opening a new worktree reconciles older local workspaces into the rem
   session.workspaceRegistry.get = async (lookupWorkspaceId: string) =>
     workspaces.get(lookupWorkspaceId) ?? null;
   session.workspaceRegistry.list = async () => Array.from(workspaces.values());
-  session.workspaceRegistry.upsert = async (
-    record: ReturnType<typeof createPersistedWorkspaceRecord>,
-  ) => {
-    workspaces.set(record.workspaceId, record);
-  };
+  bindWorkspaceMapWrites(session, workspaces);
   session.buildProjectPlacement = async (cwd: string) => ({
     projectKey: remoteProjectId,
     projectName: "zimakki/inkwell",
@@ -6393,11 +6338,7 @@ test.skip("fetch_workspaces_request reconciles remote URL changes for existing w
   session.workspaceRegistry.get = async (lookupWorkspaceId: string) =>
     workspaces.get(lookupWorkspaceId) ?? null;
   session.workspaceRegistry.list = async () => Array.from(workspaces.values());
-  session.workspaceRegistry.upsert = async (
-    record: ReturnType<typeof createPersistedWorkspaceRecord>,
-  ) => {
-    workspaces.set(record.workspaceId, record);
-  };
+  bindWorkspaceMapWrites(session, workspaces);
   session.buildProjectPlacement = async (cwd: string) => ({
     projectKey: newProjectId,
     projectName: "new-owner/inkwell",
@@ -6489,11 +6430,7 @@ test.skip("reconcile archives stale subdirectory workspace records when collapsi
   session.workspaceRegistry.get = async (lookupWorkspaceId: string) =>
     workspaces.get(lookupWorkspaceId) ?? null;
   session.workspaceRegistry.list = async () => Array.from(workspaces.values());
-  session.workspaceRegistry.upsert = async (
-    record: ReturnType<typeof createPersistedWorkspaceRecord>,
-  ) => {
-    workspaces.set(record.workspaceId, record);
-  };
+  bindWorkspaceMapWrites(session, workspaces);
   session.workspaceRegistry.archive = async (workspaceId: string, archivedAt: string) => {
     const existing = workspaces.get(workspaceId);
     if (!existing) return;
