@@ -66,7 +66,7 @@ function visibleParents(snapshot: WorkspaceLayoutSnapshot) {
     serverId: row.ref.serverId,
     projectViewKey: row.projectId,
     parentWorkspaceId: row.parent?.workspaceId ?? null,
-    siblingOrder: row.siblingOrder,
+    siblingOrder: row.siblingOrder ?? undefined,
     sidebarSection: section(row),
   }));
   const placements = Object.fromEntries(
@@ -285,6 +285,16 @@ describe("canonical workspace layout authority", () => {
     expect(inspect()).toBe("srv_a:parent");
     await change("child", { superpinnedAt: timestamp });
     expect(inspect()).toBeNull();
+  });
+
+  it("round trips explicit unranked roots without assigning an invented rank", async () => {
+    const unranked = { ...entry("srv_a", "unranked"), siblingOrder: null };
+    const state = await seed([unranked, entry("srv_a", "ranked")]);
+    expect(
+      state.entries.find((row) => row.ref.workspaceId === "unranked")?.siblingOrder,
+    ).toBeNull();
+    const reader = new WorkspaceLayoutStore({ paseoHome: home, identity, serverId: "srv_hub" });
+    expect(await reader.inspect()).toEqual(state);
   });
 
   it("imports a historical archived-parent placement without erasing the edge or permitting a new invalid assignment", async () => {

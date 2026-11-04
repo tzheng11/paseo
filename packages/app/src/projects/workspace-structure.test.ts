@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import type { ProjectDescriptor, WorkspaceDescriptor } from "@/stores/session-store";
 import { buildWorkspaceStructureProjects, createProjectViewKey } from "./workspace-structure";
+import { decodeLegacyWorkspaceLayout } from "../../../server/src/server/workspace-layout-import.js";
 
 function project(input: {
   id: string;
@@ -40,6 +41,60 @@ function workspace(id: string, projectId: string, root: string): WorkspaceDescri
 }
 
 describe("buildWorkspaceStructureProjects", () => {
+  test("the explicit disk import decoder preserves mixed-host numeric and legacy-name root ordering", () => {
+    const key = "remote:github.com/acme/app";
+    const original = [
+      { ...workspace("z-id", "old-project", "/old/app"), name: "Alpha" },
+      { ...workspace("a-id", "old-project", "/old/app"), name: "Zulu" },
+    ];
+    const decoded = decodeLegacyWorkspaceLayout({
+      serverId: "old",
+      profile: "upstream-014",
+      bytes: new TextEncoder().encode(
+        JSON.stringify(
+          original.map((record) => ({
+            workspaceId: record.id,
+            projectId: record.projectId,
+            pinnedAt: null,
+            archivedAt: null,
+          })),
+        ),
+      ),
+    });
+    const oldSession = {
+      serverId: "old",
+      projects: [project({ id: "old-project", key, root: "/old/app" })],
+      workspaces: original,
+    };
+    const rankedSession = {
+      serverId: "ranked",
+      projects: [project({ id: "ranked-project", key, root: "/new/app" })],
+      workspaces: [
+        {
+          ...workspace("first", "ranked-project", "/new/app"),
+          name: "Last alphabetically",
+          siblingOrder: 40,
+        },
+      ],
+    };
+    const before = buildWorkspaceStructureProjects({ sessions: [oldSession, rankedSession] });
+    const after = buildWorkspaceStructureProjects({
+      sessions: [
+        rankedSession,
+        {
+          ...oldSession,
+          workspaces: original.map((record, index) =>
+            Object.assign({}, record, {
+              siblingOrder: decoded.entries[index].siblingOrder ?? undefined,
+            }),
+          ),
+        },
+      ],
+    });
+    expect(after[0].workspaceKeys).toEqual(before[0].workspaceKeys);
+    expect(after[0].workspaceKeys).toEqual(["ranked:first", "old:z-id", "old:a-id"]);
+  });
+
   test("carries persisted parenting and sibling order into the structural sidebar model", () => {
     const first = {
       ...workspace("first", "prj_a", "/repo"),

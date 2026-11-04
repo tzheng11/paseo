@@ -45,7 +45,8 @@ export const WorkspaceLayoutEntrySchema = z.object({
   pinnedAt: TimestampSchema.nullable(),
   superpinnedAt: TimestampSchema.nullable(),
   parent: WorkspaceReferenceSchema.nullable(),
-  siblingOrder: z.number().finite(),
+  // null preserves an older producer's unranked/name-sorted position.
+  siblingOrder: z.number().finite().nullable(),
   pinPlacement: WorkspacePinPlacementSchema.nullable(),
   archivedAt: TimestampSchema.nullable(),
   revision: RevisionSchema,

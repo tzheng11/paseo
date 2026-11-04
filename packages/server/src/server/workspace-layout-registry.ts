@@ -8,6 +8,7 @@ import {
 } from "@getpaseo/protocol/workspace-layout";
 import {
   FileBackedWorkspaceRegistry,
+  resolveWorkspaceDisplayName,
   type PersistedWorkspaceRecord,
   type WorkspaceMutationContext,
   type WorkspaceMoveInput,
@@ -161,6 +162,12 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
       const raw = await super.get(id);
       if (!raw || raw.archivedAt) throw new WorkspaceLayoutRefusal("workspace_not_active");
       const current = this.project(raw, snapshot);
+      const local = new Map((await super.list()).map((record) => [record.workspaceId, record]));
+      const name = (entry: WorkspaceLayoutEntry) => {
+        const record = local.get(entry.ref.workspaceId);
+        if (!record) throw new WorkspaceLayoutRefusal("missing_local_order_observation");
+        return resolveWorkspaceDisplayName(record);
+      };
       const siblings = snapshot.entries
         .filter(
           (entry) =>
@@ -170,27 +177,42 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
             !entry.archivedAt &&
             (entry.parent?.workspaceId ?? null) === input.parentWorkspaceId,
         )
-        .sort(
-          (a, b) =>
-            a.siblingOrder - b.siblingOrder || a.ref.workspaceId.localeCompare(b.ref.workspaceId),
-        );
+        .sort((a, b) => {
+          if (a.siblingOrder !== null) {
+            if (b.siblingOrder === null) return -1;
+            return (
+              a.siblingOrder - b.siblingOrder || a.ref.workspaceId.localeCompare(b.ref.workspaceId)
+            );
+          }
+          if (b.siblingOrder !== null) return 1;
+          return (
+            name(a).localeCompare(name(b), undefined, { numeric: true, sensitivity: "base" }) ||
+            a.ref.workspaceId.localeCompare(b.ref.workspaceId)
+          );
+        });
       const index =
         input.beforeWorkspaceId == null
           ? siblings.length
           : siblings.findIndex((entry) => entry.ref.workspaceId === input.beforeWorkspaceId);
       if (index < 0) throw new WorkspaceLayoutRefusal("invalid_destination_sibling");
-      const order = () => orderBetween(siblings, index);
-      let siblingOrder = order();
       const changes: WorkspaceLayoutEntry[] = [];
-      if (
-        !Number.isFinite(siblingOrder) ||
-        (index > 0 && siblingOrder <= siblings[index - 1].siblingOrder) ||
-        (index < siblings.length && siblingOrder >= siblings[index].siblingOrder)
-      ) {
+      const rebalance = () => {
         for (let position = 0; position < siblings.length; position++) {
           siblings[position] = { ...siblings[position], siblingOrder: position };
           changes.push(siblings[position]);
         }
+      };
+      // An explicit move may rank a previously unranked group, preserving the
+      // actual numeric-then-name order rather than assigning import-time zeros.
+      if (siblings.some((entry) => entry.siblingOrder === null)) rebalance();
+      const order = () => orderBetween(siblings, index);
+      let siblingOrder = order();
+      if (
+        !Number.isFinite(siblingOrder) ||
+        (index > 0 && siblingOrder <= numericRank(siblings[index - 1])) ||
+        (index < siblings.length && siblingOrder >= numericRank(siblings[index]))
+      ) {
+        rebalance();
         siblingOrder = order();
       }
       const next = { ...current, parentWorkspaceId: input.parentWorkspaceId, siblingOrder };
@@ -276,9 +298,9 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
         (entry.parent?.workspaceId ?? null) === (record.parentWorkspaceId ?? null) &&
         !entry.archivedAt,
     );
-    const order = siblings.length
-      ? Math.max(...siblings.map((entry) => entry.siblingOrder)) + 1
-      : 0;
+    // Until an explicit move ranks the group, preserve its legacy name order.
+    if (siblings.some((entry) => entry.siblingOrder === null)) return undefined;
+    const order = siblings.length ? Math.max(...siblings.map(numericRank)) + 1 : 0;
     if (!Number.isFinite(order)) throw new WorkspaceLayoutRefusal("sibling_order_exhausted");
     return order;
   }
@@ -299,7 +321,7 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
       parent: record.parentWorkspaceId
         ? { serverId: this.serverId, workspaceId: record.parentWorkspaceId }
         : null,
-      siblingOrder: record.siblingOrder ?? 0,
+      siblingOrder: record.siblingOrder ?? null,
       pinPlacement: record.pinPlacement ?? null,
       archivedAt: record.archivedAt,
       revision: previous?.revision ?? 0,
@@ -324,7 +346,7 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
       pinnedAt: entry.pinnedAt,
       superpinnedAt: entry.superpinnedAt,
       parentWorkspaceId: entry.parent?.workspaceId ?? null,
-      siblingOrder: entry.siblingOrder,
+      siblingOrder: entry.siblingOrder ?? undefined,
       pinPlacement: entry.pinPlacement ?? undefined,
     };
   }
@@ -383,9 +405,14 @@ function changedFields(before: PersistedWorkspaceRecord, after: PersistedWorkspa
 
 function orderBetween(siblings: WorkspaceLayoutEntry[], index: number): number {
   if (!siblings.length) return 0;
-  if (index === 0) return siblings[0].siblingOrder - 1;
-  if (index === siblings.length) return siblings[index - 1].siblingOrder + 1;
-  return siblings[index - 1].siblingOrder / 2 + siblings[index].siblingOrder / 2;
+  if (index === 0) return numericRank(siblings[0]) - 1;
+  if (index === siblings.length) return numericRank(siblings[index - 1]) + 1;
+  return numericRank(siblings[index - 1]) / 2 + numericRank(siblings[index]) / 2;
+}
+
+function numericRank(entry: WorkspaceLayoutEntry): number {
+  if (entry.siblingOrder === null) throw new WorkspaceLayoutRefusal("unranked_destination");
+  return entry.siblingOrder;
 }
 
 export function createWorkspaceRegistry(

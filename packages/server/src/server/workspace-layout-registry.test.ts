@@ -57,7 +57,7 @@ function canonical(record: PersistedWorkspaceRecord, serverId = "srv_a"): Worksp
     pinnedAt: record.pinnedAt,
     superpinnedAt: record.superpinnedAt,
     parent: record.parentWorkspaceId ? { serverId, workspaceId: record.parentWorkspaceId } : null,
-    siblingOrder: record.siblingOrder ?? 0,
+    siblingOrder: record.siblingOrder ?? null,
     pinPlacement: record.pinPlacement ?? null,
     archivedAt: record.archivedAt,
     revision: 0,
@@ -260,6 +260,37 @@ it("keeps the local creation protection copy equal to the committed canonical or
     (record: PersistedWorkspaceRecord) => record.workspaceId === "new",
   );
   expect(local.siblingOrder).toBe(canonicalRow?.siblingOrder);
+});
+
+it("preserves an imported unranked root in legacy responses and its local protection copy", async () => {
+  const unranked = { ...row("z-id"), displayName: "Alpha", siblingOrder: undefined };
+  await seed([unranked]);
+  const { value, file } = await registry([unranked]);
+  expect((await value.get("z-id"))?.siblingOrder).toBeUndefined();
+  expect(JSON.parse(await readFile(file, "utf8"))[0]).not.toHaveProperty("siblingOrder");
+  await value.update("z-id", (record) => ({ ...record, pinnedAt: at }));
+  expect((await service.inspect()).entries[0].siblingOrder).toBeNull();
+});
+
+it("only ranks an unranked group on an explicit move, retaining its numeric-then-name order", async () => {
+  const records = [
+    { ...row("ranked"), siblingOrder: 7, title: "ZZZ" },
+    { ...row("z-id"), siblingOrder: undefined, title: "Alpha" },
+    { ...row("a-id"), siblingOrder: undefined, title: "Zulu" },
+    { ...row("moving"), siblingOrder: undefined, title: "Omega" },
+  ];
+  await seed(records);
+  const { value } = await registry(records);
+  await value.upsert({ ...row("new"), siblingOrder: undefined });
+  expect(
+    (await service.inspect()).entries.find((entry) => entry.ref.workspaceId === "new")
+      ?.siblingOrder,
+  ).toBeNull();
+  await value.move("moving", { parentWorkspaceId: null, beforeWorkspaceId: "a-id" });
+  const ordered = (await value.list())
+    .sort((a, b) => a.siblingOrder! - b.siblingOrder!)
+    .map((record) => record.workspaceId);
+  expect(ordered).toEqual(["ranked", "z-id", "new", "moving", "a-id"]);
 });
 
 it("never lets a stale whole-record reconciliation overwrite layout or host-local identity", async () => {

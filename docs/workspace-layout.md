@@ -48,6 +48,10 @@ Entity identity is `(serverId, workspaceId)`. Equal local IDs, paths, repository
 URLs and display names on different hosts never merge entities. Each entry holds
 ordinary/superpin timestamps, structural parent, structural sibling order,
 sidebar placement, archive observation, project membership and entry revision.
+Structural `siblingOrder: null` means unranked. Legacy workspace responses omit
+that optional rank, preserving their existing numeric-first, then-name ordering
+within mixed-host project views. No zero or array-index rank is invented on import.
+An explicit move may rank its group while retaining that observed order.
 Archived entries and both pin holds remain in snapshots. The structural parent
 is host-local; explicit sidebar parents can cross hosts. Both parent graphs
 are validated without recursively walking deep trees. A structurally nested pin
@@ -99,7 +103,19 @@ source hash and cannot drop an existing entry. Different source bytes require a
 new preview and explicit conflict resolution, not a latest-mtime or union rule.
 
 `pinnedAt` and `superpinnedAt` are required null/timestamp values in import entries.
-An absent legacy value is unresolved and cannot be presented as unpinned. Client
+The pure disk decoder `decodeLegacyWorkspaceLayout` accepts an explicit producer
+profile and hashes the original bytes. `upstream-014` requires every row to have
+explicit ordinary pin and archive observations and to omit all four unsupported
+fork fields. It maps unsupported superpins/parents/placements to null and ranks to
+unranked. `impower-layout-v1` requires the rich producer's explicit fields and
+preserves finite ranks; an omitted placement means no override. A mixed census,
+missing ordinary pin, malformed value or duplicate identity refuses the import.
+The profile is a decoding declaration, not proof of source origin or that an
+earlier client never discarded data; the controller still binds exact source
+provenance and all retained backups. This exception applies only to retained disk
+bytes. Missing fields in a fresh RPC observation remain unresolved.
+
+Client
 order/layout sources require the same explicit preservation and conflict process.
 The deployment import preview must bind those rulings and all original source
 bytes; the store does not infer them from a hash supplied by a caller.
