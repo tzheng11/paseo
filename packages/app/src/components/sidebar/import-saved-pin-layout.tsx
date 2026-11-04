@@ -4,6 +4,7 @@ import { useToast } from "@/contexts/toast-context";
 import { splitPinnedSidebarGroups, usePinnedSidebarKeys } from "@/hooks/use-sidebar-pins";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
 import { useSidebarOrderStore } from "@/stores/sidebar-order-store";
+import { useCanonicalSidebarState } from "@/stores/canonical-sidebar-runtime";
 import { useSidebarModel } from "./sidebar-model";
 import { seedPinnedWorkspaceTree } from "./workspace-tree/pinned-layout";
 import {
@@ -17,6 +18,7 @@ import {
  * never overwrite placements already shared by another client.
  */
 export function ImportSavedPinLayout() {
+  const canonical = useCanonicalSidebarState();
   const { allProjects } = useSidebarModel();
   const keys = usePinnedSidebarKeys(allProjects);
   const legacyTree = useSidebarOrderStore((state) => state.pinnedWorkspaceTree);
@@ -60,7 +62,7 @@ export function ImportSavedPinLayout() {
       setPending(false);
     }
   }, [updates, toast]);
-  if (!updates.length) return null;
+  if (canonical.enabled || !updates.length) return null;
   return (
     <Button
       variant="ghost"

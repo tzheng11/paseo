@@ -13,6 +13,8 @@ import { loadOrCreateDaemonKeyPair } from "./daemon-keypair.js";
 import { createTestPaseoDaemon } from "./test-utils/paseo-daemon.js";
 import { loadConfig } from "./config.js";
 import { savePersistedConfig } from "./persisted-config.js";
+import { CanonicalSidebarLayout } from "../../../app/src/stores/canonical-sidebar-layout.js";
+import { canonicalWorkspaceDrop } from "../../../app/src/components/sidebar/workspace-tree/canonical-drop.js";
 
 let root: string;
 const cleanup: Array<() => Promise<unknown>> = [];
@@ -128,6 +130,16 @@ test("password admission protects actual layout RPCs; two authenticated clients 
         entries: [entry],
       },
       {
+        kind: "import-host",
+        previousSourceSha256: null,
+        source: {
+          serverId: "srv_other",
+          sourceSha256: "c".repeat(64),
+          resolutionSha256: "d".repeat(64),
+        },
+        entries: [{ ...entry, ref: { serverId: "srv_other", workspaceId: "workspace" } }],
+      },
+      {
         kind: "put-navigation",
         expectedRevision: 0,
         preferences: emptyWorkspaceNavigationPreferences(),
@@ -197,6 +209,64 @@ test("password admission protects actual layout RPCs; two authenticated clients 
     await readFile(path.join(home, "workspace-layout.json"), "utf8"),
   );
   expect(disk.snapshot).toEqual(canonical);
+  let browserReplica: string | null = null;
+  const dependencies = {
+    read: async () => browserReplica,
+    write: async (bytes: string) => {
+      browserReplica = bytes;
+    },
+    hash: async (bytes: string) => createHash("sha256").update(bytes).digest("hex"),
+    requestId: randomUUID,
+    changed: () => {},
+  };
+  const browser = new CanonicalSidebarLayout(dependencies);
+  const detach = await browser.attach("private-hub-fixture", a, mode);
+  cleanup.push(() => browser.close());
+  await expect.poll(() => browser.state().writable).toBe(true);
+  await browser.update((preferences) => ({ ...preferences, pinnedWorkspaceSortMode: "activity" }));
+  const afterBrowser = await reconnected.getWorkspaceLayout();
+  expect(afterBrowser.navigation?.preferences.pinnedWorkspaceSortMode).toBe("activity");
+  expect(afterBrowser.stamp.revision).toBe(canonical.stamp.revision + 1);
+  expect(browser.state().snapshot).toEqual(afterBrowser);
+  await browser.mutate((snapshot) =>
+    canonicalWorkspaceDrop({
+      snapshot,
+      now: at,
+      catalog: [
+        {
+          workspaceKey: "srv_replica:workspace",
+          projectViewKey: "shared-view",
+          sidebarSection: "superpinned",
+        },
+        { workspaceKey: "srv_other:workspace", projectViewKey: "shared-view" },
+      ],
+      projectOrder: ["srv_replica:workspace", "srv_other:workspace"],
+      drop: {
+        workspaceKey: "srv_replica:workspace",
+        targetWorkspaceKey: "srv_other:workspace",
+        position: "after",
+        parentWorkspaceId: null,
+        beforeWorkspaceId: null,
+      },
+    }),
+  );
+  const afterDrop = await reconnected.getWorkspaceLayout();
+  expect(afterDrop.stamp.revision).toBe(afterBrowser.stamp.revision + 1);
+  expect(afterDrop.entries[0]).toMatchObject({ pinnedAt: null, superpinnedAt: null });
+  expect(afterDrop.navigation?.preferences.workspaceOrderByProject["shared-view"]).toEqual([
+    "srv_other:workspace",
+    "srv_replica:workspace",
+  ]);
+  detach();
+  await browser.close();
+  const freshBrowser = new CanonicalSidebarLayout(dependencies);
+  await freshBrowser.ready;
+  expect(freshBrowser.state()).toMatchObject({
+    enabled: true,
+    writable: false,
+    pending: false,
+    snapshot: afterDrop,
+  });
   for (const line of logs) {
     expect(line).not.toContain(password);
     expect(line).not.toContain(verifier);

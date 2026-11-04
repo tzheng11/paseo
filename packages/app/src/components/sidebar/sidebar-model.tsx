@@ -19,6 +19,7 @@ import {
   type SidebarGroupMode,
 } from "@/stores/sidebar-view-store";
 import { useSidebarOrderStore } from "@/stores/sidebar-order-store";
+import { useCanonicalSidebarState } from "@/stores/canonical-sidebar-runtime";
 import { useAppSettings } from "@/hooks/use-settings";
 import type { SidebarShortcutModel } from "@/utils/sidebar-shortcuts";
 import { buildSidebarProjection } from "./sidebar-projection";
@@ -81,8 +82,12 @@ export function SidebarModelProvider({
   const collapsedWorkspaceKeys = useSidebarCollapsedSectionsStore(
     (state) => state.collapsedWorkspaceKeys,
   );
-  const superpinnedWorkspaceOrder = useMemo<string[]>(() => [], []);
-  const pinnedWorkspaceOrder = superpinnedWorkspaceOrder;
+  const canonicalLayout = useCanonicalSidebarState();
+  const emptyOrder = useMemo<string[]>(() => [], []);
+  const superpinnedWorkspaceOrder =
+    canonicalLayout.snapshot?.navigation?.preferences.superpinnedWorkspaceOrder ?? emptyOrder;
+  const pinnedWorkspaceOrder =
+    canonicalLayout.snapshot?.navigation?.preferences.pinnedWorkspaceOrder ?? emptyOrder;
   const pinnedWorkspaceTree = useMemo(
     () => sharedPinnedWorkspaceTree(list.allProjects),
     [list.allProjects],

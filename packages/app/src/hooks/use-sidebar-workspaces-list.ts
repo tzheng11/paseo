@@ -8,6 +8,7 @@ import { workspaceEqualityFns } from "@/stores/session-store-hooks/selectors";
 import { useWorkspaceStructure } from "@/stores/session-store-hooks";
 import { getHostRuntimeStore, useHostRegistryLoaded, useHosts } from "@/runtime/host-runtime";
 import { useSidebarOrderStore } from "@/stores/sidebar-order-store";
+import { canonicalSidebar } from "@/stores/canonical-sidebar-runtime";
 import { useSidebarViewStore } from "@/stores/sidebar-view-store";
 import {
   buildSidebarWorkspacePlacementModel,
@@ -179,6 +180,7 @@ export function useSidebarWorkspacesList(options?: {
       : EMPTY_PROJECT_NAMES;
 
   useEffect(() => {
+    if (!canonicalSidebar.state().loaded || canonicalSidebar.state().enabled) return;
     const orderStore = useSidebarOrderStore.getState();
     const updates = computeSidebarOrderUpdates({
       projects,

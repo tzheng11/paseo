@@ -140,9 +140,38 @@ migration rule. Filters and grouping remain client preferences. Each source key
 has its own original hash in `clientImports`; partial preferences are provenance,
 and the resolved canonical navigation must explicitly supply the global sort.
 
-This store/API contract does not make an old client's independent local ordering
-canonical. Browser/native writer routing and read-only replica behavior must be
-qualified on the actual client before that client can count toward acceptance.
+The fork client binds its sidebar to the configured authority identity advertised
+by its authenticated host connection. Matching replicas are routes to that same
+authority; they do not elect a different authority. Conflicting server/key/epoch
+declarations refuse edits. The client subscribes to canonical snapshots and routes
+all project order, workspace order, pin-section order and sort setters through
+the daemon's forwarding API. Automatic local catalogue reconciliation never
+publishes an import or fills a shared order with defaults.
+
+The original `sidebar-project-workspace-order` and `sidebar-view` bytes remain
+untouched after canonical mode is known. A separate
+`canonical-sidebar-layout-replica-v1` observation/journal retains the last view,
+identity and original pending request. Client-only filters can still persist in a
+separate local preference key; their copy of global sort never becomes a writer.
+Hydration cannot replace a canonical observation with those old values. Cached
+views survive reload while offline, with editing refused and no offline queue.
+
+A client persists the normalized request and digest before dispatch. A definite
+CAS refusal requires refresh and a new user intent; an uncertain outcome retains
+the original request and blocks further edits. “Check saved change” performs only
+receipt/read queries. A matching receipt clears the uncertainty; no receipt is
+never permission to retry. An acknowledged revision remains the minimum accepted
+revision across client reloads. A failed follow-up read keeps the view read-only
+without relabelling the acknowledged write as failed.
+
+Canonical drag/drop commits pin membership, explicit placements and shared order
+in one transaction. Ordinary project order uses host-qualified keys, so moving
+one host's row does not rank other hosts' unranked rows or discard archived order
+references. Older, noncanonical hosts retain their existing host-local operation.
+This does not make an old client's independent local ordering canonical. Actual
+client/build/transport and cross-client restart acceptance still require release
+verification; stock packaged renderers that lack this client code are not
+qualified by daemon feature flags alone.
 
 ## Bootstrap and import
 

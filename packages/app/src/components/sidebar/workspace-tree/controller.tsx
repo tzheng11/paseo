@@ -17,6 +17,7 @@ import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import type { SidebarWorkspacePlacement } from "@/hooks/use-sidebar-workspaces-list";
 import { useSidebarCollapsedSectionsStore } from "@/stores/sidebar-collapsed-sections-store";
 import { useToast } from "@/contexts/toast-context";
+import { canonicalSidebar } from "@/stores/canonical-sidebar-runtime";
 import {
   resolveWorkspaceTreeDropResult,
   type WorkspaceDropPosition,
@@ -76,6 +77,7 @@ export function WorkspaceTreeController({
       setFailure(null);
       try {
         const current = resolveWorkspaceTreeDropResult({
+          canonicalOrder: canonicalSidebar.state().enabled,
           workspaces,
           allWorkspaces,
           workspaceKey: next.workspaceKey,
@@ -131,6 +133,7 @@ export function WorkspaceTreeController({
       const source = activeRef.current;
       const result = source
         ? resolveWorkspaceTreeDropResult({
+            canonicalOrder: canonicalSidebar.state().enabled,
             workspaces,
             allWorkspaces,
             workspaceKey: source,

@@ -76,6 +76,13 @@ import {
   type SidebarWorkspacePlacement,
 } from "@/hooks/use-sidebar-workspaces-list";
 import { useSidebarOrderStore } from "@/stores/sidebar-order-store";
+import {
+  canonicalSidebar,
+  saveSidebarLayout,
+  useCanonicalSidebarState,
+} from "@/stores/canonical-sidebar-runtime";
+import { canonicalWorkspaceDrop } from "@/components/sidebar/workspace-tree/canonical-drop";
+import { CanonicalSidebarNotice } from "@/components/sidebar/canonical-sidebar-notice";
 import { useSidebarViewStore, type SidebarGroupMode } from "@/stores/sidebar-view-store";
 import { useShowShortcutBadges } from "@/hooks/use-show-shortcut-badges";
 import {
@@ -1981,8 +1988,12 @@ export function SidebarWorkspaceList({
   const { allProjects } = useSidebarModel();
   const pinnedWorkspaceTree = useMemo(() => sharedPinnedWorkspaceTree(allProjects), [allProjects]);
   const fullPinnedKeys = usePinnedSidebarKeys(allProjects);
-  const pinnedWorkspaceOrder = useMemo<string[]>(() => [], []);
-  const superpinnedWorkspaceOrder = pinnedWorkspaceOrder;
+  const canonicalLayout = useCanonicalSidebarState();
+  const emptyOrder = useMemo<string[]>(() => [], []);
+  const pinnedWorkspaceOrder =
+    canonicalLayout.snapshot?.navigation?.preferences.pinnedWorkspaceOrder ?? emptyOrder;
+  const superpinnedWorkspaceOrder =
+    canonicalLayout.snapshot?.navigation?.preferences.superpinnedWorkspaceOrder ?? emptyOrder;
   const fullPinnedGroups = useMemo(() => {
     return splitPinnedSidebarGroups({
       projects: allProjects,
@@ -2054,6 +2065,12 @@ export function SidebarWorkspaceList({
     (reorderedWorkspaces: SidebarWorkspacePlacement[]) => {
       const reorderedWorkspaceKeys = reorderedWorkspaces.map((workspace) => workspace.workspaceKey);
       const currentOrder = getPinnedWorkspaceOrder();
+      if (canonicalSidebar.state().enabled) {
+        setPinnedWorkspaceOrder(
+          mergeWithRemainder({ currentOrder, reorderedVisibleKeys: reorderedWorkspaceKeys }),
+        );
+        return;
+      }
       setPinnedWorkspaceSortMode("manual");
       if (
         !hasVisibleOrderChanged({
@@ -2075,6 +2092,24 @@ export function SidebarWorkspaceList({
   );
   const handleWorkspaceMove = useCallback(
     async (drop: WorkspaceTreeDrop) => {
+      if (canonicalSidebar.state().enabled) {
+        const source = fullHierarchyWorkspaces.find(
+          (item) => item.workspaceKey === drop.workspaceKey,
+        );
+        const project = allProjects.find(
+          (candidate) => candidate.viewKey === source?.projectViewKey,
+        );
+        await saveSidebarLayout((snapshot) =>
+          canonicalWorkspaceDrop({
+            snapshot,
+            drop,
+            catalog: fullHierarchyWorkspaces,
+            projectOrder: project?.workspaces.map((item) => item.workspaceKey) ?? [],
+            now: new Date().toISOString(),
+          }),
+        );
+        return;
+      }
       if (!useSidebarOrderStore.persist.hasHydrated())
         throw new Error("Sidebar is still loading. Try again in a moment");
       const workspace = fullHierarchyWorkspaces.find(
@@ -2300,6 +2335,7 @@ export function SidebarWorkspaceList({
     },
     [
       fullHierarchyWorkspaces,
+      allProjects,
       hierarchyWorkspaces,
       pinnedWorkspaceTree,
       pinnedGroups.unpinnedProjects,
@@ -2375,6 +2411,7 @@ export function SidebarWorkspaceList({
       supportedPinnedServerIds={supportsPinPlacementByServerId}
       onMove={handleWorkspaceMove}
     >
+      <CanonicalSidebarNotice />
       {content}
     </WorkspaceTreeProvider>
   );

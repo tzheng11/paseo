@@ -1,4 +1,5 @@
 import { z } from "zod";
+export const UNGROUPED_WORKSPACE_SORT_KEY = "section:workspaces";
 import type { WorkspaceNavigationPreferences } from "./workspace-layout.js";
 
 type SidebarWorkspaceSortMode = WorkspaceNavigationPreferences["pinnedWorkspaceSortMode"];

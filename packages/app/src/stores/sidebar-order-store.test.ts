@@ -164,7 +164,7 @@ describe("migrateSidebarOrderState", () => {
           complete = true;
           return undefined;
         });
-      await Promise.resolve();
+      await vi.waitFor(() => expect(typeof release).toBe("function"));
       expect(complete).toBe(false);
       release();
       await pending;

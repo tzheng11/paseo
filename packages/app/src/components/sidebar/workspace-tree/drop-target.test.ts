@@ -30,6 +30,33 @@ const input = {
   position: "inside" as const,
 };
 describe("pinned workspace tree drops", () => {
+  it("permits host-qualified ordinary order within one canonical project view while legacy hosts keep their boundary", () => {
+    const rows = [
+      { ...workspace("same"), sidebarSection: undefined },
+      {
+        ...workspace("same"),
+        workspaceKey: "remote:same",
+        serverId: "remote",
+        sidebarSection: undefined,
+      },
+    ];
+    const request = {
+      workspaces: rows,
+      workspaceKey: "remote:same",
+      targetWorkspaceKey: "host:same",
+      position: "before" as const,
+    };
+    expect(resolveWorkspaceTreeDrop(request)).toBeNull();
+    expect(resolveWorkspaceTreeDrop({ ...request, canonicalOrder: true })).toMatchObject({
+      workspaceKey: "remote:same",
+      targetWorkspaceKey: "host:same",
+      beforeWorkspaceKey: "host:same",
+      parentWorkspaceId: null,
+    });
+    expect(
+      resolveWorkspaceTreeDrop({ ...request, canonicalOrder: true, position: "inside" }),
+    ).toBeNull();
+  });
   it("nests and reorders unpinned workspaces across projects and hosts in None", () => {
     const unpinned = [
       { ...workspace("a"), sidebarSection: "unpinned" as const },

@@ -5,6 +5,12 @@ import { persist, type StateStorage } from "zustand/middleware";
 import { z } from "zod";
 import { workspaceLabelKey } from "@getpaseo/protocol/workspace-labels";
 import { createValidatedPersistStorage } from "@/storage/validated-persist-storage";
+import {
+  canonicalSidebar,
+  canonicalSidebarState,
+  routeSidebarNavigation,
+  preserveLegacySidebarStorage,
+} from "./canonical-sidebar-runtime";
 
 export type SidebarGroupMode = "none" | "project" | "status";
 
@@ -201,7 +207,10 @@ export const useSidebarViewStore = create<SidebarViewStoreState>()(
       labelFilter: emptyLabelFilter(),
       toggleBackground: () => set((state) => ({ showBackground: !state.showBackground })),
       setGroupMode: (mode) => set({ groupMode: mode }),
-      setWorkspaceSort: (workspaceSort) => set({ workspaceSort }),
+      setWorkspaceSort: (workspaceSort) => {
+        if (routeSidebarNavigation((current) => ({ ...current, workspaceSort }))) return;
+        set({ workspaceSort });
+      },
       toggleHostFilter: (serverId) =>
         set((state) => ({ hostFilters: toggleFilterEntry(state.hostFilters, serverId) })),
       clearHostFilters: () => set({ hostFilters: [] }),
@@ -243,7 +252,9 @@ export const useSidebarViewStore = create<SidebarViewStoreState>()(
       name: SIDEBAR_VIEW_STORAGE_KEY,
       version: SIDEBAR_VIEW_STORE_VERSION,
       storage: createValidatedPersistStorage(
-        createSidebarViewStorage(),
+        createSidebarViewStorage(
+          preserveLegacySidebarStorage(AsyncStorage, "sidebar-view-local-replica-v1"),
+        ),
         SidebarViewPersistedStateSchema,
       ),
       partialize: (state) => ({
@@ -255,9 +266,19 @@ export const useSidebarViewStore = create<SidebarViewStoreState>()(
         labelFilter: state.labelFilter,
       }),
       migrate: migrateSidebarViewState,
+      merge: (persisted, current) => {
+        const merged = Object.assign({}, current, persisted);
+        if (canonicalSidebar.state().enabled) merged.workspaceSort = current.workspaceSort;
+        return merged;
+      },
     },
   ),
 );
+
+canonicalSidebarState.subscribe((state) => {
+  const workspaceSort = state.snapshot?.navigation?.preferences.workspaceSort;
+  if (state.enabled && workspaceSort) useSidebarViewStore.setState({ workspaceSort });
+});
 
 function emptyLabelFilter(): SidebarLabelFilter {
   return { labels: [] };

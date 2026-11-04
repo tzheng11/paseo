@@ -41,6 +41,7 @@ import {
 } from "./controller";
 import { workspaceDropPosition, type WorkspaceTreeDrop } from "./drop-target";
 import { resolveWorkspaceKeyboardDrop } from "./keyboard-drop";
+import { canonicalSidebar } from "@/stores/canonical-sidebar-runtime";
 import {
   WorkspaceTreeRowChrome,
   WorkspaceTreeDragPreview,
@@ -105,6 +106,7 @@ function WebTreeDragSurface({ children }: { children: React.ReactNode }) {
         })
         .sort((left, right) => left.rect.top - right.rect.top);
       const next = resolveWorkspaceKeyboardDrop({
+        canonicalOrder: canonicalSidebar.state().enabled,
         code: event.code,
         workspaces: drag.workspaces,
         allWorkspaces: drag.allWorkspaces,

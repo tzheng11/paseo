@@ -3,6 +3,12 @@ import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { createValidatedPersistStorage } from "@/storage/validated-persist-storage";
 import {
+  canonicalSidebar,
+  canonicalSidebarState,
+  routeSidebarNavigation,
+  preserveLegacySidebarStorage,
+} from "./canonical-sidebar-runtime";
+import {
   migrateSidebarOrderState,
   dedupeKeys,
   PinnedWorkspaceTreeSchema,
@@ -48,6 +54,11 @@ export const useSidebarOrderStore = create<SidebarOrderStoreState>()(
       superpinnedWorkspaceOrder: [],
       pinnedWorkspaceTree: {},
       setPinnedWorkspaceTree: async (tree, rootOrder) => {
+        await canonicalSidebar.ready;
+        if (canonicalSidebar.state().enabled)
+          throw new Error(
+            "Legacy client trees are read-only. Use the shared workspace placement action.",
+          );
         const previous = get();
         const update: Partial<SidebarOrderStoreState> = {
           pinnedWorkspaceTree: PinnedWorkspaceTreeSchema.parse(tree),
@@ -89,13 +100,36 @@ export const useSidebarOrderStore = create<SidebarOrderStoreState>()(
           throw error;
         }
       },
-      setSuperpinnedWorkspaceOrder: (keys) => set({ superpinnedWorkspaceOrder: dedupeKeys(keys) }),
+      setSuperpinnedWorkspaceOrder: (keys) => {
+        if (
+          routeSidebarNavigation((current) => ({
+            ...current,
+            superpinnedWorkspaceOrder: dedupeKeys(keys),
+          }))
+        )
+          return;
+        set({ superpinnedWorkspaceOrder: dedupeKeys(keys) });
+      },
       pinnedWorkspaceSortMode: "manual",
-      setPinnedWorkspaceSortMode: (mode) => set({ pinnedWorkspaceSortMode: mode }),
+      setPinnedWorkspaceSortMode: (mode) => {
+        if (routeSidebarNavigation((current) => ({ ...current, pinnedWorkspaceSortMode: mode })))
+          return;
+        set({ pinnedWorkspaceSortMode: mode });
+      },
       workspaceOrderByProject: {},
       workspaceSortModeByProject: {},
       setWorkspaceSortMode: (projectViewKey, mode) => {
         if (!projectViewKey.trim()) return;
+        if (
+          routeSidebarNavigation((current) => ({
+            ...current,
+            workspaceSortModeByProject: {
+              ...current.workspaceSortModeByProject,
+              [projectViewKey]: mode,
+            },
+          }))
+        )
+          return;
         set((state) => ({
           workspaceSortModeByProject: {
             ...state.workspaceSortModeByProject,
@@ -105,10 +139,20 @@ export const useSidebarOrderStore = create<SidebarOrderStoreState>()(
       },
       getProjectOrder: () => get().projectOrder,
       setProjectOrder: (keys) => {
+        if (routeSidebarNavigation((current) => ({ ...current, projectOrder: dedupeKeys(keys) })))
+          return;
         set({ projectOrder: dedupeKeys(keys) });
       },
       getPinnedWorkspaceOrder: () => get().pinnedWorkspaceOrder,
       setPinnedWorkspaceOrder: (keys) => {
+        if (
+          routeSidebarNavigation((current) => ({
+            ...current,
+            pinnedWorkspaceOrder: dedupeKeys(keys),
+            pinnedWorkspaceSortMode: "manual",
+          }))
+        )
+          return;
         set({
           pinnedWorkspaceOrder: dedupeKeys(keys),
           pinnedWorkspaceSortMode: "manual",
@@ -120,6 +164,16 @@ export const useSidebarOrderStore = create<SidebarOrderStoreState>()(
       },
       setWorkspaceOrder: (projectViewKey, keys) => {
         if (!projectViewKey.trim()) return;
+        if (
+          routeSidebarNavigation((current) => ({
+            ...current,
+            workspaceOrderByProject: {
+              ...current.workspaceOrderByProject,
+              [projectViewKey]: dedupeKeys(keys),
+            },
+          }))
+        )
+          return;
         set((state) => ({
           workspaceOrderByProject: {
             ...state.workspaceOrderByProject,
@@ -130,7 +184,10 @@ export const useSidebarOrderStore = create<SidebarOrderStoreState>()(
     }),
     {
       name: "sidebar-project-workspace-order",
-      storage: createValidatedPersistStorage(AsyncStorage, SidebarOrderPersistedStateSchema),
+      storage: createValidatedPersistStorage(
+        preserveLegacySidebarStorage(AsyncStorage),
+        SidebarOrderPersistedStateSchema,
+      ),
       partialize: (state) => ({
         projectOrder: state.projectOrder,
         pinnedWorkspaceOrder: state.pinnedWorkspaceOrder,
@@ -142,6 +199,16 @@ export const useSidebarOrderStore = create<SidebarOrderStoreState>()(
       }),
       version: 3,
       migrate: migrateSidebarOrderState,
+      merge: (persisted, current) =>
+        canonicalSidebar.state().enabled ? current : Object.assign({}, current, persisted),
     },
   ),
 );
+
+canonicalSidebarState.subscribe((state) => {
+  const preferences = state.snapshot?.navigation?.preferences;
+  if (state.enabled && preferences) {
+    const { workspaceSort: _sort, ...orders } = preferences;
+    useSidebarOrderStore.setState(orders);
+  }
+});

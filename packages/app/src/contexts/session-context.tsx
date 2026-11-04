@@ -47,6 +47,8 @@ import {
 import { derivePendingPermissionKey } from "@/utils/agent-snapshots";
 import { useToast } from "@/contexts/toast-context";
 import { toErrorMessage } from "@/utils/error-messages";
+import { canonicalSidebar, canonicalSidebarState } from "@/stores/canonical-sidebar-runtime";
+import { WorkspaceLayoutConfigSchema } from "@getpaseo/protocol/workspace-layout";
 import { showProviderNoticeToast } from "@/utils/provider-notice-toast";
 import { applyCheckoutStatusUpdateFromEvent } from "@/git/checkout-status-cache";
 import { resyncProviderSubagents, useProviderSubagentStore } from "@/subagents/provider-store";
@@ -203,7 +205,39 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
   const voiceAudioEngine = useVoiceAudioEngineOptional();
   const queryClient = useQueryClient();
   const isConnected = useHostRuntimeIsConnected(serverId);
+  const layoutAuthority = useSessionStore((state) => {
+    const config = state.sessions[serverId]?.serverInfo?.workspaceLayout;
+    return config
+      ? JSON.stringify({
+          role: config.role,
+          authorityServerId: config.authorityServerId,
+          authorityId: config.authorityId,
+          epoch: config.epoch,
+          authorityKeySha256: config.authorityKeySha256,
+        })
+      : null;
+  });
   const toast = useToast();
+
+  useEffect(() => {
+    if (!isConnected || !layoutAuthority) return;
+    let disposed = false;
+    let detach: (() => void) | undefined;
+    void canonicalSidebar
+      .attach(serverId, client, WorkspaceLayoutConfigSchema.parse(JSON.parse(layoutAuthority)))
+      .then((release) => {
+        if (disposed) release();
+        else detach = release;
+        return undefined;
+      })
+      .catch((error) => {
+        canonicalSidebarState.setState({ actionError: toErrorMessage(error) });
+      });
+    return () => {
+      disposed = true;
+      detach?.();
+    };
+  }, [serverId, client, isConnected, layoutAuthority]);
 
   // Zustand store actions
   const setIsPlayingAudio = useSessionStore((state) => state.setIsPlayingAudio);
