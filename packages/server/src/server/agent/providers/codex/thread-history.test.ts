@@ -23,10 +23,12 @@ function agentItem(id: string, text: string) {
 async function openCodexThread(
   thread: FakeCodexHistoryThread,
   options?: FakeCodexHistoryOptions,
+  userAgent = "codex/0.159.2",
 ): Promise<{ appServer: FakeCodexAppServer; session: AgentSession }> {
-  const appServer = createFakeCodexAppServer(
-    fakeCodexThreadHistory({ "saved-thread": thread }, options),
-  );
+  const appServer = createFakeCodexAppServer({
+    ...fakeCodexThreadHistory({ "saved-thread": thread }, options),
+    initialize: () => ({ userAgent }),
+  });
   const provider = new CodexAppServerAgentClient(createTestLogger());
   const internals = provider as unknown as {
     goalsEnabledPromise: Promise<boolean> | null;
@@ -155,7 +157,7 @@ describe("Codex thread history", () => {
     );
     const loaded = [
       { type: "user_message", text: "One", messageId: "user-1" },
-      ...answers.slice(0, 99).map((answer) => ({
+      ...answers.map((answer) => ({
         type: "assistant_message",
         text: answer.text,
         messageId: answer.id,
@@ -168,8 +170,14 @@ describe("Codex thread history", () => {
     ];
     try {
       expect(timelineItems(await readHistory(session))).toEqual(loaded);
-      // The oversized reply failed only its own request; the session still answers.
-      expect(timelineItems(await readHistory(session))).toEqual(loaded);
+      // The fork transfers replay windows to Paseo once; another inspection
+      // must not reread the rejected provider response.
+      expect(timelineItems(await readHistory(session))).toEqual([]);
+      const requestsBeforeTurn = historyRequests(appServer);
+      await session.startTurn("Continue without rereading oversized history");
+      await appServer.waitForTurnStart();
+      appServer.completeTurn({ threadId: "saved-thread" });
+      expect(historyRequests(appServer)).toEqual(requestsBeforeTurn);
     } finally {
       await session.close();
     }
@@ -195,26 +203,34 @@ describe("Codex thread history", () => {
     appServer.assertNoErrors();
   });
 
-  test("a legacy thread too big for one read shows the migration command", async () => {
-    const { appServer, session } = await openCodexThread(
-      {
-        historyMode: "legacy",
-        turns: [{ id: "turn-1", items: [userItem("user-1", "Hello"), agentItem("huge", "x")] }],
-      },
-      { oversizedItemIds: ["huge"] },
-    );
-    const migrationRow = {
-      type: "notification",
-      level: "warning",
-      message: expect.stringContaining("codex migrate-rollouts --apply --thread saved-thread"),
-    };
-    try {
-      expect(timelineItems(await readHistory(session))).toEqual([migrationRow]);
-      // The session stays up for the user to prompt until they archive it to migrate.
-      expect(timelineItems(await readHistory(session))).toEqual([migrationRow]);
-    } finally {
-      await session.close();
-    }
-    appServer.assertNoErrors();
-  });
+  test.each(["codex/0.148.0", "codex/0.159.2"])(
+    "a legacy thread too big for one read shows the migration command and remains usable (%s)",
+    async (userAgent) => {
+      const { appServer, session } = await openCodexThread(
+        {
+          historyMode: "legacy",
+          turns: [{ id: "turn-1", items: [userItem("user-1", "Hello"), agentItem("huge", "x")] }],
+        },
+        { oversizedItemIds: ["huge"] },
+        userAgent,
+      );
+      const migrationRow = {
+        type: "notification",
+        level: "warning",
+        message: expect.stringContaining("codex migrate-rollouts --apply --thread saved-thread"),
+      };
+      try {
+        expect(timelineItems(await readHistory(session))).toEqual([migrationRow]);
+        expect(timelineItems(await readHistory(session))).toEqual([]);
+        const requestsBeforeTurn = historyRequests(appServer);
+        await session.startTurn("Continue without rereading oversized history");
+        await appServer.waitForTurnStart();
+        appServer.completeTurn({ threadId: "saved-thread" });
+        expect(historyRequests(appServer)).toEqual(requestsBeforeTurn);
+      } finally {
+        await session.close();
+      }
+      appServer.assertNoErrors();
+    },
+  );
 });

@@ -103,6 +103,7 @@ import {
   type CodexThreadRollbackResponse,
   type CodexAppServerTraceContext,
 } from "./codex/app-server-transport.js";
+import { codexHistoryReadWarning } from "./codex/thread-history.js";
 import {
   type CodexUserMessageTurnIndex,
   readCodexThreadHistoryMode,
@@ -2238,8 +2239,11 @@ async function loadCodexThreadHistoryTimeline(params: {
   const subAgents = new Map<string, PersistedTimelineEntry>();
   const userMessages: CodexThreadHistoryProjection["userMessages"] = [];
   const asyncQuestionIds = new Set<string>();
+  const historyMode = params.pagedHistoryAvailable
+    ? (params.historyMode ?? (await readCodexThreadHistoryMode(params.client, params.threadId)))
+    : "legacy";
   async function* entries(): AsyncGenerator<PersistedTimelineEntry> {
-    for await (const turn of readCodexHistoryTurns(params)) {
+    for await (const turn of readCodexHistoryTurns({ ...params, historyMode })) {
       for (const item of turn.items) {
         const activity = readCodexSubAgentActivity(item);
         const existing = activity && subAgents.get(activity.agentThreadId);
@@ -2283,7 +2287,22 @@ async function loadCodexThreadHistoryTimeline(params: {
       }
     }
   }
-  const timeline = await AgentHistoryReplay.create(entries(), {
+  async function* entriesWithWarning(): AsyncGenerator<PersistedTimelineEntry> {
+    try {
+      yield* entries();
+    } catch (error) {
+      const message = codexHistoryReadWarning(error, params.threadId, historyMode);
+      if (message === null) throw error;
+      // Retain preceding pages and mark this history loaded. A transport cap is
+      // not a reason to block every subsequent turn or reread it on each prompt.
+      yield {
+        type: "timeline",
+        provider: CODEX_PROVIDER,
+        item: { type: "notification", level: "warning", message },
+      };
+    }
+  }
+  const timeline = await AgentHistoryReplay.create(entriesWithWarning(), {
     measureSource: false,
     key: ({ item }) =>
       item.type === "tool_call" && item.detail.type === "sub_agent" ? item.callId : null,
