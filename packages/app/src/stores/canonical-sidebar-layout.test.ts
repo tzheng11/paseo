@@ -245,3 +245,109 @@ test("a retired subscription cannot make the replacement connection read-only", 
   failRetired(new Error("late old connection failure"));
   expect(f.controller.state().writable).toBe(true);
 });
+
+test.each(["workspace_cycle", "authority_busy", "layout_importing", "authority_request_not_sent"])(
+  "a definite %s refusal retires its intent without replay",
+  async (code) => {
+    const f = fixture();
+    const p = peer();
+    await f.controller.attach("replica", p.client, config);
+    await vi.waitFor(() => expect(f.controller.state().writable).toBe(true));
+    p.commit.mockRejectedValueOnce(Object.assign(new Error("refused"), { code }));
+    await expect(
+      f.controller.update((current) => ({ ...current, projectOrder: ["refused"] })),
+    ).rejects.toThrow("refused");
+    expect(f.controller.state()).toMatchObject({ pending: false, writable: false });
+    await f.controller.reconcile();
+    expect(f.controller.state().writable).toBe(true);
+    expect(p.commit).toHaveBeenCalledTimes(1);
+  },
+);
+
+test("a never-sent storage failure cannot be saved later as an uncertain dispatch", async () => {
+  const f = fixture();
+  const p = peer();
+  await f.controller.attach("replica", p.client, config);
+  await vi.waitFor(() => expect(f.controller.state().writable).toBe(true));
+  f.write.mockRejectedValueOnce(new Error("disk full"));
+  await expect(
+    f.controller.update((current) => ({ ...current, projectOrder: ["never-sent"] })),
+  ).rejects.toThrow("disk full");
+  expect(f.controller.state().pending).toBe(false);
+  await f.controller.reconcile();
+  expect(JSON.parse(f.bytes()!).pending).toBeNull();
+  expect(f.controller.state().writable).toBe(true);
+  expect(p.commit).not.toHaveBeenCalled();
+});
+
+test("a newer same-epoch CAS followed by an absent receipt retires an impossible original request", async () => {
+  const f = fixture();
+  const p = peer();
+  await f.controller.attach("replica", p.client, config);
+  await vi.waitFor(() => expect(f.controller.state().writable).toBe(true));
+  p.commit.mockRejectedValueOnce(new Error("unknown"));
+  await expect(
+    f.controller.update((current) => ({ ...current, projectOrder: ["unknown"] })),
+  ).rejects.toThrow("unknown");
+  p.snapshot().stamp.revision++;
+  await f.controller.reconcile();
+  expect(f.controller.state()).toMatchObject({ pending: false, writable: true });
+  expect(p.commit).toHaveBeenCalledTimes(1);
+});
+
+test("a request that commits between the snapshot and receipt reads remains uncertain when the receipt read races it", async () => {
+  const f = fixture();
+  const p = peer();
+  await f.controller.attach("replica", p.client, config);
+  await vi.waitFor(() => expect(f.controller.state().writable).toBe(true));
+  const apply = p.commit.getMockImplementation()!;
+  p.commit.mockRejectedValueOnce(new Error("unknown"));
+  await expect(
+    f.controller.update((current) => ({ ...current, projectOrder: ["later"] })),
+  ).rejects.toThrow("unknown");
+  const input = JSON.parse(f.bytes()!).pending.input;
+  p.lookup.mockImplementationOnce(async () => {
+    await apply(input);
+    return null;
+  });
+  await expect(f.controller.reconcile()).rejects.toThrow("No durable receipt");
+  expect(f.controller.state().pending).toBe(true);
+  await f.controller.reconcile();
+  expect(f.controller.state()).toMatchObject({ pending: false, writable: true });
+  expect(p.commit).toHaveBeenCalledTimes(1);
+});
+
+test("a proven pre-send SDK refusal leaves no uncertain intent", async () => {
+  const f = fixture();
+  const p = peer();
+  await f.controller.attach("replica", p.client, config);
+  await vi.waitFor(() => expect(f.controller.state().writable).toBe(true));
+  p.commit.mockRejectedValueOnce(
+    Object.assign(new Error("not sent"), { code: "DAEMON_REQUEST_NOT_SENT", outcome: "not-sent" }),
+  );
+  await expect(
+    f.controller.update((current) => ({ ...current, projectOrder: ["no-send"] })),
+  ).rejects.toThrow("not sent");
+  expect(f.controller.state().pending).toBe(false);
+  await f.controller.reconcile();
+  expect(f.controller.state().writable).toBe(true);
+  expect(p.commit).toHaveBeenCalledTimes(1);
+});
+
+test("a retired subscription's late release failure cannot disable its replacement", async () => {
+  const f = fixture();
+  const old = peer();
+  let failRelease!: (reason: Error) => void;
+  const released = new Promise<void>((_resolve, reject) => {
+    failRelease = reject;
+  });
+  old.release.mockImplementationOnce(() => released);
+  const detach = await f.controller.attach("replica", old.client, config);
+  await vi.waitFor(() => expect(f.controller.state().writable).toBe(true));
+  detach();
+  await f.controller.attach("replica", peer().client, config);
+  await vi.waitFor(() => expect(f.controller.state().writable).toBe(true));
+  failRelease(new Error("old release failed"));
+  await released.catch(() => {});
+  expect(f.controller.state().writable).toBe(true);
+});

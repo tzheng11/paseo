@@ -151,3 +151,97 @@ test("stale section or unavailable targets refuse before returning any mutation"
     }),
   ).toThrow("pin sections changed");
 });
+
+test.each(["pinned", "superpinned"] as const)(
+  "an archived child's dormant edge does not block a live parent's %s move",
+  (destination) => {
+    const parent = {
+      ...entry("a", "parent"),
+      pinnedAt: now,
+      pinPlacement: { parentWorkspaceKey: null, siblingOrder: 0, revision: 1 },
+    };
+    const child = {
+      ...entry("b", "archived"),
+      archivedAt: now,
+      pinnedAt: now,
+      pinPlacement: { parentWorkspaceKey: "a:parent", siblingOrder: 8, revision: 2 },
+    };
+    const target = {
+      ...entry("c", "target"),
+      pinnedAt: now,
+      superpinnedAt: destination === "superpinned" ? now : null,
+      pinPlacement: { parentWorkspaceKey: null, siblingOrder: 1024, revision: 1 },
+    };
+    const snapshot = state([parent, child, target]);
+    const mutations = canonicalWorkspaceDrop({
+      snapshot,
+      now,
+      catalog: [
+        { workspaceKey: "a:parent", sidebarSection: "pinned" },
+        { workspaceKey: "c:target", sidebarSection: destination },
+      ],
+      projectOrder: [],
+      drop: {
+        workspaceKey: "a:parent",
+        targetWorkspaceKey: "c:target",
+        position: "before",
+        parentWorkspaceId: null,
+        beforeWorkspaceId: "target",
+        parentWorkspaceKey: null,
+        beforeWorkspaceKey: "c:target",
+        pinSection: destination,
+      },
+    });
+    expect(
+      mutations.some(
+        (mutation) => mutation.kind === "put" && mutation.entry.ref.workspaceId === "parent",
+      ),
+    ).toBe(true);
+    expect(
+      mutations.some(
+        (mutation) => mutation.kind === "put" && mutation.entry.ref.workspaceId === "archived",
+      ),
+    ).toBe(false);
+    expect(snapshot.entries[1]).toEqual(child);
+  },
+);
+
+test("switching global sort for one project preserves every other visible unsaved order", () => {
+  const snapshot = state([entry("a", "one"), entry("b", "two")]);
+  snapshot.navigation!.preferences.workspaceSort = "created";
+  snapshot.navigation!.preferences.workspaceOrderByProject.saved = ["z:old"];
+  const mutations = canonicalWorkspaceDrop({
+    snapshot,
+    now,
+    catalog: [
+      { workspaceKey: "a:one", projectViewKey: "moved" },
+      { workspaceKey: "b:two", projectViewKey: "moved" },
+    ],
+    projectOrder: ["a:one", "b:two"],
+    projects: [
+      {
+        viewKey: "untouched",
+        workspaces: [{ workspaceKey: "z:newer" }, { workspaceKey: "z:older" }],
+      },
+      { viewKey: "saved", workspaces: [{ workspaceKey: "z:new" }] },
+    ],
+    drop: {
+      workspaceKey: "b:two",
+      targetWorkspaceKey: "a:one",
+      position: "before",
+      parentWorkspaceId: null,
+      beforeWorkspaceId: "one",
+    },
+  });
+  expect(mutations.at(-1)).toMatchObject({
+    kind: "put-navigation",
+    preferences: {
+      workspaceSort: "manual",
+      workspaceOrderByProject: {
+        moved: ["b:two", "a:one"],
+        untouched: ["z:newer", "z:older"],
+        saved: ["z:old"],
+      },
+    },
+  });
+});

@@ -2105,6 +2105,7 @@ export function SidebarWorkspaceList({
             drop,
             catalog: fullHierarchyWorkspaces,
             projectOrder: project?.workspaces.map((item) => item.workspaceKey) ?? [],
+            projects: pinnedGroups.unpinnedProjects,
             now: new Date().toISOString(),
           }),
         );

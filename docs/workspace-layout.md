@@ -157,17 +157,24 @@ Hydration cannot replace a canonical observation with those old values. Cached
 views survive reload while offline, with editing refused and no offline queue.
 
 A client persists the normalized request and digest before dispatch. A definite
-CAS refusal requires refresh and a new user intent; an uncertain outcome retains
+semantic or proven pre-send refusal requires refresh and a new user intent; an uncertain outcome retains
 the original request and blocks further edits. “Check saved change” performs only
-receipt/read queries. A matching receipt clears the uncertainty; no receipt is
-never permission to retry. An acknowledged revision remains the minimum accepted
+receipt/read queries. A matching receipt clears the uncertainty. Alternatively,
+a newer same-epoch snapshot read **before** a subsequent absent-receipt read
+proves the old CAS can never apply; the intent can be retired without replay.
+An absent receipt at the original CAS, transport loss after submission or a
+generic persistence failure stays unknown. Layout commits never queue for a
+later connection. An acknowledged revision remains the minimum accepted
 revision across client reloads. A failed follow-up read keeps the view read-only
 without relabelling the acknowledged write as failed.
 
 Canonical drag/drop commits pin membership, explicit placements and shared order
 in one transaction. Ordinary project order uses host-qualified keys, so moving
 one host's row does not rank other hosts' unranked rows or discard archived order
-references. Older, noncanonical hosts retain their existing host-local operation.
+references. Archived descendants retain dormant edges and are excluded from
+active drag membership. Before a client observes canonical mode, legacy hosts
+retain their host-local operation. Afterwards, rows missing from the canonical
+import refuse shared edits; the client never switches those rows to a local writer.
 This does not make an old client's independent local ordering canonical. Actual
 client/build/transport and cross-client restart acceptance still require release
 verification; stock packaged renderers that lack this client code are not

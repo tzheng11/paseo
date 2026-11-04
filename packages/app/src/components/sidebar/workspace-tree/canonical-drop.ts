@@ -12,6 +12,7 @@ import {
 } from "./pinned-layout";
 import type { WorkspaceTreeDrop } from "./drop-target";
 import { UNGROUPED_WORKSPACE_SORT_KEY } from "@getpaseo/protocol/sidebar-order";
+import { captureUnmovedProjectOrders } from "../../../utils/sidebar-reorder";
 
 interface CatalogItem {
   workspaceKey: string;
@@ -28,6 +29,7 @@ interface CanonicalDropInput {
   drop: WorkspaceTreeDrop;
   catalog: readonly CatalogItem[];
   projectOrder: readonly string[];
+  projects?: Parameters<typeof captureUnmovedProjectOrders>[0]["projects"];
   now: string;
 }
 /** One CAS transaction for membership, parent links and cross-host visible order. No per-host effects. */
@@ -65,7 +67,7 @@ function prepareDrop(input: CanonicalDropInput) {
   }
   const tree = Object.fromEntries(
     snapshot.entries.flatMap((entry) =>
-      entry.pinPlacement
+      entry.pinPlacement && !entry.archivedAt
         ? [[`${entry.ref.serverId}:${entry.ref.workspaceId}`, entry.pinPlacement]]
         : [],
     ),
@@ -155,6 +157,16 @@ function applyProjectOrder(
   const view = catalog.get(drop.workspaceKey)!.projectViewKey;
   if (!view || view !== catalog.get(drop.targetWorkspaceKey)!.projectViewKey)
     throw new Error("Reorder within the same project view.");
+  if (preferences.workspaceSort !== "manual") {
+    if (!input.projects) throw new Error("Refresh project orders before changing the shared sort.");
+    for (const update of captureUnmovedProjectOrders({
+      projects: input.projects,
+      movedProjectViewKey: view,
+      workspaceOrderByProject: preferences.workspaceOrderByProject,
+      workspaceSortModeByProject: preferences.workspaceSortModeByProject,
+    }))
+      preferences.workspaceOrderByProject[update.projectViewKey] = update.order;
+  }
   const ordered = input.projectOrder.filter((key) => key !== drop.workspaceKey);
   const index = ordered.indexOf(drop.targetWorkspaceKey);
   if (index < 0) throw new Error("Destination workspace is not in the current project view.");

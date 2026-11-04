@@ -1,6 +1,9 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import {
+  DaemonRequestNotSentError,
+  type DaemonClient,
+} from "@getpaseo/client/internal/daemon-client";
 import {
   WorkspaceLayoutSnapshotSchema,
   WorkspaceLayoutCommitSchema,
@@ -153,7 +156,7 @@ export class WorkspaceLayoutService {
     this.assertIdentity(input.expected);
     let receipt: WorkspaceLayoutReceipt;
     if (this.store) receipt = await this.store.commit(input);
-    else receipt = (await this.remote((client) => client.commitWorkspaceLayout(input))).receipt;
+    else receipt = await this.forwardCommit(input);
     this.assertIdentity(receipt.stamp);
     if (receipt.requestId !== input.requestId || receipt.requestSha256 !== hashLayoutValue(input))
       throw new WorkspaceLayoutRefusal("invalid_commit_receipt");
@@ -167,6 +170,20 @@ export class WorkspaceLayoutService {
       this.options.failed(error);
     }
     return receipt;
+  }
+
+  private async forwardCommit(input: WorkspaceLayoutCommit): Promise<WorkspaceLayoutReceipt> {
+    let entered = false;
+    try {
+      return await this.remote(async (client) => {
+        entered = true;
+        return (await client.commitWorkspaceLayout(input)).receipt;
+      });
+    } catch (error) {
+      if (!entered || error instanceof DaemonRequestNotSentError)
+        throw new WorkspaceLayoutRefusal("authority_request_not_sent");
+      throw error;
+    }
   }
 
   async close(): Promise<void> {

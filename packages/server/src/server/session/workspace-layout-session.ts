@@ -2,6 +2,7 @@ import type { Logger } from "pino";
 import type { SessionInboundMessage, SessionOutboundMessage } from "../messages.js";
 import type { WorkspaceLayoutService } from "../workspace-layout-service.js";
 import { WorkspaceLayoutRefusal } from "../workspace-layout-store.js";
+import { DaemonRpcError } from "@getpaseo/client/internal/daemon-client";
 import type { SessionDelivery } from "./owned-subscriptions/index.js";
 
 type LayoutRequest = Extract<
@@ -69,7 +70,11 @@ export class WorkspaceLayoutSession {
           },
         });
     } catch (error) {
-      if (!(error instanceof WorkspaceLayoutRefusal))
+      let code: string | undefined;
+      if (error instanceof WorkspaceLayoutRefusal) code = error.code;
+      else if (error instanceof DaemonRpcError && error.requestType === message.type)
+        code = error.code;
+      if (!code)
         this.logger.error(
           { err: error, operation: message.type },
           "Workspace layout request failed",
@@ -79,7 +84,7 @@ export class WorkspaceLayoutSession {
         payload: {
           requestId: message.requestId,
           requestType: message.type,
-          code: error instanceof WorkspaceLayoutRefusal ? error.code : "layout_failed",
+          code: code ?? "layout_failed",
           error: "Workspace layout could not be verified. Refresh the authority before writing.",
         },
       });

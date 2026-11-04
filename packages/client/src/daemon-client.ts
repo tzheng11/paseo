@@ -1005,6 +1005,7 @@ interface Waiter<T> {
 interface WaitHandle<T> {
   promise: Promise<T>;
   cancel: (error: Error) => void;
+  wasSubmitted(): boolean;
 }
 
 interface WaitOptions {
@@ -1086,7 +1087,17 @@ export class CredentialReloadUnsupportedError extends Error {
   }
 }
 
-class DaemonRpcError extends Error {
+/** A request rejected before its frame reached the transport submission boundary. */
+export class DaemonRequestNotSentError extends Error {
+  readonly code = "DAEMON_REQUEST_NOT_SENT";
+  readonly outcome = "not-sent";
+  constructor(cause: unknown) {
+    super("The daemon request was not sent.", { cause });
+    this.name = "DaemonRequestNotSentError";
+  }
+}
+
+export class DaemonRpcError extends Error {
   readonly mainHost: import("@getpaseo/protocol/fleet/main-host").MainHostState | undefined;
   readonly requestId: string;
   readonly requestType?: string;
@@ -2293,9 +2304,16 @@ export class DaemonClient {
     select: (msg: SessionOutboundMessage) => T | null;
     options?: { skipQueue?: boolean };
   }): Promise<T> {
-    const wire = this.owned.prepareRequest(params.message);
+    let wire: ReturnType<ConnectionSubscriptions["prepareRequest"]>;
+    try {
+      wire = this.owned.prepareRequest(params.message);
+    } catch (error) {
+      if (params.message.type === "workspace.layout.commit.request")
+        throw new DaemonRequestNotSentError(error);
+      throw error;
+    }
     const timeout = params.timeout ?? DEFAULT_SESSION_RPC_TIMEOUT_MS;
-    const { promise, cancel } = this.waitForWithCancel<RpcWaitResult<T>>(
+    const { promise, cancel, wasSubmitted } = this.waitForWithCancel<RpcWaitResult<T>>(
       (msg) => {
         if (msg.type === "rpc_error" && msg.payload.requestId === params.requestId) {
           return {
@@ -2323,12 +2341,19 @@ export class DaemonClient {
     // The response deadline still applies while the transport waits for drain.
     void promise.catch(() => undefined);
     try {
-      const sent = this.sendSessionMessageOrThrow(wire.message);
+      // A layout CAS must never remain queued for a later connection after its
+      // caller has received a definite pre-send refusal.
+      const sent =
+        params.message.type === "workspace.layout.commit.request"
+          ? this.sendSessionMessageStrict(wire.message)
+          : this.sendSessionMessageOrThrow(wire.message);
       const result = await Promise.race([promise, sent.then(() => promise)]);
       if (result.kind === "error") throw result.error;
       return result.value;
     } catch (error) {
-      const err = error instanceof Error ? error : new Error(String(error));
+      let err = error instanceof Error ? error : new Error(String(error));
+      if (params.message.type === "workspace.layout.commit.request" && !wasSubmitted())
+        err = new DaemonRequestNotSentError(error);
       cancel(err);
       throw err;
     } finally {
@@ -5874,12 +5899,16 @@ export class DaemonClient {
   }
 
   async commitWorkspaceLayout(input: WorkspaceLayoutCommit) {
-    this.requireWorkspaceLayout();
-    const { requestId, ...fields } = input;
-    return this.sendNamespacedCorrelatedSessionRequest<"workspace.layout.commit.response">({
-      requestId,
-      message: { type: "workspace.layout.commit.request", ...fields },
-    });
+    try {
+      this.requireWorkspaceLayout();
+      const { requestId, ...fields } = input;
+      return this.sendNamespacedCorrelatedSessionRequest<"workspace.layout.commit.response">({
+        requestId,
+        message: { type: "workspace.layout.commit.request", ...fields },
+      });
+    } catch (error) {
+      throw new DaemonRequestNotSentError(error);
+    }
   }
 
   observeWorkspaceLayout(): OwnedSubscription<WorkspaceLayoutSnapshot> {
@@ -7925,7 +7954,7 @@ export class DaemonClient {
       });
     };
 
-    return { promise, cancel };
+    return { promise, cancel, wasSubmitted: () => waiter?.submitted ?? false };
   }
 }
 

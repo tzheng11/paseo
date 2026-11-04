@@ -9508,3 +9508,107 @@ test("routed channels inherit an origin without drain support", async () => {
   expect(route.supportsDrain).toBe(false);
   route.close();
 });
+
+function layoutCommitFixture() {
+  return {
+    requestId: "layout-once",
+    expected: {
+      authorityServerId: "hub",
+      authorityId: "00000000-0000-4000-8000-000000000001",
+      epoch: "00000000-0000-4000-8000-000000000002",
+      revision: 1,
+      phase: "active" as const,
+    },
+    mutations: [
+      {
+        kind: "put" as const,
+        entry: {
+          ref: { serverId: "replica", workspaceId: "workspace" },
+          projectId: "project",
+          pinnedAt: null,
+          superpinnedAt: null,
+          parent: null,
+          siblingOrder: null,
+          pinPlacement: null,
+          archivedAt: null,
+          revision: 1,
+        },
+      },
+    ],
+  };
+}
+
+test("layout commits refused before connection are proven unsent and never queue on a later connection", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "layout-fixture",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  await expect(client.commitWorkspaceLayout(layoutCommitFixture())).rejects.toMatchObject({
+    code: "DAEMON_REQUEST_NOT_SENT",
+    outcome: "not-sent",
+  });
+  const connection = client.connect();
+  mock.triggerOpen({ features: { workspaceLayout: true, ownedSubscriptions: true } });
+  await connection;
+  expect(mock.sent).toHaveLength(0);
+});
+
+test("layout commits submitted before connection loss remain unknown without replay", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "layout-fixture",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connection = client.connect();
+  mock.triggerOpen({ features: { workspaceLayout: true, ownedSubscriptions: true } });
+  await connection;
+  const result = client.commitWorkspaceLayout(layoutCommitFixture());
+  const rejection = expect(result).rejects.toMatchObject({
+    code: "DAEMON_CONNECTION_LOST",
+    outcome: "unknown",
+  });
+  mock.triggerClose();
+  await rejection;
+  expect(mock.sent).toHaveLength(1);
+});
+
+test("a layout RPC refusal retains the authority code and request identity", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "layout-fixture",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connection = client.connect();
+  mock.triggerOpen({ features: { workspaceLayout: true, ownedSubscriptions: true } });
+  await connection;
+  const result = client.commitWorkspaceLayout(layoutCommitFixture());
+  const rejection = expect(result).rejects.toMatchObject({
+    name: "DaemonRpcError",
+    code: "workspace_cycle",
+    requestId: "layout-once",
+    requestType: "workspace.layout.commit.request",
+  });
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "rpc_error",
+      payload: {
+        requestId: "layout-once",
+        requestType: "workspace.layout.commit.request",
+        code: "workspace_cycle",
+        error: "refused",
+      },
+    }),
+  );
+  await rejection;
+  expect(mock.sent).toHaveLength(1);
+});

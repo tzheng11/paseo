@@ -164,9 +164,19 @@ export class CanonicalSidebarLayout {
       // Persist the original input before dispatch. Storage failure sends nothing.
       await this.persist();
     } catch (error) {
+      this.replica.pending = null;
       this.busy = false;
+      this.fresh = false;
       this.error = "Shared layout intent could not be saved. No change was sent.";
       this.publish();
+      try {
+        // Also retire any queued observation's copy of the never-sent intent.
+        await this.persist();
+      } catch (storageError) {
+        throw new Error("No layout change was sent, but its local journal could not be retired.", {
+          cause: storageError,
+        });
+      }
       throw error;
     }
     try {
@@ -174,9 +184,9 @@ export class CanonicalSidebarLayout {
       await this.confirm(response.receipt, pending);
     } catch (error) {
       this.fresh = false;
-      if (isDefiniteCasRefusal(error)) {
+      if (isDefiniteLayoutRefusal(error)) {
         this.replica.pending = null;
-        this.error = "Shared layout changed in another client. Refresh before trying again.";
+        this.error = "Shared layout refused the change. Refresh before trying again.";
         try {
           await this.persist();
         } catch (storageError) {
@@ -203,14 +213,31 @@ export class CanonicalSidebarLayout {
     this.selectRoute();
     const peer = this.observation?.peer;
     if (!peer) throw new Error("Reconnect a host to check the shared layout.");
+    // Read the new CAS first. Reading an absent receipt before this snapshot
+    // could race a later commit and mistake our own applied write for a refusal.
+    const snapshot = await peer.client.getWorkspaceLayout();
+    this.requireIdentity(snapshot.stamp);
     const pending = this.replica?.pending;
     if (pending) {
       const receipt = await peer.client.getWorkspaceLayoutReceipt(pending.input.requestId);
-      if (!receipt)
+      if (receipt) {
+        await this.confirm(receipt, pending);
+        await this.accept(peer, await peer.client.getWorkspaceLayout());
+        return;
+      }
+      if (snapshot.stamp.revision <= pending.input.expected.revision)
         throw new Error("No durable receipt is available. The original change remains unresolved.");
-      await this.confirm(receipt, pending);
+      // Receipts are retained atomically with commits. A later same-epoch CAS,
+      // followed by an absent receipt, means this original CAS can never apply.
+      this.replica!.pending = null;
+      try {
+        await this.persist();
+      } catch (error) {
+        this.replica!.pending = pending;
+        throw error;
+      }
     }
-    await this.accept(peer, await peer.client.getWorkspaceLayout());
+    await this.accept(peer, snapshot);
   }
 
   async close(): Promise<void> {
@@ -300,7 +327,7 @@ export class CanonicalSidebarLayout {
       return;
     }
     const subscription = peer.client.observeWorkspaceLayout();
-    const generation = this.observationGeneration;
+    const generation = ++this.observationGeneration;
     const failed = (error: unknown) => {
       if (generation === this.observationGeneration) this.observationFailed(error);
     };
@@ -419,10 +446,34 @@ function sameAuthority(
     (b.authorityKeySha256 === undefined || a.authorityKeySha256 === b.authorityKeySha256)
   );
 }
-function isDefiniteCasRefusal(error: unknown): boolean {
+const COMMIT_REFUSALS = new Set([
+  "stale_revision",
+  "stale_navigation_revision",
+  "stale_entry_revision",
+  "workspace_cycle",
+  "parent_section_mismatch",
+  "authority_busy",
+  "layout_importing",
+  "authority_request_not_sent",
+  "canonical_layout_not_configured",
+  "revision_exhausted",
+  "request_id_conflict",
+  "unresolved_parent",
+  "structural_parent_host_mismatch",
+  "structural_parent_project_mismatch",
+  "duplicate_workspace_identity",
+  "orphan_superpin",
+  "duplicate_navigation_reference",
+  "navigation_not_resolved",
+  "global_sort_not_resolved",
+]);
+function isDefiniteLayoutRefusal(error: unknown): boolean {
   return (
     error instanceof Error &&
     "code" in error &&
-    (error.code === "stale_revision" || error.code === "stale_navigation_revision")
+    (COMMIT_REFUSALS.has(String(error.code)) ||
+      (error.code === "DAEMON_REQUEST_NOT_SENT" &&
+        "outcome" in error &&
+        error.outcome === "not-sent"))
   );
 }

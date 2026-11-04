@@ -309,3 +309,27 @@ it("refuses a receipt for another payload without replaying the mutation or adva
   expect(client.commitWorkspaceLayout).toHaveBeenCalledOnce();
   expect(value.cached().snapshot).toEqual(snapshot(8));
 });
+
+it("a route rejected before entering its authority client is a definite no-send refusal", async () => {
+  const value = service();
+  value.attachTransport({
+    changed: () => () => {},
+    use: async () => {
+      throw new Error("route rejected before action");
+    },
+  });
+  await expect(
+    value.commit({
+      requestId: "unsent",
+      expected: snapshot(8).stamp,
+      mutations: [
+        {
+          kind: "put-navigation",
+          expectedRevision: 1,
+          preferences: emptyWorkspaceNavigationPreferences(),
+        },
+      ],
+    }),
+  ).rejects.toMatchObject({ code: "authority_request_not_sent" });
+  expect(value.cached().snapshot).toBeNull();
+});
