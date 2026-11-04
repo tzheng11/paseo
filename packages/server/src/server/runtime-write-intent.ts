@@ -1,6 +1,15 @@
 import { randomUUID } from "node:crypto";
-import { openSync, readFileSync, writeFileSync, fsyncSync, closeSync, mkdirSync } from "node:fs";
-import { open, readFile, mkdir } from "node:fs/promises";
+import {
+  openSync,
+  readFileSync,
+  writeFileSync,
+  fsyncSync,
+  closeSync,
+  mkdirSync,
+  linkSync,
+  unlinkSync,
+} from "node:fs";
+import { open, readFile, mkdir, link, unlink } from "node:fs/promises";
 import path from "node:path";
 import {
   RuntimeWriteIntentSchema,
@@ -14,37 +23,51 @@ export const RUNTIME_WRITE_INTENT_FILENAME = "runtime-write-intent.json";
 
 /** A positive, conservative write boundary. Absence never proves that stock/other writers did nothing. */
 export function readRuntimeWriteIntent(home: string): RuntimeWriteIntent | undefined {
+  const file = path.join(home, RUNTIME_WRITE_INTENT_FILENAME);
   try {
-    return RuntimeWriteIntentSchema.parse(
-      JSON.parse(readFileSync(path.join(home, RUNTIME_WRITE_INTENT_FILENAME), "utf8")),
-    );
+    return RuntimeWriteIntentSchema.parse(JSON.parse(readFileSync(file, "utf8")));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-    throw error;
+    throw new Error(`Cannot read runtime write-intent marker: ${file}`, { cause: error });
   }
 }
 
 /** Persist before custom bootstrap or supported config writes; never reset a home or infer operation completion. */
 export function ensureRuntimeWriteIntent(home: string): RuntimeWriteIntent {
   const existing = readRuntimeWriteIntent(home);
-  if (existing) return existing;
+  if (existing) {
+    syncDirectory(home);
+    return existing;
+  }
   const record = createIntent(readRuntimeBuildIdentity());
   mkdirSync(home, { recursive: true });
-  let fd: number;
+  const temporary = path.join(home, `.${RUNTIME_WRITE_INTENT_FILENAME}.${randomUUID()}.tmp`);
+  let result = record;
+  const fd = openSync(temporary, "wx", 0o600);
   try {
-    fd = openSync(path.join(home, RUNTIME_WRITE_INTENT_FILENAME), "wx", 0o600);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    const concurrent = readRuntimeWriteIntent(home);
-    if (!concurrent) throw new Error("Runtime write intent disappeared", { cause: error });
-    return concurrent;
-  }
-  try {
-    writeFileSync(fd, `${JSON.stringify(record, null, 2)}\n`);
-    fsyncSync(fd);
+    try {
+      writeFileSync(fd, `${JSON.stringify(record, null, 2)}\n`);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    try {
+      // Publish complete bytes atomically, without replacing another writer.
+      linkSync(temporary, path.join(home, RUNTIME_WRITE_INTENT_FILENAME));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const concurrent = readRuntimeWriteIntent(home);
+      if (!concurrent) throw new Error("Runtime write intent disappeared", { cause: error });
+      result = concurrent;
+    }
   } finally {
-    closeSync(fd);
+    unlinkSync(temporary);
   }
+  syncDirectory(home);
+  return result;
+}
+
+function syncDirectory(home: string): void {
   if (process.platform !== "win32") {
     const directory = openSync(home, "r");
     try {
@@ -53,7 +76,6 @@ export function ensureRuntimeWriteIntent(home: string): RuntimeWriteIntent {
       closeSync(directory);
     }
   }
-  return record;
 }
 
 function createIntent(build: RuntimeBuildIdentity | undefined): RuntimeWriteIntent {
@@ -71,36 +93,49 @@ function createIntent(build: RuntimeBuildIdentity | undefined): RuntimeWriteInte
 }
 
 async function readIntentAsync(home: string): Promise<RuntimeWriteIntent | undefined> {
+  const file = path.join(home, RUNTIME_WRITE_INTENT_FILENAME);
   try {
-    return RuntimeWriteIntentSchema.parse(
-      JSON.parse(await readFile(path.join(home, RUNTIME_WRITE_INTENT_FILENAME), "utf8")),
-    );
+    return RuntimeWriteIntentSchema.parse(JSON.parse(await readFile(file, "utf8")));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-    throw error;
+    throw new Error(`Cannot read runtime write-intent marker: ${file}`, { cause: error });
   }
 }
 
 export async function ensureRuntimeWriteIntentAsync(home: string): Promise<RuntimeWriteIntent> {
   const existing = await readIntentAsync(home);
-  if (existing) return existing;
+  if (existing) {
+    await syncDirectoryAsync(home);
+    return existing;
+  }
   const record = createIntent(await readRuntimeBuildIdentityAsync());
   await mkdir(home, { recursive: true });
-  let fd;
+  const temporary = path.join(home, `.${RUNTIME_WRITE_INTENT_FILENAME}.${randomUUID()}.tmp`);
+  let result = record;
+  const fd = await open(temporary, "wx", 0o600);
   try {
-    fd = await open(path.join(home, RUNTIME_WRITE_INTENT_FILENAME), "wx", 0o600);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    const concurrent = await readIntentAsync(home);
-    if (!concurrent) throw new Error("Runtime write intent disappeared", { cause: error });
-    return concurrent;
-  }
-  try {
-    await fd.writeFile(`${JSON.stringify(record, null, 2)}\n`);
-    await fd.sync();
+    try {
+      await fd.writeFile(`${JSON.stringify(record, null, 2)}\n`);
+      await fd.sync();
+    } finally {
+      await fd.close();
+    }
+    try {
+      await link(temporary, path.join(home, RUNTIME_WRITE_INTENT_FILENAME));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const concurrent = await readIntentAsync(home);
+      if (!concurrent) throw new Error("Runtime write intent disappeared", { cause: error });
+      result = concurrent;
+    }
   } finally {
-    await fd.close();
+    await unlink(temporary);
   }
+  await syncDirectoryAsync(home);
+  return result;
+}
+
+async function syncDirectoryAsync(home: string): Promise<void> {
   if (process.platform !== "win32") {
     const directory = await open(home, "r");
     try {
@@ -109,7 +144,6 @@ export async function ensureRuntimeWriteIntentAsync(home: string): Promise<Runti
       await directory.close();
     }
   }
-  return record;
 }
 
 export async function prepareRuntimeProvenance(home: string, daemonVersion: string) {

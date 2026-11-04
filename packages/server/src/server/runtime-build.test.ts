@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { pathToFileURL } from "node:url";
@@ -91,4 +91,25 @@ test("the actual producer binds both compiled entry trees to the same Git identi
   const dirty = await writeRuntimeBuildProvenance(home, paths);
   expect(dirty.sourceDirty).toBe(true);
   expect(dirty.buildId).not.toBe(clean.buildId);
+});
+
+test("Git-free Nix and Docker source builds remain explicitly unverified and remove stale build files", async () => {
+  await writeFile(
+    path.join(home, "package.json"),
+    JSON.stringify({
+      version: source.distributionVersion,
+      paseoDistribution: {
+        upstreamVersion: source.upstreamVersion,
+        upstreamCommit: source.upstreamCommit,
+      },
+    }),
+  );
+  await writeFile(path.join(home, "package-lock.json"), "{}");
+  const outputs = runtimeBuildOutputPaths(home);
+  for (const file of outputs) {
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, JSON.stringify(runtimeBuildIdentity(source)));
+  }
+  expect(await writeRuntimeBuildProvenance(home, outputs)).toBeUndefined();
+  for (const file of outputs) expect(readRuntimeBuildIdentity(pathToFileURL(file))).toBeUndefined();
 });

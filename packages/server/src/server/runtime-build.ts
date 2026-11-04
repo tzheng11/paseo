@@ -33,7 +33,19 @@ export async function readRuntimeBuildIdentityAsync(
 
 function parseRuntimeBuildIdentity(raw: string): RuntimeBuildIdentity {
   const build = RuntimeBuildIdentitySchema.parse(JSON.parse(raw));
-  const { buildId, ...payload } = build;
+  const { buildId } = build;
+  // This is the schemaVersion 1 wire digest order, independent of Zod's field
+  // declaration order. Keep the producer and consumer parity fixture in sync.
+  const payload = {
+    schemaVersion: build.schemaVersion,
+    distributionVersion: build.distributionVersion,
+    upstreamVersion: build.upstreamVersion,
+    upstreamCommit: build.upstreamCommit,
+    sourceCommit: build.sourceCommit,
+    sourceTree: build.sourceTree,
+    sourceDirty: build.sourceDirty,
+    lockSha256: build.lockSha256,
+  };
   const actual = createHash("sha256").update(JSON.stringify(payload)).digest("hex");
   if (buildId !== actual) throw new Error("Runtime build identity digest mismatch");
   return build;

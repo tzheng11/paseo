@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile, stat, readdir } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import {
   ensureRuntimeWriteIntent,
+  ensureRuntimeWriteIntentAsync,
   readRuntimeWriteIntent,
   RUNTIME_WRITE_INTENT_FILENAME,
 } from "./runtime-write-intent.js";
@@ -62,11 +63,25 @@ test("a damaged or newer marker refuses before any supported config write instea
     await writeFile(file, bytes);
     expect(() =>
       savePersistedConfig(home, { version: 1, agents: { resumeOnStartup: true } }),
-    ).toThrow();
-    await expect(savePersistedConfigAsync(home, { version: 1 })).rejects.toThrow();
+    ).toThrow("runtime-write-intent.json");
+    await expect(savePersistedConfigAsync(home, { version: 1 })).rejects.toThrow(
+      "runtime-write-intent.json",
+    );
     expect(await readFile(file, "utf8")).toBe(bytes);
     expect(await readFile(path.join(home, "config.json"), "utf8")).toBe('{"version":1}');
   }
+});
+
+test("concurrent first writers publish only a complete marker and retain the winning generation", async () => {
+  const intents = await Promise.all(
+    Array.from({ length: 30 }, () => ensureRuntimeWriteIntentAsync(home)),
+  );
+  expect(new Set(intents.map((intent) => intent.generation)).size).toBe(1);
+  expect(readRuntimeWriteIntent(home)).toEqual(intents[0]);
+  expect(ensureRuntimeWriteIntent(home)).toEqual(intents[0]);
+  expect(await readdir(home)).toEqual([RUNTIME_WRITE_INTENT_FILENAME]);
+  // A create-only publication hard link must be retired before returning.
+  expect((await stat(path.join(home, RUNTIME_WRITE_INTENT_FILENAME))).nlink).toBe(1);
 });
 
 test("fresh 015 source readers preserve new config and canonical writes on the current home without snapshot restoration", async () => {

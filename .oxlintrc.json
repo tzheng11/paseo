@@ -155,13 +155,16 @@
               "server/persisted-config.ts": ["existsSync", "readFileSync"],
               // Synchronous exported config API only; daemon bootstrap/runtime saves use the async variants.
               "server/runtime-build.ts": ["readFileSync"],
+              // Atomic create-only publication for that synchronous config API; async bootstrap uses fs/promises.
               "server/runtime-write-intent.ts": [
                 "openSync",
                 "readFileSync",
                 "writeFileSync",
                 "fsyncSync",
                 "closeSync",
-                "mkdirSync"
+                "mkdirSync",
+                "linkSync",
+                "unlinkSync"
               ],
               // Startup pid identity: read and memoize the Linux boot id for the daemon lock.
               "server/pid-lock.ts": ["readFileSync"],

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile, lstat, rm } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -30,6 +30,17 @@ export function runtimeBuildIdentity(source) {
 }
 
 export async function writeRuntimeBuildProvenance(repoRoot, outputs) {
+  const destinations = Array.isArray(outputs) ? outputs : [outputs];
+  try {
+    // Git worktrees use a file here. Never walk up into an unrelated parent repo.
+    await lstat(path.join(repoRoot, ".git"));
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    // Nix and Docker deliberately omit .git. They may build unverified code,
+    // but must not keep an old identity file or invent a source commit.
+    await Promise.all(destinations.map((output) => rm(output, { force: true })));
+    return undefined;
+  }
   const git = async (...args) => (await exec("git", args, { cwd: repoRoot })).stdout.trim();
   const [sourceCommit, sourceTree, status, rootBytes, lock] = await Promise.all([
     git("rev-parse", "HEAD"),
@@ -51,7 +62,7 @@ export async function writeRuntimeBuildProvenance(repoRoot, outputs) {
     sourceDirty: status.length !== 0,
     lockSha256: createHash("sha256").update(lock).digest("hex"),
   });
-  for (const output of Array.isArray(outputs) ? outputs : [outputs]) {
+  for (const output of destinations) {
     await mkdir(path.dirname(output), { recursive: true });
     await writeFile(output, `${JSON.stringify(result, null, 2)}\n`);
   }
