@@ -373,6 +373,7 @@ async function daemonStartupError(
   recentOutput: () => string,
 ): Promise<Error> {
   let workerOutput = "";
+  let workerRecords: string[] = [];
   try {
     // Only this fixture's private home is read. A detached worker's failure is
     // written here rather than to its launcher's stderr.
@@ -380,8 +381,42 @@ async function daemonStartupError(
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
-  return new Error(`${message}\n${recentOutput()}\nTerminal worker fixture log:\n${workerOutput}`);
+  try {
+    // A record is persisted only after self-inspection succeeds and before ready
+    // is sent. List names only: record contents contain a private socket secret.
+    workerRecords = (await readdir(path.join(home, "terminal-worker"))).filter((name) =>
+      /^\d+\.json$/.test(name),
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  return new Error(
+    `${message}\n${recentOutput()}\nTerminal worker records: ${JSON.stringify(workerRecords.sort())}\nTerminal worker fixture log:\n${workerOutput}`,
+  );
 }
+
+test.each([false, true])(
+  "startup diagnostics retain only worker record names (present=%s)",
+  async (present) => {
+    const { home } = await createConfiguredHome();
+    if (present) {
+      await mkdir(path.join(home, "terminal-worker"));
+      await writeFile(
+        path.join(home, "terminal-worker/4242.json"),
+        '{"secret":"fixture-must-not-log"}',
+      );
+      await writeFile(path.join(home, "terminal-worker.log"), "fixture worker checkpoint");
+    }
+    const error = await daemonStartupError(
+      "fixture startup failed",
+      home,
+      () => "fixture launcher",
+    );
+    expect(error.message).toContain(`Terminal worker records: ${present ? '["4242.json"]' : "[]"}`);
+    expect(error.message.includes("fixture worker checkpoint")).toBe(present);
+    expect(error.message).not.toContain("fixture-must-not-log");
+  },
+);
 
 async function waitForDaemon(
   child: ChildProcess,
