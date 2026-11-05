@@ -732,6 +732,9 @@ function isSessionServerInfoUnchanged(input: {
   nextDesktopManaged: boolean | undefined;
   nextCapabilities: ServerCapabilities | undefined;
   nextFeatures: ServerInfoStatusPayload["features"] | undefined;
+  nextWorkspaceLayout: ServerInfoStatusPayload["workspaceLayout"];
+  nextRuntimeBuild: ServerInfoStatusPayload["runtimeBuild"];
+  nextRuntimeWriteIntent: ServerInfoStatusPayload["runtimeWriteIntent"];
   nextServerId: string;
   nextPermissions: ServerInfoStatusPayload["permissions"];
   nextFieldCatalogVersion: number | undefined;
@@ -744,17 +747,21 @@ function isSessionServerInfoUnchanged(input: {
     nextCapabilities,
     nextFeatures,
   } = input;
-  const prevHostname = currentServerInfo?.hostname?.trim() || null;
-  const prevVersion = currentServerInfo?.version?.trim() || null;
+  if (!currentServerInfo) return false;
+  const prevHostname = currentServerInfo.hostname?.trim() || null;
+  const prevVersion = currentServerInfo.version?.trim() || null;
   return (
-    currentServerInfo?.serverId === input.nextServerId &&
-    JSON.stringify(currentServerInfo?.permissions) === JSON.stringify(input.nextPermissions) &&
-    currentServerInfo?.workspaceFieldCatalogVersion === input.nextFieldCatalogVersion &&
+    currentServerInfo.serverId === input.nextServerId &&
+    JSON.stringify(currentServerInfo.permissions) === JSON.stringify(input.nextPermissions) &&
+    currentServerInfo.workspaceFieldCatalogVersion === input.nextFieldCatalogVersion &&
     prevHostname === nextHostname &&
     prevVersion === nextVersion &&
-    currentServerInfo?.desktopManaged === nextDesktopManaged &&
-    areServerCapabilitiesEqual(currentServerInfo?.capabilities, nextCapabilities) &&
-    areServerInfoFeaturesEqual(currentServerInfo?.features, nextFeatures)
+    currentServerInfo.desktopManaged === nextDesktopManaged &&
+    areServerCapabilitiesEqual(currentServerInfo.capabilities, nextCapabilities) &&
+    areServerInfoFeaturesEqual(currentServerInfo.features, nextFeatures) &&
+    equal(currentServerInfo.workspaceLayout, input.nextWorkspaceLayout) &&
+    equal(currentServerInfo.runtimeBuild, input.nextRuntimeBuild) &&
+    equal(currentServerInfo.runtimeWriteIntent, input.nextRuntimeWriteIntent)
   );
 }
 
@@ -901,6 +908,9 @@ export const useSessionStore = create<SessionStore>()(
               nextDesktopManaged,
               nextCapabilities,
               nextFeatures,
+              nextWorkspaceLayout: info.workspaceLayout,
+              nextRuntimeBuild: info.runtimeBuild,
+              nextRuntimeWriteIntent: info.runtimeWriteIntent,
               nextServerId: info.serverId,
               nextPermissions: info.permissions,
               nextFieldCatalogVersion: info.workspaceFieldCatalogVersion,
@@ -924,6 +934,11 @@ export const useSessionStore = create<SessionStore>()(
                     : {}),
                   ...(nextCapabilities ? { capabilities: nextCapabilities } : {}),
                   ...(nextFeatures ? { features: nextFeatures } : {}),
+                  ...(info.workspaceLayout ? { workspaceLayout: info.workspaceLayout } : {}),
+                  ...(info.runtimeBuild ? { runtimeBuild: info.runtimeBuild } : {}),
+                  ...(info.runtimeWriteIntent
+                    ? { runtimeWriteIntent: info.runtimeWriteIntent }
+                    : {}),
                   permissions: info.permissions,
                   workspaceFieldCatalogVersion: info.workspaceFieldCatalogVersion,
                 },

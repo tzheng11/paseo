@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { beforeEach, expect, test, vi } from "vitest";
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import {
   canonicalLayoutJson,
   emptyWorkspaceNavigationPreferences,
@@ -30,6 +31,7 @@ test("actual sidebar setters forward edits, project observations, and preserve b
   await runtime.canonicalSidebar.ready;
   const { useSidebarOrderStore: orders } = await import("./sidebar-order-store");
   const { useSidebarViewStore: view } = await import("./sidebar-view-store");
+  const { useSessionStore: sessions, toDaemonServerInfo } = await import("./session-store");
   await orders.persist.rehydrate();
   await view.persist.rehydrate();
   const config = {
@@ -93,7 +95,22 @@ test("actual sidebar setters forward edits, project observations, and preserve b
       release: async () => {},
     }),
   };
-  const detach = await runtime.canonicalSidebar.attach("host-a", client, config);
+  // The connection and SessionProvider both consume this stored handshake;
+  // bypassing it with the raw config hid a dropped-field activation defect.
+  sessions.getState().initializeSession("host-a", null as unknown as DaemonClient);
+  sessions.getState().updateSessionServerInfo(
+    "host-a",
+    toDaemonServerInfo({
+      status: "server_info",
+      serverId: "host-a",
+      hostname: null,
+      version: "0.15.0-impower",
+      workspaceLayout: { ...config, stamp: snapshot.stamp, synchronized: true },
+    }),
+  );
+  const advertised = sessions.getState().sessions["host-a"].serverInfo?.workspaceLayout;
+  expect(advertised).toBeDefined();
+  const detach = await runtime.canonicalSidebar.attach("host-a", client, advertised!);
   await vi.waitFor(() => expect(runtime.canonicalSidebar.state().writable).toBe(true));
   expect(orders.getState().projectOrder).toEqual(["shared"]);
   expect(view.getState().workspaceSort).toBe("manual");
@@ -105,6 +122,33 @@ test("actual sidebar setters forward edits, project observations, and preserve b
   view.getState().setWorkspaceSort("lastPrompt");
   await vi.waitFor(() => expect(snapshot.navigation!.preferences.workspaceSort).toBe("lastPrompt"));
   await vi.waitFor(() => expect(view.getState().workspaceSort).toBe("lastPrompt"));
+  for (const [setOrder, expected] of [
+    [
+      () => orders.getState().setPinnedWorkspaceSortMode("alphabetical"),
+      () => snapshot.navigation!.preferences.pinnedWorkspaceSortMode === "alphabetical",
+    ],
+    [
+      () => orders.getState().setWorkspaceSortMode("shared", "activity"),
+      () => snapshot.navigation!.preferences.workspaceSortModeByProject.shared === "activity",
+    ],
+    [
+      () => orders.getState().setWorkspaceOrder("shared", ["host-a:workspace"]),
+      () =>
+        snapshot.navigation!.preferences.workspaceOrderByProject.shared?.[0] === "host-a:workspace",
+    ],
+    [
+      () => orders.getState().setPinnedWorkspaceOrder(["host-a:workspace"]),
+      () => snapshot.navigation!.preferences.pinnedWorkspaceOrder[0] === "host-a:workspace",
+    ],
+    [
+      () => orders.getState().setSuperpinnedWorkspaceOrder(["host-a:workspace"]),
+      () => snapshot.navigation!.preferences.superpinnedWorkspaceOrder[0] === "host-a:workspace",
+    ],
+  ] as const) {
+    await vi.waitFor(() => expect(runtime.canonicalSidebar.state().writable).toBe(true));
+    setOrder();
+    await vi.waitFor(() => expect(expected()).toBe(true));
+  }
   expect(await storage.getItem("sidebar-project-workspace-order")).toBe(oldOrders);
   expect(await storage.getItem("sidebar-view")).toBe(oldView);
   view.getState().toggleHostFilter("host-b");
@@ -124,4 +168,5 @@ test("actual sidebar setters forward edits, project observations, and preserve b
   expect(view.getState().workspaceSort).toBe("lastPrompt");
   expect(await storage.getItem("sidebar-project-workspace-order")).toBe(oldOrders);
   expect(await storage.getItem("sidebar-view")).toBe(oldView);
+  sessions.getState().clearSession("host-a");
 });
