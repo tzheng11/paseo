@@ -10,6 +10,7 @@ import { expect, test } from "vitest";
 import { DaemonClient } from "../test-utils/daemon-client.js";
 import { createTestPaseoDaemon } from "../test-utils/paseo-daemon.js";
 import { BuiltinPluginLoader, resolveBuiltinPluginsRoot } from "./builtin/index.js";
+import { isolatedWindowsEnvironment } from "../../test-utils/isolated-windows-environment.js";
 
 const fixtureRoot = fileURLToPath(new URL("./test-fixtures/", import.meta.url));
 const subprocessDirectory = fileURLToPath(
@@ -410,8 +411,7 @@ require('node:module').syncBuiltinESMExports();`,
             // Inherited proxy aliases are case-insensitive on Windows, and
             // inherited provider credentials are never fixture inputs.
             PATH: process.env.PATH,
-            SystemRoot: process.env.SystemRoot,
-            ComSpec: process.env.ComSpec,
+            ...isolatedWindowsEnvironment(),
             NODE_ENV: "test",
             TEMP: root,
             TMP: root,
@@ -424,7 +424,11 @@ require('node:module').syncBuiltinESMExports();`,
             XDG_DATA_HOME: path.join(root, "data"),
             CODEX_HOME: path.join(root, ".codex"),
             CLAUDE_CONFIG_DIR: path.join(root, ".claude"),
-            NODE_OPTIONS: `--require=${JSON.stringify(guard.replaceAll("\\", "/"))}`,
+            NODE_OPTIONS: `--require=${JSON.stringify(guard.replaceAll("\\", "/"))} --require=${JSON.stringify(
+              fileURLToPath(
+                new URL("../../test-utils/terminal-worker-startup-observer.cjs", import.meta.url),
+              ).replaceAll("\\", "/"),
+            )}`,
             https_proxy: `http://127.0.0.1:${address.port}`,
             no_proxy: "",
             NO_PROXY: "",

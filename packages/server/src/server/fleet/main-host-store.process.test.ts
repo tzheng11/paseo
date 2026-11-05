@@ -21,6 +21,7 @@ import type { MainHostProvenance, MainHostState } from "@getpaseo/protocol/fleet
 import { getPidLockInfo } from "../pid-lock.js";
 import { DaemonClient } from "../test-utils/daemon-client.js";
 import { MainHostStore } from "./main-host-store.js";
+import { isolatedWindowsEnvironment } from "../../test-utils/isolated-windows-environment.js";
 
 // Only server and protocol source are archived. Client/plugin/relay/highlight
 // and external dependencies remain the current checkout's installations. This
@@ -31,6 +32,9 @@ const repositoryRoot = fileURLToPath(new URL("../../../../../", import.meta.url)
 const execute = promisify(execFile);
 const allocatorSource = fileURLToPath(new URL("./main-host-store.ts", import.meta.url));
 const tsxLoader = import.meta.resolve("tsx");
+const startupObserver = fileURLToPath(
+  new URL("../../test-utils/terminal-worker-startup-observer.cjs", import.meta.url),
+);
 const children = new Map<ChildProcess, boolean>();
 let temporaryRoot: string;
 
@@ -57,8 +61,7 @@ function isolatedEnvironment(home: string): NodeJS.ProcessEnv {
   // Inherit executable lookup and Windows runtime necessities, never owner credentials.
   return {
     PATH: process.env.PATH,
-    SystemRoot: process.env.SystemRoot,
-    ComSpec: process.env.ComSpec,
+    ...isolatedWindowsEnvironment(),
     HOME: path.join(temporaryRoot, "os-home"),
     USERPROFILE: path.join(temporaryRoot, "os-home"),
     TEMP: temporaryRoot,
@@ -80,6 +83,7 @@ function isolatedEnvironment(home: string): NodeJS.ProcessEnv {
     PASEO_LOG_LEVEL: "error",
     PASEO_LOG_FORMAT: "json",
     NODE_ENV: "test",
+    NODE_OPTIONS: `--require=${JSON.stringify(startupObserver.replaceAll("\\", "/"))}`,
   };
 }
 
@@ -352,7 +356,7 @@ async function extractBaseline(): Promise<string> {
     ],
     { cwd: path.join(baseline, "packages/server") },
   );
-  expect(fileURLToPath(resolved.stdout.trim())).toBe(
+  expect(await realpath(fileURLToPath(resolved.stdout.trim()))).toBe(
     await realpath(path.join(protocol, "dist/terminal-snapshot.js")),
   );
   await expect(
@@ -500,6 +504,10 @@ describe("DOTS2-114 · real process interruption and rollback", () => {
       const before = await readFile(fleetPath, "utf8");
       const { child, client } = await connectCurrentDaemon(home);
       try {
+        const workerLog = await readFile(path.join(home, "terminal-worker.log"), "utf8");
+        expect(workerLog).toContain("[fixture-terminal-startup] preload");
+        expect(workerLog).toContain("[fixture-terminal-startup] listening");
+        expect(workerLog).toContain("[fixture-terminal-startup] fd3-writeSync-complete");
         expect(client.getLastServerInfoMessage()?.features?.mainHost).toBe(false);
         expect((await client.getDaemonConfig()).config.autoArchiveAfterMerge).toBe(false);
         await expect(client.getMainHost()).rejects.toThrow(
