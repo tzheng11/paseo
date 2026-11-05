@@ -1791,3 +1791,43 @@ test("a Manual drag in a collapsed group keeps the open workspace's saved place"
     await seed.cleanup();
   }
 });
+
+for (const { section, position } of [
+  { section: "pinned", position: "before" },
+  { section: "superpinned", position: "after" },
+] as const) {
+  test(`a ${section} workspace can be dragged into its project list`, async ({ page }) => {
+    const seed = await seedWorkspace({ repoPrefix: "sidebar-unpin-project-" });
+    try {
+      const anchor = await createWorkspace(seed, "Project anchor");
+      const remainder = await createWorkspace(seed, "Project remainder");
+      await seed.client.setWorkspacePinned(seed.workspaceId, true);
+      if (section === "superpinned")
+        await seed.client.setWorkspaceSuperpinned(seed.workspaceId, true);
+      const key = (id: string) => `${getServerId()}:${id}`;
+      await gotoAppShell(page);
+      await waitForSidebarHydration(page);
+      await restorePreBetaOrder(page, projectEquivalenceViewKey(seed.projectKey), [
+        key(anchor),
+        key(remainder),
+      ]);
+      await selectWorkspaceSort(page, "Manual");
+      await expect(treeNode(page, key(seed.workspaceId), section)).toBeVisible();
+      await dragWorkspace(page, key(seed.workspaceId), key(anchor), position);
+      await expect
+        .poll(() => readGroupPinMember({ seeded: seed, id: seed.workspaceId }))
+        .toEqual({ id: seed.workspaceId, pinned: false, superpinned: false });
+      const expected =
+        position === "before"
+          ? [seed.workspaceId, anchor, remainder]
+          : [anchor, seed.workspaceId, remainder];
+      const rows = workspaceRows(page, expected);
+      await expectWorkspaceOrder(rows, expected);
+      await reconnectSidebar(page);
+      await expectWorkspaceOrder(rows, expected);
+      await expect(treeNode(page, key(seed.workspaceId), section)).toHaveCount(0);
+    } finally {
+      await seed.cleanup();
+    }
+  });
+}

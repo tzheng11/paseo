@@ -2126,7 +2126,9 @@ export function SidebarWorkspaceList({
         if (!project || drop.position === "inside")
           throw new Error("Project order is no longer available. Refresh before moving it.");
         reorderedLegacyKeys = reorderVisibleWorkspaceKeys({
-          order: project.workspaces.map((item) => item.workspaceKey),
+          // A catalog-verified pinned source is absent from the target list.
+          // Include it before reordering; other unavailable keys still refuse.
+          order: [...project.workspaces.map((item) => item.workspaceKey), workspace.workspaceKey],
           workspaceKey: drop.workspaceKey,
           targetWorkspaceKey: drop.targetWorkspaceKey,
           position: drop.position,

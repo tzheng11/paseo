@@ -22,6 +22,10 @@ import { getPidLockInfo } from "../pid-lock.js";
 import { DaemonClient } from "../test-utils/daemon-client.js";
 import { MainHostStore } from "./main-host-store.js";
 
+// Only server and protocol source are archived. Client/plugin/relay/highlight
+// and external dependencies remain the current checkout's installations. This
+// proves the Main-store boundary below, not a complete old-installation or
+// current-home downgrade/recovery contract.
 const BASE_REVISION = "8046e550e32ac7fe9dc9720a00b35bd747950094";
 const repositoryRoot = fileURLToPath(new URL("../../../../../", import.meta.url));
 const execute = promisify(execFile);
@@ -593,7 +597,7 @@ describe("DOTS2-114 · real process interruption and rollback", () => {
     });
   }, 45_000);
 
-  test("the actual pre-Main baseline daemon starts and ignores fleet.json with unchanged config", async () => {
+  test("the archived pre-Main server and protocol ignore fleet.json with unchanged config", async () => {
     const { home, configBytes } = await createConfiguredHome();
     const prior = await createPriorChoice(home);
     const fleetBefore = await readFile(path.join(home, "fleet.json"), "utf8");
