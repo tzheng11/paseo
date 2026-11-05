@@ -1,3 +1,9 @@
+import {
+  parseCapturedJson,
+  validateCapturedValue,
+  type CapturedJson,
+  type ParsedCapture,
+} from "./captured-json.js";
 import { createHash } from "node:crypto";
 import { mkdir, readFile, rmdir } from "node:fs/promises";
 import path from "node:path";
@@ -6,6 +12,9 @@ import { writeFileDurably } from "./atomic-file.js";
 import {
   WorkspaceLayoutCommitSchema,
   WorkspaceLayoutIdentitySchema,
+  WorkspaceLayoutConfigSchema,
+  WorkspaceLayoutHomeMarkerSchema,
+  type WorkspaceLayoutConfig,
   WorkspaceLayoutReceiptSchema,
   WorkspaceLayoutReceiptRequestSchema,
   WorkspaceLayoutSnapshotSchema,
@@ -37,6 +46,176 @@ export class WorkspaceLayoutRefusal extends Error {
     super(`Workspace layout refused: ${code}`);
     this.name = "WorkspaceLayoutRefusal";
   }
+}
+
+export interface CapturedWorkspaceLayoutInput {
+  serverId: string;
+  configured: WorkspaceLayoutConfig | undefined;
+  marker: CapturedJson;
+  store: CapturedJson;
+  guard: CapturedJson;
+  replica: CapturedJson;
+}
+
+/** Pure DOWN-state inspection; no filesystem calls, locking, initialization or authority contact.
+ * A cached replica is only a replica, never a fresh authority or a source of commit receipts.
+ */
+export function parseCapturedWorkspaceLayout(input: CapturedWorkspaceLayoutInput) {
+  const marker = parseCapturedJson(input.marker, WorkspaceLayoutHomeMarkerSchema);
+  const store = parseCapturedJson(input.store, StoreSchema);
+  const guard = parseCapturedJson(input.guard, GuardSchema);
+  const replica = parseCapturedJson(input.replica, WorkspaceLayoutSnapshotSchema);
+  const mode = resolveCapturedMode({ configured: input.configured, marker });
+  if (!mode) {
+    if ([store, guard, replica].some((file) => file.state === "present"))
+      throw new WorkspaceLayoutRefusal("unconfigured_layout_data");
+    return { role: "legacy" as const };
+  }
+  const identity = (value: WorkspaceLayoutIdentity) => {
+    if (
+      value.authorityServerId !== mode.authorityServerId ||
+      value.authorityId !== mode.authorityId ||
+      value.epoch !== mode.epoch
+    )
+      throw new WorkspaceLayoutRefusal("authority_identity_mismatch");
+  };
+  if (mode.role === "replica") {
+    if (input.serverId === mode.authorityServerId)
+      throw new WorkspaceLayoutRefusal("replica_is_authority");
+    if (store.state === "present" || guard.state === "present")
+      throw new WorkspaceLayoutRefusal("layout_role_data_mismatch");
+    if (replica.state === "present") {
+      identity(replica.value.stamp);
+      validateCapturedSnapshot(replica.value);
+    }
+    return { role: "replica" as const, mode, marker, cache: replica };
+  }
+  if (input.serverId !== mode.authorityServerId)
+    throw new WorkspaceLayoutRefusal("authority_server_mismatch");
+  if (replica.state === "present") throw new WorkspaceLayoutRefusal("layout_role_data_mismatch");
+  if (guard.state === "present") identity(guard.value);
+  if (store.state === "absent") {
+    if (guard.state === "present" && guard.value.initialized)
+      throw new WorkspaceLayoutRefusal("restore_authority_store");
+    return {
+      role: "authority" as const,
+      state: "uninitialized" as const,
+      mode,
+      marker,
+      guard: guard.state === "present" ? guard.value : null,
+    };
+  }
+  if (guard.state !== "present" || !guard.value.initialized)
+    throw new WorkspaceLayoutRefusal("initialized_guard_required");
+  identity(store.value.snapshot.stamp);
+  validateCapturedSnapshot(store.value.snapshot);
+  validateCapturedReceipts(store.value);
+  validateInitialCapturedLayout(store.value);
+  return {
+    role: "authority" as const,
+    state: "initialized" as const,
+    mode,
+    marker,
+    guard: guard.value,
+    store: store.value,
+  };
+}
+
+function resolveCapturedMode(input: {
+  configured: WorkspaceLayoutConfig | undefined;
+  marker: ParsedCapture<z.infer<typeof WorkspaceLayoutHomeMarkerSchema>>;
+}): WorkspaceLayoutConfig | undefined {
+  const configured =
+    input.configured === undefined
+      ? undefined
+      : validateCapturedValue(input.configured, WorkspaceLayoutConfigSchema);
+  let mode = configured;
+  if (input.marker.state === "present") {
+    const {
+      schemaVersion: _version,
+      destructiveRetirement: _retirement,
+      ...bound
+    } = input.marker.value;
+    if (configured && canonicalLayoutJson(configured) !== canonicalLayoutJson(bound))
+      throw new WorkspaceLayoutRefusal("home_authority_binding_changed");
+    mode = bound;
+  }
+  return mode;
+}
+
+function requireCapturedIdentity(
+  value: WorkspaceLayoutIdentity,
+  expected: WorkspaceLayoutIdentity,
+): void {
+  if (
+    value.authorityServerId !== expected.authorityServerId ||
+    value.authorityId !== expected.authorityId ||
+    value.epoch !== expected.epoch
+  )
+    throw new WorkspaceLayoutRefusal("authority_identity_mismatch");
+}
+
+function validateCapturedReceipts(file: StoreFile): void {
+  const current = file.snapshot.stamp;
+  const receipts = Object.entries(file.receipts);
+  if (receipts.length !== current.revision)
+    throw new WorkspaceLayoutRefusal("incomplete_commit_receipts");
+  const revisions = new Map<number, WorkspaceLayoutReceipt>();
+  for (const [key, receipt] of receipts) {
+    requireCapturedIdentity(receipt.stamp, current);
+    if (
+      !receipt.requestId ||
+      receipt.requestId.length > 256 ||
+      key !== receiptKey(receipt.requestId) ||
+      receipt.stamp.revision < 1 ||
+      receipt.stamp.revision > current.revision ||
+      revisions.has(receipt.stamp.revision)
+    )
+      throw new WorkspaceLayoutRefusal("invalid_commit_receipt");
+    revisions.set(receipt.stamp.revision, receipt);
+  }
+  let active = false;
+  for (let revision = 1; revision <= current.revision; revision++) {
+    const receipt = revisions.get(revision);
+    if (!receipt || (active && receipt.stamp.phase !== "active"))
+      throw new WorkspaceLayoutRefusal("invalid_commit_receipt");
+    active ||= receipt.stamp.phase === "active";
+  }
+  if (
+    current.revision > 0 &&
+    canonicalLayoutJson(revisions.get(current.revision)?.stamp) !== canonicalLayoutJson(current)
+  )
+    throw new WorkspaceLayoutRefusal("invalid_commit_receipt");
+}
+
+function validateInitialCapturedLayout(file: StoreFile): void {
+  const current = file.snapshot.stamp;
+  if (
+    current.revision === 0 &&
+    (current.phase !== "importing" ||
+      file.snapshot.entries.length ||
+      file.snapshot.imports.length ||
+      file.snapshot.clientImports?.length ||
+      file.snapshot.navigation !== null)
+  )
+    throw new WorkspaceLayoutRefusal("invalid_initial_layout");
+}
+
+function validateCapturedSnapshot(snapshot: WorkspaceLayoutSnapshot): void {
+  // Format 3 always persists these fields. Wire compatibility optionality is not evidence of absence.
+  if (!Object.hasOwn(snapshot, "clientImports") || !Object.hasOwn(snapshot, "navigation"))
+    throw new WorkspaceLayoutRefusal("incomplete_layout_provenance");
+  if (new Set(snapshot.imports.map((source) => source.serverId)).size !== snapshot.imports.length)
+    throw new WorkspaceLayoutRefusal("duplicate_import_source");
+  const sources = (snapshot.clientImports ?? []).map((entry) => entry.source.sourceId);
+  if (new Set(sources).size !== sources.length)
+    throw new WorkspaceLayoutRefusal("duplicate_client_source");
+  if (
+    snapshot.entries.some((entry) => entry.revision > snapshot.stamp.revision) ||
+    (snapshot.navigation && snapshot.navigation.revision > snapshot.stamp.revision)
+  )
+    throw new WorkspaceLayoutRefusal("invalid_layout_revision");
+  validateLayoutGraph(snapshot);
 }
 
 export interface WorkspaceLayoutStoreOptions {

@@ -1,3 +1,4 @@
+import { parseCapturedJson, type CapturedJson } from "./captured-json.js";
 import { readFile } from "node:fs/promises";
 import { PluginRegistriesSchema } from "@getpaseo/protocol/plugin-registry";
 import { WorkspaceLayoutConfigSchema } from "@getpaseo/protocol/workspace-layout";
@@ -374,6 +375,13 @@ export const PersistedConfigSchema = z
     log: LogConfigSchema.optional(),
   })
   .strict();
+
+/** Pure strict inspection. No config initialization, migration, chmod or write intent.
+ * Returns validated disk INPUT; callers must retain bytes and must not log credentials.
+ */
+export function parseCapturedConfig(capture: CapturedJson) {
+  return parseCapturedJson(capture, PersistedConfigSchema);
+}
 
 type PersistedConfigSchemaOutput = z.infer<typeof PersistedConfigSchema>;
 

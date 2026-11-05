@@ -1,3 +1,4 @@
+import { parseCapturedJson, CapturedJsonRefusal, type CapturedJson } from "./captured-json.js";
 import { promises as fs } from "node:fs";
 
 import type { Logger } from "pino";
@@ -137,6 +138,25 @@ const PersistedWorkspaceRecordSchema = z
     // Repair orphaned superpins on load and at every registry write boundary.
     pinnedAt: record.pinnedAt ?? record.superpinnedAt,
   }));
+
+/** Offline inspection retains legacy omissions instead of invoking loader repairs/defaults. */
+export function parseCapturedWorkspaceRegistry(capture: CapturedJson) {
+  const result = parseCapturedJson(capture, z.array(PersistedWorkspaceRecordSchema));
+  if (result.state === "present")
+    assertUniqueCapturedIds(result.value.map((row) => row.workspaceId));
+  return result;
+}
+
+export function parseCapturedProjectRegistry(capture: CapturedJson) {
+  const result = parseCapturedJson(capture, z.array(PersistedProjectRecordSchema));
+  if (result.state === "present") assertUniqueCapturedIds(result.value.map((row) => row.projectId));
+  return result;
+}
+
+function assertUniqueCapturedIds(ids: string[]): void {
+  if (new Set(ids).size !== ids.length)
+    throw new CapturedJsonRefusal("duplicate_registry_identity");
+}
 
 export type PersistedProjectRecord = z.infer<typeof PersistedProjectRecordSchema>;
 export type PersistedWorkspaceRecord = z.infer<typeof PersistedWorkspaceRecordSchema>;

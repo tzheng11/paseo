@@ -37,6 +37,60 @@ The password-bearing connection stays in private daemon `hosts.json` (mode
 bootstrap, localStorage, source, logs or a public receipt. Web/native clients
 call their own daemon; its forwarding keeps the authority credential server-side.
 
+## Offline captured-data inspection
+
+A DOWN recovery reader must not call `WorkspaceLayoutStore.inspect()`: it locks the
+home and may complete an initialized-guard write. The pure exports below consume
+caller-captured bytes without constructing a store, reading files, locking,
+initializing config, creating a write intent, or normalizing persisted records:
+
+- `workspace-layout-store.ts`: `parseCapturedWorkspaceLayout({ serverId, configured,
+marker, store, guard, replica })`. The four file captures correspond to
+  `workspace-layout-mode.json`, `workspace-layout.json`,
+  `workspace-layout-initialized.json`, and `workspace-layout-replica.json`.
+  `configured` is the validated config's `workspaceLayout`, or `undefined`.
+- `workspace-registry.ts`: `parseCapturedWorkspaceRegistry(capture)` and
+  `parseCapturedProjectRegistry(capture)` for `projects/workspaces.json` and
+  `projects/projects.json`.
+- `persisted-config.ts`: `parseCapturedConfig(capture)` for `config.json`.
+
+A capture is explicitly `{ state: "present", bytes: string | Uint8Array }`,
+`{ state: "absent" }`, or `{ state: "unreadable" }`. An unreadable capture refuses;
+an absent registry/config remains absent, never an empty array/default config.
+UTF-8 byte input must decode strictly. Invalid JSON, duplicate decoded object
+keys, invalid schema values, unknown fields that a schema would strip, and
+normalization of an explicitly supplied field refuse with static error codes.
+Successful registry/config results contain the validated schema **input**, not
+its normalized output: omitted legacy fields remain omitted. For example, an
+explicit orphan-superpin repair or `daemon.allowedHosts` rewrite is refused,
+not silently applied. Supported passthrough config fields remain present.
+Config values and results are private and must never be printed in diagnostics.
+
+The layout parser resolves the sticky mode against configured identity/key and
+returns a discriminated legacy, uninitialized-authority, initialized-authority,
+or replica result. Replica cache absence is explicit; a cached snapshot never
+becomes authoritative or fresh and contains no invented commit receipts.
+Authority data requires the matching initialized guard. A present store with a
+missing/false guard is an incomplete initialization and refuses without repair.
+Format 3 requires complete navigation/client provenance, nullable unranked
+entries, valid graphs and import identities. The full receipt map must retain
+one correctly indexed, identity-bound receipt per committed revision, with a
+non-regressing phase history and the final receipt's exact current stamp.
+Request payloads are not stored in this file: its parser cannot authenticate a
+receipt's request digest against an unavailable original request.
+
+These exports are available in the packet's corresponding
+`runtime/packages/server/dist/server/server/*.js` modules (and the second
+`dist/src/server` compiled tree). They reuse the live schemas and graph validator;
+`captured-json.js` is their shared pure decoding dependency. They return typed
+validated data or refusal only. They do not authorize recovery, replay,
+retirement, a downgrade, or authority freshness. The native caller owns nofollow
+and UID/home/server binding, explicit absence, stable byte capture, current
+writer/guard/generation checks and any newer-state comparison. Local registry
+records are retained as observations; their omitted pin/rank fields are not
+canonical unpin/order decisions, and their schema validation is not a separate
+cross-file hierarchy or filesystem-closure proof.
+
 ## Durable identity and transactions
 
 The authority owns `workspace-layout.json` relative to its qualified Paseo home.
