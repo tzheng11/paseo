@@ -7,6 +7,7 @@ import {
   submitNewWorkspacePrompt,
 } from "../support/helpers/new-workspace";
 import { seedWorkspace, type SeededWorkspace } from "../support/helpers/seed-client";
+import { chooseModel, startWithoutRememberedModel } from "../support/helpers/model-memory";
 import { getServerId } from "../support/helpers/server-id";
 import { waitForSidebarHydration } from "../support/helpers/workspace-ui";
 
@@ -62,6 +63,9 @@ async function watchPinnedRow(page: Page, testId: string): Promise<() => Promise
 test.describe("New workspace live pin", () => {
   test("keeps a pin made before the creation response arrives", async ({ page }) => {
     test.setTimeout(120_000);
+    // Model hydration is not this regression. Select an actual fixture model before
+    // submitting so a remembered label cannot mask a still-unresolved provider.
+    await startWithoutRememberedModel(page);
     const creation = await delayBrowserAgentCreatedStatus(page);
     const seeded = await seedWorkspace({ repoPrefix: "new-workspace-live-pin-" });
 
@@ -69,6 +73,7 @@ test.describe("New workspace live pin", () => {
       await gotoAppShell(page);
       await waitForSidebarHydration(page);
       await openNewWorkspaceComposer(page, seeded);
+      await chooseModel(page, "mock", "Ten second stream");
       await submitNewWorkspacePrompt(page, "Pin me while I start");
 
       await creation.waitForCreateRequest();
