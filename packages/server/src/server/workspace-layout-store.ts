@@ -210,10 +210,8 @@ function validateCapturedSnapshot(snapshot: WorkspaceLayoutSnapshot): void {
   const sources = (snapshot.clientImports ?? []).map((entry) => entry.source.sourceId);
   if (new Set(sources).size !== sources.length)
     throw new WorkspaceLayoutRefusal("duplicate_client_source");
-  if (
-    snapshot.entries.some((entry) => entry.revision > snapshot.stamp.revision) ||
-    (snapshot.navigation && snapshot.navigation.revision > snapshot.stamp.revision)
-  )
+  // Navigation has its own counter: a commit may contain several navigation mutations.
+  if (snapshot.entries.some((entry) => entry.revision > snapshot.stamp.revision))
     throw new WorkspaceLayoutRefusal("invalid_layout_revision");
   validateLayoutGraph(snapshot);
 }

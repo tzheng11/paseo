@@ -68,7 +68,9 @@ Config values and results are private and must never be printed in diagnostics.
 
 The layout parser resolves the sticky mode against configured identity/key and
 returns a discriminated legacy, uninitialized-authority, initialized-authority,
-or replica result. Replica cache absence is explicit; a cached snapshot never
+or replica result. A damaged replica cache deliberately refuses offline inspection even though the
+live service can discard it and try to fetch a fresh authority snapshot.
+Replica cache absence is explicit; a cached snapshot never
 becomes authoritative or fresh and contains no invented commit receipts.
 Authority data requires the matching initialized guard. A present store with a
 missing/false guard is an incomplete initialization and refuses without repair.
@@ -80,8 +82,10 @@ Request payloads are not stored in this file: its parser cannot authenticate a
 receipt's request digest against an unavailable original request.
 
 These exports are available in the packet's corresponding
-`runtime/packages/server/dist/server/server/*.js` modules (and the second
-`dist/src/server` compiled tree). They reuse the live schemas and graph validator;
+`runtime/packages/server/dist/server/server/*.js` modules. The secondary
+`dist/src/server` supervisor closure additionally includes the config parser and
+its `captured-json.js` dependency; it does not promise a second copy of the
+registry or layout-store exports. They reuse the live schemas and graph validator;
 `captured-json.js` is their shared pure decoding dependency. They return typed
 validated data or refusal only. They do not authorize recovery, replay,
 retirement, a downgrade, or authority freshness. The native caller owns nofollow

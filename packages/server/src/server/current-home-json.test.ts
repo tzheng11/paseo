@@ -8,8 +8,13 @@ import type {
   WorkspaceLayoutReceipt,
 } from "@getpaseo/protocol/workspace-layout";
 import { emptyWorkspaceNavigationPreferences } from "@getpaseo/protocol/workspace-layout";
+import { createTestLogger } from "../test-utils/test-logger.js";
 import { parseCapturedConfig } from "./persisted-config.js";
 import {
+  FileBackedProjectRegistry,
+  FileBackedWorkspaceRegistry,
+  createPersistedProjectRecord,
+  createPersistedWorkspaceRecord,
   parseCapturedProjectRegistry,
   parseCapturedWorkspaceRegistry,
 } from "./workspace-registry.js";
@@ -203,6 +208,77 @@ describe("pure current-home byte inspection", () => {
       });
       snapshot = await writer.inspect();
       expect(parseCapturedWorkspaceLayout(await capture())).toMatchObject({ store: { snapshot } });
+    } finally {
+      await fs.rm(home, { recursive: true, force: true });
+    }
+  });
+  it("accepts independent navigation revisions from multiple real mutations in one commit", async () => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "paseo-captured-navigation-"));
+    try {
+      const writer = new WorkspaceLayoutStore({ paseoHome: home, identity, serverId: "srv_hub" });
+      const initialized = await writer.initialize(identity);
+      await writer.commit({
+        requestId: "two-navigation-mutations",
+        expected: initialized.stamp,
+        mutations: [0, 1].map((expectedRevision) => ({
+          kind: "put-navigation" as const,
+          expectedRevision,
+          preferences: emptyWorkspaceNavigationPreferences(),
+          importResolution: { clientSources: [], resolutionSha256: "f".repeat(64) },
+        })),
+      });
+      const captured = {
+        ...input(),
+        store: {
+          state: "present" as const,
+          bytes: await fs.readFile(path.join(home, "workspace-layout.json")),
+        },
+        guard: {
+          state: "present" as const,
+          bytes: await fs.readFile(path.join(home, "workspace-layout-initialized.json")),
+        },
+      };
+      expect(parseCapturedWorkspaceLayout(captured)).toMatchObject({
+        store: { snapshot: { stamp: { revision: 1 }, navigation: { revision: 2 } } },
+      });
+    } finally {
+      await fs.rm(home, { recursive: true, force: true });
+    }
+  });
+  it("retains exact bytes produced by the real project and workspace registry writers", async () => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "paseo-captured-registries-"));
+    try {
+      const projectFile = path.join(home, "projects/projects.json");
+      const workspaceFile = path.join(home, "projects/workspaces.json");
+      const projects = new FileBackedProjectRegistry(projectFile, createTestLogger());
+      const workspaces = new FileBackedWorkspaceRegistry(workspaceFile, createTestLogger());
+      const project = createPersistedProjectRecord({
+        projectId: "project",
+        rootPath: home,
+        kind: "non_git",
+        displayName: "Fixture",
+        createdAt: "2026-11-04",
+        updatedAt: "2026-11-04",
+      });
+      const row = createPersistedWorkspaceRecord({
+        ...workspace,
+        kind: "directory",
+        cwd: home,
+        pinnedAt: "2026-11-04",
+        archivedAt: "2026-11-04",
+      });
+      await projects.upsert(project);
+      await workspaces.upsert(row);
+      const projectBytes = await fs.readFile(projectFile);
+      const workspaceBytes = await fs.readFile(workspaceFile);
+      expect(parseCapturedProjectRegistry({ state: "present", bytes: projectBytes })).toEqual({
+        state: "present",
+        value: JSON.parse(projectBytes.toString()),
+      });
+      expect(parseCapturedWorkspaceRegistry({ state: "present", bytes: workspaceBytes })).toEqual({
+        state: "present",
+        value: JSON.parse(workspaceBytes.toString()),
+      });
     } finally {
       await fs.rm(home, { recursive: true, force: true });
     }
