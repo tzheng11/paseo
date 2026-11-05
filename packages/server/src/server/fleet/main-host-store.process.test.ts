@@ -6,6 +6,7 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  realpath,
   rm,
   symlink,
   writeFile,
@@ -291,6 +292,7 @@ async function extractBaseline(): Promise<string> {
       BASE_REVISION,
       "package.json",
       "packages/server",
+      "packages/protocol",
     ],
     { cwd: repositoryRoot },
   );
@@ -300,12 +302,54 @@ async function extractBaseline(): Promise<string> {
     path.join(baseline, "node_modules"),
     process.platform === "win32" ? "junction" : "dir",
   );
-  // Hoisted installs can keep server-specific versions (for example p-limit)
-  // below this workspace; use those same versions for the archived source.
+  // Keep external dependency versions, but never run the archived server against
+  // today's protocol output. Removed exports can survive in a developer's stale
+  // dist while being absent from a clean CI build.
+  const serverModules = path.join(baseline, "packages/server/node_modules");
+  await mkdir(serverModules);
+  const installedModules = path.join(repositoryRoot, "packages/server/node_modules");
+  for (const name of await readdir(installedModules)) {
+    if (name.startsWith(".") || name === "@getpaseo") continue;
+    await symlink(
+      path.join(installedModules, name),
+      path.join(serverModules, name),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+  }
+  await mkdir(path.join(serverModules, "@getpaseo"));
+  const protocol = path.join(baseline, "packages/protocol");
   await symlink(
-    path.join(repositoryRoot, "packages/server/node_modules"),
-    path.join(baseline, "packages/server/node_modules"),
+    protocol,
+    path.join(serverModules, "@getpaseo/protocol"),
     process.platform === "win32" ? "junction" : "dir",
+  );
+  await execute(
+    process.execPath,
+    [
+      path.join(repositoryRoot, "node_modules/typescript/bin/tsc"),
+      "-p",
+      path.join(protocol, "tsconfig.json"),
+      "--noCheck",
+      "--declaration",
+      "false",
+      "--declarationMap",
+      "false",
+      "--sourceMap",
+      "false",
+    ],
+    { cwd: baseline, maxBuffer: 1024 * 1024 },
+  );
+  const resolved = await execute(
+    process.execPath,
+    [
+      "--input-type=module",
+      "--eval",
+      'console.log(import.meta.resolve("@getpaseo/protocol/terminal-snapshot"))',
+    ],
+    { cwd: path.join(baseline, "packages/server") },
+  );
+  expect(fileURLToPath(resolved.stdout.trim())).toBe(
+    await realpath(path.join(protocol, "dist/terminal-snapshot.js")),
   );
   await expect(
     access(path.join(baseline, "packages/server/src/server/fleet/main-host-store.ts")),
@@ -323,6 +367,22 @@ function captureChildOutput(child: ChildProcess): () => string {
   return () => output;
 }
 
+async function daemonStartupError(
+  message: string,
+  home: string,
+  recentOutput: () => string,
+): Promise<Error> {
+  let workerOutput = "";
+  try {
+    // Only this fixture's private home is read. A detached worker's failure is
+    // written here rather than to its launcher's stderr.
+    workerOutput = (await readFile(path.join(home, "terminal-worker.log"), "utf8")).slice(-32_768);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  return new Error(`${message}\n${recentOutput()}\nTerminal worker fixture log:\n${workerOutput}`);
+}
+
 async function waitForDaemon(
   child: ChildProcess,
   port: number,
@@ -332,8 +392,10 @@ async function waitForDaemon(
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
     if (child.exitCode !== null || child.signalCode !== null)
-      throw new Error(
-        `Baseline daemon exited before listening (${child.exitCode}, ${child.signalCode})\n${recentOutput()}`,
+      throw await daemonStartupError(
+        `Baseline daemon exited before listening (${child.exitCode}, ${child.signalCode})`,
+        home,
+        recentOutput,
       );
     // HTTP binds before plugin startup finishes. The supervisor publishes its
     // listen receipt only after daemon.start() has enabled WebSocket acceptance.
@@ -347,7 +409,11 @@ async function waitForDaemon(
     }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  throw new Error(`Baseline daemon did not listen within 60 seconds\n${recentOutput()}`);
+  throw await daemonStartupError(
+    "Baseline daemon did not listen within 60 seconds",
+    home,
+    recentOutput,
+  );
 }
 
 async function connectCurrentDaemon(home: string): Promise<{
