@@ -106,6 +106,7 @@ import {
   captureUnmovedProjectOrders,
   hasVisibleOrderChanged,
   mergeWithRemainder,
+  reorderVisibleWorkspaceKeys,
 } from "@/utils/sidebar-reorder";
 import { confirmDialog } from "@/utils/confirm-dialog";
 import type { SidebarStateBucket } from "@/utils/sidebar-agent-state";
@@ -2117,6 +2118,20 @@ export function SidebarWorkspaceList({
         (item) => item.workspaceKey === drop.workspaceKey,
       );
       if (!workspace) throw new Error("Workspace is no longer available");
+      let reorderedLegacyKeys: string[] | undefined;
+      if (!drop.pinSection) {
+        const project = pinnedGroups.unpinnedProjects.find(
+          (item) => item.viewKey === workspace.projectViewKey,
+        );
+        if (!project || drop.position === "inside")
+          throw new Error("Project order is no longer available. Refresh before moving it.");
+        reorderedLegacyKeys = reorderVisibleWorkspaceKeys({
+          order: project.workspaces.map((item) => item.workspaceKey),
+          workspaceKey: drop.workspaceKey,
+          targetWorkspaceKey: drop.targetWorkspaceKey,
+          position: drop.position,
+        });
+      }
       const shouldPin = drop.pinSection === "pinned" || drop.pinSection === "superpinned";
       const shouldSuperpin = drop.pinSection === "superpinned";
       const treeForDrop = (store: ReturnType<typeof useSidebarOrderStore.getState>) => {
@@ -2323,10 +2338,15 @@ export function SidebarWorkspaceList({
                 }))
                   store.setWorkspaceOrder(update.projectViewKey, update.order);
               }
-              // The host now owns the successful ordinary move. Retire only
-              // this project's legacy client order; untouched projects retain
-              // their pre-beta manual order until the user moves them.
-              store.setWorkspaceOrder(workspace.projectViewKey, []);
+              // One host move does not migrate the rest of a legacy client's
+              // saved order. Retain it until the explicit canonical import.
+              store.setWorkspaceOrder(
+                workspace.projectViewKey,
+                mergeWithRemainder({
+                  currentOrder: store.getWorkspaceOrder(workspace.projectViewKey),
+                  reorderedVisibleKeys: reorderedLegacyKeys!,
+                }),
+              );
               store.setWorkspaceSortMode(workspace.projectViewKey, "manual");
               useSidebarViewStore.getState().setWorkspaceSort("manual");
             }

@@ -1,4 +1,5 @@
 import path from "node:path";
+import { configureHttpTransport } from "../../http-transport.js";
 import { initializeEnvironmentProxy } from "../../network/index.js";
 import { DaemonClient } from "../../test-utils/daemon-client.js";
 import { createTestPaseoDaemon } from "../../test-utils/paseo-daemon.js";
@@ -8,7 +9,11 @@ const mode = process.argv[2];
 if (mode !== "builtin" && mode !== "directory") throw new Error("Expected builtin or directory");
 const sources = ["claude-usage-source", "codex-usage-source"];
 // Built-ins run inside the daemon; directory plugins initialize their own subprocess network.
-if (mode === "builtin") initializeEnvironmentProxy();
+if (mode === "builtin") {
+  // Match daemon-worker startup: the fixed parser is selected before its proxy.
+  configureHttpTransport();
+  initializeEnvironmentProxy();
+}
 const daemon = await createTestPaseoDaemon({
   pluginsEnabled: mode === "directory",
   builtinPlugins: new BuiltinPluginLoader(
@@ -24,7 +29,9 @@ try {
       await client.installDirectoryPlugin(path.join(resolveBuiltinPluginsRoot(), source), source);
     }
   }
-  await client.listUsageReports();
+  const result = await client.listUsageReports();
+  if (result.reports.length < 2)
+    throw new Error(`Synthetic usage discovery incomplete (${result.reports.length} reports)`);
 } finally {
   await client.close();
   await daemon.close();

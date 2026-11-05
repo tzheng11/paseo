@@ -12,7 +12,10 @@ import {
 } from "./pinned-layout";
 import type { WorkspaceTreeDrop } from "./drop-target";
 import { UNGROUPED_WORKSPACE_SORT_KEY } from "@getpaseo/protocol/sidebar-order";
-import { captureUnmovedProjectOrders } from "../../../utils/sidebar-reorder";
+import {
+  captureUnmovedProjectOrders,
+  reorderVisibleWorkspaceKeys,
+} from "../../../utils/sidebar-reorder";
 
 interface CatalogItem {
   workspaceKey: string;
@@ -167,10 +170,13 @@ function applyProjectOrder(
     }))
       preferences.workspaceOrderByProject[update.projectViewKey] = update.order;
   }
-  const ordered = input.projectOrder.filter((key) => key !== drop.workspaceKey);
-  const index = ordered.indexOf(drop.targetWorkspaceKey);
-  if (index < 0) throw new Error("Destination workspace is not in the current project view.");
-  ordered.splice(index + Number(drop.position === "after"), 0, drop.workspaceKey);
+  if (drop.position === "inside") throw new Error("Pin workspaces before nesting them.");
+  const ordered = reorderVisibleWorkspaceKeys({
+    order: input.projectOrder,
+    workspaceKey: drop.workspaceKey,
+    targetWorkspaceKey: drop.targetWorkspaceKey,
+    position: drop.position,
+  });
   const stored = preferences.workspaceOrderByProject[view] ?? [];
   preferences.workspaceOrderByProject[view] = [
     ...ordered,

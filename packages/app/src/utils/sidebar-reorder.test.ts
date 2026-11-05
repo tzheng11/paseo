@@ -4,6 +4,7 @@ import {
   captureUnmovedProjectOrders,
   hasVisibleOrderChanged,
   mergeWithRemainder,
+  reorderVisibleWorkspaceKeys,
 } from "./sidebar-reorder";
 
 describe("hasVisibleOrderChanged", () => {
@@ -101,4 +102,38 @@ describe("captureUnmovedProjectOrders", () => {
       }),
     ).toEqual([{ projectViewKey: "visible", order: ["h:b", "h:a"] }]);
   });
+});
+
+describe("reorderVisibleWorkspaceKeys", () => {
+  it.each([
+    { position: "before" as const, source: "c", target: "a", expected: ["c", "a", "b"] },
+    { position: "after" as const, source: "a", target: "b", expected: ["b", "a", "c"] },
+  ])(
+    "preserves every other visible key for $position",
+    ({ position, source, target, expected }) => {
+      const order = ["a", "b", "c"];
+      expect(
+        reorderVisibleWorkspaceKeys({
+          order,
+          workspaceKey: source,
+          targetWorkspaceKey: target,
+          position,
+        }),
+      ).toEqual(expected);
+      expect(order).toEqual(["a", "b", "c"]);
+    },
+  );
+  it.each(["source", "target"])(
+    "refuses an unavailable %s instead of inventing an order",
+    (missing) => {
+      expect(() =>
+        reorderVisibleWorkspaceKeys({
+          order: ["a", "b"],
+          workspaceKey: missing === "source" ? "missing" : "a",
+          targetWorkspaceKey: missing === "target" ? "missing" : "b",
+          position: "after",
+        }),
+      ).toThrow("no longer in view");
+    },
+  );
 });

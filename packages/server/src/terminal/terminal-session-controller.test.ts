@@ -1,7 +1,8 @@
 import type { TerminalReplayOptions } from "./terminal-replay.js";
 import type { TerminalRestoreOptions } from "./terminal-restore.js";
 import type { TerminalReplayMetadata } from "./terminal-replay.js";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, onTestFinished, test, vi } from "vitest";
+import { TerminalOutputCoalescer } from "./terminal-output-coalescer.js";
 import pino from "pino";
 
 import type { SessionInboundMessage, SessionOutboundMessage } from "../server/messages.js";
@@ -100,6 +101,16 @@ describe("terminal-session-controller restore", () => {
     vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
     const restoreTime = 1000;
     vi.setSystemTime(restoreTime);
+    const markFlushed = TerminalOutputCoalescer.prototype.markFlushed;
+    const marked = vi
+      .spyOn(TerminalOutputCoalescer.prototype, "markFlushed")
+      .mockImplementation(function () {
+        markFlushed.call(this);
+        // Streaming replay may await several sinks after emitting Restore. Move
+        // the clock at the real flush boundary, not an earlier frame callback.
+        vi.setSystemTime(restoreTime + delayMs);
+      });
+    onTestFinished(() => marked.mockRestore());
     let terminalListener: ((message: ServerMessage) => void) | null = null;
     const snapshot = deferred<ReplayFixture | null>();
     const binaryFrames: TerminalStreamFrame[] = [];
@@ -155,11 +166,6 @@ describe("terminal-session-controller restore", () => {
         const frame = decodeTerminalStreamFrame(bytes);
         if (frame) {
           binaryFrames.push(frame);
-          if (frame.opcode === TerminalStreamOpcode.Restore) {
-            // markFlushed runs before the async replay continuation. Advance
-            // that gap deterministically to cover both output frame boundaries.
-            queueMicrotask(() => vi.setSystemTime(restoreTime + delayMs));
-          }
         }
       },
       hasBinaryChannel: () => true,

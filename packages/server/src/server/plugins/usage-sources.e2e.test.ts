@@ -363,7 +363,26 @@ const lookup = dns.lookup;
 dns.lookup = function(host, ...args) {
   if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return lookup.call(this, host, ...args);
   args.at(-1)(Object.assign(new Error('External DNS forbidden in proxy test'), { code: 'ENOTFOUND' }));
-};`,
+};
+const childProcess = require('node:child_process');
+const path = require('node:path');
+const custom = require('node:util').promisify.custom;
+function allowed(file) {
+  if (['security', 'secret-tool', 'cmdkey', 'cmdkey.exe'].includes(path.basename(String(file))))
+    throw new Error('Native credential lookup forbidden in proxy fixture');
+}
+for (const name of ['execFile', 'execFileSync', 'spawn', 'spawnSync']) {
+  const original = childProcess[name];
+  childProcess[name] = function(file, ...args) {
+    allowed(file);
+    return original.call(this, file, ...args);
+  };
+  if (original[custom]) childProcess[name][custom] = function(file, ...args) {
+    allowed(file);
+    return original[custom].call(this, file, ...args);
+  };
+}
+require('node:module').syncBuiltinESMExports();`,
     );
     await mkdir(path.join(root, ".claude"));
     await mkdir(path.join(root, ".codex"));
@@ -388,9 +407,21 @@ dns.lookup = function(host, ...args) {
           timeout: 45_000,
           maxBuffer: 1024 * 1024,
           env: {
-            ...process.env,
+            // Inherited proxy aliases are case-insensitive on Windows, and
+            // inherited provider credentials are never fixture inputs.
+            PATH: process.env.PATH,
+            SystemRoot: process.env.SystemRoot,
+            ComSpec: process.env.ComSpec,
+            NODE_ENV: "test",
+            TEMP: root,
+            TMP: root,
+            TMPDIR: root,
             HOME: root,
             USERPROFILE: root,
+            APPDATA: path.join(root, "appdata"),
+            LOCALAPPDATA: path.join(root, "localappdata"),
+            XDG_CONFIG_HOME: path.join(root, "config"),
+            XDG_DATA_HOME: path.join(root, "data"),
             CODEX_HOME: path.join(root, ".codex"),
             CLAUDE_CONFIG_DIR: path.join(root, ".claude"),
             NODE_OPTIONS: `--require=${JSON.stringify(guard.replaceAll("\\", "/"))}`,

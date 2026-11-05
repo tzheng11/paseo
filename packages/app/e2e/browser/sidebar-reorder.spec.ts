@@ -1535,9 +1535,11 @@ type CompactProject = Awaited<ReturnType<typeof seedCompactProject>>;
 
 function compactProjectRows(page: Page, seed: CompactProject["seed"]) {
   const list = page.getByTestId(`sidebar-workspace-list-${seed.projectKey}`);
+  const group = list.locator("..");
   return {
-    rows: list.locator('[data-testid^="sidebar-workspace-row-"]'),
-    group: list.locator(".."),
+    // The selected overflow row intentionally sits outside the drag list.
+    rows: group.locator('[data-testid^="sidebar-workspace-row-"]'),
+    group,
     project: page.getByTestId(`sidebar-project-row-${projectEquivalenceViewKey(seed.projectKey)}`),
   };
 }

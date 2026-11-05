@@ -155,6 +155,10 @@ identity and original pending request. Client-only filters can still persist in 
 separate local preference key; their copy of global sort never becomes a writer.
 Hydration cannot replace a canonical observation with those old values. Cached
 views survive reload while offline, with editing refused and no offline queue.
+Before canonical mode is configured, an ordinary host move retains the client's
+saved project order and hidden references. A single host rank update is not an
+import of that entire view. Import captures those original bytes under the
+layout-writer fence; it never clears them merely because one row moved.
 
 A client persists the normalized request and digest before dispatch. A definite
 semantic or proven pre-send refusal requires refresh and a new user intent; an uncertain outcome retains

@@ -7,6 +7,20 @@ export function mergeWithRemainder(input: {
   return [...input.reorderedVisibleKeys, ...remainder];
 }
 
+export function reorderVisibleWorkspaceKeys(input: {
+  order: readonly string[];
+  workspaceKey: string;
+  targetWorkspaceKey: string;
+  position: "before" | "after";
+}): string[] {
+  if (!input.order.includes(input.workspaceKey)) throw new Error("Workspace is no longer in view");
+  const next = input.order.filter((key) => key !== input.workspaceKey);
+  const index = next.indexOf(input.targetWorkspaceKey);
+  if (index < 0) throw new Error("Destination workspace is no longer in view");
+  next.splice(index + Number(input.position === "after"), 0, input.workspaceKey);
+  return next;
+}
+
 export function hasVisibleOrderChanged(input: {
   currentOrder: string[];
   reorderedVisibleKeys: string[];
