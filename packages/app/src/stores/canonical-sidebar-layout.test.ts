@@ -8,7 +8,7 @@ import {
   type WorkspaceLayoutSnapshot,
   type WorkspaceLayoutCommit,
 } from "@getpaseo/protocol/workspace-layout";
-import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import { DaemonClient, DaemonConnectionError } from "@getpaseo/client/internal/daemon-client";
 
 const config: WorkspaceLayoutConfig = {
   role: "replica",
@@ -80,6 +80,7 @@ function peer() {
   const read = vi.fn(async () => structuredClone(snapshot));
   const release = vi.fn(async () => {});
   const client = {
+    isConnected: true,
     getWorkspaceLayout: read,
     commitWorkspaceLayout: commit,
     getWorkspaceLayoutReceipt: lookup,
@@ -132,6 +133,177 @@ test("offline replicas survive reload but cannot become independent writers", as
     second.controller.update((current) => ({ ...current, projectOrder: ["offline"] })),
   ).rejects.toThrow("read-only");
   expect(p.commit).not.toHaveBeenCalled();
+});
+
+test("detaching a route with an actual disconnected SDK peer stays cached/read-only and reconnects without replay", async () => {
+  const f = fixture();
+  const online = peer();
+  const transportFactory = vi.fn(() => {
+    throw new Error("This supplied-state test must not open a transport");
+  });
+  const disconnected = new DaemonClient({
+    url: "ws://unit.invalid",
+    clientId: "canonical-disconnect-unit",
+    transportFactory,
+    reconnect: { enabled: false },
+  });
+  try {
+    const detach = await f.controller.attach("online", online.client, config);
+    await vi.waitFor(() => expect(f.controller.state().writable).toBe(true));
+    const removeDisconnected = await f.controller.attach("other", disconnected, config);
+    expect(() => detach()).not.toThrow();
+    expect(f.controller.state()).toMatchObject({
+      enabled: true,
+      writable: false,
+      pending: false,
+      snapshot: baseline(),
+    });
+    await expect(
+      f.controller.update((current) => ({ ...current, workspaceSort: "manual" })),
+    ).rejects.toThrow("read-only");
+    await expect(f.controller.reconcile()).rejects.toThrow("Reconnect");
+    removeDisconnected();
+    const reconnected = peer();
+    await f.controller.attach("other", reconnected.client, config);
+    await vi.waitFor(() => expect(f.controller.state().writable).toBe(true));
+    expect(reconnected.commit).not.toHaveBeenCalled();
+    await f.controller.update((current) => ({ ...current, workspaceSort: "lastPrompt" }));
+    expect(reconnected.commit).toHaveBeenCalledTimes(1);
+    expect(f.controller.state().snapshot?.navigation?.preferences.workspaceSort).toBe("lastPrompt");
+    expect(online.commit).not.toHaveBeenCalled();
+    expect(transportFactory).not.toHaveBeenCalled();
+  } finally {
+    await f.controller.close();
+    await disconnected.close();
+  }
+});
+
+test("attach handles a typed disconnect during synchronous subscription creation", async () => {
+  const f = fixture();
+  const p = peer();
+  p.client.observeWorkspaceLayout = () => {
+    throw new DaemonConnectionError("Transport not connected");
+  };
+  const detach = await f.controller.attach("racing", p.client, config);
+  expect(f.controller.state()).toMatchObject({ enabled: true, writable: false, pending: false });
+  expect(f.controller.state().error).toContain("read-only");
+  detach();
+  await f.controller.close();
+});
+
+test("a connection lost after route selection cannot block a fresh matching peer or permit writes", async () => {
+  const f = fixture();
+  const lost = peer();
+  lost.client.observeWorkspaceLayout = () => {
+    throw new DaemonConnectionError("lost between connected check and observation");
+  };
+  await f.controller.attach("lost", lost.client, config);
+  const connected = peer();
+  await f.controller.attach("connected", connected.client, config);
+  await vi.waitFor(() => expect(f.controller.state().writable).toBe(true));
+  connected.client.isConnected = false;
+  expect(f.controller.state().writable).toBe(false);
+  await expect(
+    f.controller.update((current) => ({ ...current, workspaceSort: "lastPrompt" })),
+  ).rejects.toThrow("read-only");
+  expect(connected.commit).not.toHaveBeenCalled();
+  expect(lost.commit).not.toHaveBeenCalled();
+  await f.controller.close();
+});
+
+test("reconcile connection loss retires the observation before a late snapshot can enable writes", async () => {
+  const f = fixture();
+  const p = peer();
+  await f.controller.attach("replica", p.client, config);
+  await vi.waitFor(() => expect(f.controller.state().writable).toBe(true));
+  let acceptLate!: (snapshot: WorkspaceLayoutSnapshot & { subscriptionId: string }) => void;
+  p.client.observeWorkspaceLayout = () => ({
+    subscriptionId: "racing",
+    ready: new Promise((resolve) => {
+      acceptLate = resolve;
+    }),
+    subscribe: () => () => {},
+    release: p.release,
+  });
+  p.read.mockRejectedValueOnce(new DaemonConnectionError("connection lost during refresh"));
+  await expect(f.controller.reconcile()).rejects.toThrow("connection lost");
+  acceptLate({ ...baseline(), subscriptionId: "racing" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(f.controller.state()).toMatchObject({
+    writable: false,
+    pending: false,
+    snapshot: baseline(),
+  });
+  await expect(f.controller.update((current) => current)).rejects.toThrow("read-only");
+  expect(p.commit).not.toHaveBeenCalled();
+  await f.controller.close();
+});
+
+test("subscription creation programming errors remain visible", async () => {
+  const f = fixture();
+  const p = peer();
+  p.client.observeWorkspaceLayout = () => {
+    throw new TypeError("invalid subscription implementation");
+  };
+  await expect(f.controller.attach("broken", p.client, config)).rejects.toThrow(TypeError);
+  expect(f.controller.state().writable).toBe(false);
+  await f.controller.close();
+});
+
+test("an observation error retires late ready/snapshot callbacks until a fresh route attaches", async () => {
+  const f = fixture();
+  const p = peer();
+  type Observer = Parameters<ReturnType<DaemonClient["observeWorkspaceLayout"]>["subscribe"]>[0];
+  let observer!: Observer;
+  let acceptLate!: (snapshot: WorkspaceLayoutSnapshot & { subscriptionId: string }) => void;
+  p.client.observeWorkspaceLayout = () => ({
+    subscriptionId: "lost",
+    ready: new Promise((resolve) => {
+      acceptLate = resolve;
+    }),
+    subscribe: (value) => {
+      observer = value;
+      return () => {};
+    },
+    release: p.release,
+  });
+  const detach = await f.controller.attach("replica", p.client, config);
+  observer.snapshot({ ...baseline(), subscriptionId: "lost" });
+  observer.error?.(new DaemonConnectionError("connection lost during snapshot persistence"));
+  acceptLate({ ...baseline(), subscriptionId: "lost" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(f.controller.state()).toMatchObject({
+    enabled: true,
+    writable: false,
+    snapshot: baseline(),
+  });
+  detach();
+  await f.controller.attach("replica", peer().client, config);
+  await vi.waitFor(() => expect(f.controller.state().writable).toBe(true));
+  observer.error?.(new DaemonConnectionError("retired peer failure"));
+  expect(f.controller.state().writable).toBe(true);
+  expect(p.commit).not.toHaveBeenCalled();
+  await f.controller.close();
+});
+
+test("connection loss during receipt reconciliation preserves the original UNKNOWN intent without redispatch", async () => {
+  const f = fixture();
+  const p = peer();
+  await f.controller.attach("replica", p.client, config);
+  await vi.waitFor(() => expect(f.controller.state().writable).toBe(true));
+  p.commit.mockRejectedValueOnce(
+    new DaemonConnectionError("lost ACK", "DAEMON_CONNECTION_LOST", { outcome: "unknown" }),
+  );
+  await expect(
+    f.controller.update((current) => ({ ...current, workspaceSort: "lastPrompt" })),
+  ).rejects.toThrow("lost ACK");
+  const original = JSON.parse(f.bytes()!).pending;
+  p.lookup.mockRejectedValueOnce(new DaemonConnectionError("receipt connection lost"));
+  await expect(f.controller.reconcile()).rejects.toThrow("receipt connection lost");
+  expect(JSON.parse(f.bytes()!).pending).toEqual(original);
+  expect(f.controller.state()).toMatchObject({ enabled: true, writable: false, pending: true });
+  expect(p.commit).toHaveBeenCalledTimes(1);
+  await f.controller.close();
 });
 
 test("a lost ACK is checked by the original receipt after reload and never replayed", async () => {

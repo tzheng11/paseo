@@ -85,6 +85,7 @@ test("actual sidebar setters forward edits, project observations, and preserve b
     };
   });
   const client = {
+    isConnected: true,
     getWorkspaceLayout: async () => snapshot,
     commitWorkspaceLayout: commit,
     getWorkspaceLayoutReceipt: async () => null,

@@ -12,7 +12,7 @@ import {
   type WorkspaceLayoutReceipt,
   type WorkspaceNavigationPreferences,
 } from "@getpaseo/protocol/workspace-layout";
-import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import { DaemonConnectionError, type DaemonClient } from "@getpaseo/client/internal/daemon-client";
 
 export const CANONICAL_SIDEBAR_REPLICA_KEY = "canonical-sidebar-layout-replica-v1";
 type LayoutClient = Pick<
@@ -21,6 +21,7 @@ type LayoutClient = Pick<
   | "commitWorkspaceLayout"
   | "getWorkspaceLayoutReceipt"
   | "observeWorkspaceLayout"
+  | "isConnected"
 >;
 interface Peer {
   client: LayoutClient;
@@ -84,6 +85,7 @@ export class CanonicalSidebarLayout {
         this.fresh &&
         !this.busy &&
         !this.error &&
+        this.observation?.peer.client.isConnected === true &&
         !this.replica?.pending &&
         this.replica?.snapshot?.stamp.phase === "active" &&
         !!this.replica.snapshot.navigation,
@@ -208,6 +210,18 @@ export class CanonicalSidebarLayout {
   async reconcile(): Promise<void> {
     await this.ready;
     if (this.busy) throw new Error("Wait for the current shared layout change to finish.");
+    try {
+      await this.reconcileRoute();
+    } catch (error) {
+      if (error instanceof DaemonConnectionError) {
+        this.stopObservation();
+        this.observationFailed(error);
+      }
+      throw error;
+    }
+  }
+
+  private async reconcileRoute(): Promise<void> {
     // Refresh repairs a failed subscription as well as its one-shot read.
     this.stopObservation();
     this.selectRoute();
@@ -318,18 +332,33 @@ export class CanonicalSidebarLayout {
         return;
       }
     }
-    const peer = [...this.peers.values()][0];
-    if (peer === this.observation?.peer) return;
+    const peers = [...this.peers.values()].filter((peer) => peer.client.isConnected);
+    const peer = peers[0];
+    if (peer && peer === this.observation?.peer) return;
     this.stopObservation();
-    this.fresh = false;
-    if (!peer) {
-      this.publish();
-      return;
+    for (const connected of peers) if (this.observePeer(connected)) return;
+    if (this.peers.size > 0)
+      this.observationFailed(new DaemonConnectionError("No connected shared-layout peer"));
+    else this.publish();
+  }
+
+  private observePeer(peer: Peer): boolean {
+    let subscription: ReturnType<LayoutClient["observeWorkspaceLayout"]>;
+    try {
+      // The SDK checks its connection synchronously; a peer can disconnect
+      // before React detaches it or while another peer's cleanup reselects it.
+      subscription = peer.client.observeWorkspaceLayout();
+    } catch (error) {
+      if (!(error instanceof DaemonConnectionError)) throw error;
+      this.observationFailed(error);
+      return false;
     }
-    const subscription = peer.client.observeWorkspaceLayout();
     const generation = ++this.observationGeneration;
     const failed = (error: unknown) => {
-      if (generation === this.observationGeneration) this.observationFailed(error);
+      if (generation === this.observationGeneration) {
+        this.stopObservation();
+        this.observationFailed(error);
+      }
     };
     const stop = subscription.subscribe({
       snapshot: (snapshot) => {
@@ -346,6 +375,7 @@ export class CanonicalSidebarLayout {
       .then((snapshot) => this.accept(peer, snapshot, generation))
       .catch(failed);
     this.publish();
+    return true;
   }
 
   private async accept(
@@ -414,6 +444,7 @@ export class CanonicalSidebarLayout {
     return run;
   }
   private stopObservation(): void {
+    this.fresh = false;
     const generation = ++this.observationGeneration;
     const current = this.observation;
     this.observation = null;
