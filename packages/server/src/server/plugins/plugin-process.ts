@@ -1,9 +1,12 @@
+import { configureHttpTransport } from "../http-transport.js";
+import { PluginAgentTools } from "./agent-tools.js";
 import { PluginHookHandlers } from "./lifecycle/index.js";
 import { evaluateBundle } from "./bundle-evaluator.js";
 import {
   PluginProcessRequestSchema,
   type PluginProcessMessage,
   type PluginProcessRequest,
+  type PluginInitializationPhase,
 } from "./plugin-process-protocol.js";
 import type { UsageSourceRegistration } from "@getpaseo/plugin/server/usage";
 import type { SettingsDefinition, PluginRpcContract } from "@getpaseo/plugin";
@@ -23,6 +26,7 @@ import { createPluginClientId } from "./plugin-session-identity.js";
 
 import { PluginSettingsStore } from "./settings/index.js";
 import { readPluginProviderIcon } from "./provider-icon.js";
+import { initializeEnvironmentProxy } from "../network/index.js";
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -33,11 +37,68 @@ export interface PluginWorkerChannel {
   disconnect(): void;
 }
 
+type RecordInitializationPhase = (phase: PluginInitializationPhase) => void;
+
+function initializationDiagnostics(channel: PluginWorkerChannel): RecordInitializationPhase {
+  const started = performance.now();
+  const recorded = new Set<PluginInitializationPhase>();
+  let warned = false;
+  return (phase) => {
+    if (recorded.has(phase)) return;
+    recorded.add(phase);
+    try {
+      // Best-effort telemetry must not become a startup acknowledgment or a new
+      // failure boundary. No initialization work awaits diagnostic delivery.
+      channel.send(
+        { type: "initialization.phase", phase, elapsedMs: performance.now() - started },
+        () => {},
+      );
+    } catch {
+      if (!warned) {
+        warned = true;
+        console.error("Plugin initialization diagnostics unavailable");
+      }
+    }
+  };
+}
+
+function isInitializationFrame(data: string | Uint8Array, kind: "hello" | "server_info"): boolean {
+  if (typeof data !== "string") return false;
+  try {
+    const frame = JSON.parse(data) as {
+      type?: unknown;
+      message?: { type?: unknown; payload?: { status?: unknown } };
+    } | null;
+    return kind === "hello"
+      ? frame?.type === "hello"
+      : frame?.type === "session" &&
+          frame.message?.type === "status" &&
+          frame.message.payload?.status === "server_info";
+  } catch {
+    // Diagnostics do not consume or validate the underlying protocol frame.
+    return false;
+  }
+}
+
+export function createPluginWorkerFromBundle(options: {
+  channel: PluginWorkerChannel;
+  message: Extract<PluginProcessRequest, { type: "initialize" }>;
+}): ReturnType<typeof createPluginWorker> {
+  const recordInitialization = initializationDiagnostics(options.channel);
+  recordInitialization("initialize-received");
+  recordInitialization("evaluation-started");
+  const contribute = evaluateBundle(options.message.bundle);
+  recordInitialization("evaluation-completed");
+  return createPluginWorker({ channel: options.channel, contribute, recordInitialization });
+}
+
 export function createPluginWorker(options: {
   channel: PluginWorkerChannel;
   contribute: PluginServerContribution;
+  recordInitialization?: RecordInitializationPhase;
 }): { shutdown(): Promise<void> } {
   const { channel, contribute } = options;
+  const recordInitialization = options.recordInitialization ?? initializationDiagnostics(channel);
   let settingsStore: PluginSettingsStore | null = null;
   function registerSettings<Schema extends ZodType>(definition: SettingsDefinition<Schema>) {
     if (!settingsStore) throw new Error("Plugin settings storage is unavailable");
@@ -59,9 +120,10 @@ export function createPluginWorker(options: {
     handler: RpcHandler;
   }
 
+  const agentTools = new PluginAgentTools();
   const hooks = new PluginHookHandlers(() => {
     send({ type: "hooks.changed", hooks: hooks.catalog() });
-  });
+  }, agentTools);
   const handlers = new Map<string, RegisteredRpc>();
   const providers = new Map<string, ProviderRegistration>();
   const usageSources = new Map<string, UsageSourceRegistration>();
@@ -256,14 +318,39 @@ export function createPluginWorker(options: {
     return closing;
   }
 
+  let helloReported = false;
+  let serverInfoReported = false;
   const transportFactory = createPluginDaemonTransportFactory({
-    send,
+    send(message) {
+      send(message);
+      if (
+        !helloReported &&
+        message.type === "paseo_frame" &&
+        !message.isBinary &&
+        isInitializationFrame(message.data, "hello")
+      ) {
+        helloReported = true;
+        recordInitialization("hello-sent");
+      }
+    },
     onMessage(handler) {
-      return channel.onMessage(handler);
+      return channel.onMessage((message) => {
+        if (
+          !serverInfoReported &&
+          message.type === "paseo_frame" &&
+          !message.isBinary &&
+          isInitializationFrame(message.data, "server_info")
+        ) {
+          serverInfoReported = true;
+          recordInitialization("server-info-received");
+        }
+        handler(message);
+      });
     },
   });
 
   async function initialize(message: Extract<PluginProcessRequest, { type: "initialize" }>) {
+    recordInitialization("initialize-received");
     daemonClient = new DaemonClient({
       url: `ipc://plugin/${encodeURIComponent(message.pluginId)}`,
       clientId: createPluginClientId(message.pluginId),
@@ -280,15 +367,18 @@ export function createPluginWorker(options: {
           send({ type: "settings.changed", settingsId }),
         )
       : null;
+    recordInitialization("contribute-started");
     const contributedCleanup = contribute({
       handle: (contract, handler) =>
         register(contract, (input, context) => handler(contract.input.parse(input), context)),
       registerProvider,
       registerUsageSource,
       registerSettings,
+      addHook: hooks.addHook,
       on: hooks.on,
       before: hooks.before,
     });
+    recordInitialization("contribute-returned");
     if (typeof contributedCleanup !== "function") {
       throw new Error("Plugin contribution must return a cleanup function");
     }
@@ -313,6 +403,7 @@ export function createPluginWorker(options: {
         .map(providerMetadata),
       usageSources: usageSourceMetadata,
     });
+    recordInitialization("ready-sent");
   }
 
   async function shutdown(): Promise<void> {
@@ -322,6 +413,7 @@ export function createPluginWorker(options: {
       ?.dispose()
       .catch((error) => console.error("Plugin API cleanup failed", error));
     hooks.close();
+    agentTools.close();
     for (const pending of pendingProviderConnections.values()) pending.tombstoned = true;
     const currentCleanup = cleanup;
     cleanup = null;
@@ -381,6 +473,42 @@ export function createPluginWorker(options: {
     }
   }
 
+  function handleToolMessage(
+    message: PluginProcessRequest,
+  ): message is Extract<
+    PluginProcessRequest,
+    { type: "tool.call" | "tool.cancel" | "tools.detach" }
+  > {
+    if (message.type === "tools.detach") {
+      agentTools.detach(message.agentId);
+      return true;
+    }
+    if (message.type === "tool.cancel") {
+      agentTools.cancel(message.requestId);
+      return true;
+    }
+    if (message.type === "tool.call") {
+      if (!paseo) {
+        send({ type: "error", requestId: message.requestId, error: "Plugin API unavailable" });
+        return true;
+      }
+      void agentTools
+        .call(message.requestId, message.agent, message.name, message.input, paseo)
+        .then((output) =>
+          send({
+            type: "result",
+            requestId: message.requestId,
+            output: jsonTransportValue(output),
+          }),
+        )
+        .catch((error) =>
+          send({ type: "error", requestId: message.requestId, error: describeError(error) }),
+        );
+      return true;
+    }
+    return false;
+  }
+
   function handleMessage(rawMessage: unknown): void {
     const parsed = PluginProcessRequestSchema.safeParse(rawMessage);
     if (!parsed.success) {
@@ -422,6 +550,7 @@ export function createPluginWorker(options: {
       rejectWhileStopping(message);
       return;
     }
+    if (handleToolMessage(message)) return;
     if (message.type === "provider.status") {
       void (async () => {
         const provider = providers.get(message.providerId);
@@ -523,7 +652,7 @@ export function createPluginWorker(options: {
         });
         return;
       }
-      void hooks.invoke(message.requestId, message.kind, message.name, message.input, paseo).then(
+      void hooks.invoke(message.requestId, message.name, message.input, paseo).then(
         (output) => {
           return send({ type: "result", requestId: message.requestId, output });
         },
@@ -544,6 +673,7 @@ export function createPluginWorker(options: {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  configureHttpTransport();
   let worker: ReturnType<typeof createPluginWorker> | null = null;
   const handlers = new Set<(message: PluginProcessRequest) => void>();
   const channel: PluginWorkerChannel = {
@@ -565,7 +695,8 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     const parsed = PluginProcessRequestSchema.safeParse(raw);
     if (!worker && parsed.success && parsed.data.type === "initialize") {
       try {
-        worker = createPluginWorker({ channel, contribute: evaluateBundle(parsed.data.bundle) });
+        initializeEnvironmentProxy();
+        worker = createPluginWorkerFromBundle({ channel, message: parsed.data });
       } catch (error) {
         channel.send({ type: "fatal", error: describeError(error) });
         return;

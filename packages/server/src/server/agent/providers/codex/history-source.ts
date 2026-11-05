@@ -33,7 +33,7 @@ export interface CodexHistorySourceOptions {
   databasePath: string;
   threadId: string;
   retainedItemIds?: string[];
-  mapItem: (entry: CodexHistoryItemEntry) => AgentStreamEvent[];
+  mapItem: (entry: CodexHistoryItemEntry) => AgentStreamEvent[] | Promise<AgentStreamEvent[]>;
 }
 
 /** The native store supplies metadata; the provider remains the item decoder. */
@@ -82,7 +82,7 @@ export class CodexHistorySource {
             entry.item.type !== ref.messageType
           )
             throw new Error("Native history changed while reading its message selection");
-          for (const value of this.options.mapItem(entry))
+          for (const value of await this.options.mapItem(entry))
             yield {
               index: ref.index,
               bytes: Buffer.byteLength(JSON.stringify(value), "utf8"),
@@ -108,7 +108,7 @@ export class CodexHistorySource {
         throw new Error("Native history repeated a stream cursor");
       if (page.nextCursor !== null) seen.add(page.nextCursor);
       for (const entry of page.data) {
-        for (const value of this.options.mapItem(entry))
+        for (const value of await this.options.mapItem(entry))
           yield { index, bytes: Buffer.byteLength(JSON.stringify(value), "utf8"), value };
         index++;
       }
@@ -228,7 +228,7 @@ export class CodexHistorySource {
       const nativeEntries = await this.readBatch(client, batch);
       for (let offset = 0; offset < batch.length; offset++) {
         const ref = batch[offset];
-        const values = this.options.mapItem(nativeEntries[offset]);
+        const values = await this.options.mapItem(nativeEntries[offset]);
         const sizes = values.map((value) =>
           Buffer.byteLength(JSON.stringify(value) + "\n", "utf8"),
         );

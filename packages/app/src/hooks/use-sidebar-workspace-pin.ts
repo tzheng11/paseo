@@ -17,6 +17,7 @@ export type ToggleSidebarWorkspacePin = (workspace: PinnableWorkspace) => void;
 
 // Shared by menus, command center and shortcut, including separately mounted controllers.
 const pendingWorkspaceKeys = new Set<string>();
+const activeWorkspaceKeys = new Set<string>();
 const unknownWorkspaceKeys = new Set<string>();
 const reconcilingWorkspaceKeys = new Set<string>();
 const pendingListeners = new Set<() => void>();
@@ -97,26 +98,58 @@ export async function confirmWorkspacePinChange(
   }
 }
 
+// Reserve a complete subtree before reconciling or mutating any member. Pending unknown
+// outcomes remain guarded between attempts; active reservations also prevent another batch
+// from entering an unknown member while this batch is checking a different host.
+export async function runWorkspacePinChanges<T>(
+  workspaces: readonly Pick<PinnableWorkspace, "workspaceKey" | "serverId">[],
+  action: () => Promise<T>,
+): Promise<T> {
+  const unique = new Map<string, (typeof workspaces)[number]>();
+  for (const workspace of workspaces) {
+    const previous = unique.get(workspace.workspaceKey);
+    if (previous && previous.serverId !== workspace.serverId)
+      throw new Error("Workspace identity changed. Refresh and try again");
+    unique.set(workspace.workspaceKey, workspace);
+  }
+  // Validate the entire set before acquiring anything, so a rejected overlapping
+  // group cannot leave unrelated workspaces locked.
+  for (const key of unique.keys()) {
+    if (
+      activeWorkspaceKeys.has(key) ||
+      (pendingWorkspaceKeys.has(key) && !unknownWorkspaceKeys.has(key))
+    )
+      throw new Error("This workspace's pin change is still pending");
+    if (reconcilingWorkspaceKeys.has(key))
+      throw new Error("This workspace's pin state is already being checked");
+  }
+  for (const key of unique.keys()) {
+    activeWorkspaceKeys.add(key);
+    pendingWorkspaceKeys.add(key);
+  }
+  notifyPending();
+  try {
+    for (const workspace of unique.values()) {
+      if (unknownWorkspaceKeys.has(workspace.workspaceKey))
+        await confirmWorkspacePinChange(workspace);
+    }
+    return await action();
+  } finally {
+    for (const key of unique.keys()) {
+      activeWorkspaceKeys.delete(key);
+      if (!unknownWorkspaceKeys.has(key)) pendingWorkspaceKeys.delete(key);
+    }
+    notifyPending();
+  }
+}
+
 // Tree dragging shares the same admission guard as menus and keyboard shortcuts.
 // A retry after a lost ACK must finish a read before another mutation is allowed.
-export async function runWorkspacePinChange<T>(
+export function runWorkspacePinChange<T>(
   workspace: Pick<PinnableWorkspace, "workspaceKey" | "serverId">,
   action: () => Promise<T>,
 ): Promise<T> {
-  const key = workspace.workspaceKey;
-  if (pendingWorkspaceKeys.has(key) && !unknownWorkspaceKeys.has(key))
-    throw new Error("This workspace's pin change is still pending");
-  if (reconcilingWorkspaceKeys.has(key))
-    throw new Error("This workspace's pin state is already being checked");
-  pendingWorkspaceKeys.add(key);
-  notifyPending();
-  try {
-    if (unknownWorkspaceKeys.has(key)) await confirmWorkspacePinChange(workspace);
-    return await action();
-  } finally {
-    if (!unknownWorkspaceKeys.has(key)) pendingWorkspaceKeys.delete(key);
-    notifyPending();
-  }
+  return runWorkspacePinChanges([workspace], action);
 }
 
 function useWorkspacePinController(kind: "pin" | "superpin"): ToggleSidebarWorkspacePin {
@@ -124,13 +157,18 @@ function useWorkspacePinController(kind: "pin" | "superpin"): ToggleSidebarWorks
   const toast = useToast();
   const confirm = useCallback(
     async function confirmState(workspace: PinnableWorkspace) {
-      if (reconcilingWorkspaceKeys.has(workspace.workspaceKey)) return;
+      if (
+        activeWorkspaceKeys.has(workspace.workspaceKey) ||
+        reconcilingWorkspaceKeys.has(workspace.workspaceKey)
+      )
+        return;
       reconcilingWorkspaceKeys.add(workspace.workspaceKey);
       toast.show(t("sidebar.superpinned.outcomeUnknown"), { durationMs: null });
       try {
         await reconcileWorkspacePin(workspace.serverId);
         unknownWorkspaceKeys.delete(workspace.workspaceKey);
-        pendingWorkspaceKeys.delete(workspace.workspaceKey);
+        if (!activeWorkspaceKeys.has(workspace.workspaceKey))
+          pendingWorkspaceKeys.delete(workspace.workspaceKey);
         notifyPending();
         toast.show(t("sidebar.superpinned.stateConfirmed"), { variant: "info" });
       } catch {
@@ -188,7 +226,10 @@ function useWorkspacePinController(kind: "pin" | "superpin"): ToggleSidebarWorks
       );
     },
     onSettled: (_data, _error, workspace) => {
-      if (!unknownWorkspaceKeys.has(workspace.workspaceKey)) {
+      if (
+        !unknownWorkspaceKeys.has(workspace.workspaceKey) &&
+        !activeWorkspaceKeys.has(workspace.workspaceKey)
+      ) {
         pendingWorkspaceKeys.delete(workspace.workspaceKey);
         notifyPending();
       }

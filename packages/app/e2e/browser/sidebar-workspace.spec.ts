@@ -565,6 +565,10 @@ test.describe("Half-screen desktop layout", () => {
       await gotoAppShell(page);
       await waitForSidebarWorkspace(page, lastWorkspaceId);
 
+      // Done workspaces are initially limited to seven rows. Expand the group
+      // so this fixture exercises scrolling rather than a non-overflowing list.
+      await page.getByTestId(`sidebar-project-show-more-${workspace.projectKey}`).click();
+      await expect(page.locator('[data-testid^="sidebar-workspace-row-"]')).toHaveCount(25);
       const sidebarScroll = page.getByTestId("sidebar-project-workspace-list-scroll");
       const scrollTop = await sidebarScroll.evaluate((element) => {
         element.scrollTop = 160;

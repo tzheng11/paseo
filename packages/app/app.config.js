@@ -7,7 +7,7 @@ const withAndroidProfileable = require("./plugins/with-android-profileable");
 const withFdroidAutolinking = require("./plugins/with-fdroid-autolinking");
 const withPasteInput = require("./plugins/with-paste-input");
 const withAndroidScroll = require("./modules/paseo-scroll/app.plugin");
-const { getNativeReleaseVersion } = require("./native-release-version");
+const { getNativeConfigVersion } = require("./native-release-version");
 const appVariant = process.env.APP_VARIANT ?? "production";
 const isFdroidBuild = process.env.PASEO_FDROID_BUILD === "1";
 const isWatchdogBuild = process.env.PASEO_WATCHDOG_BUILD === "1";
@@ -95,14 +95,17 @@ const variants = {
 };
 
 const variant = variants[appVariant] ?? variants.production;
-const nativeReleaseVersion = getNativeReleaseVersion(pkg.version);
+const nativeReleaseVersion = getNativeConfigVersion(
+  pkg.version,
+  require("../../package.json").paseoDistribution,
+);
 
 export default {
   expo: {
     name: variant.name,
     slug: "voice-mobile",
     version: nativeReleaseVersion.appVersion,
-    orientation: "portrait",
+    orientation: "default",
     icon: "./assets/images/icon.png",
     scheme: "paseo",
     userInterfaceStyle: "automatic",

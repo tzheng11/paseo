@@ -27,6 +27,23 @@ import { deriveProjectKey } from "./project-key.js";
 
 const cleanupPaths: string[] = [];
 
+test("canonical refusal precedes worktree hooks, git and filesystem creation", async () => {
+  const deps = createDeps();
+  const checkout = vi.fn();
+  deps.workspaceGitService.getCheckout = checkout;
+  const guard = vi.fn(async () => {
+    throw new Error("layout_importing");
+  });
+  deps.workspaceProvisioning.assertCreationAllowed = guard;
+  await expect(
+    createPaseoWorktree({ cwd: "/not-read", paseoHome: "/not-written" }, deps),
+  ).rejects.toThrow("layout_importing");
+  expect(guard).toHaveBeenCalledOnce();
+  expect(checkout).not.toHaveBeenCalled();
+  expect(deps.workspaces.size).toBe(0);
+  expect(deps.projects.size).toBe(0);
+});
+
 afterEach(() => {
   for (const target of cleanupPaths.splice(0)) {
     rmSync(target, { recursive: true, force: true });
@@ -548,7 +565,7 @@ test("renames an eligible unnamed branch-off worktree once on first agent contex
   );
 
   expect(created.worktree.branchName).toBe("dazzling-yak");
-  expect(readPaseoWorktreeMetadata(created.worktree.worktreePath)).toMatchObject({
+  expect(await readPaseoWorktreeMetadata(created.worktree.worktreePath)).toMatchObject({
     version: 2,
     firstAgentBranchAutoName: {
       status: "pending",
@@ -575,7 +592,7 @@ test("renames an eligible unnamed branch-off worktree once on first agent contex
     branchName: "renamed-from-agent-context",
   });
   expect(branchAfterFirst).toBe("renamed-from-agent-context");
-  expect(readPaseoWorktreeMetadata(created.worktree.worktreePath)).toMatchObject({
+  expect(await readPaseoWorktreeMetadata(created.worktree.worktreePath)).toMatchObject({
     version: 2,
     firstAgentBranchAutoName: {
       status: "attempted",
@@ -762,7 +779,7 @@ test("leaves the branch alone when generated branch text is invalid", async () =
       .toString()
       .trim(),
   ).toBe("dazzling-yak");
-  expect(readPaseoWorktreeMetadata(created.worktree.worktreePath)).toMatchObject({
+  expect(await readPaseoWorktreeMetadata(created.worktree.worktreePath)).toMatchObject({
     version: 2,
     firstAgentBranchAutoName: {
       status: "attempted",
@@ -794,7 +811,7 @@ test("does not mark checkout branch worktrees as eligible for first-agent rename
   // baseRefName must be the repo's default branch, not the checked-out branch
   // itself — otherwise the diff panel compares the branch against itself and
   // always shows no changes.
-  expect(readPaseoWorktreeMetadata(created.worktree.worktreePath)).toMatchObject({
+  expect(await readPaseoWorktreeMetadata(created.worktree.worktreePath)).toMatchObject({
     version: 1,
     baseRefName: "main",
   });
@@ -831,7 +848,7 @@ test("does not mark GitHub PR checkout worktrees as eligible for first-agent ren
     createDeps(),
   );
 
-  expect(readPaseoWorktreeMetadata(created.worktree.worktreePath)).toMatchObject({
+  expect(await readPaseoWorktreeMetadata(created.worktree.worktreePath)).toMatchObject({
     version: 1,
     baseRefName: "main",
   });
@@ -1221,7 +1238,7 @@ function createWorkspaceGitServiceStub(): WorkspaceGitService {
     registerWorkspace: () => ({
       unsubscribe: () => {},
     }),
-    peekSnapshot: (cwd) => createWorkspaceGitSnapshot(cwd),
+
     getCheckout: async (cwd) => {
       try {
         const snapshot = createWorkspaceGitSnapshot(cwd);

@@ -5,6 +5,14 @@ interface WorkerExecArgvOptions {
   enableProductionHeap?: boolean;
 }
 
+/** Only a successfully published first readiness may consume maintenance boot. */
+export function finishMaintenanceBootEnvironment(env: NodeJS.ProcessEnv): void {
+  if (env.PASEO_MAINTENANCE_BOOT !== "closed") return;
+  delete env.PASEO_MAINTENANCE_BOOT;
+  delete env.PASEO_MAINTENANCE_CONTROL_DIR;
+  delete env.PASEO_MAINTENANCE_BOOT_TIMEOUT_MS;
+}
+
 export function resolveWorkerExecArgv({
   workerEntry,
   devMode,

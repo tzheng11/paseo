@@ -6,6 +6,8 @@ import type {
   SidebarWorkspacePlacement,
 } from "@/hooks/use-sidebar-workspaces-list";
 import { buildSidebarProjection } from "./sidebar-projection";
+import { UNGROUPED_WORKSPACE_SORT_KEY } from "./workspace-sort";
+import { flattenWorkspaceTree } from "./workspace-tree/model";
 
 function makeWorkspace(
   id: string,
@@ -69,7 +71,7 @@ function makeProject(
 }
 
 function projectionInput(options?: {
-  groupMode?: "project" | "status";
+  groupMode?: "none" | "project" | "status";
   pinnedCollapsed?: boolean;
 }) {
   const pinned = makeWorkspace("pinned", "running");
@@ -118,6 +120,97 @@ function twoProjectInput(groupMode: "project" | "status") {
 }
 
 describe("buildSidebarProjection", () => {
+  it("renders one unpinned cross-project tree in None with shared ordering and collapsed shortcuts", () => {
+    const parent = makeWorkspace("parent");
+    const child = makeWorkspace("child", "done", [], "other");
+    Object.assign(child.placement, { serverId: "remote", workspaceKey: "remote:child" });
+    Object.assign(child.entry, { serverId: "remote", workspaceKey: "remote:child" });
+    const root = makeWorkspace("root");
+    child.placement.parentWorkspaceId = "old-parent";
+    const entries = [root.entry, child.entry, parent.entry];
+    const input = {
+      ...projectionInput({ groupMode: "none" }),
+      projects: [
+        makeProject([root.placement, parent.placement]),
+        makeProject([child.placement], "other"),
+      ],
+      pinnedKeys: { pinnedWorkspaceKeys: [], pinnedAtByKey: {}, superpinnedAtByKey: {} },
+      workspaceEntriesByKey: new Map(entries.map((entry) => [entry.workspaceKey, entry])),
+      pinnedWorkspaceTree: {
+        [parent.entry.workspaceKey]: { parentWorkspaceKey: null, siblingOrder: 0 },
+        [child.entry.workspaceKey]: {
+          parentWorkspaceKey: parent.entry.workspaceKey,
+          siblingOrder: 0,
+        },
+        [root.entry.workspaceKey]: { parentWorkspaceKey: null, siblingOrder: 1024 },
+      },
+      collapsedWorkspaceKeys: new Set([parent.entry.workspaceKey]),
+    };
+    const projection = buildSidebarProjection(input);
+    expect(projection.workspaceGroups).toHaveLength(1);
+    const group = projection.workspaceGroups[0]!;
+    expect(group.leading.kind).toBe("workspaces");
+    expect(
+      flattenWorkspaceTree(group.rows, new Set()).map((row) => [
+        row.workspace.workspaceId,
+        row.depth,
+      ]),
+    ).toEqual([
+      ["parent", 0],
+      ["child", 1],
+      ["root", 0],
+    ]);
+    expect(projection.shortcutModel.shortcutTargets.map((target) => target.workspaceId)).toEqual([
+      "parent",
+      "root",
+    ]);
+    expect(
+      buildSidebarProjection({
+        ...input,
+        collapsedWorkspaceKeys: new Set<string>(),
+      }).shortcutModel.shortcutTargets.map((target) => target.workspaceId),
+    ).toEqual(["parent", "child", "root"]);
+  });
+
+  it.each(["alphabetical", "activity"] as const)(
+    "sorts None roots and child groups independently by %s",
+    (mode) => {
+      const parent = makeWorkspace("z-parent");
+      const a = makeWorkspace("a-child");
+      const z = makeWorkspace("z-child");
+      const root = makeWorkspace("b-root");
+      const entries = [parent.entry, z.entry, a.entry, root.entry];
+      entries.forEach((entry, index) => {
+        entry.statusEnteredAt = new Date(index * 1000);
+      });
+      const projection = buildSidebarProjection({
+        ...projectionInput({ groupMode: "none" }),
+        projects: [makeProject(entries)],
+        pinnedKeys: { pinnedWorkspaceKeys: [], pinnedAtByKey: {}, superpinnedAtByKey: {} },
+        workspaceEntriesByKey: new Map(entries.map((entry) => [entry.workspaceKey, entry])),
+        workspaceSortModeByProject: { [UNGROUPED_WORKSPACE_SORT_KEY]: mode },
+        pinnedWorkspaceTree: {
+          [parent.entry.workspaceKey]: { parentWorkspaceKey: null, siblingOrder: 0 },
+          [z.entry.workspaceKey]: {
+            parentWorkspaceKey: parent.entry.workspaceKey,
+            siblingOrder: 0,
+          },
+          [a.entry.workspaceKey]: {
+            parentWorkspaceKey: parent.entry.workspaceKey,
+            siblingOrder: 1024,
+          },
+          [root.entry.workspaceKey]: { parentWorkspaceKey: null, siblingOrder: 1024 },
+        },
+      });
+      expect(projection.shortcutModel.shortcutTargets.map((target) => target.workspaceId)).toEqual([
+        "b-root",
+        "z-parent",
+        "a-child",
+        "z-child",
+      ]);
+    },
+  );
+
   for (const groupMode of ["project", "status"] as const) {
     it(`keeps collapsed pinned children out of ${groupMode} keyboard shortcuts`, () => {
       const parent = makeWorkspace("parent");

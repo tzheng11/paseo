@@ -21,7 +21,10 @@ import {
   selectNewWorkspaceProject,
   submitNewWorkspaceEmpty,
 } from "../support/helpers/new-workspace";
-import { selectSidebarStatusGrouping } from "../support/helpers/sidebar";
+import {
+  seedProjectSidebarGrouping,
+  selectSidebarStatusGrouping,
+} from "../support/helpers/sidebar";
 import { killProcessTree, spawnTsx } from "../support/helpers/spawn-node";
 import { waitForSidebarHydration } from "../support/helpers/workspace-ui";
 import { getVisibleWorkspaceAgentTabIds } from "../support/helpers/workspace-tabs";
@@ -302,6 +305,7 @@ function loadAppVersion(): string {
 }
 
 async function seedBrowserForDaemon(page: Page, input: { serverId: string; port: number }) {
+  await seedProjectSidebarGrouping(page);
   await page.route(/:(6767)\b/, (route) => route.abort());
   await page.routeWebSocket(/:(6767)\b/, async (ws) => {
     await ws.close({ code: 1008, reason: "Blocked connection to localhost:6767 during e2e." });

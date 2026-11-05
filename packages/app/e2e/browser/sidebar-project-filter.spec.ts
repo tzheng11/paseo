@@ -30,8 +30,13 @@ test.describe("Sidebar project filter", () => {
       await expect(betaRow).toBeVisible({ timeout: 30_000 });
 
       await page.getByTestId("sidebar-display-preferences-menu").click();
-      await expect(page.getByRole("menuitem")).toHaveText([
+      // The worker's label catalog may add an unrelated Labels filter to this menu.
+      const projectDisplayItems = page
+        .getByRole("menuitem")
+        .and(page.locator(':not([data-testid="sidebar-display-label-filter"])'));
+      await expect(projectDisplayItems).toHaveText([
         /^Grouping/,
+        /^Sort/,
         /^Title/,
         "Show",
         "Project",

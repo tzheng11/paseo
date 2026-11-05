@@ -21,6 +21,7 @@ import {
   type HostUpdate,
 } from "@getpaseo/protocol/hosts";
 import type { DaemonPermission, WSHelloMessage } from "@getpaseo/protocol/messages";
+import { webSocketProxyAgent } from "../network/index.js";
 
 export class HostError extends Error {
   constructor(
@@ -46,6 +47,12 @@ interface Route {
   registrationId: string;
   close(code?: string, message?: string): void;
 }
+export interface HostIdentityBinding {
+  expectedServerId: string;
+  authorityKeySha256: string;
+  authorityId: string;
+  epoch: string;
+}
 
 /** Daemon-owned configuration, identity pinning, retry and routed session lifetime. */
 export class ConnectedHosts {
@@ -60,6 +67,7 @@ export class ConnectedHosts {
   constructor(
     private readonly home: string,
     private readonly self: HostDirectory["self"],
+    private readonly layoutAuthority?: HostIdentityBinding,
   ) {
     this.ready = this.load();
     void this.ready.catch(() => {});
@@ -154,6 +162,7 @@ export class ConnectedHosts {
         nextRetryAt: null,
         error: null,
       };
+      this.assertLayoutRegistration(row);
       await this.persist([...this.rows, row]);
       this.rows.push(row);
       this.start(row);
@@ -190,6 +199,7 @@ export class ConnectedHosts {
         row.targetDescription = parseHostTarget(patch.connection).description;
       }
       if (patch.replaceIdentity) row.serverId = null;
+      this.assertLayoutRegistration(row);
       const restart =
         patch.connection !== undefined || patch.enabled !== undefined || patch.replaceIdentity;
       if (restart) {
@@ -236,12 +246,22 @@ export class ConnectedHosts {
   }
   private start(row: Saved): void {
     if (!row.enabled || this.closed) return;
+    try {
+      this.assertLayoutRegistration(row);
+    } catch (error) {
+      row.status = "error";
+      row.error = connectionFailure(error, false);
+      row.nextRetryAt = null;
+      this.changed();
+      return;
+    }
     let stopped = false;
     const client = createHostClient(
       row.connection,
       {
         clientId: `host-link-${this.self.serverId}-${row.registrationId}`,
         connectTimeoutMs: 10000,
+        webSocketAgent: webSocketProxyAgent,
       },
       this.budget,
     );
@@ -258,6 +278,7 @@ export class ConnectedHosts {
       try {
         const info = client.getLastServerInfoMessage();
         if (!info) throw new HostError("host_offline", "No daemon identity received");
+        this.assertLayoutRegistration({ ...row, serverId: info.serverId }, "connected");
         if (row.serverId && info.serverId !== row.serverId)
           throw new HostError(
             "server_id_mismatch",
@@ -349,6 +370,25 @@ export class ConnectedHosts {
     });
     void client.connect().catch(() => {});
   }
+  private assertLayoutRegistration(
+    row: Pick<Saved, "serverId" | "connection" | "metadata">,
+    stage: "before-connect" | "connected" = "before-connect",
+  ): void {
+    const target = parseHostTarget(row.connection);
+    const offerServerId = target.kind === "socket" ? target.offer?.serverId : undefined;
+    const canonical =
+      row.metadata.role === "layout-authority" ||
+      (this.layoutAuthority &&
+        (row.serverId === this.layoutAuthority.expectedServerId ||
+          offerServerId === this.layoutAuthority.expectedServerId));
+    if (!canonical) return;
+    if (!this.layoutAuthority)
+      throw new HostError(
+        "canonical_layout_not_configured",
+        "Configure the layout authority before registering it",
+      );
+    assertHostIdentityBinding(row, this.layoutAuthority, stage);
+  }
   async openRoute(input: {
     serverId: string;
     scopeId: string;
@@ -356,6 +396,7 @@ export class ConnectedHosts {
     originSessionId: string;
     permissions: readonly DaemonPermission[];
     signal: AbortSignal;
+    identityBinding?: HostIdentityBinding;
     frame(data: string | Uint8Array): void;
     ended(code: string, message: string): void;
   }): Promise<{ send(data: string | Uint8Array): void; close(): void }> {
@@ -379,6 +420,7 @@ export class ConnectedHosts {
     const client = live?.client;
     if (!live?.accepted || !client?.isConnected)
       throw new HostError("host_offline", "Host is offline", input.serverId);
+    if (input.identityBinding) assertHostIdentityBinding(row, input.identityBinding);
     const transport = createHostChannelTransport(
       client,
       input.serverId,
@@ -508,10 +550,13 @@ export class ConnectedHosts {
           return;
         }
         if (!verified) throw new HostError("host_offline", "Host identity has not been verified");
-        try {
-          transport.send(data);
-        } catch {
+        const rejectWrite = () =>
           route.close("resource_limit", "Host buffer limit reached or transport unavailable");
+        try {
+          const write = transport.send(data);
+          if (write) void write.catch(rejectWrite);
+        } catch {
+          rejectWrite();
         }
       },
     };
@@ -524,6 +569,43 @@ export class ConnectedHosts {
     for (const route of this.routes) route.close();
     this.listeners.clear();
   }
+}
+
+/** Verify the actual E2EE target, not a caller's descriptive metadata alone. */
+export function assertHostIdentityBinding(
+  row: Pick<Saved, "serverId" | "connection" | "metadata">,
+  binding: HostIdentityBinding,
+  stage: "before-connect" | "connected" = "connected",
+): void {
+  const target = parseHostTarget(row.connection);
+  const offer = target.kind === "socket" ? target.offer : undefined;
+  if (
+    !offer ||
+    offer.serverId !== binding.expectedServerId ||
+    (row.serverId !== binding.expectedServerId &&
+      !(stage === "before-connect" && row.serverId === null)) ||
+    createHash("sha256").update(offer.daemonPublicKeyB64).digest("hex") !==
+      binding.authorityKeySha256 ||
+    row.metadata.expectedServerId !== binding.expectedServerId ||
+    row.metadata.authorityKeySha256 !== binding.authorityKeySha256 ||
+    row.metadata.authorityId !== binding.authorityId ||
+    row.metadata.epoch !== binding.epoch ||
+    row.metadata.role !== "layout-authority"
+  )
+    throw new HostError(
+      "authority_identity_mismatch",
+      "Workspace layout authority identity is not verified",
+    );
+  if (target.kind !== "socket" || !target.password)
+    throw new HostError(
+      "authority_password_required",
+      "Workspace layout authority requires a private service credential",
+    );
+  if (offer.minimumSecurityMode !== "protected")
+    throw new HostError(
+      "authority_secure_mode_required",
+      "Workspace layout authority requires protected relay encryption",
+    );
 }
 
 function connectionFailure(error: unknown, authenticationFailed: boolean): HostSummary["error"] {
