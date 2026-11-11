@@ -149,6 +149,8 @@ const WORKSPACE_GIT_AUXILIARY_READ_TTL_MS = 15_000;
 const WORKSPACE_GIT_INTERNAL_MIN_GAP_MS = 2_000;
 // Small values (booleans, short strings, small arrays); generous cap.
 const WORKSPACE_GIT_AUXILIARY_CACHE_MAX = 256;
+// Default bases resolved without `<remote>/HEAD` naming an existing branch.
+const FALLBACK_DEFAULT_BRANCHES = new Set(["main", "master"]);
 
 function mergeSets<T>(
   left: ReadonlySet<T>,
@@ -3167,8 +3169,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     }
     this.routeRemoteBranchRef(target, remoteRef, refreshes);
     // A base named only as a local branch compares against its remote copy once it exists.
-    // Without a stored base, the default branch is whatever `<remote>/HEAD` names, so the
-    // created or deleted ref may be it.
+    // Without a stored base, the default follows `<remote>/HEAD`, routed above. Another ref
+    // can become that default only while resolution finds nothing or falls back to main or
+    // master, as it does until the branch `<remote>/HEAD` names exists.
     const separator = remoteRef.indexOf("/");
     const branch = separator === -1 ? remoteRef : remoteRef.slice(separator + 1);
     for (const workspaceKey of target.workspaceKeys) {
@@ -3177,7 +3180,11 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       const usesBranchAsBase = [facts.storedBaseRef, facts.resolvedBaseRef].some(
         (ref) => ref !== null && branchNameFromRef(ref) === branch,
       );
-      if (usesBranchAsBase || facts.storedBaseRef === null) {
+      const defaultMayChange =
+        facts.storedBaseRef === null &&
+        (facts.resolvedBaseRef === null ||
+          FALLBACK_DEFAULT_BRANCHES.has(branchNameFromRef(facts.resolvedBaseRef)));
+      if (usesBranchAsBase || defaultMayChange) {
         this.addWorkspaceMetadataRefresh(refreshes, workspaceKey, true);
       }
     }
