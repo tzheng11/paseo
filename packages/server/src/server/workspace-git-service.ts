@@ -19,6 +19,7 @@ import {
   getCheckoutIdentity,
   getCheckoutSnapshotFacts,
   getCheckoutShortstat,
+  getCheckoutShortstatIfMergeBaseMoved,
   getCheckoutStatus,
   getCheckoutWorktreeState,
   getPullRequestStatus,
@@ -59,6 +60,12 @@ import { branchNameFromRef } from "../utils/worktree-metadata.js";
 import { listPaseoWorktrees, type PaseoWorktreeInfo } from "../utils/worktree.js";
 import { READ_ONLY_GIT_ENV } from "./checkout-git-utils.js";
 import { classifyGitMetadataPath, getPrunedGitMetadataPaths } from "./git-metadata-event-rules.js";
+import { diffGitConfigSections, parseGitConfigSections } from "./git-config-sections.js";
+import { createDutyCycleLimit } from "../utils/duty-cycle-limit.js";
+import {
+  summarizeDurations,
+  type GitCommandDurationStats,
+} from "../utils/git-command-runtime-metrics.js";
 import {
   fetchWorkspaceGitRemote,
   type WorkspaceGitFetchResult,
@@ -119,6 +126,14 @@ const WORKING_TREE_KNOWN_DIRECTORIES_MAX = 50_000;
 // retains subprocess and event-loop headroom during large workspace reconciliation bursts.
 export const WORKSPACE_GIT_REFRESH_CONCURRENCY = 4;
 export const WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY = 2;
+// Background Git work rests in proportion to its own run time. However many workspaces a
+// watch event, fetch or cold inventory fans out to, each background slot stays busy for at
+// most this share of wall time, so queued scans leave the disk to foreground commands.
+export const WORKSPACE_GIT_BACKGROUND_DUTY_CYCLE = 0.25;
+// Cold discovery is what an empty sidebar row waits for, so it gets a larger share.
+export const WORKSPACE_GIT_INITIAL_REFRESH_DUTY_CYCLE = 0.5;
+const WORKSPACE_GIT_BACKGROUND_MAX_REST_MS = 60_000;
+const WORKSPACE_GIT_REFRESH_REASONS_TOP = 8;
 export const WORKSPACE_GIT_WATCHER_SUBSCRIBE_TIMEOUT_MS = 10_000;
 // Recovery runs in the background. A large inventory can need a minute under
 // load; reusing the initial RPC deadline would discard every healthy attempt.
@@ -289,6 +304,23 @@ export interface WorkspaceGitServiceMetrics {
   snapshotUpdatedListenerCount: number;
   watcherErrorCallbackCount: number;
   fileObserver: FileObserverDiagnostics;
+  /** Background admission slots resting after a job (see WORKSPACE_GIT_BACKGROUND_DUTY_CYCLE). */
+  workspaceRefreshRestingCount?: number;
+  /** Activity since the previous `getMetrics` call; one runtime metrics window. */
+  workspaceRefreshWindow?: WorkspaceGitRefreshWindowMetrics;
+}
+
+export interface WorkspaceGitRefreshWindowMetrics {
+  completed: number;
+  /** Refreshes that read the working tree (`git status` and the diff stat scan). */
+  worktreeScans: number;
+  /** Ignore inventories (`git ls-files --ignored`) started after watch events. */
+  ignoreInventories: number;
+  durationMs: GitCommandDurationStats;
+  reasonsTop: Array<[string, number]>;
+  /** Run and rest time of paced background jobs, summed over their slots. */
+  backgroundBusyMs: number;
+  backgroundRestMs: number;
 }
 
 /**
@@ -396,6 +428,7 @@ interface WorkspaceGitServiceDependencies {
   getCheckoutRefDerivedState: typeof getCheckoutRefDerivedState;
   getCheckoutStatus: typeof getCheckoutStatus;
   getCheckoutShortstat: typeof getCheckoutShortstat;
+  getCheckoutShortstatIfMergeBaseMoved: typeof getCheckoutShortstatIfMergeBaseMoved;
   getCheckoutWorktreeState: typeof getCheckoutWorktreeState;
   getCheckoutDiff: typeof getCheckoutDiff;
   getPullRequestStatus: typeof getPullRequestStatus;
@@ -420,6 +453,7 @@ interface WorkspaceGitServiceDependencies {
   createRunGitCommand: typeof createRunGitCommand;
   getWorkspaceGitSelfHealPhaseMs: typeof getWorkspaceGitObservationReensurePhaseMs;
   getWorkingTreeIgnoreRefreshIntervalMs: () => number;
+  readGitConfigFile: (path: string) => Promise<string>;
   createWatcherLivenessCanary: typeof createWatcherLivenessCanary;
   now: () => Date;
 }
@@ -499,6 +533,9 @@ interface RepoGitTarget {
     { change: WorkspaceGitRemoteRefChange; expiresAtMs: number }
   >;
   knownRemoteRefs: Set<string> | null;
+  // Last observed shared `config`, by section; null until read or after a failed read.
+  sharedConfigSections: Map<string, string> | null;
+  sharedConfigRead: Promise<void>;
   closeController: AbortController;
   closed: boolean;
 }
@@ -506,6 +543,9 @@ interface RepoGitTarget {
 interface RepoMetadataWorkspaceRefresh {
   refreshBase: boolean;
   structural: boolean;
+  // Only the workspace's own index, HEAD or branch can change what its working tree
+  // reports. Shared refs and config reach dependents as structure-only refreshes.
+  worktree: boolean;
   movedRemoteRefs: Set<string>;
   queueIfBusy: boolean;
 }
@@ -576,8 +616,11 @@ interface WatchRecoveryState {
   establishedAt: number | null;
 }
 
-function setsEqual(left: ReadonlySet<string>, right: ReadonlySet<string>): boolean {
-  return left.size === right.size && [...left].every((value) => right.has(value));
+function symmetricDifference(left: ReadonlySet<string>, right: ReadonlySet<string>): string[] {
+  return [
+    ...[...left].filter((value) => !right.has(value)),
+    ...[...right].filter((value) => !left.has(value)),
+  ];
 }
 
 type WorkingTreeWatchFallbackReason =
@@ -610,6 +653,7 @@ function buildDefaultWorkspaceGitServiceDeps(
     getCheckoutRefDerivedState,
     getCheckoutStatus,
     getCheckoutShortstat,
+    getCheckoutShortstatIfMergeBaseMoved,
     getCheckoutWorktreeState,
     getCheckoutDiff,
     getPullRequestStatus,
@@ -626,6 +670,7 @@ function buildDefaultWorkspaceGitServiceDeps(
     createWatcherLivenessCanary,
     now: () => new Date(),
     getWorkingTreeIgnoreRefreshIntervalMs: () => WORKING_TREE_IGNORE_REFRESH_INTERVAL_MS,
+    readGitConfigFile: (path) => readFile(path, "utf8"),
   };
 }
 
@@ -650,7 +695,12 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   // Cold sidebar inventory must not reserve the shared refresh pool ahead of
   // explicit reads. Keep targets idle until admitted so a live request can
   // refresh any queued workspace immediately and the cold pass can reuse it.
-  private readonly workspaceInitialRefreshLimit = pLimit({ concurrency: 1, rejectOnClear: true });
+  private readonly workspaceInitialRefreshLimit = createDutyCycleLimit({
+    concurrency: 1,
+    dutyCycle: WORKSPACE_GIT_INITIAL_REFRESH_DUTY_CYCLE,
+    maxRestMs: WORKSPACE_GIT_BACKGROUND_MAX_REST_MS,
+    now: () => this.deps.now().getTime(),
+  });
   private readonly initialRefreshScheduled = new Set<WorkspaceGitTarget>();
   // Remote authentication/PR discovery is enrichment, not cold Git admission.
   // Bound it separately so slow forge calls cannot own every refresh slot.
@@ -666,11 +716,20 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     WorkspaceGitRefreshRequest
   >();
   // Watch/poll refreshes must leave a slot for an uncached explicit read.
-  private readonly backgroundRefreshLimit = pLimit({
+  private readonly backgroundRefreshLimit = createDutyCycleLimit({
     // Two warm jobs, one independent cold job and one explicit read.
     concurrency: WORKSPACE_GIT_REFRESH_CONCURRENCY - 2,
-    rejectOnClear: true,
+    dutyCycle: WORKSPACE_GIT_BACKGROUND_DUTY_CYCLE,
+    maxRestMs: WORKSPACE_GIT_BACKGROUND_MAX_REST_MS,
+    now: () => this.deps.now().getTime(),
   });
+  private refreshWindow = {
+    completed: 0,
+    worktreeScans: 0,
+    ignoreInventories: 0,
+    durationsMs: [] as number[],
+    reasons: new Map<string, number>(),
+  };
   private readonly checkoutMetadataLimit = pLimit({ concurrency: 2, rejectOnClear: true });
   // Inventory passes queue one read per active checkout; they get their own lane.
   private readonly backgroundCheckoutMetadataLimit = pLimit({
@@ -853,6 +912,33 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       snapshotUpdatedListenerCount: this.snapshotUpdatedListeners.size,
       watcherErrorCallbackCount: this.watcherErrorCallbackCount,
       fileObserver: this.fileObserver.getDiagnostics(),
+      workspaceRefreshRestingCount:
+        this.backgroundRefreshLimit.restingCount + this.workspaceInitialRefreshLimit.restingCount,
+      workspaceRefreshWindow: this.takeRefreshWindowMetrics(),
+    };
+  }
+
+  private takeRefreshWindowMetrics(): WorkspaceGitRefreshWindowMetrics {
+    const window = this.refreshWindow;
+    this.refreshWindow = {
+      completed: 0,
+      worktreeScans: 0,
+      ignoreInventories: 0,
+      durationsMs: [],
+      reasons: new Map(),
+    };
+    const background = this.backgroundRefreshLimit.takeStats();
+    const initial = this.workspaceInitialRefreshLimit.takeStats();
+    return {
+      completed: window.completed,
+      worktreeScans: window.worktreeScans,
+      ignoreInventories: window.ignoreInventories,
+      durationMs: summarizeDurations(window.durationsMs),
+      reasonsTop: [...window.reasons.entries()]
+        .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+        .slice(0, WORKSPACE_GIT_REFRESH_REASONS_TOP),
+      backgroundBusyMs: background.busyMs + initial.busyMs,
+      backgroundRestMs: background.restMs + initial.restMs,
     };
   }
 
@@ -2557,6 +2643,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   private async replaceWorkingTreeIgnoredDirectories(
     target: WorkingTreeWatchTarget,
   ): Promise<boolean> {
+    this.refreshWindow.ignoreInventories += 1;
     const { ignored: ignoredDirectories, failed } = await this.loadIgnoredDirs(
       target.watchPath,
       target.ignoredDirectories,
@@ -2721,10 +2808,13 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       bufferedFetchMetadataEvents: [],
       recentFetchRemoteRefChanges: new Map(),
       knownRemoteRefs: null,
+      sharedConfigSections: null,
+      sharedConfigRead: Promise.resolve(),
       closeController: new AbortController(),
       closed: false,
     };
     this.repoTargets.set(repoGitRoot, repoTarget);
+    repoTarget.sharedConfigRead = this.loadSharedConfigSections(repoTarget);
     await this.startRepoMetadataObservation(repoTarget);
     if (repoTarget.closed || this.repoTargets.get(repoGitRoot) !== repoTarget) {
       return;
@@ -2827,7 +2917,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
               this.scheduleRepoMetadataRefresh(
                 target,
                 "git-metadata-watch",
-                routedRefreshes === null || [...routedRefreshes.values()].some((r) => r.structural),
+                false,
                 routedRefreshes,
               );
             }
@@ -2954,7 +3044,8 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     const workspaceKeys = new Set<string>();
     for (const event of events) {
       const commonRelativePath = target.paths.relative(event.path)?.replaceAll("\\", "/");
-      if (commonRelativePath === "config" || commonRelativePath === "info/exclude") {
+      // Shared `config` changes reach ignore rules through `routeSharedConfigChange`.
+      if (commonRelativePath === "info/exclude") {
         for (const workspaceKey of target.workspaceKeys) workspaceKeys.add(workspaceKey);
         continue;
       }
@@ -3010,34 +3101,14 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       case "ref":
         if (effect.namespace === "local") {
           this.routeLocalBranchRef(target, effect.ref, refreshes);
-        } else {
-          if (event.type === "delete") {
-            target.recentFetchRemoteRefChanges.delete(effect.ref);
-            target.knownRemoteRefs = null;
-            return false;
-          }
-          const recent = target.recentFetchRemoteRefChanges.get(effect.ref);
-          if (recent && recent.expiresAtMs >= this.deps.now().getTime()) {
-            this.routeRemoteBranchRef(target, effect.ref, refreshes, {
-              narrow: recent.change.kind === "moved",
-            });
-          } else {
-            target.recentFetchRemoteRefChanges.delete(effect.ref);
-            if (target.knownRemoteRefs?.has(effect.ref)) {
-              this.routeRemoteBranchRef(target, effect.ref, refreshes, { narrow: true });
-            } else if (
-              event.type === "create" &&
-              target.knownRemoteRefs &&
-              [...target.knownRemoteRefs].some((ref) => ref.startsWith(`${effect.ref}/`))
-            ) {
-              return true;
-            } else {
-              return false;
-            }
-          }
+          return true;
         }
-        return true;
+        return this.routeRemoteRefEvent(target, effect.ref, event, refreshes);
       case "all":
+        if (commonRelativePath === "config") {
+          this.scheduleSharedConfigRefresh(target);
+          return true;
+        }
         if (
           commonRelativePath === "packed-refs" ||
           commonRelativePath?.startsWith("reftable/") === true
@@ -3045,6 +3116,135 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
           target.knownRemoteRefs = null;
         }
         return false;
+    }
+  }
+
+  private routeRemoteRefEvent(
+    target: RepoGitTarget,
+    remoteRef: string,
+    event: FileChange,
+    refreshes: Map<string, RepoMetadataWorkspaceRefresh>,
+  ): boolean {
+    if (event.type === "delete") {
+      target.recentFetchRemoteRefChanges.delete(remoteRef);
+      target.knownRemoteRefs?.delete(remoteRef);
+      return this.routeRemoteRefShapeChange(target, remoteRef, refreshes);
+    }
+    const recent = target.recentFetchRemoteRefChanges.get(remoteRef);
+    if (recent && recent.expiresAtMs >= this.deps.now().getTime()) {
+      this.routeRemoteBranchRef(target, remoteRef, refreshes, {
+        narrow: recent.change.kind === "moved",
+      });
+      return true;
+    }
+    target.recentFetchRemoteRefChanges.delete(remoteRef);
+    if (target.knownRemoteRefs?.has(remoteRef)) {
+      this.routeRemoteBranchRef(target, remoteRef, refreshes, { narrow: true });
+      return true;
+    }
+    if (
+      event.type === "create" &&
+      target.knownRemoteRefs &&
+      [...target.knownRemoteRefs].some((ref) => ref.startsWith(`${remoteRef}/`))
+    ) {
+      return true;
+    }
+    return this.routeRemoteRefShapeChange(target, remoteRef, refreshes);
+  }
+
+  /**
+   * A created or deleted remote-tracking ref changes which comparison and upstream refs
+   * exist, which only matters to workspaces that name it. `<remote>/HEAD` picks the
+   * default base of every workspace without a stored one, so it still reaches all of them.
+   */
+  private routeRemoteRefShapeChange(
+    target: RepoGitTarget,
+    remoteRef: string,
+    refreshes: Map<string, RepoMetadataWorkspaceRefresh>,
+  ): boolean {
+    if (remoteRef.endsWith("/HEAD")) {
+      return false;
+    }
+    this.routeRemoteBranchRef(target, remoteRef, refreshes);
+    // A base named only as a local branch compares against its remote copy once it exists.
+    // Without a stored base, the default branch is whatever `<remote>/HEAD` names, so the
+    // created or deleted ref may be it.
+    const separator = remoteRef.indexOf("/");
+    const branch = separator === -1 ? remoteRef : remoteRef.slice(separator + 1);
+    for (const workspaceKey of target.workspaceKeys) {
+      const facts = this.workspaceTargets.get(workspaceKey)?.latestFacts;
+      if (!facts?.isGit) continue;
+      const usesBranchAsBase = [facts.storedBaseRef, facts.resolvedBaseRef].some(
+        (ref) => ref !== null && branchNameFromRef(ref) === branch,
+      );
+      if (usesBranchAsBase || facts.storedBaseRef === null) {
+        this.addWorkspaceMetadataRefresh(refreshes, workspaceKey, true);
+      }
+    }
+    return true;
+  }
+
+  private scheduleSharedConfigRefresh(target: RepoGitTarget): void {
+    target.sharedConfigRead = target.sharedConfigRead.then(() =>
+      this.routeSharedConfigChange(target),
+    );
+  }
+
+  private async loadSharedConfigSections(target: RepoGitTarget): Promise<void> {
+    target.sharedConfigSections = await this.readSharedConfigSections(target);
+  }
+
+  private async readSharedConfigSections(
+    target: RepoGitTarget,
+  ): Promise<Map<string, string> | null> {
+    try {
+      return parseGitConfigSections(
+        await this.deps.readGitConfigFile(join(target.repoGitRoot, "config")),
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Every upstream set by any worktree rewrites the shared `config`. Compare it by section:
+   * a `[branch "<name>"]` change refreshes workspaces on or based on that branch, a remote
+   * change refreshes every workspace's structure, and anything else, or an unreadable file,
+   * keeps the full refresh because core and status settings change what `git status` reports.
+   */
+  private async routeSharedConfigChange(target: RepoGitTarget): Promise<void> {
+    const previous = target.sharedConfigSections;
+    const next = await this.readSharedConfigSections(target);
+    if (target.closed || this.repoTargets.get(target.repoGitRoot) !== target) {
+      return;
+    }
+    target.sharedConfigSections = next;
+    const change = previous && next ? diffGitConfigSections(previous, next) : null;
+    if (change && !change.other && !change.remotes) {
+      const refreshes = new Map<string, RepoMetadataWorkspaceRefresh>();
+      for (const branch of change.branches) {
+        this.routeLocalBranchRef(target, branch, refreshes, { ownBranchWorktree: false });
+      }
+      if (refreshes.size > 0) {
+        this.scheduleRepoMetadataRefresh(target, "git-metadata-watch-config", false, refreshes);
+      }
+      return;
+    }
+    if (change && !change.other) {
+      this.scheduleRepoMetadataRefresh(target, "git-metadata-watch-config", false);
+      return;
+    }
+    this.refreshAllWorkingTreeIgnores(target);
+    this.scheduleRepoMetadataRefresh(target, "git-metadata-watch-config", true);
+  }
+
+  private refreshAllWorkingTreeIgnores(target: RepoGitTarget): void {
+    for (const workspaceKey of target.workspaceKeys) {
+      const workspaceTarget = this.workspaceTargets.get(workspaceKey);
+      const workingTreeTarget = workspaceTarget
+        ? this.getWorkingTreeWatchTargetForWorkspace(workspaceTarget)
+        : null;
+      if (workingTreeTarget) void this.refreshWorkingTreeIgnoredDirectories(workingTreeTarget);
     }
   }
 
@@ -3067,7 +3267,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       matched = true;
       const effect = classifyGitMetadataPath("worktree", relativePath);
       if (effect.kind === "owner") {
-        this.addWorkspaceMetadataRefresh(refreshes, workspaceKey, effect.refreshBase);
+        this.addWorkspaceMetadataRefresh(refreshes, workspaceKey, effect.refreshBase, {
+          worktree: true,
+        });
       } else if (effect.kind !== "ignore") {
         throw new Error(`Invalid ${effect.kind} effect for worktree metadata`);
       }
@@ -3084,7 +3286,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     for (const workspaceKey of target.workspaceKeys) {
       const facts = this.workspaceTargets.get(workspaceKey)?.latestFacts;
       if (facts?.isGit && facts.absoluteGitDir && matchesRepoGitRoot(facts.absoluteGitDir)) {
-        this.addWorkspaceMetadataRefresh(refreshes, workspaceKey, refreshBase);
+        this.addWorkspaceMetadataRefresh(refreshes, workspaceKey, refreshBase, { worktree: true });
       }
     }
   }
@@ -3093,6 +3295,8 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     target: RepoGitTarget,
     branch: string,
     refreshes: Map<string, RepoMetadataWorkspaceRefresh>,
+    // A checkout's own branch moving changes what its index compares against.
+    options: { ownBranchWorktree?: boolean } = {},
   ): void {
     for (const workspaceKey of target.workspaceKeys) {
       const facts = this.workspaceTargets.get(workspaceKey)?.latestFacts;
@@ -3107,7 +3311,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
         (ref) => ref === branch || ref === `refs/heads/${branch}`,
       );
       if (facts.currentBranch === branch || usesBranch) {
-        this.addWorkspaceMetadataRefresh(refreshes, workspaceKey, true);
+        this.addWorkspaceMetadataRefresh(refreshes, workspaceKey, true, {
+          worktree: facts.currentBranch === branch && options.ownBranchWorktree !== false,
+        });
       }
     }
   }
@@ -3159,6 +3365,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     refreshBase: boolean,
     options?: {
       structural?: boolean;
+      worktree?: boolean;
       movedRemoteRef?: string;
       queueIfBusy?: boolean;
     },
@@ -3171,6 +3378,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     refreshes.set(workspaceKey, {
       refreshBase: previous?.refreshBase === true || refreshBase,
       structural: previous?.structural === true || options?.structural !== false,
+      worktree: previous?.worktree === true || options?.worktree === true,
       movedRemoteRefs,
       queueIfBusy: (previous?.queueIfBusy ?? false) || (options?.queueIfBusy ?? true),
     });
@@ -3194,6 +3402,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
           {
             refreshBase: true,
             structural: true,
+            worktree: refreshWorktree,
             movedRemoteRefs: new Set<string>(),
             queueIfBusy: true,
           },
@@ -3203,7 +3412,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       const workspaceTarget = this.workspaceTargets.get(workspaceKey);
       if (workspaceTarget) {
         let scope: ScheduledWorkspaceGitRefreshOptions["scope"];
-        if (!refreshWorktree) {
+        if (!refresh.worktree) {
           scope = refresh.structural ? "structure" : "refs";
         }
         if (refresh.refreshBase) {
@@ -3212,7 +3421,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
             this.invalidateCheckoutDiffCache(workspaceTarget.latestFacts.worktreeRoot, "base");
           }
         }
-        if (refreshWorktree) {
+        if (refresh.worktree) {
           const workingTreeTarget = this.getWorkingTreeWatchTargetForWorkspace(workspaceTarget);
           if (workingTreeTarget) {
             workingTreeTargets.add(workingTreeTarget);
@@ -3921,6 +4130,22 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     request: WorkspaceGitRefreshRequest,
     runRefreshGitCommand: RunGitCommand,
   ): Promise<WorkspaceGitRuntimeSnapshot> {
+    const startedAtMs = this.deps.now().getTime();
+    try {
+      return await this.loadRefreshedSnapshot(target, request, runRefreshGitCommand);
+    } finally {
+      const window = this.refreshWindow;
+      window.completed += 1;
+      window.durationsMs.push(Math.max(0, this.deps.now().getTime() - startedAtMs));
+      window.reasons.set(request.reason, (window.reasons.get(request.reason) ?? 0) + 1);
+    }
+  }
+
+  private async loadRefreshedSnapshot(
+    target: WorkspaceGitTarget,
+    request: WorkspaceGitRefreshRequest,
+    runRefreshGitCommand: RunGitCommand,
+  ): Promise<WorkspaceGitRuntimeSnapshot> {
     let facts = target.latestFacts;
     if (request.movedRemoteRefs.size > 0 && !request.refreshStructure && !request.refreshWorktree) {
       if (facts?.isGit && target.latestGit?.isGit) {
@@ -4011,6 +4236,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     }
 
     target.lastShellOutAtMs = this.deps.now().getTime();
+    this.refreshWindow.worktreeScans += 1;
     const context: CheckoutContext = {
       paseoHome: this.paseoHome,
       worktreesRoot: this.worktreesRoot,
@@ -4053,6 +4279,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     const context: CheckoutContext = { ...baseContext, facts };
     const cachedIsDirty = target.latestGit?.isDirty;
     const refreshWorktree = request.refreshWorktree || cachedIsDirty == null;
+    if (refreshWorktree) {
+      this.refreshWindow.worktreeScans += 1;
+    }
     const checkoutStatus = await this.deps.getCheckoutStatus(
       cwd,
       context,
@@ -4069,13 +4298,21 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       return facts;
     }
 
+    const cachedDiffStat = target.latestGit?.diffStat ?? null;
+    // A structure refresh leaves the working tree to its own observation, but a moved
+    // base can still move the merge base the diff stat is measured from.
     const diffStat = refreshWorktree
       ? await this.deps
           .getCheckoutShortstat(cwd, context, {
             force: request.force || target.latestGit !== null,
           })
           .catch(() => null)
-      : (target.latestGit?.diffStat ?? null);
+      : await this.deps
+          .getCheckoutShortstatIfMergeBaseMoved(cwd, cachedDiffStat, context, {
+            throwOnGitError: true,
+            keepCurrentWhenUnrecorded: true,
+          })
+          .catch(() => cachedDiffStat);
 
     target.latestGit = {
       isGit: true,
@@ -4302,10 +4539,11 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       );
     }
     const expiresAtMs = this.deps.now().getTime() + FETCH_METADATA_ECHO_TTL_MS;
-    const remoteRefShapeChanged =
-      target.knownRemoteRefs !== null &&
-      result.remoteRefs !== undefined &&
-      !setsEqual(target.knownRemoteRefs, result.remoteRefs);
+    // Refs created or deleted outside the fetch (pushes, prunes) since the last one.
+    const remoteRefShapeChanges =
+      target.knownRemoteRefs !== null && result.remoteRefs !== undefined
+        ? symmetricDifference(target.knownRemoteRefs, result.remoteRefs)
+        : [];
     if (result.remoteRefs) {
       target.knownRemoteRefs = new Set(result.remoteRefs);
     }
@@ -4314,22 +4552,82 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       target.recentFetchRemoteRefChanges.set(change.ref, { change, expiresAtMs });
     }
     this.flushBufferedFetchMetadataEvents(target);
-    if (
-      result.nonRemoteRefsChanged === true ||
-      remoteRefShapeChanged ||
-      result.changes.some((change) => change.kind !== "moved")
-    ) {
+    const { refreshes, shapeChanged } = this.routeRepoFetchRefChanges(
+      target,
+      result,
+      result.changes,
+      remoteRefShapeChanges,
+    );
+    if (!refreshes) {
       this.scheduleRepoMetadataRefresh(target, "repo-fetch-ref-shape", false);
       return;
     }
-    if (result.changes.length === 0) {
+    if (refreshes.size === 0) {
       return;
     }
+    this.scheduleRepoMetadataRefresh(
+      target,
+      shapeChanged ? "repo-fetch-ref-shape" : "repo-fetch",
+      false,
+      refreshes,
+    );
+  }
+
+  /**
+   * Each changed ref reaches only the workspaces that name it. With hundreds of worktrees,
+   * nearly every fetch window also sees some agent's commit or push. Returns null refreshes
+   * when a change can reach every workspace.
+   */
+  private routeRepoFetchRefChanges(
+    target: RepoGitTarget,
+    result: WorkspaceGitFetchResult,
+    changes: WorkspaceGitRemoteRefChange[],
+    remoteRefShapeChanges: string[],
+  ): { refreshes: Map<string, RepoMetadataWorkspaceRefresh> | null; shapeChanged: boolean } {
     const refreshes = new Map<string, RepoMetadataWorkspaceRefresh>();
-    for (const change of result.changes) {
-      this.routeRemoteBranchRef(target, change.ref, refreshes, { narrow: true });
+    let routed = result.nonRemoteRefsChanged !== true || result.nonRemoteRefChanges !== undefined;
+    for (const ref of result.nonRemoteRefChanges ?? []) {
+      this.routeNonRemoteRefChange(target, ref, refreshes);
     }
-    this.scheduleRepoMetadataRefresh(target, "repo-fetch", false, refreshes);
+    let shapeChanged = (result.nonRemoteRefChanges?.length ?? 0) > 0;
+    for (const change of changes) {
+      if (change.kind === "moved") {
+        this.routeRemoteBranchRef(target, change.ref, refreshes, { narrow: true });
+      } else {
+        shapeChanged = true;
+        routed = this.routeRemoteRefShapeChange(target, change.ref, refreshes) && routed;
+      }
+    }
+    for (const ref of remoteRefShapeChanges) {
+      shapeChanged = true;
+      routed = this.routeRemoteRefShapeChange(target, ref, refreshes) && routed;
+    }
+    return { refreshes: routed ? refreshes : null, shapeChanged };
+  }
+
+  private routeNonRemoteRefChange(
+    target: RepoGitTarget,
+    ref: string,
+    refreshes: Map<string, RepoMetadataWorkspaceRefresh>,
+  ): void {
+    if (ref.startsWith("refs/heads/")) {
+      // The metadata watcher already refreshed the owner's working tree for its own commit.
+      this.routeLocalBranchRef(target, ref.slice("refs/heads/".length), refreshes, {
+        ownBranchWorktree: false,
+      });
+      return;
+    }
+    const shortRef = ref.replace(/^refs\/tags\//, "");
+    for (const workspaceKey of target.workspaceKeys) {
+      const facts = this.workspaceTargets.get(workspaceKey)?.latestFacts;
+      if (!facts?.isGit) continue;
+      const usesRef = [facts.storedBaseRef, facts.resolvedBaseRef, facts.comparisonBaseRef].some(
+        (candidate) => candidate === ref || candidate === shortRef,
+      );
+      if (usesRef) {
+        this.addWorkspaceMetadataRefresh(refreshes, workspaceKey, true);
+      }
+    }
   }
 
   private flushBufferedFetchMetadataEvents(target: RepoGitTarget): void {
@@ -4344,8 +4642,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     this.scheduleRepoMetadataRefresh(
       target,
       "git-metadata-watch-after-fetch",
-      routedRefreshes === null ||
-        [...routedRefreshes.values()].some((refresh) => refresh.structural),
+      false,
       routedRefreshes,
     );
   }

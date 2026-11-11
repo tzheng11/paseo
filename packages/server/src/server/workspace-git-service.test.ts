@@ -1168,6 +1168,8 @@ describe("WorkspaceGitServiceImpl", () => {
       await vi.waitFor(() => expect(facts).toHaveBeenCalledWith(cold, expect.any(Object)));
       nowMs = 10_000;
       gate.resolve();
+      // The cold lane rests for as long as the hot snapshot ran before admitting the next one.
+      await vi.advanceTimersByTimeAsync(10_000);
       await vi.waitFor(() => expect(service.peekSnapshot(cold)?.git.currentBranch).toBe("after"));
     } finally {
       gate.resolve();
@@ -1814,6 +1816,67 @@ describe("WorkspaceGitServiceImpl", () => {
     });
     expect(getCheckoutRefDerivedState).not.toHaveBeenCalled();
 
+    first.unsubscribe();
+    second.unsubscribe();
+    service.dispose();
+  });
+
+  test("fetched ref shape changes refresh only the workspaces with a stored base that name them", async () => {
+    const releaseFetch = createDeferred<void>();
+    const onMain = join(REPO_CWD, "packages", "server");
+    const onRelease = join(REPO_CWD, "packages", "app");
+    const getCheckoutSnapshotFacts = vi.fn(async (cwd: string) => ({
+      ...createCheckoutSnapshotFacts(cwd),
+      currentBranch: cwd === onMain ? "feature-a" : "feature-b",
+      storedBaseRef: cwd === onMain ? "refs/heads/main" : "refs/heads/release",
+      resolvedBaseRef: cwd === onMain ? "refs/heads/main" : "refs/heads/release",
+      gitCommonDir: join(REPO_CWD, ".git"),
+      absoluteGitDir: join(REPO_CWD, ".git"),
+    }));
+    const getCheckoutRefDerivedState = vi.fn();
+    const service = createService({
+      getCheckoutSnapshotFacts,
+      getCheckoutRefDerivedState,
+      resolveAbsoluteGitDir: vi.fn(async () => join(REPO_CWD, ".git")),
+      hasOriginRemote: vi.fn(async () => true),
+      runGitFetch: vi.fn(async () => {
+        await releaseFetch.promise;
+        return {
+          changes: [
+            { kind: "added" as const, ref: "origin/unrelated", afterOid: "b" },
+            { kind: "added" as const, ref: "origin/release", afterOid: "c" },
+          ],
+          nonRemoteRefsChanged: true,
+          nonRemoteRefChanges: ["refs/heads/unrelated", "refs/tags/v1"],
+          error: null,
+        };
+      }),
+    });
+    await Promise.all([service.getSnapshot(onMain), service.getSnapshot(onRelease)]);
+    const first = service.registerWorkspace({ cwd: onMain }, vi.fn());
+    const second = service.registerWorkspace({ cwd: onRelease }, vi.fn());
+    await Promise.all([first.ready, second.ready]);
+    await vi.waitFor(() => {
+      expect(getCheckoutSnapshotFacts).toHaveBeenCalledTimes(2);
+      expect(service.getMetrics()).toMatchObject({
+        workspaceRefreshInFlightCount: 0,
+        fetchInFlightCount: 1,
+      });
+    });
+    getCheckoutSnapshotFacts.mockClear();
+
+    releaseFetch.resolve();
+    await vi.waitFor(() => {
+      expect(service.getMetrics().fetchInFlightCount).toBe(0);
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.waitFor(() => {
+      expect(getCheckoutSnapshotFacts).toHaveBeenCalledTimes(1);
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(getCheckoutSnapshotFacts.mock.calls.map(([cwd]) => cwd)).toEqual([onRelease]);
+    expect(getCheckoutRefDerivedState).not.toHaveBeenCalled();
     first.unsubscribe();
     second.unsubscribe();
     service.dispose();
