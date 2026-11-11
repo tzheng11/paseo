@@ -218,7 +218,7 @@ export interface WorkspaceGitService {
 
   /** Publishes computed snapshot changes independently of workspace UI subscriptions. */
   onSnapshotUpdated(listener: WorkspaceGitSnapshotUpdatedListener): WorkspaceGitSubscription;
-  getCheckout(cwd: string): Promise<ProjectCheckoutLitePayload>;
+  getCheckout(cwd: string, options?: CheckoutReadOptions): Promise<ProjectCheckoutLitePayload>;
   getSnapshot(
     cwd: string,
     options?: WorkspaceGitSnapshotOptions,
@@ -289,6 +289,21 @@ export interface WorkspaceGitServiceMetrics {
   snapshotUpdatedListenerCount: number;
   watcherErrorCallbackCount: number;
   fileObserver: FileObserverDiagnostics;
+}
+
+/**
+ * Request-path reads (workspace create, project resolution) are foreground. Passes that
+ * read every active checkout (reconciliation, registry bootstrap) are background, so a
+ * create never waits behind a whole-inventory scan.
+ */
+export interface CheckoutReadOptions {
+  priority?: "foreground" | "background";
+}
+
+interface CheckoutMetadataRead {
+  lane: NonNullable<CheckoutReadOptions["priority"]>;
+  started: boolean;
+  read: Promise<ProjectCheckoutLitePayload>;
 }
 
 export type WorkspaceGitListener = (snapshot: WorkspaceGitRuntimeSnapshot) => void;
@@ -657,7 +672,12 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     rejectOnClear: true,
   });
   private readonly checkoutMetadataLimit = pLimit({ concurrency: 2, rejectOnClear: true });
-  private readonly checkoutMetadataReads = new Map<string, Promise<ProjectCheckoutLitePayload>>();
+  // Inventory passes queue one read per active checkout; they get their own lane.
+  private readonly backgroundCheckoutMetadataLimit = pLimit({
+    concurrency: 2,
+    rejectOnClear: true,
+  });
+  private readonly checkoutMetadataReads = new Map<string, CheckoutMetadataRead>();
   private readonly backgroundRefreshes = new Map<
     WorkspaceGitTarget,
     {
@@ -860,19 +880,33 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     return runWithGitCommandPriority("high", () => this.requestWorkspaceSnapshot(target, request));
   }
 
-  async getCheckout(cwd: string): Promise<ProjectCheckoutLitePayload> {
+  async getCheckout(
+    cwd: string,
+    options?: CheckoutReadOptions,
+  ): Promise<ProjectCheckoutLitePayload> {
     this.assertNotDisposed();
     const normalizedCwd = resolve(cwd);
+    const lane = options?.priority ?? "foreground";
     const existing = this.checkoutMetadataReads.get(normalizedCwd);
-    if (existing) return existing;
-    const read = this.checkoutMetadataLimit(() => this.readCheckoutMetadata(normalizedCwd)).finally(
-      () => {
-        if (this.checkoutMetadataReads.get(normalizedCwd) === read)
-          this.checkoutMetadataReads.delete(normalizedCwd);
-      },
-    );
-    this.checkoutMetadataReads.set(normalizedCwd, read);
-    return read;
+    // A foreground read never joins a background read that is still queued.
+    if (existing && (lane === "background" || existing.lane === "foreground" || existing.started)) {
+      return existing.read;
+    }
+    const entry = { lane, started: false } as CheckoutMetadataRead;
+    const limit =
+      lane === "foreground" ? this.checkoutMetadataLimit : this.backgroundCheckoutMetadataLimit;
+    entry.read = limit(() => {
+      entry.started = true;
+      // Foreground Git commands pass queued refresh and inventory work in the process scheduler.
+      return runWithGitCommandPriority(lane === "foreground" ? "high" : "normal", () =>
+        this.readCheckoutMetadata(normalizedCwd),
+      );
+    }).finally(() => {
+      if (this.checkoutMetadataReads.get(normalizedCwd) === entry)
+        this.checkoutMetadataReads.delete(normalizedCwd);
+    });
+    this.checkoutMetadataReads.set(normalizedCwd, entry);
+    return entry.read;
   }
 
   private async readCheckoutMetadata(normalizedCwd: string): Promise<ProjectCheckoutLitePayload> {
@@ -1186,6 +1220,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     this.workspaceForgeRefreshLimit.clearQueue();
     this.backgroundRefreshLimit.clearQueue();
     this.checkoutMetadataLimit.clearQueue();
+    this.backgroundCheckoutMetadataLimit.clearQueue();
     this.checkoutMetadataReads.clear();
     this.backgroundRefreshes.clear();
     this.workspaceObservationSetupLimit.clearQueue();

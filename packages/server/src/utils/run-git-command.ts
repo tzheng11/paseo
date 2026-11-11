@@ -40,6 +40,10 @@ export function runWithGitCommandPriority<T>(priority: GitProcessPriority, opera
   return gitCommandPriority.run(priority, operation);
 }
 
+export function getGitCommandPriority(): GitProcessPriority {
+  return gitCommandPriority.getStore() ?? "normal";
+}
+
 function createGitCommandRuntimeMetricsWindow(policy: GitProcessPolicy) {
   return new GitCommandRuntimeMetricsWindow({
     concurrencyLimit: policy.maxProcessConcurrency,
@@ -595,9 +599,7 @@ function executeGitCommand<Output>(
     // Native watcher seeds keep their high priority within the background lane.
     // Only explicitly interactive inventory uses high-priority shared read slots.
     priority:
-      isInventory && options.inventoryLane === "interactive"
-        ? "high"
-        : (gitCommandPriority.getStore() ?? "normal"),
+      isInventory && options.inventoryLane === "interactive" ? "high" : getGitCommandPriority(),
   });
   runtimeMetrics.observeLimiter(scheduler.activeCount, scheduler.pendingCount);
   return promise;

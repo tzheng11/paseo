@@ -47,6 +47,7 @@ export interface ReconciliationTimer {
 }
 
 export interface ReconciliationClock {
+  now?(): number;
   setTimeout(callback: () => void | Promise<void>, delayMs: number): ReconciliationTimer;
   clearTimeout(timer: ReconciliationTimer): void;
   setInterval(callback: () => void | Promise<void>, delayMs: number): ReconciliationTimer;
@@ -54,6 +55,7 @@ export interface ReconciliationClock {
 }
 
 const systemClock: ReconciliationClock = {
+  now: () => Date.now(),
   setTimeout: (callback, delayMs) => setTimeout(() => void callback(), delayMs),
   clearTimeout: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
   setInterval: (callback, delayMs) => setInterval(() => void callback(), delayMs),
@@ -111,6 +113,8 @@ export interface WorkspaceReconciliationServiceOptions {
   clock?: ReconciliationClock;
   rescanIntervalMs?: number;
   debounceMs?: number;
+  /** Idle time after a pass before the next may start; defaults to the pass's own duration. */
+  passCooldownMs?: (passDurationMs: number) => number;
   inspectDirectory?: (targetPath: string) => Promise<DirectoryState>;
   inspectionTimeoutMs?: number;
 }
@@ -152,10 +156,12 @@ export class WorkspaceReconciliationService {
   private readonly clock: ReconciliationClock;
   private readonly rescanIntervalMs: number;
   private readonly debounceMs: number;
+  private readonly passCooldownMs: (passDurationMs: number) => number;
   private readonly watchers: Array<{ rootPath: string; watcher: ProjectRootWatcher }> = [];
   private unsubscribeRegistry: (() => void) | null = null;
   private rescanTimer: ReconciliationTimer | null = null;
   private debounceTimer: ReconciliationTimer | null = null;
+  private cooldownTimer: ReconciliationTimer | null = null;
   private disposed = false;
   private started = false;
   private reconciling = false;
@@ -180,6 +186,9 @@ export class WorkspaceReconciliationService {
     this.clock = options.clock ?? systemClock;
     this.rescanIntervalMs = options.rescanIntervalMs ?? DEFAULT_RESCAN_INTERVAL_MS;
     this.debounceMs = options.debounceMs ?? DEFAULT_DEBOUNCE_MS;
+    // Every pass reads each active checkout. Idling for as long as the pass ran caps its
+    // share of Git capacity at half, however many workspaces the host holds.
+    this.passCooldownMs = options.passCooldownMs ?? ((passDurationMs) => passDurationMs);
   }
 
   async start(): Promise<void> {
@@ -217,6 +226,7 @@ export class WorkspaceReconciliationService {
     this.unsubscribeRegistry = null;
     if (this.rescanTimer) this.clock.clearInterval(this.rescanTimer);
     if (this.debounceTimer) this.clock.clearTimeout(this.debounceTimer);
+    if (this.cooldownTimer) this.clock.clearTimeout(this.cooldownTimer);
     for (const { watcher } of this.watchers) watcher.close();
     this.watchers.length = 0;
   }
@@ -561,13 +571,14 @@ export class WorkspaceReconciliationService {
     mode: "metadata" | "full" = "metadata",
   ): Promise<void> {
     if (this.disposed) return;
-    if (this.reconciling) {
+    if (this.reconciling || this.cooldownTimer) {
       if (mode === "full" || this.reconcileQueuedMode === null) {
         this.reconcileQueuedMode = mode;
       }
       return;
     }
     this.reconciling = true;
+    const startedAt = this.now();
     try {
       await this.syncProjectRootWatches();
       const result = mode === "full" ? await this.runOnce() : await this.reconcileGitMetadata();
@@ -594,12 +605,33 @@ export class WorkspaceReconciliationService {
       }
     } finally {
       this.reconciling = false;
-      if (this.reconcileQueuedMode) {
-        const queuedMode = this.reconcileQueuedMode;
-        this.reconcileQueuedMode = null;
-        void this.reconcileObservedGitMetadata(queuedMode);
-      }
+      this.startCooldown(this.now() - startedAt);
     }
+  }
+
+  private now(): number {
+    return this.clock.now?.() ?? Date.now();
+  }
+
+  private startCooldown(passDurationMs: number): void {
+    if (this.disposed) return;
+    const cooldownMs = this.passCooldownMs(passDurationMs);
+    if (cooldownMs <= 0) {
+      void this.runQueuedReconciliation();
+      return;
+    }
+    this.cooldownTimer = this.clock.setTimeout(() => {
+      this.cooldownTimer = null;
+      return this.runQueuedReconciliation();
+    }, cooldownMs);
+    this.cooldownTimer.unref?.();
+  }
+
+  private runQueuedReconciliation(): Promise<void> {
+    const queuedMode = this.reconcileQueuedMode;
+    if (!queuedMode) return Promise.resolve();
+    this.reconcileQueuedMode = null;
+    return this.reconcileObservedGitMetadata(queuedMode);
   }
 
   private async readCheckout(cwd: string): Promise<ProjectCheckoutLitePayload> {
@@ -614,7 +646,7 @@ export class WorkspaceReconciliationService {
         mainRepoRoot: null,
       };
     }
-    return this.workspaceGitService.getCheckout(cwd);
+    return this.workspaceGitService.getCheckout(cwd, { priority: "background" });
   }
 
   private wakeInspectionWaiters(): void {
