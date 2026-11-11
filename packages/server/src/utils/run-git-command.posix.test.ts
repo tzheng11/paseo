@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { isPlatform } from "../test-utils/platform.js";
 import { runGitCommand } from "./run-git-command.js";
 
 const tempDirs: string[] = [];
@@ -63,7 +64,7 @@ describe("runGitCommand fsmonitor isolation", () => {
   });
 });
 
-describe("runGitCommand timeouts", () => {
+describe.skipIf(isPlatform("win32"))("runGitCommand timeouts", () => {
   it("kills processes git started when the command times out", async () => {
     const repo = makeTempRepo();
     await runGitCommand(["init"], { cwd: repo });
