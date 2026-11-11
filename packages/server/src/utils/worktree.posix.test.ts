@@ -759,6 +759,71 @@ describe.skipIf(isPlatform("win32"))("worktree POSIX-only", () => {
       ).rejects.toThrow("Git rejected ref name 'bad..name'");
     });
 
+    describe("when git worktree add fails", () => {
+      function localBranchExists(name: string): boolean {
+        try {
+          execFileSync("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${name}`], {
+            cwd: repoDir,
+            stdio: "ignore",
+          });
+          return true;
+        } catch {
+          return false;
+        }
+      }
+
+      it("removes the partial checkout, its locked entry and its new branch", async () => {
+        // Leaves the state of an add killed mid-checkout: the entry locked "initializing", git exiting non-zero.
+        const hook = join(repoDir, ".git", "hooks", "post-checkout");
+        writeFileSync(
+          hook,
+          '#!/bin/sh\necho initializing > "$(git rev-parse --git-dir)/locked"\nexit 1\n',
+        );
+        chmodSync(hook, 0o755);
+        const worktreePath = join(tempDir, "worktrees", "stranded");
+
+        await expect(
+          createWorktreePrimitive({
+            cwd: repoDir,
+            worktreeSlug: "stranded",
+            worktreePath,
+            source: { kind: "branch-off", baseBranch: "main", branchName: "feature/stranded" },
+            paseoHome,
+          }),
+        ).rejects.toThrow();
+
+        expect(existsSync(worktreePath)).toBe(false);
+        expect(existsSync(join(repoDir, ".git", "worktrees", "stranded"))).toBe(false);
+        expect(
+          execFileSync("git", ["worktree", "list", "--porcelain"], {
+            cwd: repoDir,
+            encoding: "utf8",
+          }),
+        ).not.toContain(worktreePath);
+        expect(localBranchExists("feature/stranded")).toBe(false);
+      });
+
+      it("keeps a directory it did not create but drops the branch git made", async () => {
+        const worktreePath = join(tempDir, "worktrees", "occupied");
+        mkdirSync(worktreePath, { recursive: true });
+        writeFileSync(join(worktreePath, "keep.txt"), "someone else's\n");
+
+        await expect(
+          createWorktreePrimitive({
+            cwd: repoDir,
+            worktreeSlug: "occupied",
+            worktreePath,
+            source: { kind: "branch-off", baseBranch: "main", branchName: "feature/occupied" },
+            paseoHome,
+          }),
+        ).rejects.toThrow("already exists");
+
+        expect(readFileSync(join(worktreePath, "keep.txt"), "utf8")).toBe("someone else's\n");
+        expect(localBranchExists("feature/occupied")).toBe(false);
+        expect(localBranchExists("main")).toBe(true);
+      });
+    });
+
     it("throws a typed error when checking out an invalid existing branch name", async () => {
       let caughtError: unknown;
       try {

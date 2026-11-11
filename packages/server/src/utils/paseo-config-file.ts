@@ -115,6 +115,11 @@ interface Snapshot {
 }
 
 /** Owns config admission, snapshots and daemon read/modify/write ordering for every consumer. */
+// Must exceed the distinct roots a host lists. A listing walks them in a fixed order, so a
+// smaller LRU evicts each snapshot just before its reuse (mac-studio: 329 roots, 256 slots).
+const MAX_SNAPSHOTS = 4096;
+const READ_TIMEOUT_MESSAGE = "Project config unavailable";
+
 class ProjectConfigOwner {
   // A stalled mount retains its slot until the OS returns; never consume the whole fs pool.
   private readonly filesystemOperations = pLimit(2);
@@ -166,17 +171,27 @@ class ProjectConfigOwner {
     this.snapshots.delete(root);
     this.snapshots.set(root, snapshot);
     // Worktrees come and go; retain only a bounded set of reusable snapshots.
-    if (this.snapshots.size > 256) this.snapshots.delete(this.snapshots.keys().next().value!);
+    if (this.snapshots.size > MAX_SNAPSHOTS) {
+      this.snapshots.delete(this.snapshots.keys().next().value!);
+    }
     return snapshot;
   }
 
   async read(repoRoot: string): Promise<Snapshot> {
     const root = resolve(repoRoot);
-    return withTimeout(
-      this.serialized(root, "read", () => this.load(root)),
-      5_000,
-      "Project config unavailable",
-    );
+    try {
+      return await withTimeout(
+        this.serialized(root, "read", () => this.load(root)),
+        5_000,
+        READ_TIMEOUT_MESSAGE,
+      );
+    } catch (error) {
+      // The limit includes the shared queue, which a host listing hundreds of roots under I/O
+      // load overruns on queueing alone. Answer from this root's last snapshot instead.
+      const last = this.snapshots.get(root);
+      if (last && error instanceof Error && error.message === READ_TIMEOUT_MESSAGE) return last;
+      throw error;
+    }
   }
 
   private async load(root: string): Promise<Snapshot> {

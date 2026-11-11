@@ -19,6 +19,7 @@ import {
   type PullRequestStatusResult,
 } from "../utils/checkout-git.js";
 import {
+  getGitCommandPriority,
   runGitCommand as runGitCommandReal,
   snapshotGitCommandRuntimeMetrics,
 } from "../utils/run-git-command.js";
@@ -434,6 +435,56 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
 
     await expect(service.getCheckout(REPO_CWD)).rejects.toThrow("Git read failed");
 
+    service.dispose();
+  });
+
+  test("getCheckout serves request-path reads ahead of a queued inventory pass", async () => {
+    const started: Array<{ cwd: string; priority: string }> = [];
+    const gates = new Map<string, ReturnType<typeof createDeferred<void>>>();
+    const getCheckoutIdentity = vi.fn(async (cwd: string) => {
+      started.push({ cwd, priority: getGitCommandPriority() });
+      const gate = createDeferred<void>();
+      gates.set(cwd, gate);
+      await gate.promise;
+      return createCheckoutFacts(cwd);
+    });
+    const service = createService({ getCheckoutIdentity });
+    const inventory = Array.from({ length: 6 }, (_, index) => `${REPO_CWD}-inventory-${index}`);
+    const inventoryReads = inventory.map((cwd) =>
+      service.getCheckout(cwd, { priority: "background" }),
+    );
+    const createCwd = `${REPO_CWD}-new-workspace`;
+    const createRead = service.getCheckout(createCwd);
+    // A request for a checkout whose inventory read is still queued does not wait for it.
+    const queuedCwdRead = service.getCheckout(inventory[5]!);
+    await flushPromises();
+
+    expect(started).toEqual([
+      { cwd: inventory[0], priority: "normal" },
+      { cwd: inventory[1], priority: "normal" },
+      { cwd: createCwd, priority: "high" },
+      { cwd: inventory[5], priority: "high" },
+    ]);
+    gates.get(createCwd)!.resolve();
+    gates.get(inventory[5]!)!.resolve();
+    await expect(createRead).resolves.toMatchObject({ cwd: createCwd });
+    await expect(queuedCwdRead).resolves.toMatchObject({ cwd: inventory[5] });
+
+    // An inventory read joins an in-flight request-path read instead of queueing a second one.
+    const joinedCwd = `${REPO_CWD}-joined`;
+    const requestRead = service.getCheckout(joinedCwd);
+    const joinedRead = service.getCheckout(joinedCwd, { priority: "background" });
+    await flushPromises();
+    gates.get(joinedCwd)!.resolve();
+    await expect(joinedRead).resolves.toMatchObject({ cwd: joinedCwd });
+    await expect(requestRead).resolves.toMatchObject({ cwd: joinedCwd });
+    expect(started.filter((entry) => entry.cwd === joinedCwd)).toHaveLength(1);
+
+    for (const cwd of inventory) {
+      await flushPromises();
+      gates.get(cwd)?.resolve();
+    }
+    await Promise.all(inventoryReads);
     service.dispose();
   });
 
