@@ -183,3 +183,63 @@ test("an origin move refreshes an untracked main checkout shortstat", async () =
     ),
   ).toEqual({ aheadBehind: null, diffStat: null, upstreamStatus: null });
 });
+
+test("a base move that keeps the merge base reuses the diff stat without reading the working tree", async () => {
+  const { cwd, facts } = seedFeatureCheckout();
+  const first = await getCheckoutRefDerivedState(
+    cwd,
+    facts,
+    { aheadBehind: { ahead: 0, behind: 0 }, diffStat: null },
+    new Set(["origin/main"]),
+  );
+  git(cwd, ["switch", "--quiet", "main"]);
+  writeFileSync(join(cwd, "other.txt"), "other\n");
+  git(cwd, ["add", "other.txt"]);
+  git(cwd, ["commit", "-m", "other"]);
+  git(cwd, ["update-ref", "refs/remotes/origin/main", git(cwd, ["rev-parse", "HEAD"])]);
+  git(cwd, ["switch", "--quiet", "feature"]);
+
+  startGitCommandMetrics();
+  const moved = await getCheckoutRefDerivedState(
+    cwd,
+    facts,
+    { aheadBehind: first.aheadBehind, diffStat: first.diffStat },
+    new Set(["origin/main"]),
+  );
+  await waitForGitCommandMetricsIdle({ quietMs: 50, timeoutMs: 5_000 });
+  const metrics = stopGitCommandMetrics();
+
+  expect(moved.aheadBehind).toEqual({ ahead: 1, behind: 1 });
+  expect(moved.diffStat).toEqual(first.diffStat);
+  expect(metrics.submissions.map((command) => command.args[0]).sort()).toEqual([
+    "merge-base",
+    "rev-list",
+  ]);
+});
+
+test("a base move that changes the merge base recomputes the diff stat", async () => {
+  const { cwd, facts } = seedFeatureCheckout();
+  const first = await getCheckoutRefDerivedState(
+    cwd,
+    facts,
+    { aheadBehind: { ahead: 0, behind: 0 }, diffStat: null },
+    new Set(["origin/main"]),
+  );
+  writeFileSync(join(cwd, "feature.txt"), "feature\nmore\nlines\n");
+  git(cwd, ["commit", "--quiet", "-am", "more"]);
+  git(cwd, ["update-ref", "refs/remotes/origin/main", git(cwd, ["rev-parse", "HEAD~1"])]);
+
+  startGitCommandMetrics();
+  const moved = await getCheckoutRefDerivedState(
+    cwd,
+    facts,
+    { aheadBehind: first.aheadBehind, diffStat: first.diffStat },
+    new Set(["origin/main"]),
+  );
+  await waitForGitCommandMetricsIdle({ quietMs: 50, timeoutMs: 5_000 });
+  const metrics = stopGitCommandMetrics();
+
+  expect(first.diffStat).toEqual({ additions: 1, deletions: 0 });
+  expect(moved.diffStat).toEqual({ additions: 2, deletions: 0 });
+  expect(metrics.submissions.map((command) => command.args[0])).toContain("diff");
+});

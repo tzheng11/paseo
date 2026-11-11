@@ -75,10 +75,12 @@ describe("workspace Git remote refs", () => {
         new Map([
           ["refs/remotes/origin/main", "aaaaaaaa"],
           ["refs/heads/topic", "bbbbbbbb"],
+          ["refs/heads/deleted", "eeeeeeee"],
         ]),
         new Map([
           ["refs/remotes/origin/main", "cccccccc"],
           ["refs/heads/topic", "dddddddd"],
+          ["refs/tags/v1", "ffffffff"],
         ]),
       ),
     ).toEqual({
@@ -91,6 +93,7 @@ describe("workspace Git remote refs", () => {
         },
       ],
       nonRemoteRefsChanged: true,
+      nonRemoteRefChanges: ["refs/heads/topic", "refs/heads/deleted", "refs/tags/v1"],
     });
   });
 
