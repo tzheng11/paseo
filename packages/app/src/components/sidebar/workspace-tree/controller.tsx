@@ -17,6 +17,7 @@ import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import type { SidebarWorkspacePlacement } from "@/hooks/use-sidebar-workspaces-list";
 import { useSidebarCollapsedSectionsStore } from "@/stores/sidebar-collapsed-sections-store";
 import { useToast } from "@/contexts/toast-context";
+import { canonicalSidebar } from "@/stores/canonical-sidebar-runtime";
 import {
   resolveWorkspaceTreeDropResult,
   type WorkspaceDropPosition,
@@ -28,6 +29,7 @@ export interface WorkspaceTreeProviderProps {
   workspaces: readonly SidebarWorkspacePlacement[];
   allWorkspaces?: readonly SidebarWorkspacePlacement[];
   supportedServerIds: ReadonlyMap<string, boolean>;
+  supportedPinnedServerIds: ReadonlyMap<string, boolean>;
   onMove: (drop: WorkspaceTreeDrop) => Promise<void>;
   children: ReactNode;
 }
@@ -53,6 +55,7 @@ export function WorkspaceTreeController({
   workspaces,
   allWorkspaces = workspaces,
   supportedServerIds,
+  supportedPinnedServerIds,
   onMove,
   children,
 }: WorkspaceTreeProviderProps) {
@@ -74,6 +77,7 @@ export function WorkspaceTreeController({
       setFailure(null);
       try {
         const current = resolveWorkspaceTreeDropResult({
+          canonicalOrder: canonicalSidebar.state().enabled,
           workspaces,
           allWorkspaces,
           workspaceKey: next.workspaceKey,
@@ -129,6 +133,7 @@ export function WorkspaceTreeController({
       const source = activeRef.current;
       const result = source
         ? resolveWorkspaceTreeDropResult({
+            canonicalOrder: canonicalSidebar.state().enabled,
             workspaces,
             allWorkspaces,
             workspaceKey: source,
@@ -177,10 +182,10 @@ export function WorkspaceTreeController({
   }, [drop?.position, drop?.targetWorkspaceKey]);
   const enabled = useCallback(
     (workspace: SidebarWorkspacePlacement) =>
-      (workspace.sidebarSection !== undefined ||
-        supportedServerIds.get(workspace.serverId) === true) &&
-      !pending,
-    [pending, supportedServerIds],
+      (workspace.sidebarSection !== undefined ? supportedPinnedServerIds : supportedServerIds).get(
+        workspace.serverId,
+      ) === true && !pending,
+    [pending, supportedServerIds, supportedPinnedServerIds],
   );
   const activeSubtreeKeys = useMemo(
     () =>

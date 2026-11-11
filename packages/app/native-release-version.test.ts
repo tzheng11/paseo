@@ -4,9 +4,38 @@ const {
   FDROID_ABI_VERSION_CODE_SUFFIXES,
   getFdroidVersionCodes,
   getNativeReleaseVersion,
+  getNativeConfigVersion,
 } = require("./native-release-version");
 
 describe("native release version", () => {
+  it("encodes pinned Impower Expo config without changing the package version or publishing a native release", () => {
+    const distribution = {
+      name: "impower",
+      upstreamVersion: "0.15.0",
+      upstreamCommit: "a".repeat(40),
+    };
+    expect(getNativeConfigVersion("0.15.0-impower", distribution)).toEqual(
+      getNativeReleaseVersion("0.15.0"),
+    );
+    expect(() => getNativeReleaseVersion("0.15.0-impower")).toThrow("unsupported version");
+    expect(getNativeConfigVersion("0.15.0-beta.2", distribution)).toEqual(
+      getNativeReleaseVersion("0.15.0-beta.2"),
+    );
+  });
+
+  it("refuses absent or mismatched distribution bindings and never strips an arbitrary suffix", () => {
+    const binding = { name: "impower", upstreamVersion: "0.15.0", upstreamCommit: "a".repeat(40) };
+    for (const distribution of [
+      undefined,
+      { ...binding, name: "other" },
+      { ...binding, upstreamVersion: "0.14.0" },
+      { ...binding, upstreamCommit: "not-a-commit" },
+    ])
+      expect(() => getNativeConfigVersion("0.15.0-impower", distribution)).toThrow(
+        "matching pinned upstream",
+      );
+    expect(() => getNativeConfigVersion("0.15.0-other", binding)).toThrow("unsupported version");
+  });
   it("reserves the final iOS build slot for a stable release", () => {
     expect(getNativeReleaseVersion("0.2.6")).toEqual({
       appVersion: "0.2.6",

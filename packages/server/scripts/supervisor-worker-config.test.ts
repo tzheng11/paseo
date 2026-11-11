@@ -4,7 +4,33 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "vitest";
-import { resolveWorkerExecArgv } from "./supervisor-worker-config.js";
+import {
+  finishMaintenanceBootEnvironment,
+  resolveWorkerExecArgv,
+} from "./supervisor-worker-config.js";
+
+test("maintenance boot readiness consumes only its own future-worker environment", () => {
+  const env = {
+    PASEO_MAINTENANCE_BOOT: "closed",
+    PASEO_MAINTENANCE_CONTROL_DIR: "/private/control",
+    PASEO_MAINTENANCE_BOOT_TIMEOUT_MS: "300000",
+    PASEO_HOME: "/original/home",
+    NODE_OPTIONS: "--no-warnings",
+    IMPOWER_PASEO_WORKER_HEAP_MB: "16384",
+  };
+  finishMaintenanceBootEnvironment(env);
+  expect(env).toEqual({
+    PASEO_HOME: "/original/home",
+    NODE_OPTIONS: "--no-warnings",
+    IMPOWER_PASEO_WORKER_HEAP_MB: "16384",
+  });
+});
+
+test("maintenance boot cleanup does not change a normal worker environment", () => {
+  const env = { PASEO_HOME: "/original/home", NODE_OPTIONS: "--no-warnings" };
+  finishMaintenanceBootEnvironment(env);
+  expect(env).toEqual({ PASEO_HOME: "/original/home", NODE_OPTIONS: "--no-warnings" });
+});
 
 test.each([
   ["worker.js", []],

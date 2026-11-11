@@ -1,3 +1,5 @@
+import { Modal } from "@/components/ui/modal";
+import { usePanelStore } from "@/stores/panel-store";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
 import { useMainHost } from "@/hosts/use-main-host";
 import { router } from "expo-router";
@@ -22,14 +24,7 @@ import {
   type ComponentType,
   type RefObject,
 } from "react";
-import {
-  Modal,
-  Pressable,
-  ScrollView,
-  Text,
-  View,
-  type PressableStateCallbackType,
-} from "react-native";
+import { Pressable, ScrollView, Text, View, type PressableStateCallbackType } from "react-native";
 import {
   EditingTextInput as TextInput,
   type EditingTextInputHandle,
@@ -482,6 +477,7 @@ export function AddProjectFlow({ request, onClose }: AddProjectFlowProps) {
   const openNewWorkspaceForProject = useCallback(
     (serverId: string, project: WorkspaceProjectDescriptorPayload) => {
       onClose();
+      usePanelStore.getState().showMobileAgent();
       router.push(
         buildNewWorkspaceRoute({
           serverId,
@@ -629,6 +625,7 @@ export function AddProjectFlow({ request, onClose }: AddProjectFlowProps) {
           testID: "add-project-flow-add-host",
           select: () => {
             onClose();
+            usePanelStore.getState().showMobileAgent();
             router.push(buildSettingsAddHostRoute(Date.now()));
           },
         });

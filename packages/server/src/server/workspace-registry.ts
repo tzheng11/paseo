@@ -1,8 +1,10 @@
+import { parseCapturedJson, CapturedJsonRefusal, type CapturedJson } from "./captured-json.js";
 import { promises as fs } from "node:fs";
 
 import type { Logger } from "pino";
 import { z } from "zod";
 import type { WorkspaceMoveRequest } from "@getpaseo/protocol/messages";
+import { WorkspacePinPlacementSchema } from "@getpaseo/protocol/messages";
 
 import {
   MAX_WORKSPACE_FIELD_VALUE_LENGTH,
@@ -59,6 +61,7 @@ const PersistedWorkspaceRecordSchema = z
   .object({
     workspaceId: z.string(),
     projectId: z.string(),
+    pinPlacement: WorkspacePinPlacementSchema.optional(),
     // COMPAT(workspaceHierarchy): added in v0.12.0; remove optional parsing after 2027-04-21.
     parentWorkspaceId: z.string().nullable().optional(),
     siblingOrder: z.number().finite().optional(),
@@ -136,6 +139,25 @@ const PersistedWorkspaceRecordSchema = z
     pinnedAt: record.pinnedAt ?? record.superpinnedAt,
   }));
 
+/** Offline inspection retains legacy omissions instead of invoking loader repairs/defaults. */
+export function parseCapturedWorkspaceRegistry(capture: CapturedJson) {
+  const result = parseCapturedJson(capture, z.array(PersistedWorkspaceRecordSchema));
+  if (result.state === "present")
+    assertUniqueCapturedIds(result.value.map((row) => row.workspaceId));
+  return result;
+}
+
+export function parseCapturedProjectRegistry(capture: CapturedJson) {
+  const result = parseCapturedJson(capture, z.array(PersistedProjectRecordSchema));
+  if (result.state === "present") assertUniqueCapturedIds(result.value.map((row) => row.projectId));
+  return result;
+}
+
+function assertUniqueCapturedIds(ids: string[]): void {
+  if (new Set(ids).size !== ids.length)
+    throw new CapturedJsonRefusal("duplicate_registry_identity");
+}
+
 export type PersistedProjectRecord = z.infer<typeof PersistedProjectRecordSchema>;
 export type PersistedWorkspaceRecord = z.infer<typeof PersistedWorkspaceRecordSchema>;
 
@@ -148,6 +170,9 @@ export interface WorkspaceMutation {
 
 export interface WorkspaceMutationContext {
   expectsInitialAgent?: boolean;
+  requestId?: string;
+  /** Explicit layout RPCs also need fresh validation when the cached value looks unchanged. */
+  layoutWrite?: true;
 }
 
 export interface WorkspaceArchiveContext {
@@ -189,21 +214,29 @@ export type WorkspaceMoveInput = Pick<
 >;
 
 export interface WorkspaceRegistry {
+  readonly destructiveRetirement?: "refuse";
+  /** Refuse creation before hooks, project writes or filesystem provisioning. */
+  assertLayoutWriteAllowed?(): Promise<void>;
   initialize(): Promise<void>;
   existsOnDisk(): Promise<boolean>;
   list(): Promise<PersistedWorkspaceRecord[]>;
   get(workspaceId: string): Promise<PersistedWorkspaceRecord | null>;
-  move(workspaceId: string, input: WorkspaceMoveInput): Promise<PersistedWorkspaceRecord>;
+  move(
+    workspaceId: string,
+    input: WorkspaceMoveInput,
+    context?: WorkspaceMutationContext,
+  ): Promise<PersistedWorkspaceRecord>;
   update(
     workspaceId: string,
     updater: (record: PersistedWorkspaceRecord) => PersistedWorkspaceRecord,
+    context?: WorkspaceMutationContext,
   ): Promise<PersistedWorkspaceRecord | null>;
   upsert(record: PersistedWorkspaceRecord, context?: WorkspaceMutationContext): Promise<void>;
   archive(
     workspaceId: string,
     archivedAt: string,
     context?: WorkspaceArchiveContext,
-  ): Promise<void>;
+  ): Promise<boolean>;
   remove(workspaceId: string): Promise<void>;
   /** Central lifecycle seam for daemon-global workspace observers. */
   subscribeToMutations?(
@@ -283,20 +316,6 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
       const proposed = updater(existing);
       if (proposed === existing) return existing;
       const next = this.schema.parse(proposed);
-      records.set(id, next);
-      return next;
-    });
-  }
-
-  async archive(id: string, archivedAt: string): Promise<void> {
-    await this.archiveIfPresent(id, archivedAt);
-  }
-
-  protected async archiveIfPresent(id: string, archivedAt: string): Promise<TRecord | null> {
-    return this.mutateCache((records) => {
-      const existing = records.get(id);
-      if (!existing) return null;
-      const next = this.schema.parse({ ...existing, updatedAt: archivedAt, archivedAt });
       records.set(id, next);
       return next;
     });
@@ -526,7 +545,7 @@ export class FileBackedProjectRegistry
     return project;
   }
 
-  override async archive(projectId: string, archivedAt: string): Promise<void> {
+  async archive(projectId: string, archivedAt: string): Promise<void> {
     const project = await this.archiveIfActive(projectId, archivedAt);
     if (!project) return;
     await this.notifyMutation({ kind: "archive", projectId, project });
@@ -637,6 +656,8 @@ export class FileBackedWorkspaceRegistry
       }
       const next = PersistedWorkspaceRecordSchema.parse({
         ...record,
+        // Full-record refreshes must preserve the placement written through its CAS RPC.
+        pinPlacement: previous?.pinPlacement ?? record.pinPlacement,
         parentWorkspaceId,
         siblingOrder,
       });
@@ -723,27 +744,34 @@ export class FileBackedWorkspaceRegistry
     return workspace;
   }
 
-  override async archive(
+  async archive(
     workspaceId: string,
     archivedAt: string,
     context?: WorkspaceArchiveContext,
-  ): Promise<void> {
-    const workspace = await super.update(workspaceId, (existing) => ({
-      ...existing,
-      updatedAt: archivedAt,
-      archivedAt,
-      ...(context?.autoArchivedChangeRequestUrl
-        ? { autoArchivedChangeRequestUrl: context.autoArchivedChangeRequestUrl }
-        : {}),
-    }));
-    if (!workspace) return;
+  ): Promise<boolean> {
+    const [workspace] = await this.mutateMany((records) => {
+      const existing = records.get(workspaceId);
+      if (!existing || existing.archivedAt) return [];
+      return [
+        {
+          ...existing,
+          updatedAt: archivedAt,
+          archivedAt,
+          ...(context?.autoArchivedChangeRequestUrl
+            ? { autoArchivedChangeRequestUrl: context.autoArchivedChangeRequestUrl }
+            : {}),
+        },
+      ];
+    });
+    if (!workspace) return false;
     await this.notifyMutation({ kind: "archive", workspaceId, workspace });
+    return true;
   }
 
   override async remove(workspaceId: string): Promise<void> {
     const workspace = await this.removeIfPresent(workspaceId);
     if (!workspace) return;
-    await this.notifyMutation({ kind: "remove", workspaceId, workspace: null });
+    await this.notifyMutation({ kind: "remove", workspaceId, workspace });
   }
 
   async commitWorkspaceLabelMutation<TResult>(input: {
@@ -826,6 +854,7 @@ export function resolveProjectDisplayName(record: PersistedProjectRecord): strin
 }
 
 export function createPersistedWorkspaceRecord(input: {
+  pinPlacement?: PersistedWorkspaceRecord["pinPlacement"];
   workspaceId: string;
   projectId: string;
   parentWorkspaceId?: string | null;

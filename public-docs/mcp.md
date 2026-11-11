@@ -108,10 +108,17 @@ Paseo agents receive finish, error, and permission notifications by default; set
 | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `create_workspace`  | Create a local or worktree-isolated workspace. Worktrees can branch off, check out a branch, or a PR. `background: true` hides it from default lists and the sidebar while preserving history and access by ID. Omission inherits the calling agent’s workspace setting, or defaults to false without a caller. |
 | `list_workspaces`   | List active workspaces and their directories and isolation. Use `includeBackground: true` to include background workspaces.                                                                                                                                                                                     |
+| `move_workspace`    | Move or reorder a workspace in the shared sidebar with `parentWorkspaceKey`, `beforeWorkspaceKey` or `siblingOrder`, and optional `section`.                                                                                                                                                                    |
 | `rename_workspace`  | Change the user-visible name of the current or specified workspace.                                                                                                                                                                                                                                             |
 | `archive_workspace` | Archive a workspace and the sessions it owns.                                                                                                                                                                                                                                                                   |
 
 For worktree isolation, `create_workspace` accepts the same useful choices as the app: branch off from a base, check out an existing branch, or check out a pull request. The worktree remains an implementation detail of the workspace lifecycle.
+
+New agent-created workspaces default beneath the calling workspace, including when created on a registered remote host. Pass `parentWorkspaceKey: "serverId:workspaceId"` to choose another parent, or `parentWorkspaceKey: null` for a root. Children inherit their parent's Pinned, Superpinned, or unpinned section and append after existing children. For a root, `section` selects `unpinned`, `pinned`, or `superpinned`. `siblingOrder` sets an explicit rank.
+
+`move_workspace` keeps the current parent when `parentWorkspaceKey` is omitted. Use `beforeWorkspaceKey` to order it before a destination sibling. Section changes include the complete subtree across registered hosts; reconnect those hosts before moving it. These tools update the layout shared across clients. They keep directories, project ownership, and agent parentage unchanged. Older `parentWorkspaceId` inputs still address the destination host's project hierarchy.
+
+A parent available only through an app connection can be referenced during creation by supplying its saved `section` and `siblingOrder` too. Otherwise, register its host so MCP can resolve its section and global sibling order.
 
 ### Workspace scripts
 

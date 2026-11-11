@@ -351,13 +351,13 @@ test("an origin/main update narrowly refreshes 59 sibling worktrees", async () =
     }),
   ).toEqual({
     fetchCount: 1,
-    gitCommands: 239,
+    gitCommands: 121,
     nonRemoteRefsChanged: false,
+    // Each sibling's merge base with the advanced main is unchanged, so its diff stat is
+    // reused without reading its working tree again.
     operations: {
-      diff: 59,
       fetch: 1,
       "for-each-ref": 2,
-      "ls-files": 59,
       "merge-base": 59,
       "rev-list": 59,
     },
@@ -392,13 +392,13 @@ test("an overlapping external fetch of one main update stays narrow", async () =
   );
   expect(result).toEqual({
     fetchCount: 1,
-    gitCommands: 239,
+    gitCommands: 121,
     nonRemoteRefsChanged: false,
+    // Each sibling's merge base with the advanced main is unchanged, so its diff stat is
+    // reused without reading its working tree again.
     operations: {
-      diff: 59,
       fetch: 1,
       "for-each-ref": 2,
-      "ls-files": 59,
       "merge-base": 59,
       "rev-list": 59,
     },
@@ -441,13 +441,11 @@ test("a second same-ref fetch during calculation stays narrow", async () => {
   );
   expect(result).toEqual({
     fetchCount: 1,
-    gitCommands: 475,
+    gitCommands: 239,
     nonRemoteRefsChanged: false,
     operations: {
-      diff: 118,
       fetch: 1,
       "for-each-ref": 2,
-      "ls-files": 118,
       "merge-base": 118,
       "rev-list": 118,
     },

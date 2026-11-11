@@ -1,5 +1,6 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { fork } from "node:child_process";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { PassThrough } from "node:stream";
 import path from "node:path";
@@ -10,6 +11,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentStreamEvent } from "../agent/agent-sdk-types.js";
 import { PluginAgentClientRegistry } from "../agent/plugin-provider.js";
 import { PluginRuntime } from "./runtime.js";
+import { resolveDaemonVersion } from "../daemon-version.js";
 import type { PluginSessionSocket } from "./session-socket.js";
 
 const temporaryDirectories: string[] = [];
@@ -38,7 +40,10 @@ function pluginMessages(runtime: PluginRuntime, pluginId: string): string[] {
   return runtime.getLogs(pluginId).map((entry) => entry.message);
 }
 
-function spawnObservedPluginProcess(onMessage: (message: unknown) => void) {
+function spawnObservedPluginProcess(
+  onMessage: (message: unknown) => void,
+  env?: NodeJS.ProcessEnv,
+) {
   const loaderUrl = new URL("../../terminal/terminal-ts-loader.mjs", import.meta.url).href;
   const setup = `import { register } from "node:module"; register(${JSON.stringify(loaderUrl)});`;
   const child = fork(new URL("./plugin-process.ts", import.meta.url), [], {
@@ -49,6 +54,7 @@ function spawnObservedPluginProcess(onMessage: (message: unknown) => void) {
     ],
     serialization: "advanced",
     stdio: ["ignore", "pipe", "pipe", "ipc"],
+    ...(env ? { env } : {}),
   });
   child.on("message", onMessage);
   return child;
@@ -104,6 +110,12 @@ function createReloadChild(
       emit("message", message);
     },
   };
+}
+
+function sha256(text: string | undefined): string {
+  return createHash("sha256")
+    .update(text ?? "")
+    .digest("hex");
 }
 
 function createTestRuntime(
@@ -651,7 +663,8 @@ lines.on("line", (line) => {
         type: "timeline.item",
         item: expect.objectContaining({
           type: "assistant_message",
-          id: "assistant-1",
+          id: JSON.stringify(["agent_message_chunk", "assistant-1"]),
+          messageId: "assistant-1",
           text: "ACP says hi",
         }),
       }),
@@ -836,10 +849,19 @@ export default function contribute(server: any) { server.registerProvider(provid
     await runtime.startPlugin("lifecycle", directory);
     await runtime.stopPluginById("lifecycle");
 
+    const phasePrefix = "[paseo] Plugin initialization phase ";
     expect(
-      runtime.getLogs("lifecycle").map(({ stream, message }) => ({ stream, message })),
+      runtime
+        .getLogs("lifecycle")
+        .map(({ stream, message }) =>
+          message.startsWith(phasePrefix)
+            ? { stream, phase: JSON.parse(message.slice(phasePrefix.length)).phase }
+            : { stream, message },
+        ),
     ).toEqual([
       { stream: "stdout", message: "[paseo] Loading plugin" },
+      { stream: "stdout", phase: "session-attached" },
+      { stream: "stdout", phase: "ready-received" },
       { stream: "stdout", message: "[paseo] Plugin ready" },
       { stream: "stdout", message: "[paseo] Stopping plugin" },
       { stream: "stdout", message: "[paseo] Plugin stopped" },
@@ -893,12 +915,14 @@ export default function contribute(server: any) { server.registerProvider(provid
 
     child.stderr.write("connection failed\n");
 
+    const output = runtime
+      .getLogs("tagged-output")
+      .find((entry) => entry.message === "connection failed");
+    if (!output) throw new Error("Expected plugin output in the retained log tail");
     expect(records.find((record) => record.message === "connection failed")).toMatchObject({
       module: "plugins",
       pluginId: "tagged-output",
-      sequence: 3,
-      stream: "stderr",
-      message: "connection failed",
+      ...output,
     });
     expect(records.find((record) => record.message === "connection failed")?.timestamp).toEqual(
       expect.any(String),
@@ -1535,6 +1559,7 @@ export default function contribute(server: { registerProvider(provider: Provider
 
     expect(spawnChild).not.toHaveBeenCalled();
     expect(runtime.catalog()[0]?.clientBundle).toContain("addTheme");
+    expect(runtime.catalog()[0]?.clientBundleHash).toBe(sha256(runtime.catalog()[0]?.clientBundle));
     await runtime.stopAll();
   });
 
@@ -1697,6 +1722,7 @@ export function inspectHost(_input: z.input<typeof inspectRpc.input>) {
     const plugin = runtime.catalog()[0];
     expect(plugin?.clientBundle).toContain("Client-only surface");
     expect(plugin?.clientBundle).not.toContain("node:os");
+    expect(plugin?.clientBundleHash).toBe(sha256(plugin?.clientBundle));
     await expect(runtime.invoke("split-runtime", "inspect", {})).resolves.toMatchObject({
       platform: expect.any(String),
     });
@@ -1849,9 +1875,9 @@ export default function contribute(plugin: any) {
     const child = createReloadChild("blocked", events);
     const runtime = createTestRuntime({ spawnChild: () => child });
 
-    await expect(runtime.startPlugin("blocked", directory, () => false)).rejects.toThrow(
-      "Plugin start cancelled: blocked",
-    );
+    await expect(
+      runtime.startPlugin("blocked", directory, () => events.length === 0),
+    ).rejects.toThrow("Plugin start cancelled: blocked");
 
     expect(runtime.catalog()).toEqual([]);
     expect(events).toEqual(["start:blocked", "shutdown:blocked", "exit:blocked"]);
@@ -2031,6 +2057,170 @@ export default function contribute(plugin: any) {
   });
 });
 
+it("correlates initialization diagnostics with the child and session without granting readiness", async () => {
+  const directory = await createPlugin("diagnostic-host", `export default () => () => undefined;`);
+  const child = Object.assign(createReloadChild("diagnostic-host", []), { pid: 12345 });
+  const originalSend = child.send;
+  let initialized!: () => void;
+  const initialization = new Promise<void>((resolve) => {
+    initialized = resolve;
+  });
+  child.send = function (message, callback) {
+    if (message.type === "initialize") {
+      callback?.(null);
+      child.emitMessage({
+        type: "initialization.phase",
+        phase: "evaluation-started",
+        elapsedMs: 2,
+      });
+      child.emitMessage({ type: "initialization.phase", phase: "ready-sent", elapsedMs: 3 });
+      initialized();
+      return true;
+    }
+    return originalSend.call(this, message, callback);
+  };
+  const runtime = createTestRuntime({
+    spawnChild: () => child,
+    sessionHost: {
+      async attachPluginSocket(_id, socket) {
+        return {
+          connectionId: "conn_synthetic-diagnostic",
+          closed: new Promise<void>((resolve) => socket.once("close", resolve)),
+        };
+      },
+    },
+  });
+  const start = runtime.startPlugin("diagnostic-host", directory);
+  const failed = expect(start).rejects.toThrow("synthetic initialization failure");
+  try {
+    await initialization;
+    expect(runtime.catalog()).toEqual([]);
+    const records = runtime
+      .getLogs("diagnostic-host")
+      .filter((entry) => entry.message.startsWith("[paseo] Plugin initialization phase "))
+      .map((entry) =>
+        JSON.parse(entry.message.slice("[paseo] Plugin initialization phase ".length)),
+      );
+    expect(records.map((row) => row.phase)).toEqual([
+      "session-attached",
+      "evaluation-started",
+      "ready-sent",
+    ]);
+    expect(new Set(records.map((row) => row.instanceId)).size).toBe(1);
+    for (const row of records) {
+      expect(row).toMatchObject({
+        pluginId: "diagnostic-host",
+        childPid: 12345,
+        clientId: "plugin:diagnostic-host",
+        connectionId: "conn_synthetic-diagnostic",
+      });
+      expect(row.elapsedMs).toBeGreaterThanOrEqual(0);
+      expect(row).not.toHaveProperty("pluginDirectory");
+      expect(row).not.toHaveProperty("payload");
+    }
+    expect(JSON.stringify(records)).not.toContain(directory);
+  } finally {
+    child.emitMessage({ type: "fatal", error: "synthetic initialization failure" });
+    await failed;
+    await runtime.stopAll();
+  }
+  expect(child.killed).toBe(true);
+  expect(runtime.catalog()).toEqual([]);
+});
+
+it("reports initialization phases from a tiny owned child process and reaps it", async () => {
+  const fixtureHome = await mkdtemp(path.join(tmpdir(), "paseo-diagnostic-child-home-"));
+  temporaryDirectories.push(fixtureHome);
+  const messages: Array<{ type?: string; phase?: string }> = [];
+  let ready!: () => void;
+  let fail!: (error: Error) => void;
+  const initialized = new Promise<void>((resolve, reject) => {
+    ready = resolve;
+    fail = reject;
+  });
+  const child = spawnObservedPluginProcess(
+    (raw) => {
+      const message = raw as { type?: string; phase?: string; error?: string; data?: string };
+      messages.push(message);
+      if (message.type === "fatal") fail(new Error(message.error));
+      if (message.type === "ready") ready();
+      if (
+        message.type === "paseo_frame" &&
+        typeof message.data === "string" &&
+        JSON.parse(message.data).type === "hello"
+      ) {
+        child.send({
+          type: "paseo_frame",
+          isBinary: false,
+          data: JSON.stringify({
+            type: "session",
+            message: {
+              type: "status",
+              payload: {
+                status: "server_info",
+                serverId: "synthetic-server",
+                hostname: "synthetic-host",
+                version: "0.14.0",
+                features: {},
+              },
+            },
+          }),
+        });
+      }
+    },
+    {
+      HOME: fixtureHome,
+      PASEO_HOME: fixtureHome,
+      TMPDIR: fixtureHome,
+      TMP: fixtureHome,
+      TEMP: fixtureHome,
+      PATH: path.dirname(process.execPath),
+    },
+  );
+  const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+  child.stdout?.resume();
+  child.stderr?.resume();
+  try {
+    child.send({
+      type: "initialize",
+      pluginId: "diagnostic-child",
+      pluginDirectory: fixtureHome,
+      appVersion: "0.14.0",
+      bundle: `(require) => ({ default: () => () => undefined })`,
+    });
+    await initialized;
+    await vi.waitFor(() =>
+      expect(messages.some((message) => message.phase === "ready-sent")).toBe(true),
+    );
+    expect(
+      messages
+        .filter((message) => message.type === "initialization.phase")
+        .map((message) => message.phase),
+    ).toEqual([
+      "initialize-received",
+      "evaluation-started",
+      "evaluation-completed",
+      "hello-sent",
+      "server-info-received",
+      "contribute-started",
+      "contribute-returned",
+      "ready-sent",
+    ]);
+    child.send({ type: "shutdown" });
+    await exited;
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      const kill = setTimeout(() => child.kill("SIGKILL"), 2000);
+      child.kill();
+      await exited.finally(() => clearTimeout(kill));
+    }
+    child.stdout?.destroy();
+    child.stderr?.destroy();
+  }
+  expect(child.exitCode).toBe(0);
+  expect(await readdir(fixtureHome)).toEqual([]);
+});
+
 it("rejects a usage source without discovery at registration", async () => {
   const directory = await createPlugin(
     "missing-discovery",
@@ -2051,6 +2241,57 @@ export default function contribute(server) {
     await expect(runtime.startPlugin("missing-discovery", directory)).rejects.toThrow(
       "Invalid usage source: missing-discovery",
     );
+  } finally {
+    await runtime.stopAll();
+  }
+});
+
+const examplesDirectory = fileURLToPath(
+  new URL("../../../../../plugin-examples/", import.meta.url),
+);
+// The Markdown example owns npm preparation in the real app fixture:
+// packages/app/e2e/browser/plugin-file-panel-examples.spec.ts.
+const examples = (await readdir(examplesDirectory, { withFileTypes: true }))
+  .filter((entry) => entry.isDirectory() && entry.name !== "markdown-panel")
+  .map((entry) => entry.name);
+
+it.each(examples)("builds and loads the %s plugin example", async (example) => {
+  const settingsDirectory = await mkdtemp(path.join(tmpdir(), "paseo-example-settings-"));
+  temporaryDirectories.push(settingsDirectory);
+  const runtime = createTestRuntime(
+    { settingsDirectory },
+    undefined,
+    resolveDaemonVersion(import.meta.url),
+  );
+  try {
+    await runtime.startPlugin(example, path.join(examplesDirectory, example));
+    expect(runtime.catalog()).toMatchObject([{ id: example }]);
+    expect(pluginMessages(runtime, example)).toContain("[paseo] Plugin ready");
+  } finally {
+    await runtime.stopAll();
+  }
+});
+
+it("does not initialize a plugin cancelled during compilation", async () => {
+  const directory = await createPlugin("cancelled-build", "export default () => {};");
+  const marker = path.join(directory, "initialized.txt");
+  await writeFile(
+    path.join(directory, "index.server.ts"),
+    `
+import { writeFileSync } from "node:fs";
+export default function contribute() {
+  writeFileSync(${JSON.stringify(marker)}, "initialized");
+  return () => {};
+}`,
+  );
+  const runtime = createTestRuntime();
+  let allowed = true;
+  try {
+    const loading = runtime.startPlugin("cancelled-build", directory, () => allowed);
+    allowed = false;
+    await expect(loading).rejects.toThrow("Plugin start cancelled: cancelled-build");
+    expect(await readTextIfPresent(marker)).toBeNull();
+    expect(runtime.catalog()).toEqual([]);
   } finally {
     await runtime.stopAll();
   }

@@ -23,6 +23,8 @@ import {
   type AppUpdateCheckIntent,
 } from "./app-update-rollout.js";
 
+import { desktopUpdatesEnabled } from "./update-policy.js";
+
 export {
   bucketFromStagingUserId,
   rolloutManifestSchema,
@@ -225,6 +227,7 @@ class ElectronAppUpdateRuntime implements AppUpdateRuntime {
 const appUpdateService = createAppUpdateService({
   runtime: new ElectronAppUpdateRuntime(),
   isPackaged: () => app.isPackaged,
+  updatesEnabled: desktopUpdatesEnabled,
   now: () => Date.now(),
   bucket: async () => bucketFromStagingUserId(await getStagingUserId()),
   reportCheckError: (error) => {

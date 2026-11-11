@@ -100,10 +100,17 @@ Paseo Agent 默认会收到完成、错误和权限通知；设置 `notifyOnFini
 | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `create_workspace`  | 创建本地工作区或使用 worktree 隔离的工作区。worktree 可以从某个分支分出、检出一个分支或一个 PR。`background: true` 会把它从默认列表和侧边栏中隐藏，同时保留历史记录和按 ID 访问。省略时继承调用方 Agent 工作区的设置；没有调用方时默认为 false。 |
 | `list_workspaces`   | 列出活动的工作区及其目录和隔离方式。使用 `includeBackground: true` 可以包含后台工作区。                                                                                                                                                          |
+| `move_workspace`    | 使用 `parentWorkspaceKey`、`beforeWorkspaceKey` 或 `siblingOrder` 以及可选的 `section`，在共享侧边栏中移动工作区或调整顺序。                                                                                                                     |
 | `rename_workspace`  | 修改当前或指定工作区在界面上显示的名称。                                                                                                                                                                                                         |
 | `archive_workspace` | 归档工作区及其拥有的会话。                                                                                                                                                                                                                       |
 
 对于 worktree 隔离，`create_workspace` 接受与应用中相同的常用选择：从某个基础分支分出、检出一个已有分支，或检出一个 Pull Request。worktree 仍然是工作区生命周期的实现细节。
+
+Agent 创建的新工作区默认放在调用方工作区下面，在已注册的远程主机上创建时也是如此。传入 `parentWorkspaceKey: "serverId:workspaceId"` 可以选择其他父工作区，传入 `parentWorkspaceKey: null` 则创建根工作区。子工作区继承父工作区的 Pinned、Superpinned 或未固定分区，并排在已有子工作区之后。根工作区可以通过 `section` 选择 `unpinned`、`pinned` 或 `superpinned`。`siblingOrder` 可指定排序值。
+
+`move_workspace` 省略 `parentWorkspaceKey` 时会保留当前父工作区。使用 `beforeWorkspaceKey` 可以将它排在目标分区的某个同级工作区之前。切换分区会同时移动所有已注册主机上的整个子树；移动前请重新连接这些主机。这些工具更新各客户端共享的布局，不改变目录、项目归属或 Agent 父子关系。旧的 `parentWorkspaceId` 参数仍指向目标主机的项目内层级。
+
+如果父工作区仅通过应用连接可见，创建时还需提供已保存的 `section` 和 `siblingOrder`。否则请先注册其主机，让 MCP 读取其分区和所有同级工作区的顺序。
 
 ### 工作区脚本 {#workspace-scripts}
 

@@ -7,6 +7,7 @@ export const QuotaTurnCheckpointSchema = z.object({
   failedAt: z.string(),
   credentialGeneration: z.string().optional(),
   credentialChangedAt: z.string().optional(),
+  credentialLoadedAt: z.string().optional(),
 });
 export type QuotaTurnCheckpoint = z.infer<typeof QuotaTurnCheckpointSchema>;
 
@@ -40,10 +41,14 @@ export function quotaRecoveryRefusal(
   if (!Number.isFinite(failedAt)) return "CREDENTIAL_CHANGE_UNCONFIRMED";
   if (change.credentialGeneration === checkpoint.credentialGeneration)
     return "CREDENTIAL_GENERATION_UNCHANGED";
+  const loadedAt = Date.parse(checkpoint.credentialLoadedAt ?? "");
+  if (Number.isFinite(loadedAt) && changedAt <= loadedAt)
+    return "CREDENTIAL_CHANGE_PRECEDES_BASELINE";
   const baselineAt = Date.parse(checkpoint.credentialChangedAt ?? "");
   if (checkpoint.credentialGeneration && Number.isFinite(baselineAt)) {
     if (changedAt <= baselineAt) return "CREDENTIAL_CHANGE_PRECEDES_BASELINE";
-  } else if (changedAt <= failedAt) return "CREDENTIAL_CHANGE_PRECEDES_FAILURE";
+  } else if (!Number.isFinite(loadedAt) && changedAt <= failedAt)
+    return "CREDENTIAL_CHANGE_PRECEDES_FAILURE";
   return null;
 }
 

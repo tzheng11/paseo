@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync, readdirSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { relative as relativePath } from "node:path";
 import test from "node:test";
 import { runInNewContext } from "node:vm";
@@ -157,6 +160,14 @@ test("focused contracts stay inside existing required checks", () => {
   assert.ok(!jobs.has("playwright-desktop"));
 });
 
+test("ordinary CI keeps app tests without prebuilding Android modules", () => {
+  const source = readFileSync(ciWorkflowPath, "utf8");
+  const app = jobBlocks(source).get("app-tests").join("\n");
+  assert.match(app, /npm run build:app-deps/);
+  assert.match(app, /npm run test --workspace=@getpaseo\/app/);
+  assert.doesNotMatch(source, /test:android|expo prebuild|gradlew|actions\/setup-java/);
+});
+
 test("server builds exclude test utilities at every domain depth", () => {
   const tsconfig = JSON.parse(readFileSync(serverTsconfigPath, "utf8"));
   assert.ok(tsconfig.exclude.includes("src/server/**/test-utils/**"));
@@ -191,6 +202,7 @@ test("PR routing declares stable behavior ownership", () => {
     desktop: [
       "packages/desktop/**",
       "packages/app/src/desktop/**",
+      "packages/app/src/**/*.electron.{ts,tsx}",
       "packages/server/src/server/browser-tools/**",
       "packages/app/e2e/support/**",
       "packages/app/*config.{cjs,js,ts}",
@@ -254,13 +266,11 @@ test("browser and desktop tests have exclusive, directory-owned suites", () => {
   const filters = loadFilters(filtersPath);
   const browserSpecs = filesUnder("packages/app/e2e", (path) => path.endsWith(".spec.ts"));
   const desktopSpecs = filesUnder("packages/desktop/e2e", (path) => path.endsWith(".spec.ts"));
-  const electronModules = filesUnder("packages/app/src", (path) => /\.electron\.tsx?$/.test(path));
 
   assert.ok(browserSpecs.length > 0);
   assert.ok(desktopSpecs.length > 0);
   assert.ok(browserSpecs.every((path) => path.startsWith("packages/app/e2e/browser/")));
   assert.ok(desktopSpecs.every((path) => path.startsWith("packages/desktop/e2e/")));
-  assert.ok(electronModules.every((path) => path.startsWith("packages/app/src/desktop/")));
 
   const desktopPackage = JSON.parse(readFileSync(desktopPackagePath, "utf8"));
   assert.match(desktopPackage.scripts.test, /--exclude ["']e2e\/\*\*["']/);
@@ -280,6 +290,7 @@ test("browser and desktop tests have exclusive, directory-owned suites", () => {
   assert.deepEqual(filters.desktop, [
     "packages/desktop/**",
     "packages/app/src/desktop/**",
+    "packages/app/src/**/*.electron.{ts,tsx}",
     "packages/server/src/server/browser-tools/**",
     "packages/app/e2e/support/**",
     "packages/app/*config.{cjs,js,ts}",
@@ -490,7 +501,7 @@ test("Windows units and integration run independently with complete routed cover
   assert.doesNotMatch(invocations[0], / -t /);
   assert.equal(
     invocations[1],
-    'vitest run --maxWorkers=1 src/server/daemon-e2e/git-operations.e2e.test.ts src/server/session.create-agent-worktree-autoarchive.e2e.test.ts src/server/agent/providers/opencode-bridge.local.e2e.test.ts src/server/daemon-e2e/relay-transport.e2e.test.ts src/server/agent/agent-mcp.e2e.test.ts -t "merges into|creates a worktree and auto-archives both|versioned runtime|oversized attachments|connected hosts|signals legacy initialization|password-protected daemon"',
+    'vitest run --maxWorkers=1 src/server/agent/providers/omp/history.e2e.test.ts src/server/daemon-e2e/git-operations.e2e.test.ts src/server/session.create-agent-worktree-autoarchive.e2e.test.ts src/server/agent/providers/opencode-bridge.local.e2e.test.ts src/server/daemon-e2e/relay-transport.e2e.test.ts src/server/agent/agent-mcp.e2e.test.ts -t "merges into|creates a worktree and auto-archives both|versioned runtime|oversized attachments|connected hosts|signals legacy initialization|password-protected daemon refuses|replays selected OMP history"',
   );
   const serverConfig = readFileSync(new URL("packages/server/vitest.config.ts", repoRoot), "utf8");
   assert.doesNotMatch(serverConfig, /maxWorkers/);
@@ -531,5 +542,190 @@ test("Windows units and integration run independently with complete routed cover
     assert.equal(selected(hubStep, outputs), hub);
     assert.equal(selected(unitCondition, outputs, true), false);
     assert.equal(selected(integrationCondition, outputs, true), false);
+  }
+});
+
+test("macOS release retries only transient stapling failures without rebuilding the signed app", async (t) => {
+  const workflow = readFileSync(new URL(".github/workflows/desktop-release.yml", repoRoot), "utf8");
+  const wrapper = workflow
+    .match(/<<'STAPLER'\n([\s\S]*?)\n          STAPLER/)[1]
+    .replace(/^          /gm, "");
+  const networkError =
+    'Error Domain=NSURLErrorDomain Code=-1005 "The network connection was lost."';
+  const cases = [
+    {
+      name: "success",
+      outcomes: [0],
+      output: "stapled",
+      command: "stapler",
+      expected: 0,
+      attempts: 1,
+    },
+    {
+      name: "transient then success",
+      outcomes: [68, 0],
+      output: networkError,
+      command: "stapler",
+      expected: 0,
+      attempts: 2,
+    },
+    {
+      name: "exhausted network retries",
+      outcomes: [68, 68, 68, 68, 0],
+      output: networkError,
+      command: "stapler",
+      expected: 68,
+      attempts: 4,
+    },
+    {
+      name: "non-network staple error",
+      outcomes: [68, 0],
+      output: "ticket not found",
+      command: "stapler",
+      expected: 68,
+      attempts: 1,
+    },
+    {
+      name: "different exit code",
+      outcomes: [1, 0],
+      output: networkError,
+      command: "stapler",
+      expected: 1,
+      attempts: 1,
+    },
+    {
+      name: "notary submission is not retried",
+      outcomes: [68, 0],
+      output: networkError,
+      command: "notarytool",
+      expected: 68,
+      attempts: 1,
+    },
+  ];
+  for (const scenario of cases) {
+    await t.test(scenario.name, () => {
+      const directory = mkdtempSync(join(tmpdir(), "stapler-retry-"));
+      try {
+        const statePath = join(directory, "state.json");
+        const realXcrun = join(directory, "real-xcrun");
+        const wrapperPath = join(directory, "xcrun");
+        writeFileSync(wrapperPath, wrapper, { mode: 0o755 });
+        writeFileSync(join(directory, "sleep"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+        writeFileSync(
+          statePath,
+          JSON.stringify({ outcomes: scenario.outcomes, output: scenario.output, calls: [] }),
+        );
+        writeFileSync(
+          realXcrun,
+          `#!/usr/bin/env node
+const fs = require("node:fs");
+const state = JSON.parse(fs.readFileSync(process.env.STAPLER_STATE, "utf8"));
+state.calls.push(process.argv.slice(2));
+const code = state.outcomes.shift();
+fs.writeFileSync(process.env.STAPLER_STATE, JSON.stringify(state));
+console.log(state.output);
+process.exit(code);
+`,
+          { mode: 0o755 },
+        );
+        const args = [scenario.command, "staple", "-v", "Paseo signed.app"];
+        const result = spawnSync("bash", [wrapperPath, ...args], {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            PASEO_REAL_XCRUN: realXcrun,
+            STAPLER_STATE: statePath,
+            PATH: `${directory}:${process.env.PATH}`,
+          },
+          timeout: 5000,
+        });
+        assert.equal(result.status, scenario.expected, result.stdout + result.stderr);
+        const state = JSON.parse(readFileSync(statePath, "utf8"));
+        assert.deepEqual(
+          state.calls,
+          Array.from({ length: scenario.attempts }, () => args),
+        );
+        assert.match(result.stdout, /stapled|network connection was lost|ticket not found/);
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+// GitHub retires macOS 14 on 2026-11-02; brownouts already reject these jobs.
+test("workflows avoid retired macOS 14 runners", () => {
+  for (const path of filesUnder(".github/workflows", (candidate) => /\.ya?ml$/.test(candidate))) {
+    assert.doesNotMatch(
+      readFileSync(new URL(path, repoRoot), "utf8"),
+      /macos-14(?:-large|-xlarge)?\b/,
+      path,
+    );
+  }
+});
+
+test("macOS jobs use latest runners while preserving release architectures", () => {
+  for (const [workflow, jobId] of [
+    [ciWorkflowPath, "server-tests-macos"],
+    [nixWorkflowPath, "build-desktop-darwin"],
+  ]) {
+    assert.match(
+      jobBlocks(readFileSync(workflow, "utf8")).get(jobId).join("\n"),
+      /^    runs-on: macos-latest$/m,
+    );
+  }
+  const release = readFileSync(new URL(".github/workflows/desktop-release.yml", repoRoot), "utf8");
+  assert.match(release, /runner: macos-latest\n\s+electron_arch: arm64/);
+  // GitHub has no standard macos-latest-intel alias; use the newest Intel image.
+  assert.match(release, /runner: macos-26-intel\n\s+electron_arch: x64/);
+});
+
+test("macOS signing repair keeps certificate and keychain passwords separate", () => {
+  const workflow = readFileSync(new URL(".github/workflows/desktop-release.yml", repoRoot), "utf8");
+  const match = workflow.match(/<<'KEYCHAIN_FIX'\n([\s\S]*?)\n          KEYCHAIN_FIX/);
+  assert.ok(match, "the release workflow repairs the pinned signing tool");
+  const script = match[1].replace(/^          /gm, "");
+  const original = [
+    "return await importCerts(keychainFile, certPaths, cscPasswords);",
+    "async function importCerts(keychainFile, paths, keyPasswords) {",
+    '["import", paths[i], "-P", password]',
+    '["set-key-partition-list", "-S", "apple-tool:,apple:", "-s", "-k", password, keychainFile]',
+    "}",
+  ].join("\n");
+  const directory = mkdtempSync(join(tmpdir(), "signing-repair-"));
+  try {
+    const packageDirectory = join(directory, "node_modules/app-builder-lib");
+    mkdirSync(join(packageDirectory, "out/codeSign"), { recursive: true });
+    const manifest = join(packageDirectory, "package.json");
+    const sourcePath = join(packageDirectory, "out/codeSign/macCodeSign.js");
+    for (const [version, source, succeeds] of [
+      ["26.8.1", original, true],
+      ["26.8.1", original.replace("cscPasswords);", "differentArguments);"), false],
+      ["26.18.0", original, false],
+    ]) {
+      writeFileSync(manifest, JSON.stringify({ name: "app-builder-lib", version }));
+      writeFileSync(sourcePath, source);
+      const result = spawnSync(process.execPath, ["-e", script], {
+        cwd: directory,
+        encoding: "utf8",
+      });
+      const actual = readFileSync(sourcePath, "utf8");
+      if (succeeds) {
+        assert.equal(result.status, 0, result.stderr);
+        assert.ok(
+          actual.includes("importCerts(keychainFile, certPaths, cscPasswords, keychainPassword)"),
+        );
+        assert.ok(
+          actual.includes("importCerts(keychainFile, paths, keyPasswords, keychainPassword)"),
+        );
+        assert.ok(actual.includes('["import", paths[i], "-P", password]'));
+        assert.ok(actual.includes('"-k", keychainPassword, keychainFile]'));
+      } else {
+        assert.notEqual(result.status, 0);
+        assert.equal(actual, source, "unexpected tool inputs must fail without a partial write");
+      }
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 });

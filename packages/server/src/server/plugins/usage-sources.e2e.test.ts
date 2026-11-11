@@ -1,11 +1,16 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { createServer } from "node:http";
+import { once } from "node:events";
 import { expect, test } from "vitest";
 import { DaemonClient } from "../test-utils/daemon-client.js";
 import { createTestPaseoDaemon } from "../test-utils/paseo-daemon.js";
 import { BuiltinPluginLoader, resolveBuiltinPluginsRoot } from "./builtin/index.js";
+import { isolatedWindowsEnvironment } from "../../test-utils/isolated-windows-environment.js";
 
 const fixtureRoot = fileURLToPath(new URL("./test-fixtures/", import.meta.url));
 const subprocessDirectory = fileURLToPath(
@@ -335,3 +340,108 @@ export default function contribute(server) {
     await rm(root, { recursive: true, force: true });
   }
 }, 60_000);
+
+test.each(["builtin", "directory"])(
+  "%s usage plugins reach the environment proxy",
+  async (mode) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "usage-proxy-"));
+    const tunnels: string[] = [];
+    const proxy = createServer();
+    proxy.on("connect", (request, socket) => {
+      tunnels.push(request.url!);
+      socket.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
+    });
+    proxy.listen(0, "127.0.0.1");
+    await once(proxy, "listening");
+    const address = proxy.address();
+    if (!address || typeof address === "string") throw new Error("Missing proxy address");
+    const guard = path.join(root, "network-guard.cjs");
+    // Prevent vendor DNS/network access even when proxy support is broken.
+    await writeFile(
+      guard,
+      `const dns = require('node:dns');
+const lookup = dns.lookup;
+dns.lookup = function(host, ...args) {
+  if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return lookup.call(this, host, ...args);
+  args.at(-1)(Object.assign(new Error('External DNS forbidden in proxy test'), { code: 'ENOTFOUND' }));
+};
+const childProcess = require('node:child_process');
+const path = require('node:path');
+const custom = require('node:util').promisify.custom;
+function allowed(file) {
+  if (['security', 'secret-tool', 'cmdkey', 'cmdkey.exe'].includes(path.basename(String(file))))
+    throw new Error('Native credential lookup forbidden in proxy fixture');
+}
+for (const name of ['execFile', 'execFileSync', 'spawn', 'spawnSync']) {
+  const original = childProcess[name];
+  childProcess[name] = function(file, ...args) {
+    allowed(file);
+    return original.call(this, file, ...args);
+  };
+  if (original[custom]) childProcess[name][custom] = function(file, ...args) {
+    allowed(file);
+    return original[custom].call(this, file, ...args);
+  };
+}
+require('node:module').syncBuiltinESMExports();`,
+    );
+    await mkdir(path.join(root, ".claude"));
+    await mkdir(path.join(root, ".codex"));
+    await writeFile(
+      path.join(root, ".claude", ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "fixture-claude" } }),
+    );
+    await writeFile(
+      path.join(root, ".codex", "auth.json"),
+      JSON.stringify({ tokens: { access_token: "fixture-codex", account_id: "fixture-account" } }),
+    );
+    try {
+      await promisify(execFile)(
+        process.execPath,
+        [
+          "--import",
+          "tsx",
+          fileURLToPath(new URL("./test-fixtures/usage-proxy-daemon.ts", import.meta.url)),
+          mode,
+        ],
+        {
+          timeout: 45_000,
+          maxBuffer: 1024 * 1024,
+          env: {
+            // Inherited proxy aliases are case-insensitive on Windows, and
+            // inherited provider credentials are never fixture inputs.
+            PATH: process.env.PATH,
+            ...isolatedWindowsEnvironment(),
+            NODE_ENV: "test",
+            TEMP: root,
+            TMP: root,
+            TMPDIR: root,
+            HOME: root,
+            USERPROFILE: root,
+            APPDATA: path.join(root, "appdata"),
+            LOCALAPPDATA: path.join(root, "localappdata"),
+            XDG_CONFIG_HOME: path.join(root, "config"),
+            XDG_DATA_HOME: path.join(root, "data"),
+            CODEX_HOME: path.join(root, ".codex"),
+            CLAUDE_CONFIG_DIR: path.join(root, ".claude"),
+            NODE_OPTIONS: `--require=${JSON.stringify(guard.replaceAll("\\", "/"))} --require=${JSON.stringify(
+              fileURLToPath(
+                new URL("../../test-utils/terminal-worker-startup-observer.cjs", import.meta.url),
+              ).replaceAll("\\", "/"),
+            )}`,
+            https_proxy: `http://127.0.0.1:${address.port}`,
+            no_proxy: "",
+            NO_PROXY: "",
+          },
+        },
+      );
+      expect(tunnels).toContain("api.anthropic.com:443");
+      expect(tunnels).toContain("chatgpt.com:443");
+    } finally {
+      proxy.closeAllConnections();
+      await new Promise<void>((resolve) => proxy.close(() => resolve()));
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+  60_000,
+);

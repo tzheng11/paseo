@@ -1,12 +1,7 @@
+import { Modal } from "@/components/ui/modal";
+import { usePanelStore } from "@/stores/panel-store";
 import { createElement, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  Modal,
-  Pressable,
-  ScrollView,
-  Text,
-  View,
-  type PressableStateCallbackType,
-} from "react-native";
+import { Pressable, ScrollView, Text, View, type PressableStateCallbackType } from "react-native";
 import {
   EditingTextInput as TextInput,
   type EditingTextInputHandle,
@@ -81,7 +76,13 @@ export function useHostChooser() {
       );
 
       if (availableHosts.length === 0) {
-        (input.onNoHosts ?? (() => router.push(buildSettingsAddHostRoute(Date.now()))))();
+        (
+          input.onNoHosts ??
+          (() => {
+            usePanelStore.getState().showMobileAgent();
+            router.push(buildSettingsAddHostRoute(Date.now()));
+          })
+        )();
         return false;
       }
 

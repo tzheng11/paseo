@@ -1,4 +1,5 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { promisify } from "node:util";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -35,6 +36,40 @@ async function runCliWithClosedStdout(
 }
 
 describe("runCli", () => {
+  it("initializes fixed native fetch for programmatic and Desktop passthrough calls", async () => {
+    const serverPackageUrl = new URL("../../server/package.json", import.meta.url).href;
+    const home = mkdtempSync(path.join(tmpdir(), "paseo-cli-transport-"));
+    const script = `
+      import assert from "node:assert/strict";
+      import { createRequire } from "node:module";
+      const nativeFetch = globalThis.fetch;
+      await (await nativeFetch("data:application/json,{}")).json();
+      const { Agent, getGlobalDispatcher } = createRequire(${JSON.stringify(serverPackageUrl)})("undici");
+      const before = getGlobalDispatcher();
+      const { runCli } = await import(${JSON.stringify(runModuleUrl)});
+      assert.equal(await runCli(["daemon", "status", "--json", "--home", ${JSON.stringify(home)}]), 0);
+      assert.ok(getGlobalDispatcher() instanceof Agent);
+      assert.notEqual(getGlobalDispatcher(), before);
+      assert.equal(globalThis.fetch, nativeFetch);
+      await getGlobalDispatcher().close();
+      process.stdout.write("programmatic CLI transport ready");
+    `;
+    try {
+      const result = await promisify(execFile)(
+        process.execPath,
+        ["--import", "tsx", "--input-type=module", "--eval", script],
+        {
+          cwd: path.dirname(fileURLToPath(import.meta.url)),
+          timeout: 15_000,
+          env: { ...process.env, NODE_OPTIONS: "", NODE_USE_ENV_PROXY: "0" },
+        },
+      );
+      expect(result.stdout.endsWith("programmatic CLI transport ready")).toBe(true);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("lets plugin update own --version while preserving global output options", async () => {
     const cli = createCli()
       .exitOverride()

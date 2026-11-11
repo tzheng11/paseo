@@ -7,7 +7,11 @@ import {
   type SidebarWorkspacesListResult,
 } from "@/hooks/use-sidebar-workspaces-list";
 import { useSidebarWorkspaceEntries } from "@/hooks/use-sidebar-workspace-entries";
-import { usePinnedSidebarKeys, type PinnedSidebarGroups } from "@/hooks/use-sidebar-pins";
+import {
+  usePinnedSidebarKeys,
+  sharedPinnedWorkspaceTree,
+  type PinnedSidebarGroups,
+} from "@/hooks/use-sidebar-pins";
 import { useSidebarCollapsedSectionsStore } from "@/stores/sidebar-collapsed-sections-store";
 import {
   hasActiveSidebarLabelFilter,
@@ -15,6 +19,7 @@ import {
   type SidebarGroupMode,
 } from "@/stores/sidebar-view-store";
 import { useSidebarOrderStore } from "@/stores/sidebar-order-store";
+import { useCanonicalSidebarState } from "@/stores/canonical-sidebar-runtime";
 import { useAppSettings } from "@/hooks/use-settings";
 import type { SidebarShortcutModel } from "@/utils/sidebar-shortcuts";
 import { buildSidebarProjection } from "./sidebar-projection";
@@ -77,11 +82,16 @@ export function SidebarModelProvider({
   const collapsedWorkspaceKeys = useSidebarCollapsedSectionsStore(
     (state) => state.collapsedWorkspaceKeys,
   );
-  const superpinnedWorkspaceOrder = useSidebarOrderStore(
-    (state) => state.superpinnedWorkspaceOrder,
+  const canonicalLayout = useCanonicalSidebarState();
+  const emptyOrder = useMemo<string[]>(() => [], []);
+  const superpinnedWorkspaceOrder =
+    canonicalLayout.snapshot?.navigation?.preferences.superpinnedWorkspaceOrder ?? emptyOrder;
+  const pinnedWorkspaceOrder =
+    canonicalLayout.snapshot?.navigation?.preferences.pinnedWorkspaceOrder ?? emptyOrder;
+  const pinnedWorkspaceTree = useMemo(
+    () => sharedPinnedWorkspaceTree(list.allProjects),
+    [list.allProjects],
   );
-  const pinnedWorkspaceOrder = useSidebarOrderStore((state) => state.pinnedWorkspaceOrder);
-  const pinnedWorkspaceTree = useSidebarOrderStore((state) => state.pinnedWorkspaceTree);
   const pinnedWorkspaceSortMode = useSidebarOrderStore((state) => state.pinnedWorkspaceSortMode);
   const workspaceSortModeByProject = useSidebarOrderStore(
     (state) => state.workspaceSortModeByProject,
@@ -152,7 +162,7 @@ export function SidebarModelProvider({
           visibleWorkspaceKeys.has(workspace.workspaceKey),
         );
         return workspaces.length > 0 || (!hasActiveLabelFilter && project.workspaces.length === 0)
-          ? [{ ...project, workspaces }]
+          ? [workspaces.length === project.workspaces.length ? project : { ...project, workspaces }]
           : [];
       });
     }

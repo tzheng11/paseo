@@ -117,3 +117,62 @@ test("literal workspace metadata stays outside automatic agent config, initial p
     await rm(directory, { recursive: true, force: true });
   }
 }, 60_000);
+
+test("pin layout is shared by independent clients, with cross-host parents and stale-write protection", async () => {
+  const ctx = await createDaemonTestContext({ mcpEnabled: false });
+  const second = new DaemonClient({ url: `ws://127.0.0.1:${ctx.daemon.port}/ws` });
+  const directory = await mkdtemp(path.join(os.tmpdir(), "paseo-shared-pins-"));
+  try {
+    await second.connect();
+    expect(second.getLastServerInfoMessage()?.features?.workspacePinPlacement).toBe(true);
+    const result = await ctx.client.createWorkspace({
+      source: { kind: "directory", path: directory },
+    });
+    if (!result.workspace) throw new Error("No workspace");
+    const workspaceId = result.workspace.id;
+    await ctx.client.setWorkspacePinned(workspaceId, true);
+    const observed: unknown[] = [];
+    const observation = second.observeWorkspaces();
+    observation.subscribe({ snapshot: () => {}, update: (message) => observed.push(message) });
+    await observation.ready;
+    const placement = { parentWorkspaceKey: "remote-host:remote-workspace", siblingOrder: 512 };
+    expect(
+      await ctx.client.setWorkspacePinPlacement({ workspaceId, placement, expectedRevision: 0 }),
+    ).toEqual({ ...placement, revision: 1 });
+    expect(
+      (await second.fetchWorkspaces()).entries.find((w) => w.id === workspaceId)?.pinPlacement,
+    ).toEqual({ ...placement, revision: 1 });
+    await expect
+      .poll(() => observed)
+      .toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: "workspace_update",
+            payload: expect.objectContaining({
+              kind: "upsert",
+              workspace: expect.objectContaining({
+                id: workspaceId,
+                pinPlacement: { ...placement, revision: 1 },
+              }),
+            }),
+          }),
+        ]),
+      );
+    await observation.release();
+    const moved = { parentWorkspaceKey: null, siblingOrder: 1024 };
+    await second.setWorkspacePinPlacement({ workspaceId, placement: moved, expectedRevision: 1 });
+    await expect(
+      ctx.client.setWorkspacePinPlacement({ workspaceId, placement, expectedRevision: 1 }),
+    ).rejects.toThrow("another client");
+    expect(
+      (await ctx.client.fetchWorkspaces()).entries.find((w) => w.id === workspaceId)?.pinPlacement,
+    ).toEqual({ ...moved, revision: 2 });
+    expect(
+      (await second.fetchWorkspaces()).entries.find((w) => w.id === workspaceId)?.parentWorkspaceId,
+    ).toBeNull();
+  } finally {
+    await second.close();
+    await ctx.cleanup();
+    await rm(directory, { recursive: true, force: true });
+  }
+}, 60_000);

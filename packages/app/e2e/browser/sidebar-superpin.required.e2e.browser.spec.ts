@@ -293,6 +293,16 @@ for (const viewport of [
         const gate = await installDaemonWebSocketGate(page);
         await first.client.setWorkspacePinned(first.workspaceId, true);
         await second.client.setWorkspacePinned(second.workspaceId, true);
+        await first.client.setWorkspacePinPlacement({
+          workspaceId: first.workspaceId,
+          placement: { parentWorkspaceKey: null, siblingOrder: 1024 },
+          expectedRevision: 0,
+        });
+        await second.client.setWorkspacePinPlacement({
+          workspaceId: second.workspaceId,
+          placement: { parentWorkspaceKey: null, siblingOrder: 0 },
+          expectedRevision: 0,
+        });
         await gotoAppShell(page);
         await showSidebar(page);
         await expect(pinned(page)).toBeVisible();
@@ -312,7 +322,7 @@ for (const viewport of [
         await showSidebar(page);
         await expect(
           pinned(page).locator('[data-testid^="sidebar-workspace-row-"]').first(),
-        ).toHaveAttribute("data-testid", rowID(first.workspaceId));
+        ).toHaveAttribute("data-testid", rowID(second.workspaceId));
         await rowAction(page, first.workspaceId, "superpin");
         await expect(top(page)).toBeVisible();
         await rowAction(page, second.workspaceId, "superpin");

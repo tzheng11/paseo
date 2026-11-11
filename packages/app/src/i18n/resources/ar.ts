@@ -67,6 +67,7 @@ export const ar: TranslationResources = {
       daemonClientUnavailable: "عميل Daemon غير متوفر",
       daemonClientDisconnected: "تم قطع اتصال عميل Daemon",
       noFileFound: "لم يتم العثور على ملف لـ{{token}}",
+      folderOutsideWorkspace: "{{path}} خارج مساحة العمل هذه",
       unexpectedDictationError: "حدث خطأ غير متوقع أثناء معالجة الإملاء.",
     },
     connectionStatus: {
@@ -99,6 +100,7 @@ export const ar: TranslationResources = {
       addProject: "إضافة مشروع",
       home: "بيت",
       groupByProject: "تجميع حسب المشروع",
+      groupByNone: "عرض تسلسل مساحات العمل",
       groupByStatus: "تجميع حسب الحالة",
       modelGroupLabel: "النموذج",
       modelSearchKeywords: "تبديل النموذج تغيير النموذج تعيين النموذج اختيار النموذج",
@@ -133,6 +135,8 @@ export const ar: TranslationResources = {
       sendAndInterrupt: "إرسال ومقاطعة",
       sendAndSteer: "إرسال وتوجيه",
       sendMessage: "أرسل رسالة",
+      longPressToQueue: "اضغط مطولًا لإضافتها إلى الطابور",
+      longPressToSendNow: "اضغط مطولًا للإرسال الآن",
       queue: "طابور",
       send: "يرسل",
     },
@@ -614,7 +618,11 @@ export const ar: TranslationResources = {
     terminal: {
       hostDisconnected: "Host غير متصل",
       updateHost: "حدّث المضيف لاستخدام عارض الطرفية الأصلي.",
+      restoreRequiresUpdate: "حدّث المضيف لعرض الطرفيات.",
       unableToSubscribe: "غير قادر على الاشتراك في المحطة",
+      fileUploaded: "تم رفع الملف",
+      pasteFileFailed: "تعذر لصق الملف: {{reason}}",
+      uploadingFile: "جارٍ رفع الملف…",
     },
     sheet: {
       openAsTab: "فتح كعلامة تبويب",
@@ -1163,7 +1171,15 @@ export const ar: TranslationResources = {
       showBackground: "إظهار مساحات العمل في الخلفية",
       trigger: "تفضيلات العرض",
       heading: "العرض",
+      sort: {
+        label: "الترتيب",
+        created: "تاريخ الإنشاء",
+        manual: "يدوي",
+        lastPrompt: "آخر طلب",
+        updateHost: "حدّث المضيفين لترتيب مساحات العمل",
+      },
       grouping: {
+        none: "بدون",
         label: "التجميع",
         project: "المشروع",
         status: "الحالة",
@@ -1307,6 +1323,7 @@ export const ar: TranslationResources = {
         pending: "قيد الانتظار: {{count}}",
       },
       actions: {
+        addChild: "إضافة مساحة عمل فرعية",
         menu: "إجراءات Workspace",
         newWorkspace: "مساحة عمل جديدة",
         showMore: "عرض المزيد",
@@ -1346,6 +1363,13 @@ export const ar: TranslationResources = {
     },
   },
   newWorkspace: {
+    parent: {
+      label: "اجعل هذه مساحة فرعية من",
+      none: "بدون أصل",
+      searchPlaceholder: "البحث في مساحات العمل",
+      empty: "لا توجد مساحات عمل متاحة.",
+      unavailable: "مساحة العمل غير متاحة",
+    },
     title: "مساحة عمل جديدة",
     create: "يخلق",
     isolation: {
@@ -1953,6 +1977,12 @@ export const ar: TranslationResources = {
     backdrop: "خلفية القائمة",
   },
   subagents: {
+    parent: {
+      backToParent: "العودة إلى الوكيل الأصلي",
+      backTo: "العودة إلى {{label}}",
+      parentAgent: "الوكيل الأصلي",
+      openParent: "فتح الوكيل الأصلي",
+    },
     title: "الوكلاء الفرعيون",
     pillLabelOne: "وكيل فرعي واحد",
     pillLabelMany: "{{count}} وكلاء فرعيين",
@@ -1998,7 +2028,6 @@ export const ar: TranslationResources = {
         alwaysUseExtension: "استخدام دائمًا لـ .{{extension}}",
         alwaysUseFilename: "استخدام دائمًا لـ {{filename}}",
         option: "{{title}} — {{owner}}",
-        actions: "إجراءات الملف",
         builtin: {
           owner: "Paseo",
           markdown: "Markdown",
@@ -2017,6 +2046,8 @@ export const ar: TranslationResources = {
       notFound: "الملف غير موجود",
       failedToLoadPreview: "فشل تحميل معاينة الملف",
       editor: {
+        preview: "معاينة",
+        source: "المصدر",
         fileSize: "حجم الملف {{size}}",
         lines: "{{count}} سطر",
         editorStatus: "حالة المحرر {{status}}",
@@ -2063,11 +2094,17 @@ export const ar: TranslationResources = {
   toolCallDetails: {
     error: "خطأ",
     empty: "لا توجد تفاصيل إضافية متاحة",
-    subAgentActivity: "نشاط الوكيل الفرعي",
     input: "مدخل",
     output: "الإخراج",
   },
+  turnSummary: {
+    details: "عرض تفاصيل الجولة",
+    sentBy: "أرسلها {{name}}",
+    showMore: "عرض المزيد",
+    showLess: "عرض أقل",
+  },
   toolCallGroup: {
+    thought: "فكّر",
     editedFiles: {
       one: "حرّر {{count}} ملفًا",
       other: "حرّر {{count}} ملفات",
@@ -2135,6 +2172,11 @@ export const ar: TranslationResources = {
     },
   },
   providerUsage: {
+    checkUsage: "التحقق من الاستخدام",
+    checkUsageHint: "ينطبق على {{host}} على جميع الأجهزة",
+    off: "التحقق من الاستخدام متوقف على {{host}}.",
+    turnOn: "تشغيل",
+
     options: "الإعدادات",
     refreshFailed: "تعذّر تحديث الاستخدام",
     noHosts: "لا توجد مضيفات متصلة",
@@ -2200,6 +2242,7 @@ export const ar: TranslationResources = {
       minutes_few: "{{value}} دقائق",
       minutes_many: "{{value}} دقيقة",
       minutes_other: "{{value}} دقيقة",
+      pair: "{{first}} و{{second}}",
     },
     timing: {
       lastUpdated: "آخر تحديث {{relativeTime}}",
@@ -2207,6 +2250,8 @@ export const ar: TranslationResources = {
       resetTimePassed: "مضى وقت إعادة التعيين",
       resettingNow: "تتم إعادة التعيين الآن",
       resetsIn: "تتم إعادة التعيين خلال {{duration}}",
+      resetsAtWeekday: "{{weekday}} {{time}}",
+      resetsAtDate: "{{date}}، {{time}}",
       runsOutNow: "ينفد الآن",
       runsOutIn: "ينفد خلال {{duration}}",
       justNow: "الآن",
@@ -2304,6 +2349,7 @@ export const ar: TranslationResources = {
       connections: "اتصالات",
       agents: "Agents",
       metadata: "البيانات الوصفية",
+      voice: "الصوت",
       workspaces: "Workspaces",
       providers: "مقدمي الخدمات",
       usage: "الاستخدام",
@@ -2322,9 +2368,72 @@ export const ar: TranslationResources = {
       automaticHint: "يختار Paseo نموذجًا سريعًا متاحًا",
       preferredHint: "اختر النموذج الذي يستخدمه Paseo",
       model: "النموذج",
-      fallbackHint: "إذا لم يكن متاحًا، يستخدم Paseo نموذجًا آخر متاحًا",
+      modelHint: "يُستخدم هذا النموذج فقط. إذا فشل، لا يجرّب Paseo نموذجًا آخر",
       docs: "الوثائق",
       saveError: "تعذر تحديث إنشاء البيانات الوصفية",
+    },
+    voice: {
+      offline: "اتصل بهذا المضيف لضبط الصوت.",
+      updateHost: "حدّث المضيف لضبط الصوت.",
+      saveError: "تعذّر تحديث إعدادات الصوت",
+      provider: "المزوّد",
+      providers: {
+        local: "محلي",
+        openai: "OpenAI",
+      },
+      voice: "الصوت",
+      save: "حفظ",
+      retry: "إعادة المحاولة",
+      cancel: "إلغاء",
+      model: "النموذج",
+      language: "اللغة",
+      languagePlaceholder: "اكتشاف تلقائي",
+      setBy: "محدد بواسطة {{name}}",
+      unknownProvider: "حدّث التطبيق لإعداد {{provider}}",
+      sites: {
+        dictationStt: "تحويل الكلام إلى نص",
+        voiceModeStt: "الاستماع",
+        voiceModeTts: "التحدث",
+      },
+      dictation: {
+        title: "الإملاء",
+        enabled: "الإملاء",
+        enabledHint: "تحدّث في مربع الرسالة بدلًا من الكتابة",
+      },
+      voiceMode: {
+        title: "وضع الصوت",
+        info: "يحوّل وضع الصوت كلامك إلى نص ويقرأ ردود الوكيل بصوت عالٍ.",
+        enabled: "وضع الصوت",
+        enabledHint: "تحدّث مع وكلائك دون استخدام يديك",
+      },
+      openai: {
+        apiKey: "مفتاح API",
+        apiKeyHint: "يُحفظ على المضيف ولا يُعرض مرة أخرى.",
+        keyPlaceholder: "sk-...",
+        savedKeyPlaceholder: "محفوظ",
+        missingKey: "مفتاح API مفقود",
+        baseUrl: "عنوان URL الأساسي",
+        baseUrlHint: "للخوادم المتوافقة مع OpenAI. اتركه فارغًا لاستخدام OpenAI.",
+      },
+      models: {
+        loading: "جارٍ تحميل النماذج...",
+        loadError: "تعذّر تحميل النماذج المحلية",
+        none: "لا توجد نماذج متاحة",
+        downloaded: "منزّل",
+        inUse: "قيد الاستخدام",
+        recommended: "موصى به",
+        download: "تنزيل",
+        downloadAction: "تنزيل {{label}}",
+        downloading: "جارٍ التنزيل...",
+        downloadingPercent: "جارٍ التنزيل {{percent}}%",
+        extracting: "جارٍ الاستخراج...",
+        delete: "حذف",
+        deleteAction: "حذف {{label}}",
+        deleteTitle: "حذف {{label}}؟",
+        deleteMessage: "سيؤدي هذا إلى تحرير {{size}}. يمكنك تنزيله مرة أخرى لاحقًا.",
+        languages: "لغات {{label}}",
+        moreLanguages: "{{languages}} و{{count}} أخرى",
+      },
     },
     general: {
       title: "عام",
@@ -2349,10 +2458,23 @@ export const ar: TranslationResources = {
             "عند تشغيل الوكيل، يوجّه Enter الجولة النشطة. يضيف Command/Ctrl+Enter إلى قائمة الانتظار.",
           queue: "عند تشغيل الوكيل، يضيف Enter إلى قائمة الانتظار. Command/Ctrl+Enter يرسل.",
         },
+        commandEnterDescriptions: {
+          interrupt: "عند تشغيل الوكيل، يوقف {{modifier}}+Enter التشغيل. يُدرج Enter سطرًا جديدًا.",
+          steer: "عند تشغيل الوكيل، يوجّه {{modifier}}+Enter الجولة النشطة. يُدرج Enter سطرًا جديدًا.",
+          queue:
+            "عند تشغيل الوكيل، يضيف {{modifier}}+Enter إلى قائمة الانتظار. يُدرج Enter سطرًا جديدًا.",
+        },
         options: {
           interrupt: "مقاطعة",
           steer: "توجيه",
           queue: "طابور",
+        },
+      },
+      sendShortcut: {
+        label: "اختصار الإرسال",
+        options: {
+          enter: "Enter",
+          "mod-enter": "{{modifier}}+Enter",
         },
       },
       serviceUrls: {
@@ -2371,12 +2493,13 @@ export const ar: TranslationResources = {
         label: "عرض التفكير دائماً",
         description: "إظهار تفكير الوكيل وخطوات الاستدلال بشكل كامل بشكل افتراضي",
       },
-      toolCallDetail: {
-        label: "عرض استدعاءات الأدوات",
-        description: "كيفية ظهور استدعاءات الأدوات في المخطط الزمني",
+      chatDisplay: {
+        label: "عرض المحادثة",
+        description: "مقدار عمل الوكيل الذي تعرضه المحادثة",
         options: {
-          overview: "ملخص",
-          detailed: "التفاصيل الكاملة",
+          full: "كامل",
+          collapseToolCalls: "طيّ استدعاءات الأدوات",
+          collapseTurns: "طيّ الأدوار",
         },
       },
       language: {
@@ -2398,11 +2521,6 @@ export const ar: TranslationResources = {
     },
     diagnostics: {
       title: "التشخيص",
-      legacyTerminalRenderer: {
-        label: "استخدام عارض الطرفية السابق",
-        description: "استخدام طرفية WebView السابقة بعد إعادة فتح الطرفية",
-        accessibilityLabel: "استخدام عارض الطرفية السابق",
-      },
       testAudio: "اختبار الصوت",
       playTest: "لعب الاختبار",
       playing: "جارٍ اللعب...",
@@ -2748,6 +2866,19 @@ export const ar: TranslationResources = {
       },
       agents: {
         unavailable: "Connect to this host to manage agents",
+        resumeOnStartup: {
+          title: "استئناف الوكلاء بعد إعادة التشغيل",
+          info: "إعادة فتح الوكلاء الذين كانوا يعملون عند توقف المضيف وإرسال طلب الاستئناف. ينطبق ذلك بعد إعادة التشغيل العادية والتعطّل.",
+          hint: "متابعة العمل المنقطع تلقائيًا.",
+          prompt: "طلب الاستئناف",
+          edit: "تحرير",
+          editAccessibilityLabel: "تعديل الطلب",
+        },
+        idleRuntimeCleanup: {
+          title: "تحرير الوكلاء الخاملين",
+          hint: "تحرير الذاكرة بعد ساعة من الخمول.",
+          info: "يوقف عملية الوكيل مع الاحتفاظ بمحادثته. أرسل رسالة لاستئنافها.\n\nيمنع العمل النشط والإشعارات المعلّقة وفحوصات أمان المزوّد عملية التنظيف.",
+        },
       },
       workspaces: {
         unavailable: "Connect to this host to manage workspaces",
@@ -2838,6 +2969,10 @@ export const ar: TranslationResources = {
           requestFailedTitle: "خطأ",
           requestFailedMessage:
             "فشل في إرسال طلب إعادة التشغيل.  يقوم Paseo بإعادة الاتصال تلقائيًا - حاول مرة أخرى بمجرد ظهور المضيف على أنه متصل بالإنترنت.",
+          closeTerminals: "إعادة التشغيل وإغلاق الطرفيات",
+          closeTerminalsHint: "يعيد التشغيل ويغلق أيضًا كل الطرفيات المفتوحة على هذا المضيف.",
+          closeTerminalsConfirmMessage:
+            "سيُعاد تشغيل الخدمة وتُغلق كل طرفياتها، مما ينهي البرامج التي تعمل فيها. سيعيد التطبيق الاتصال تلقائيًا.",
           dialogFailedMessage: "غير قادر على فتح مربع حوار تأكيد إعادة التشغيل.",
         },
         update: {

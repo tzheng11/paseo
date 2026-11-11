@@ -1,3 +1,4 @@
+import { writeWebBuildProvenance } from "./web-build-provenance.mjs";
 import { spawn } from "node:child_process";
 import { createReadStream, createWriteStream } from "node:fs";
 import { cp, mkdir, readdir, rm, stat } from "node:fs/promises";
@@ -124,6 +125,7 @@ async function main() {
     throw new Error(`Browser web export not found at ${SOURCE_DIST}`);
   }
 
+  await writeWebBuildProvenance(SOURCE_DIST, REPO_ROOT);
   await cleanTarget();
   await copyAssets();
   await precompressAssets(TARGET_DIST);

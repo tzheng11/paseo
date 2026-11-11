@@ -60,6 +60,55 @@ PASEO_DEV_SEED_HOME=/path/to/home npm run dev # seed from a different source hom
 PASEO_DEV_RESET_HOME=1 npm run dev            # clear and reseed the derived worktree home
 ```
 
+### Closed maintenance boot
+
+For a controlled standalone upgrade, launch the supervisor with
+`PASEO_MAINTENANCE_BOOT=closed`, an explicit canonical `PASEO_HOME`, and
+`PASEO_MAINTENANCE_CONTROL_DIR` pointing to a new, empty, owned `0700` directory.
+The home must already contain its original `server-id`. The worker does not create
+or repair an identity, load normal config, construct daemon bootstrap, open the
+normal endpoint, or start schedules, plugins, providers, hooks, Hub or relay.
+The supervisor still reads its logging configuration and maintains the PID lock.
+Use an independently owned supervisor handle; the ordinary CLI start's readiness
+timeout is not a maintenance launcher. No normal ready IPC is sent before release.
+
+The directory contains a private `control.sock`, a `0600` bearer `token`, and an
+immutable `identity.json`. Use HTTP over that Unix socket with
+`Authorization: Bearer <token>`; never expose the token in logs or host registries.
+`GET /v1/inspect` reports the original server ID, process PID, fresh generation and
+epoch, phase, and capability scope. `POST /v1/release` requires those exact four
+binding fields plus a unique `requestId`. It durably commits one bootstrap attempt
+before returning `202`. Observe `started.json` or the inspect result afterward;
+`202` is not readiness. Startup or persistence failure cannot be retried under a
+new request ID in the same boot. Failed startup persists an unknown outcome and
+uses the worker's fatal exit, so partial background tasks cannot keep running
+behind the control socket. If outcome persistence also fails, the release record
+remains an unknown attempt for the controller to inspect.
+
+Successful startup commits `started.json` before publishing readiness to the
+supervisor. Only after that readiness is published does the supervisor remove
+maintenance variables from future workers; ordinary crash and client-requested
+restarts then run normally. The first worker captures and removes its own
+maintenance variables before waiting, so agents, terminals and lifecycle scripts
+cannot inherit the one-use boot policy. The private control socket and epoch belong to the
+first worker, not its replacements. Do not persist maintenance variables in the
+final login LaunchAgent. A new supervisor using the consumed directory refuses
+to start; a one-time handover and ordinary login startup have different inputs.
+
+The initial release deadline defaults to five minutes, capped at fifteen via
+`PASEO_MAINTENANCE_BOOT_TIMEOUT_MS`. Expiry leaves the boot closed. This is a
+one-shot bootstrap authorization, not a renewable admission lease on a running
+daemon. Unsupported routes and WebSocket upgrades are refused. Supervisor loss
+still exits the worker while it is waiting.
+
+`POST /v1/drain` accepts the same binding only while this boot has never been
+released. Its receipt has `scope: "unreleased-boot"` and zero accepted work, and
+permanently prevents release. The current capability explicitly reports
+`activeDrain: false`; it cannot freeze or drain an already-running daemon. Runtime
+producer admission, accepted-operation draining and restart recovery are separate
+work. In particular, this mode cannot recover RAM-only work from an older daemon
+or replace that first upgrade's work-owner settlement and final-down reconciliation.
+
 ### Daemon endpoints
 
 - Stable daemon launched by the desktop app: `localhost:6767`.
@@ -272,6 +321,26 @@ Playwright dispatch lateness. Set `PASEO_PROFILE_TYPING_KEYS`, `PASEO_PROFILE_TY
 `PASEO_PROFILE_TYPING_REPEATS`, or `PASEO_PROFILE_WORKSPACE_DIGIT` to change the scenario. Optional
 `PASEO_PROFILE_CPU_PATH` and `PASEO_PROFILE_TRACE_PATH` captures run separately after the latency
 measurements so profiling overhead does not contaminate them.
+
+For diff layout, two benchmarks share one corpus
+(`packages/app/src/git/diff-document/benchmark-corpus.ts`: a real source file, a changelog with
+600-character lines, generated code with ligature punctuation, and JSON). The node bench runs the
+shared document model with the web and native measurers replaced by counters, so it reports how
+many strings each backend would have to shape, which is the cost that survives the move to canvas
+or Skia:
+
+```bash
+cd packages/app && npx vitest bench --project unit src/git/diff-document/model.bench.ts
+```
+
+The browser benchmark opens the same corpus as a working diff, toggles line wrap from the toolbar,
+and reports pointer-down to painted latency, the longest main-thread task, and the `DiffDocument`
+React commit time for cold and warm toggles, then scroll frame times in both modes:
+
+```bash
+cd packages/app && PASEO_DIFF_PERF_E2E=1 npx playwright test --project=browser \
+  e2e/browser/diff-performance.spec.ts -g "toggling line wrap"
+```
 
 Set `PASEO_PROFILE_TYPING_SCENARIO=height-growth` to alternate `Shift+Enter` and printable input.
 That report includes input and composer height changes plus React work grouped into composer,
@@ -582,6 +651,39 @@ with the current patch. Regenerate a patch with `npx patch-package <package>` af
 patch every build the consumers use: Metro resolves the `react-native` field of a package
 (`src/*.ts` for `react-native-svg`), while Node and Vitest resolve `main`/`module`
 (`lib/commonjs`, `lib/module`). Patching only `lib/` leaves the app bundle unfixed.
+
+## Dependency overrides and workspace tooling
+
+Root `package.json` `overrides` pin one Expo SDK across the tree (`expo`, `expo-router`,
+`react-native`, …). npm does not apply those overrides to packages it places under a
+workspace's own `node_modules`. When `expo-module-scripts` was declared in
+`packages/expo-two-way-audio`, npm nested it there and its `jest-expo` peer `expo@*` resolved to
+a second, newer Expo SDK and React Native: 200+ duplicate packages nothing imported (#7730).
+Declare tooling that peer-depends on `expo` or `react-native` in the root `devDependencies`,
+where the overrides apply; workspace scripts still find the binary through the root
+`node_modules/.bin`.
+
+## Dependency signature audit
+
+The `quality` CI job runs `npm audit signatures`. It verifies every lockfile package's registry
+signature and, for packages published with provenance, fetches
+`/-/npm/v1/attestations/<name>@<version>` from the registry. Cloudflare caches that document
+for a year. An edge that cached it in the seconds before the registry attached the publish
+attestation keeps serving a document with only the provenance bundle, and npm fails with:
+
+```
+npm error code EMISSINGSIGNATUREKEY
+npm error <name>@<version> has attestations but no corresponding public key(s) can be found
+```
+
+The same package's registry signature verified a moment earlier with the same keys, so the
+key list is intact. The failure names one package, repeats only for that package, and depends
+on the Azure region the runner landed in, because each region maps to one Cloudflare colo. A
+rerun passes only by landing elsewhere.
+
+To confirm, fetch the URL from several runners and compare `content-length`, the `cf-ray` colo
+suffix, and the number of `attestations` entries (#7730 has the probe). To fix, remove or
+replace that version in the lockfile and report the URL to npm so they purge it.
 
 ## ACP provider catalog versions
 

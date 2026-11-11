@@ -668,10 +668,12 @@ test("session close disposes a provider that arrives from an in-flight reconnect
 
     const turnStart = session.startTurn("continue after reconnect");
     await reconnectSpawned;
-    await session.close();
+    const turnRejected = expect(turnStart).rejects.toThrow("Codex app-server session is closed");
+    const closing = session.close();
+    // Close owns the unresolved spawn and must join disposal after it arrives.
     releaseReconnect?.();
-
-    await expect(turnStart).rejects.toThrow("Codex app-server session is closed");
+    await closing;
+    await turnRejected;
     await expect(lateExit).resolves.toBeUndefined();
     expect(events.filter((event) => event.event.type === "turn_failed")).toHaveLength(0);
 
