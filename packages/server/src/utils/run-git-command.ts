@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import type { ChildProcess } from "node:child_process";
 import type { Logger } from "pino";
 import type { ProcessEnvRecord } from "../server/paseo-env.js";
 import {
@@ -438,6 +439,8 @@ function executeGitCommand<Output>(
             cwd: options.cwd,
             envOverlay,
             shell: false,
+            // Own process group, so a kill also reaches helpers git starts (worktree add's checkout).
+            detached: OWNS_PROCESS_GROUP,
             stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
           },
         );
@@ -450,14 +453,14 @@ function executeGitCommand<Output>(
       const stdout = child.stdout;
       const stderr = child.stderr;
       if (!stdout || !stderr) {
-        child.kill("SIGKILL");
+        killGitProcess(child);
         rejectSpawnFailure(new Error("Git process did not expose piped stdout and stderr"));
         return;
       }
 
       timer = setTimeout(() => {
         timeoutError = new Error(`Git command timed out after ${timeout}ms: ${command}`);
-        child.kill("SIGKILL");
+        killGitProcess(child);
         settle(() => reject(timeoutError));
         if (processExit) {
           settleTimeoutTrace(processExit.exitCode, processExit.signal);
@@ -472,7 +475,7 @@ function executeGitCommand<Output>(
 
         if (remainingBytes <= 0) {
           truncated = true;
-          child.kill("SIGKILL");
+          killGitProcess(child);
           return;
         }
 
@@ -480,7 +483,7 @@ function executeGitCommand<Output>(
           stdoutChunks.push(buffer.subarray(0, remainingBytes));
           stdoutBytes += remainingBytes;
           truncated = true;
-          child.kill("SIGKILL");
+          killGitProcess(child);
           return;
         }
 
@@ -523,7 +526,7 @@ function executeGitCommand<Output>(
           // A command may close stdin when it exits or reaches the output limit.
           if (error.code !== "EPIPE") {
             processError = error;
-            child.kill("SIGKILL");
+            killGitProcess(child);
           }
         });
         child.stdin!.end(options.input);
@@ -606,6 +609,20 @@ function executeGitCommand<Output>(
 }
 
 export const runGitCommand: RunGitCommand = runGitCommandWithProvenance;
+
+const OWNS_PROCESS_GROUP = process.platform !== "win32";
+
+function killGitProcess(child: ChildProcess): void {
+  if (OWNS_PROCESS_GROUP && child.pid !== undefined) {
+    try {
+      process.kill(-child.pid, "SIGKILL");
+      return;
+    } catch {
+      // ESRCH, or EPERM on macOS when the group holds only zombies: fall back to the leader.
+    }
+  }
+  child.kill("SIGKILL");
+}
 
 function formatGitCommand(args: string[]): string {
   return ["git", ...args].join(" ");

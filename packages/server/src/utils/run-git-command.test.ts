@@ -224,13 +224,23 @@ async function loadRunGitCommand(concurrency: number) {
   return import("./run-git-command.js");
 }
 
+function killFakeProcessGroup(pid: number, signal?: string | number): true {
+  const child = fakeSpawnController.processes.find((candidate) => -candidate.pid === pid);
+  if (!child) throw Object.assign(new Error(`kill ESRCH ${pid}`), { code: "ESRCH" });
+  child.kill(signal as NodeJS.Signals);
+  return true;
+}
+
 describe("runGitCommand", () => {
   beforeEach(() => {
     fakeSpawnController.reset();
+    // Fake pids are not real processes: route group kills to the fake child, never to the host.
+    vi.spyOn(process, "kill").mockImplementation(killFakeProcessGroup);
   });
 
   afterEach(() => {
     fakeSpawnController.reset();
+    vi.restoreAllMocks();
     vi.resetModules();
     vi.unstubAllEnvs();
   });

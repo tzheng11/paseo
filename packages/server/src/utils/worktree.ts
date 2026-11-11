@@ -1344,6 +1344,10 @@ async function readLocalBranchTip(cwd: string, branchName: string): Promise<stri
   }
 }
 
+// A checkout writes every tracked file. On a large repository under I/O load that takes
+// minutes (63,874 files took about 4 minutes on a loaded host), so 120 s failed real creates.
+const WORKTREE_ADD_TIMEOUT_MS = 10 * 60_000;
+
 /** Resolve the default placement once, before presenting it to creation hooks. */
 export async function resolveDefaultWorktreePath(
   options: Pick<CreateWorktreeOptions, "cwd" | "paseoHome" | "worktreesRoot" | "worktreeSlug">,
@@ -1381,16 +1385,19 @@ export const createWorktree = async ({
     fetchedBranch && !branchesBefore.has(fetchedBranch)
       ? await readLocalBranchTip(cwd, fetchedBranch)
       : null;
+  const createdBranch = await readBranchCreatedByAdd(cwd, sourcePlan.addArguments);
+  let addedWorktreePath: string | null = null;
   try {
     let worktreePath =
       explicitWorktreePath ??
       (await resolveDefaultWorktreePath({ cwd, paseoHome, worktreesRoot, worktreeSlug }));
     await mkdir(dirname(worktreePath), { recursive: true });
+    addedWorktreePath = await claimWorktreeDirectory(worktreePath);
 
     // Primitive owner for `git worktree add`; callers route through createWorktreeCore.
     await runGitCommand(["worktree", "add", worktreePath, ...sourcePlan.addArguments], {
       cwd,
-      timeout: 120_000,
+      timeout: WORKTREE_ADD_TIMEOUT_MS,
     });
     worktreePath = await normalizePathForOwnership(worktreePath);
 
@@ -1425,6 +1432,13 @@ export const createWorktree = async ({
       comparisonBaseRef: sourcePlan.metadataBaseRef ?? sourcePlan.metadataBaseRefName,
     };
   } catch (error) {
+    // A failed create must not leave a locked partial checkout or its new branch behind,
+    // or every retry of the same create collides with them.
+    const cleanupError = await discardFailedWorktreeAdd({
+      cwd,
+      worktreePath: addedWorktreePath,
+      branchName: createdBranch,
+    });
     if (
       fetchedBranch &&
       fetchedTip &&
@@ -1432,9 +1446,63 @@ export const createWorktree = async ({
     ) {
       await runGitCommand(["branch", "-D", fetchedBranch], { cwd }).catch(() => {});
     }
+    if (cleanupError) throw withCleanupError(error, cleanupError);
     throw error;
   }
 };
+
+/** The branch `git worktree add -b` creates, unless it already exists. */
+async function readBranchCreatedByAdd(cwd: string, addArguments: string[]): Promise<string | null> {
+  if (addArguments[0] !== "-b") return null;
+  const branchName = addArguments[1]!;
+  return (await readLocalBranchTip(cwd, branchName)) === null ? branchName : null;
+}
+
+function withCleanupError(error: unknown, cleanupError: unknown): Error {
+  const message = error instanceof Error ? error.message : "Worktree creation failed";
+  const cleanupMessage =
+    cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+  return Object.assign(
+    new Error(`${message}; cleanup also failed: ${cleanupMessage}`, { cause: error }),
+    { cleanupError },
+  );
+}
+
+/** Git accepts an empty target directory; creating it exclusively makes this create its owner. */
+async function claimWorktreeDirectory(worktreePath: string): Promise<string | null> {
+  try {
+    await mkdir(worktreePath);
+    return worktreePath;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return null;
+    throw error;
+  }
+}
+
+async function discardFailedWorktreeAdd(input: {
+  cwd: string;
+  worktreePath: string | null;
+  branchName: string | null;
+}): Promise<unknown> {
+  try {
+    if (input.worktreePath) {
+      // An interrupted add leaves its admin entry locked "initializing"; a double force removes it.
+      await runGitCommand(["worktree", "remove", "--force", "--force", input.worktreePath], {
+        cwd: input.cwd,
+        timeout: WORKTREE_ADD_TIMEOUT_MS,
+      }).catch(() => undefined);
+      await removeDirectoryWithRetries(input.worktreePath);
+    }
+    // Git creates the -b branch before it checks the path. It refuses to delete a branch
+    // another worktree has checked out.
+    if (input.branchName && (await readLocalBranchTip(input.cwd, input.branchName)) !== null) {
+      await runGitCommand(["branch", "-D", input.branchName], { cwd: input.cwd });
+    }
+    return null;
+  } catch (cleanupError) {
+    return cleanupError;
+  }
+}
 
 interface ResolveWorktreeSourcePlanOptions {
   cwd: string;
