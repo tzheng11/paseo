@@ -93,6 +93,8 @@ const lastSuccessfulPullRequestStatus = new Map<string, PullRequestStatusResult>
 let shortstatCacheTtlMs = DEFAULT_SHORTSTAT_CACHE_TTL_MS;
 let shortstatCache = createShortstatCache(shortstatCacheTtlMs);
 const shortstatInFlight = new Map<string, Promise<CheckoutShortstat | null>>();
+// The merge base each checkout's last computed shortstat was measured against.
+const shortstatMergeBases = new Map<string, string>();
 
 interface CheckoutReadCacheOptions {
   force?: boolean;
@@ -170,6 +172,21 @@ function getShortstatCacheKey(cwd: string): string {
   return resolve(cwd);
 }
 
+function rememberShortstatMergeBase(cacheKey: string, mergeBase: string | null): void {
+  shortstatMergeBases.delete(cacheKey);
+  if (mergeBase === null) {
+    return;
+  }
+  shortstatMergeBases.set(cacheKey, mergeBase);
+  if (shortstatMergeBases.size <= SHORTSTAT_CACHE_MAX) {
+    return;
+  }
+  const oldest = shortstatMergeBases.keys().next();
+  if (!oldest.done) {
+    shortstatMergeBases.delete(oldest.value);
+  }
+}
+
 export function __resetPullRequestStatusCacheForTests(): void {
   pullRequestStatusCache.clear();
   pullRequestStatusCache.cancelTimer();
@@ -194,6 +211,7 @@ export function __resetCheckoutShortstatCacheForTests(): void {
   shortstatCacheTtlMs = DEFAULT_SHORTSTAT_CACHE_TTL_MS;
   shortstatCache = createShortstatCache(shortstatCacheTtlMs);
   shortstatInFlight.clear();
+  shortstatMergeBases.clear();
 }
 
 export function __setCheckoutShortstatCacheTtlForTests(ttlMs: number): void {
@@ -202,6 +220,7 @@ export function __setCheckoutShortstatCacheTtlForTests(ttlMs: number): void {
   shortstatCacheTtlMs = ttlMs;
   shortstatCache = createShortstatCache(ttlMs);
   shortstatInFlight.clear();
+  shortstatMergeBases.clear();
 }
 
 interface CheckoutFileChange {
@@ -2929,11 +2948,10 @@ function handleShortstatGitError(error: unknown, throwOnGitError = false): null 
   return null;
 }
 
-async function getCheckoutShortstatUncached(
+async function resolveCheckoutShortstatMergeBase(
   cwd: string,
   context?: CheckoutContext,
-  options?: { throwOnGitError?: boolean },
-): Promise<CheckoutShortstat | null> {
+): Promise<string | null> {
   if (context?.facts?.isGit === false) {
     return null;
   }
@@ -2961,37 +2979,101 @@ async function getCheckoutShortstatUncached(
     return null;
   }
 
+  const { stdout: mergeBaseOut } = await getRunGitCommand(context)(
+    ["merge-base", "HEAD", comparisonRef],
+    {
+      cwd,
+      envOverlay: READ_ONLY_GIT_ENV,
+    },
+  );
+  return mergeBaseOut.trim() || null;
+}
+
+async function getCheckoutShortstatFromMergeBase(
+  cwd: string,
+  mergeBase: string,
+  context?: CheckoutContext,
+  options?: { throwOnGitError?: boolean },
+): Promise<CheckoutShortstat | null> {
+  const [{ stdout }, untrackedAdditions] = await Promise.all([
+    getRunGitCommand(context)(["diff", "--shortstat", mergeBase], {
+      cwd,
+      envOverlay: READ_ONLY_GIT_ENV,
+    }),
+    countUntrackedAdditions(cwd, context, options?.throwOnGitError),
+  ]);
+
+  const tracked = parseCheckoutShortstat(stdout);
+
+  if (tracked) {
+    return { additions: tracked.additions + untrackedAdditions, deletions: tracked.deletions };
+  }
+  if (untrackedAdditions > 0) {
+    return { additions: untrackedAdditions, deletions: 0 };
+  }
+  return null;
+}
+
+async function getCheckoutShortstatUncached(
+  cwd: string,
+  context?: CheckoutContext,
+  options?: { throwOnGitError?: boolean },
+): Promise<CheckoutShortstat | null> {
+  const cacheKey = getShortstatCacheKey(cwd);
   try {
-    const { stdout: mergeBaseOut } = await getRunGitCommand(context)(
-      ["merge-base", "HEAD", comparisonRef],
-      {
-        cwd,
-        envOverlay: READ_ONLY_GIT_ENV,
-      },
-    );
-    const mergeBase = mergeBaseOut.trim();
+    const mergeBase = await resolveCheckoutShortstatMergeBase(cwd, context);
     if (!mergeBase) {
+      rememberShortstatMergeBase(cacheKey, null);
       return null;
     }
-
-    const [{ stdout }, untrackedAdditions] = await Promise.all([
-      getRunGitCommand(context)(["diff", "--shortstat", mergeBase], {
-        cwd,
-        envOverlay: READ_ONLY_GIT_ENV,
-      }),
-      countUntrackedAdditions(cwd, context, options?.throwOnGitError),
-    ]);
-
-    const tracked = parseCheckoutShortstat(stdout);
-
-    if (tracked) {
-      return { additions: tracked.additions + untrackedAdditions, deletions: tracked.deletions };
-    }
-    if (untrackedAdditions > 0) {
-      return { additions: untrackedAdditions, deletions: 0 };
-    }
-    return null;
+    const shortstat = await getCheckoutShortstatFromMergeBase(cwd, mergeBase, context, options);
+    rememberShortstatMergeBase(cacheKey, mergeBase);
+    return shortstat;
   } catch (error) {
+    rememberShortstatMergeBase(cacheKey, null);
+    return handleShortstatGitError(error, options?.throwOnGitError);
+  }
+}
+
+/**
+ * A moved base or upstream ref changes the diff stat only when it moves the merge base:
+ * `diff --shortstat <merge-base>` and the untracked count read the working tree, which
+ * working-tree observation refreshes on its own. Resolving the merge base reads commits
+ * only, so ref fan-out no longer rescans every dependent checkout's files.
+ *
+ * With no merge base on record, `keepCurrentWhenUnrecorded` records today's for `current`
+ * instead of rescanning, for callers that previously kept `current` unconditionally.
+ */
+export async function getCheckoutShortstatIfMergeBaseMoved(
+  cwd: string,
+  current: CheckoutShortstat | null,
+  context?: CheckoutContext,
+  options?: { throwOnGitError?: boolean; keepCurrentWhenUnrecorded?: boolean },
+): Promise<CheckoutShortstat | null> {
+  const cacheKey = getShortstatCacheKey(cwd);
+  const previousMergeBase = shortstatMergeBases.get(cacheKey);
+  if (previousMergeBase === undefined && !options?.keepCurrentWhenUnrecorded) {
+    return getCheckoutShortstatUncached(cwd, context, options);
+  }
+  try {
+    const mergeBase = await resolveCheckoutShortstatMergeBase(cwd, context);
+    if (previousMergeBase === undefined) {
+      rememberShortstatMergeBase(cacheKey, mergeBase);
+      return current;
+    }
+    if (mergeBase === previousMergeBase) {
+      return current;
+    }
+    if (!mergeBase) {
+      rememberShortstatMergeBase(cacheKey, null);
+      return null;
+    }
+    const shortstat = await getCheckoutShortstatFromMergeBase(cwd, mergeBase, context, options);
+    rememberShortstatMergeBase(cacheKey, mergeBase);
+    shortstatCache.set(cacheKey, shortstat);
+    return shortstat;
+  } catch (error) {
+    rememberShortstatMergeBase(cacheKey, null);
     return handleShortstatGitError(error, options?.throwOnGitError);
   }
 }
@@ -3146,8 +3228,9 @@ export async function getCheckoutRefDerivedState(
     });
   }
   if (baseMoved || (upstreamMoved && currentBranch === normalizedResolvedBase)) {
-    diffStat = await getCheckoutShortstatUncached(
+    diffStat = await getCheckoutShortstatIfMergeBaseMoved(
       cwd,
+      current.diffStat,
       { ...context, facts },
       { throwOnGitError: true },
     );
