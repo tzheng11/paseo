@@ -451,8 +451,8 @@ describe("ReplicaCache", () => {
     expect(restored.checkpoint).toEqual(baseline.checkpoint);
   });
 
-  it.each([1, 2])(
-    "refreshes v%s workspace cursors while keeping other cached entities",
+  it.each([1, 2, 3])(
+    "reconciles v%s checkpoints while retaining cached entities and timelines",
     async (version) => {
       const storage = new MemoryStorage();
       const writer = createCache(storage);
@@ -481,10 +481,11 @@ describe("ReplicaCache", () => {
 
       const reader = createCache(storage);
       const restored = await reader.readDirectory(SERVER_ID);
-      expect(restored.checkpoint).toEqual({
-        agents: baseline.checkpoint.agents,
-        projects: baseline.checkpoint.projects,
-      });
+      expect(restored.checkpoint).toEqual(
+        version < 3
+          ? undefined
+          : { agents: baseline.checkpoint.agents, projects: baseline.checkpoint.projects },
+      );
       expect([...restored.workspaces.keys()]).toEqual([...baseline.workspaces.keys()]);
       expect([...restored.projects.keys()]).toEqual([...baseline.projects.keys()]);
       expect([...restored.agents.keys()]).toEqual([...baseline.agents.keys()]);
@@ -546,7 +547,7 @@ describe("ReplicaCache", () => {
     const reader = createCache(storage);
     const restored = await reader.readDirectory(SERVER_ID);
     expect(restored.workspaces.get("workspace-1")?.superpinnedAt).toBeNull();
-    expect(restored.checkpoint).toEqual({ agents: baseline.checkpoint.agents });
+    expect(restored.checkpoint).toBeUndefined();
     baseline.workspaces.get("workspace-1")!.superpinnedAt = "2026-10-18T22:00:00.000Z";
     reader.replaceDirectoryBaseline(SERVER_ID, baseline);
     await reader.flush();

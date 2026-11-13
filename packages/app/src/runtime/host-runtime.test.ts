@@ -4390,6 +4390,62 @@ describe("readInitialDaemonConnectionHint", () => {
 
 describe("HostRuntimeStore initial connection hint bootstrap", () => {
   it.each([false, true])(
+    "connects to the serving origin even with a relay deployment catalogue (saved browser: %s)",
+    async (savedBrowser) => {
+      const relay = makeHost().connections[1]!;
+      const studio = makeHost({
+        serverId: "srv_studio",
+        label: "My Studio",
+        connections: [relay],
+        preferredConnectionId: relay.id,
+      });
+      const notebook = makeHost({ serverId: "srv_notebook" });
+      const storage = createMemoryHostRuntimeStorage();
+      if (savedBrowser)
+        await storage.setItem("@paseo:daemon-registry", JSON.stringify([studio, notebook]));
+      const origin: HostConnection = {
+        id: "direct:self.example:443",
+        type: "directTcp",
+        endpoint: "self.example:443",
+        useTls: true,
+      };
+      const directProbes: HostConnection[] = [];
+      const store = new HostRuntimeStore({
+        storage,
+        deps: {
+          createClient: () => new FakeDaemonClient() as unknown as DaemonClient,
+          connectToDaemon: async ({ host, connection }) => {
+            if (connection.id === origin.id) directProbes.push(connection);
+            return {
+              client: makeConnectedProbeClient(5) as unknown as DaemonClient,
+              serverId: host.serverId || studio.serverId,
+              hostname: "Origin Studio",
+            };
+          },
+          getClientId: async () => "cid_catalogue_origin",
+          readInitialHosts: () => [studio, notebook],
+          readInitialConnectionHint: () => ({ listen: "self.example:443", useTls: true }),
+        },
+      });
+      try {
+        await store.boot();
+        expect(directProbes).toEqual([origin]);
+        await vi.waitFor(() =>
+          expect(store.getSnapshot(studio.serverId)?.activeConnectionId).toBe(origin.id),
+        );
+        expect(store.getHosts().map((host) => host.serverId)).toEqual([
+          studio.serverId,
+          notebook.serverId,
+        ]);
+        expect(store.getHosts()[0]?.label).toBe("My Studio");
+        expect(store.getHosts()[0]?.connections).toEqual([relay, origin]);
+      } finally {
+        store.syncHosts([]);
+      }
+    },
+  );
+
+  it.each([false, true])(
     "registers the deployment catalogue while daemons are offline (saved browser: %s)",
     async (hasSavedHost) => {
       const origin: HostConnection = {
@@ -4445,6 +4501,40 @@ describe("HostRuntimeStore initial connection hint bootstrap", () => {
       }
     },
   );
+
+  it("keeps catalogue connections when the serving origin is unavailable without probing localhost", async () => {
+    const studio = makeHost({ serverId: "srv_studio" });
+    const bootstrapProbes: string[] = [];
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const store = new HostRuntimeStore({
+      storage: createMemoryHostRuntimeStorage(),
+      deps: {
+        createClient: () => new FakeDaemonClient() as unknown as DaemonClient,
+        connectToDaemon: async ({ host, connection }) => {
+          if (!host.serverId) {
+            bootstrapProbes.push(connection.id);
+            throw new Error("Origin unavailable");
+          }
+          return {
+            client: makeConnectedProbeClient(5) as unknown as DaemonClient,
+            serverId: host.serverId,
+            hostname: host.label,
+          };
+        },
+        getClientId: async () => "cid_catalogue_origin_offline",
+        readInitialHosts: () => [studio],
+        readInitialConnectionHint: () => ({ listen: "self.example:443", useTls: true }),
+      },
+    });
+    try {
+      await store.boot();
+      expect(bootstrapProbes).toEqual(["direct:self.example:443"]);
+      expect(store.getHosts()).toEqual([studio]);
+    } finally {
+      store.syncHosts([]);
+      warning.mockRestore();
+    }
+  });
 
   it("starts saved remote-host probes while desktop daemon startup is still pending", async () => {
     const host = makeHost({

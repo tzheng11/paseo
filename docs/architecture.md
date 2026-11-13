@@ -138,6 +138,7 @@ Cross-platform React Native app that connects to one or more daemons.
 - `HostRuntimeController` manages saved host connections, reconnection, and per-host runtime state. Direct TCP and relay connections use the ordinary client transport; desktop socket, pipe, and SSH connections cross one Electron-owned transport boundary. SSH only tunnels to an already-running daemon.
 - `runtime/replica-cache` is typed storage behind the directory and timeline owners. It never observes or mutates `SessionStore`.
 - `runtime/directory-sync` owns directory cache selection and network reconciliation. On demand it paints accepted rows for one host, then passes the persisted per-entity cursor through `project.list`, `fetch_workspaces`, and `fetch_agents`; the daemon returns each entity's latest projection when its sequence is newer, plus tombstones.
+  Live updates advance a cursor only after that entity's baseline has reconciled on the current connection, with the same generation. An interrupted refresh cannot certify unseen rows. Version 3 cache checkpoints enforce this contract; older checkpoints trigger one full directory reconciliation while retaining cached rows and timelines.
 - `workspace-labels` owns one sequenced catalog replica per connected host, the deterministic cross-host projection that surfaces spanning hosts use (the filter page, the manager), and the per-host resolution a workspace row's chips use. Two hosts may give one name different colors, so a row resolves against its own host's catalog and a merged answer would be wrong there. Catalogs never synchronize between hosts; assignment creates a missing definition only on the target host. On the daemon, catalog and assignment rewrites share a journaled commit boundary. Startup recovery completes that commit before workspace or catalog publication.
 - `SessionContext` wraps the daemon client for the active session
 - Composer UI and submit/draft behavior live in `packages/app/src/composer/`; screens and panels should integrate it from there instead of dropping composer internals into `components/`, `hooks/`, or `screens/workspace/`
@@ -150,7 +151,11 @@ declare `window.__PASEO_INITIAL_HOSTS__` before the app bundle to supply a share
 The app validates the existing stored-host schema and registers those identities before connecting,
 so an offline daemon cannot disappear because discovery timed out. Catalogue order and managed
 connection routes are authoritative; browser-only hosts, saved credentials and host presentation
-remain local. Native and Electron clients do not consume the catalogue. Relay connection metadata
+remain local. An explicit `__PASEO_INITIAL_DAEMON_CONNECTION__` hint is also probed when a catalogue
+is present: the catalogue can list only relay routes while the website's own daemon is directly
+reachable. Skipping that transport can delay its entire workspace tree behind relay synchronization.
+If the origin is unavailable, the registered catalogue remains usable. Native and Electron clients
+do not consume the catalogue. Relay connection metadata
 belongs in private deployment material, never a public export. Browser theme, sidebar filters and
 manual ordering remain separate browser preferences.
 
