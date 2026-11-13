@@ -1704,12 +1704,6 @@ export class HostRuntimeStore {
       return;
     }
 
-    // A self-hosted deployment already knows its daemon identities. Register
-    // them without discovery and let the ordinary host controllers reconnect.
-    if (this.initialHosts.length > 0) {
-      return;
-    }
-
     const initialHint = this.deps.readInitialConnectionHint
       ? this.deps.readInitialConnectionHint()
       : readInitialDaemonConnectionHint();
@@ -1718,6 +1712,14 @@ export class HostRuntimeStore {
       if (bootstrapped) {
         return;
       }
+    }
+
+    // The catalogue identifies hosts; the serving-origin hint supplies another
+    // transport. Keep it even when the catalogue only advertises relay routes,
+    // so a large directory can load directly from the website's own daemon.
+    // A failed origin probe must still leave catalogue hosts usable offline.
+    if (this.initialHosts.length > 0) {
+      return;
     }
 
     if (override) {

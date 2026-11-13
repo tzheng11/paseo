@@ -150,7 +150,11 @@ declare `window.__PASEO_INITIAL_HOSTS__` before the app bundle to supply a share
 The app validates the existing stored-host schema and registers those identities before connecting,
 so an offline daemon cannot disappear because discovery timed out. Catalogue order and managed
 connection routes are authoritative; browser-only hosts, saved credentials and host presentation
-remain local. Native and Electron clients do not consume the catalogue. Relay connection metadata
+remain local. An explicit `__PASEO_INITIAL_DAEMON_CONNECTION__` hint is also probed when a catalogue
+is present: the catalogue can list only relay routes while the website's own daemon is directly
+reachable. Skipping that transport can delay its entire workspace tree behind relay synchronization.
+If the origin is unavailable, the registered catalogue remains usable. Native and Electron clients
+do not consume the catalogue. Relay connection metadata
 belongs in private deployment material, never a public export. Browser theme, sidebar filters and
 manual ordering remain separate browser preferences.
 
