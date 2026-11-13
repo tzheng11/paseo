@@ -512,6 +512,17 @@ function buildConnectionCandidates(host: HostProfile): ConnectionCandidate[] {
   }));
 }
 
+function shouldRestoreSavedConnection(
+  host: HostProfile,
+  currentConnectionId: string,
+  nextConnectionId: string,
+): boolean {
+  const next = findConnectionById(host, nextConnectionId);
+  if (!next || next.type === "routed") return false;
+  if (next.id === host.preferredConnectionId) return true;
+  return findConnectionById(host, currentConnectionId)?.type === "routed";
+}
+
 /**
  * A pin learned from the active client is already enforced by that client, so
  * it keeps running. A pin that arrived from elsewhere (a strict offer) while
@@ -996,6 +1007,21 @@ export class HostRuntimeController {
       connectionId: string,
       client: DaemonClient,
     ): Promise<boolean> => {
+      const connection = findConnectionById(this.host, connectionId);
+      const preferred = findConnectionById(this.host, this.host.preferredConnectionId);
+      const awaitingPreference =
+        preferred?.type !== "routed" &&
+        preferred &&
+        preferred.id !== connectionId &&
+        probeByConnectionId.get(preferred.id)?.status !== "unavailable";
+      const awaitingSavedConnection =
+        connection?.type === "routed" &&
+        this.host.connections.some(
+          (candidate) =>
+            candidate.type !== "routed" &&
+            probeByConnectionId.get(candidate.id)?.status !== "unavailable",
+        );
+      if (awaitingPreference || awaitingSavedConnection) return false;
       while (!this.snapshot.activeConnectionId) {
         if (!activationLock) {
           activationLock = this.switchToConnection({
@@ -1018,16 +1044,14 @@ export class HostRuntimeController {
         return;
       }
 
-      const currentActiveConnectionId = this.snapshot.activeConnectionId;
-      const activeProbe = currentActiveConnectionId
-        ? probeByConnectionId.get(currentActiveConnectionId)
-        : null;
+      const currentConnection = findConnectionById(this.host, this.snapshot.activeConnectionId);
+      const nextConnectionId = selectBestConnection({
+        candidates: buildConnectionCandidates(this.host),
+        probeByConnectionId,
+        preferredConnectionId: this.host.preferredConnectionId,
+      });
 
-      if (!currentActiveConnectionId || !findConnectionById(this.host, currentActiveConnectionId)) {
-        const nextConnectionId = selectBestConnection({
-          candidates: buildConnectionCandidates(this.host),
-          probeByConnectionId,
-        });
+      if (!currentConnection) {
         if (nextConnectionId) {
           await this.switchToConnection({
             connectionId: nextConnectionId,
@@ -1044,11 +1068,9 @@ export class HostRuntimeController {
         return;
       }
 
+      const currentActiveConnectionId = currentConnection.id;
+      const activeProbe = probeByConnectionId.get(currentActiveConnectionId);
       if (this.isConnectionUnavailable(currentActiveConnectionId, activeProbe)) {
-        const nextConnectionId = selectBestConnection({
-          candidates: buildConnectionCandidates(this.host),
-          probeByConnectionId,
-        });
         if (nextConnectionId && nextConnectionId !== currentActiveConnectionId) {
           await this.switchToConnection({
             connectionId: nextConnectionId,
@@ -1064,35 +1086,35 @@ export class HostRuntimeController {
         return;
       }
 
-      const available = Array.from(probeByConnectionId.entries())
-        .filter(
-          (entry): entry is [string, Extract<ConnectionProbeState, { status: "available" }>] =>
-            entry[1].status === "available",
-        )
-        .map(([connectionId, probe]) => ({
-          connectionId,
-          latencyMs: probe.latencyMs,
-        }))
-        .sort((left, right) => left.latencyMs - right.latencyMs);
-
-      const fastest = available[0] ?? null;
-      if (!fastest || fastest.connectionId === currentActiveConnectionId) {
+      if (!nextConnectionId || nextConnectionId === currentActiveConnectionId) {
         this.switchCandidateConnectionId = null;
         this.switchCandidateHitCount = 0;
         return;
       }
 
-      const improvement = activeProbe.latencyMs - fastest.latencyMs;
+      if (shouldRestoreSavedConnection(this.host, currentActiveConnectionId, nextConnectionId)) {
+        this.switchCandidateConnectionId = null;
+        this.switchCandidateHitCount = 0;
+        await this.switchToConnection({
+          connectionId: nextConnectionId,
+          expectedProbeVersion: requestVersion,
+        });
+        return;
+      }
+
+      const nextProbe = probeByConnectionId.get(nextConnectionId);
+      if (nextProbe?.status !== "available") return;
+      const improvement = activeProbe.latencyMs - nextProbe.latencyMs;
       if (improvement < ADAPTIVE_SWITCH_THRESHOLD_MS) {
         this.switchCandidateConnectionId = null;
         this.switchCandidateHitCount = 0;
         return;
       }
 
-      if (this.switchCandidateConnectionId === fastest.connectionId) {
+      if (this.switchCandidateConnectionId === nextConnectionId) {
         this.switchCandidateHitCount += 1;
       } else {
-        this.switchCandidateConnectionId = fastest.connectionId;
+        this.switchCandidateConnectionId = nextConnectionId;
         this.switchCandidateHitCount = 1;
       }
 
@@ -1100,7 +1122,7 @@ export class HostRuntimeController {
         this.switchCandidateConnectionId = null;
         this.switchCandidateHitCount = 0;
         await this.switchToConnection({
-          connectionId: fastest.connectionId,
+          connectionId: nextConnectionId,
           expectedProbeVersion: requestVersion,
         });
       }
@@ -1819,6 +1841,7 @@ export class HostRuntimeStore {
       await this.probeAndUpsertConnection({
         connection,
         timeoutMs: DEFAULT_LOCALHOST_BOOTSTRAP_TIMEOUT_MS,
+        makePreferred: false,
       });
     } catch (error) {
       console.warn("[HostRuntime] bootstrap probe failed", {
@@ -1859,6 +1882,7 @@ export class HostRuntimeStore {
         await this.probeAndUpsertConnection({
           connection,
           timeoutMs: DEFAULT_LOCALHOST_BOOTSTRAP_TIMEOUT_MS,
+          makePreferred: false,
         });
         return;
       } catch (error) {
@@ -1892,6 +1916,7 @@ export class HostRuntimeStore {
     try {
       await this.probeAndUpsertConnection({
         connection: connectionWithHint,
+        makePreferred: false,
       });
       return true;
     } catch (error) {
@@ -1992,6 +2017,7 @@ export class HostRuntimeStore {
       serverId: input.serverId,
       label: input.label,
       password,
+      makePreferred: true,
       connection: {
         id: `direct:${endpoint}`,
         type: "directTcp",
@@ -2007,6 +2033,7 @@ export class HostRuntimeStore {
     password?: string;
     label?: string;
     timeoutMs?: number;
+    makePreferred?: boolean;
   }): Promise<{ profile: HostProfile; serverId: string; hostname: string | null }> {
     if (input.connection.type === "relay") {
       throw new Error("Cannot probe a relay connection without a server id.");
@@ -2033,6 +2060,7 @@ export class HostRuntimeStore {
       password: input.password,
       connection: input.connection,
       existingClient: client,
+      makePreferred: input.makePreferred ?? true,
     });
     return { profile, serverId, hostname };
   }
@@ -2147,6 +2175,7 @@ export class HostRuntimeStore {
       serverId: offer.serverId,
       label,
       connection,
+      makePreferred: true,
     });
     if (password) {
       await this.setHostPassword(profile.serverId, password);
@@ -2308,6 +2337,7 @@ export class HostRuntimeStore {
     password?: string;
     connection: HostConnection;
     existingClient?: DaemonClient;
+    makePreferred?: boolean;
   }): Promise<HostProfile> {
     const now = new Date().toISOString();
     const next = upsertHostConnectionInProfiles({
@@ -2316,6 +2346,7 @@ export class HostRuntimeStore {
       label: input.label,
       connection: input.connection,
       password: input.password,
+      makePreferred: input.makePreferred,
       now,
     });
     this.setHostsAndSync(next, {

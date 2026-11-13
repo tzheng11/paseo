@@ -13,6 +13,7 @@ export type ConnectionProbeState =
 export interface SelectBestConnectionInput {
   candidates: ConnectionCandidate[];
   probeByConnectionId: Map<string, ConnectionProbeState>;
+  preferredConnectionId?: string | null;
 }
 
 function getAvailableLatency(input: {
@@ -31,6 +32,7 @@ export function selectBestConnection(input: SelectBestConnectionInput): string |
 
   let bestConnectionId: string | null = null;
   let bestLatency: number | null = null;
+  let bestPriority = Infinity;
 
   for (const candidate of candidates) {
     const latencyMs = getAvailableLatency({
@@ -40,9 +42,17 @@ export function selectBestConnection(input: SelectBestConnectionInput): string |
     if (latencyMs === null) {
       continue;
     }
-    if (bestLatency === null || latencyMs < bestLatency) {
+    // Discovered routes are fallbacks; they must not displace a saved connection.
+    let priority = 1;
+    if (candidate.connection.type === "routed") priority = 2;
+    else if (candidate.connectionId === input.preferredConnectionId) priority = 0;
+    if (
+      priority < bestPriority ||
+      (priority === bestPriority && (bestLatency === null || latencyMs < bestLatency))
+    ) {
       bestConnectionId = candidate.connectionId;
       bestLatency = latencyMs;
+      bestPriority = priority;
     }
   }
 

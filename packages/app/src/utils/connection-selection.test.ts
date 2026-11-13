@@ -19,6 +19,46 @@ function probes(input: Record<string, ConnectionProbeState>): Map<string, Connec
 }
 
 describe("selectBestConnection", () => {
+  it("honors a saved relay preference over a faster direct connection", () => {
+    expect(
+      selectBestConnection({
+        candidates: [
+          { connectionId: "direct:a", connection: makeDirect("direct:a", "a:6767") },
+          { connectionId: "relay:b", connection: makeRelay("relay:b", "relay:443") },
+        ],
+        preferredConnectionId: "relay:b",
+        probeByConnectionId: probes({
+          "direct:a": { status: "available", latencyMs: 1 },
+          "relay:b": { status: "available", latencyMs: 90 },
+        }),
+      }),
+    ).toBe("relay:b");
+  });
+
+  it.each(["relay:saved", "via:origin", null])(
+    "keeps a saved relay ahead of discovered routes with preference %s",
+    (preferredConnectionId) => {
+      const route: HostConnection = {
+        id: "via:origin",
+        type: "routed",
+        originServerId: "srv_origin",
+      };
+      expect(
+        selectBestConnection({
+          candidates: [
+            { connectionId: route.id, connection: route },
+            { connectionId: "relay:saved", connection: makeRelay("relay:saved", "relay:443") },
+          ],
+          preferredConnectionId,
+          probeByConnectionId: probes({
+            "via:origin": { status: "available", latencyMs: 1 },
+            "relay:saved": { status: "available", latencyMs: 90 },
+          }),
+        }),
+      ).toBe("relay:saved");
+    },
+  );
+
   it("picks the available connection with lowest latency regardless of transport", () => {
     const candidates: ConnectionCandidate[] = [
       { connectionId: "direct:a", connection: makeDirect("direct:a", "a:6767") },

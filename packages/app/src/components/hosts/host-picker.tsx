@@ -9,6 +9,7 @@ import { Combobox, ComboboxItem, type ComboboxProps } from "@/components/ui/comb
 import { useLocalDaemonServerId } from "@/hooks/use-is-local-daemon";
 import { useHostRuntimeSnapshot, type ActiveConnection } from "@/runtime/host-runtime";
 import { orderHostsLocalFirst } from "@/types/host-connection";
+import { formatRoutedHostLabel } from "@/hosts/connection-label";
 import {
   ADD_HOST_OPTION_ID,
   ALL_HOSTS_OPTION_ID,
@@ -46,7 +47,11 @@ function formatConnectionEndpoint(endpoint: string): string {
 
 // Socket/pipe transports have no host:port — their endpoint is a filesystem
 // path, so they read as "Local". TCP and relay show the address being used.
-function formatActiveConnectionLabel(connection: ActiveConnection): string {
+function formatActiveConnectionLabel(
+  connection: ActiveConnection,
+  hosts: readonly HostPickerHost[],
+): string {
+  if (connection.type === "routed") return formatRoutedHostLabel(connection.endpoint, hosts);
   if (connection.type === "directSocket" || connection.type === "directPipe") {
     return "Local";
   }
@@ -54,6 +59,7 @@ function formatActiveConnectionLabel(connection: ActiveConnection): string {
 }
 
 export interface HostPickerOptionProps {
+  hosts: readonly HostPickerHost[];
   serverId: string;
   label: string;
   showActiveConnection: boolean;
@@ -65,6 +71,7 @@ export interface HostPickerOptionProps {
 }
 
 export function HostPickerOption({
+  hosts,
   serverId,
   label,
   showActiveConnection,
@@ -78,7 +85,7 @@ export function HostPickerOption({
   const activeConnection = useHostRuntimeSnapshot(serverId)?.activeConnection ?? null;
   const connectionLabel =
     showActiveConnection && activeConnection
-      ? formatActiveConnectionLabel(activeConnection)
+      ? formatActiveConnectionLabel(activeConnection, hosts)
       : undefined;
   const leadingSlot = useMemo(() => <HostStatusDotSlot serverId={serverId} />, [serverId]);
   const handleSettingsPress = useCallback(
@@ -287,6 +294,7 @@ export function HostPicker({
       }
       return (
         <HostPickerOption
+          hosts={hosts}
           serverId={option.id}
           label={option.label}
           showActiveConnection={showActiveConnection === true}
@@ -304,6 +312,7 @@ export function HostPicker({
       onOpenHostSettings,
       showActiveConnection,
       handleOpenHostSettings,
+      hosts,
     ],
   );
 

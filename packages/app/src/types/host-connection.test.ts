@@ -201,6 +201,35 @@ describe("createRemoteSshHostConnection", () => {
 });
 
 describe("upsertHostConnectionInProfiles", () => {
+  it("persists an explicitly added relay ahead of a discovered route", () => {
+    const route: HostConnection = {
+      id: "via:origin",
+      type: "routed",
+      originServerId: "srv_origin",
+    };
+    const relay: HostConnection = {
+      id: "relay:saved",
+      type: "relay",
+      relayEndpoint: "relay:443",
+      daemonPublicKeyB64: "key",
+    };
+    const [saved] = upsertHostConnectionInProfiles({
+      profiles: [
+        { ...makeHost("srv_target"), connections: [route], preferredConnectionId: route.id },
+      ],
+      serverId: "srv_target",
+      connection: relay,
+      makePreferred: true,
+    });
+    expect(saved.preferredConnectionId).toBe(relay.id);
+    const [rediscovered] = upsertHostConnectionInProfiles({
+      profiles: [saved],
+      serverId: "srv_target",
+      connection: route,
+    });
+    expect(rediscovered.preferredConnectionId).toBe(relay.id);
+  });
+
   const connection: HostConnection = {
     id: "socket:/tmp/paseo.sock",
     type: "directSocket",

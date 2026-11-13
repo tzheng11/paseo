@@ -49,7 +49,9 @@ import {
   useHostRuntimeIsConnected,
   useHostRuntimeSnapshot,
   useHosts,
+  type ActiveConnection,
 } from "@/runtime/host-runtime";
+import { formatRoutedHostLabel } from "@/hosts/connection-label";
 import { ProvidersSection } from "@/screens/settings/providers-section";
 import { HostUsageSection } from "@/usage";
 import { HostAppearanceSection } from "@/screens/settings/host-appearance-section";
@@ -108,8 +110,12 @@ const editProfileIcon = <ThemedProfilePencil size={ICON_SIZE.sm} uniProps={muted
 const removeProfileIcon = <ThemedTrash2 size={ICON_SIZE.sm} uniProps={destructiveColorMapping} />;
 const addProfileIcon = <ThemedPlus size={ICON_SIZE.sm} uniProps={mutedColorMapping} />;
 
-function formatHostConnectionLabel(connection: HostConnection, t: TFunction): string {
-  if (connection.type === "routed") return `Via ${connection.originServerId}`;
+function formatHostConnectionLabel(
+  connection: HostConnection,
+  t: TFunction,
+  hosts: HostProfile[],
+): string {
+  if (connection.type === "routed") return formatRoutedHostLabel(connection.originServerId, hosts);
   if (connection.type === "relay") {
     return `${t("settings.host.badges.relay")} (${connection.relayEndpoint})`;
   }
@@ -123,11 +129,17 @@ function formatHostConnectionLabel(connection: HostConnection, t: TFunction): st
 }
 
 function formatActiveConnectionBadge(
-  activeConnection: { type: HostConnection["type"]; display: string } | null,
+  activeConnection: ActiveConnection | null,
   theme: ReturnType<typeof useUnistyles>["theme"],
   t: TFunction,
+  hosts: HostProfile[],
 ): { icon: React.ReactNode; text: string } | null {
   if (!activeConnection) return null;
+  if (activeConnection.type === "routed")
+    return {
+      icon: <Monitor size={theme.iconSize.sm} color={theme.colors.foregroundMuted} />,
+      text: formatRoutedHostLabel(activeConnection.endpoint, hosts),
+    };
   if (activeConnection.type === "relay") {
     return {
       icon: <Globe size={theme.iconSize.sm} color={theme.colors.foregroundMuted} />,
@@ -175,6 +187,7 @@ function HostNotFound() {
 }
 
 function HostStatusBadges({ serverId }: { serverId: string }) {
+  const hosts = useHosts();
   const { t } = useTranslation();
   const { theme } = useUnistyles();
   const snapshot = useHostRuntimeSnapshot(serverId);
@@ -198,7 +211,7 @@ function HostStatusBadges({ serverId }: { serverId: string }) {
     statusVariant = "error";
     statusDotColor = theme.colors.statusDotDanger;
   }
-  const connectionBadge = formatActiveConnectionBadge(activeConnection, theme, t);
+  const connectionBadge = formatActiveConnectionBadge(activeConnection, theme, t, hosts);
   const versionBadgeText = formatDaemonVersionBadge(daemonVersion);
   const statusDotStyle = useMemo(
     () => [styles.statusDot, { backgroundColor: statusDotColor }],
@@ -394,6 +407,7 @@ export function HostSettingsPage({
 }
 
 function ConnectionsSection({ host }: { host: HostProfile }) {
+  const hosts = useHosts();
   const { t } = useTranslation();
   const { removeConnection } = useHostMutations();
   const snapshot = useHostRuntimeSnapshot(host.serverId);
@@ -412,10 +426,10 @@ function ConnectionsSection({ host }: { host: HostProfile }) {
     (connection: HostConnection) => {
       setPendingRemoveConnection({
         connectionId: connection.id,
-        title: formatHostConnectionLabel(connection, t),
+        title: formatHostConnectionLabel(connection, t, hosts),
       });
     },
-    [t],
+    [t, hosts],
   );
 
   const handleCloseConfirm = useCallback(() => {
@@ -452,6 +466,7 @@ function ConnectionsSection({ host }: { host: HostProfile }) {
             <ConnectionRow
               key={conn.id}
               connection={conn}
+              title={formatHostConnectionLabel(conn, t, hosts)}
               showBorder={index > 0}
               latencyMs={probe?.status === "available" ? probe.latencyMs : undefined}
               latencyLoading={!probe || probe.status === "pending"}
@@ -502,6 +517,7 @@ function ConnectionsSection({ host }: { host: HostProfile }) {
 }
 
 function ConnectionRow({
+  title,
   connection,
   showBorder,
   latencyMs,
@@ -509,6 +525,7 @@ function ConnectionRow({
   latencyError,
   onRemove,
 }: {
+  title: string;
   connection: HostConnection;
   showBorder: boolean;
   latencyMs: number | null | undefined;
@@ -518,7 +535,6 @@ function ConnectionRow({
 }) {
   const { t } = useTranslation();
   const { theme } = useUnistyles();
-  const title = formatHostConnectionLabel(connection, t);
 
   const latencyText = (() => {
     if (latencyLoading) return "...";

@@ -305,6 +305,7 @@ export function upsertHostConnectionInProfiles(input: {
   label?: string;
   connection: HostConnection;
   password?: string;
+  makePreferred?: boolean;
   now?: string;
 }): HostProfile[] {
   const serverId = input.serverId.trim();
@@ -356,6 +357,7 @@ export function upsertHostConnectionInProfiles(input: {
   const nextLifecycle = prev.lifecycle;
   const nextLabel = prev.label === prev.serverId ? derivedLabel : prev.label;
   const nextPreferredConnectionId =
+    !input.makePreferred &&
     prev.preferredConnectionId &&
     nextConnections.some((connection) => connection.id === prev.preferredConnectionId)
       ? prev.preferredConnectionId
