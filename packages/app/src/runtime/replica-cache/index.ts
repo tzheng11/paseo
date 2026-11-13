@@ -396,28 +396,30 @@ const DirectoryCheckpointSchema = z.strictObject({
   agents: DirectoryCursorSchema.optional(),
 });
 
-// Checkpoints describe the cached projection. Version 1 omitted workspace hierarchy, and
-// pre-versioned checkpoints could reference a baseline discarded by an overlapping refresh.
-// Revalidate those directories once without evicting cached rows or timelines.
+// Version 3 certifies a baseline reconciled before live updates advanced its cursor.
+// Older checkpoints could skip unseen parents after an interrupted refresh.
+// Revalidate directories once without evicting cached rows or timelines.
 const StoredDirectoryCheckpointSchema = z.strictObject({
-  version: z.union([z.literal(1), z.literal(2)]),
+  version: z.union([z.literal(1), z.literal(2), z.literal(3)]),
   workspaceFieldsVersion: z.union([z.literal(1), z.literal(2), z.literal(3)]).optional(),
   cursors: DirectoryCheckpointSchema,
 });
 
 function serializeDirectoryCheckpoint(cursors: DirectoryCheckpoint) {
-  return { version: 2 as const, workspaceFieldsVersion: 3 as const, cursors };
+  return { version: 3 as const, workspaceFieldsVersion: 3 as const, cursors };
 }
 
 function deserializeDirectoryCheckpoint(payload: string): DirectoryCheckpoint {
   const stored = parseStoredPayload(StoredDirectoryCheckpointSchema, payload);
+  // COMPAT(directoryBaselineCache): added 2026-11-13; remove after 2027-05-13.
+  if (stored.version < 3) throw new Error("Cached directory baseline requires reconciliation");
   const cursors = { ...stored.cursors };
   // COMPAT(workspaceFieldCache): added in v0.11.3; remove after 2027-04-15.
   // COMPAT(shared-pin-cache): added in v0.13.0-beta.1; remove after 2027-04-22.
   // Earlier workspace rows omitted shared pin placements. Refresh even when
   // its cursor is current, preserving other cached directories and timelines.
   // COMPAT(workspaceSuperpinCache): older rows omitted superpinnedAt while their cursor stayed current.
-  const refreshWorkspaces = stored.version < 2 || stored.workspaceFieldsVersion !== 3;
+  const refreshWorkspaces = stored.workspaceFieldsVersion !== 3;
   if (refreshWorkspaces) delete cursors.workspaces;
   if (refreshWorkspaces && stored.cursors.workspaces && Object.keys(cursors).length === 0) {
     throw new Error("Cached workspace directory requires refresh");

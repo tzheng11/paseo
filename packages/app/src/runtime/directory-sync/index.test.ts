@@ -480,6 +480,80 @@ describe("DirectorySync session readiness", () => {
     directory.dispose();
   });
 
+  it.each([undefined, "g", "old-generation"])(
+    "retains unseen parents after a failed refresh (previous generation: %s)",
+    async (previousGeneration) => {
+      const serverId = `directory-parent-after-failed-baseline-${previousGeneration}`;
+      const { client, directory } = createDirectory(serverId);
+      initializeDirectorySession(serverId, client);
+      useSessionStore.getState().updateSessionServerInfo(serverId, {
+        serverId,
+        hostname: null,
+        version: "test",
+        features: { projectList: true, directorySync: true },
+      });
+      const previousCursor = previousGeneration
+        ? { generation: previousGeneration, afterSeq: 5 }
+        : undefined;
+      if (previousCursor) {
+        client.workspaceResult = {
+          requestId: "baseline",
+          entries: [createWorkspaceEntry("existing")],
+          emptyProjects: [],
+          pageInfo: { hasMore: false, nextCursor: null, prevCursor: null },
+          sync: { ...previousCursor, headSeq: 5, mode: "snapshot", removals: [] },
+        };
+        await directory.refreshWorkspaces({ subscribe: true });
+      }
+      const parent = { ...createWorkspaceEntry("parent"), pinnedAt: "2026-11-13T00:00:00Z" };
+      const child = {
+        ...createWorkspaceEntry("child"),
+        pinnedAt: parent.pinnedAt,
+        pinPlacement: { parentWorkspaceKey: `${serverId}:parent`, siblingOrder: 0, revision: 1 },
+      };
+      const requests: unknown[] = [];
+      client.fetchWorkspaces = async (options?: unknown) => {
+        requests.push(options);
+        // The daemon can legitimately send nothing for a current cursor, even
+        // though this client never accepted the parent at or before that cursor.
+        const cursor = (options as { sync?: { generation?: string; afterSeq?: number } })?.sync;
+        const changes = cursor?.generation === "g";
+        const current = changes && (cursor.afterSeq ?? 0) >= 10;
+        return {
+          requestId: "workspaces",
+          entries: current ? [] : [parent, child],
+          emptyProjects: [],
+          pageInfo: { hasMore: false, nextCursor: null, prevCursor: null },
+          sync: {
+            generation: "g",
+            headSeq: 10,
+            mode: changes ? "changes" : "snapshot",
+            removals: [],
+          },
+        };
+      };
+      client.projectFailures.push(new Error("Project list timed out"));
+      try {
+        await expect(directory.refreshWorkspaces({ subscribe: true })).rejects.toThrow(
+          "Project list timed out",
+        );
+        client.emit({
+          type: "workspace_update",
+          payload: { kind: "upsert", workspace: child, generation: "g", seq: 10 },
+        });
+        expect(useSessionStore.getState().sessions[serverId]?.workspaces.has(child.id)).toBe(true);
+        await directory.refreshWorkspaces({ subscribe: true });
+        expect((requests[1] as { sync: unknown }).sync).toEqual(previousCursor ?? {});
+        expect(useSessionStore.getState().sessions[serverId]?.workspaces.has(parent.id)).toBe(true);
+        expect(
+          useSessionStore.getState().sessions[serverId]?.workspaces.get(child.id)?.pinPlacement,
+        ).toEqual(child.pinPlacement);
+      } finally {
+        directory.dispose();
+      }
+    },
+  );
+
   it.each(directoryRetryStops)(
     "cancels a pending demand retry on $name",
     async ({ name, stop }) => {
@@ -1817,6 +1891,97 @@ function createSqliteCache() {
     },
   };
 }
+
+it("repairs an older persisted cursor that skipped a pinned parent and retains the repaired baseline on reopen", async () => {
+  const serverId = "repair-persisted-missing-parent";
+  serverIds.add(serverId);
+  const { cache, database, storage, reopen } = createSqliteCache();
+  const parent = {
+    ...createWorkspaceEntry("parent"),
+    pinnedAt: "2026-11-13T00:00:00Z",
+    githubRuntime: null,
+  };
+  const child = {
+    ...createWorkspaceEntry("child"),
+    githubRuntime: null,
+    pinnedAt: parent.pinnedAt,
+    pinPlacement: { parentWorkspaceKey: `${serverId}:parent`, siblingOrder: 0, revision: 1 },
+  };
+  const project = normalizeProjectDescriptor(parent);
+  cache.setHosts([serverId]);
+  cache.replaceDirectoryBaseline(serverId, {
+    agents: new Map(),
+    workspaces: new Map([[child.id, normalizeWorkspaceDescriptor(child)]]),
+    projects: new Map([[project.projectId, project]]),
+    checkpoint: { workspaces: { generation: "g", afterSeq: 10 } },
+  });
+  await cache.flush();
+  const [checkpoint] = await storage.read(serverId, ["checkpoint"]);
+  await storage.apply({
+    deletes: [],
+    upserts: [
+      {
+        ...checkpoint!,
+        payload: JSON.stringify({ ...JSON.parse(checkpoint!.payload), version: 2 }),
+      },
+    ],
+  });
+  const reader = reopen();
+  reader.setHosts([serverId]);
+  const client = new FakeDirectoryClient();
+  client.projectResult = {
+    requestId: "projects",
+    projects: [{ ...project, projectKey: project.projectKey ?? undefined }],
+  };
+  client.fetchWorkspaces = async (options?: unknown) => {
+    client.lastWorkspaceOptions = options;
+    const changes = Boolean((options as { sync?: { generation?: string } })?.sync?.generation);
+    return {
+      requestId: "workspaces",
+      entries: changes ? [] : [parent, child],
+      emptyProjects: [],
+      pageInfo: { hasMore: false, nextCursor: null, prevCursor: null },
+      sync: { generation: "g", headSeq: 10, mode: changes ? "changes" : "snapshot", removals: [] },
+    };
+  };
+  const directory = new DirectorySync(
+    serverId,
+    {
+      onAgentStoppedRunning: () => undefined,
+      markAgentLoading: () => undefined,
+      markAgentReady: () => undefined,
+      markAgentError: () => undefined,
+    },
+    reader,
+  );
+  directory.connectionChanged({
+    client: client as unknown as DaemonClient,
+    status: "online",
+    source: { clientGeneration: 1, connectionEpoch: 1 },
+  });
+  initializeDirectorySession(serverId, client);
+  useSessionStore.getState().updateSessionServerInfo(serverId, {
+    serverId,
+    hostname: null,
+    version: "test",
+    features: { projectList: true, directorySync: true },
+  });
+  try {
+    await directory.refreshWorkspaces({ subscribe: true });
+    expect((client.lastWorkspaceOptions as { sync: unknown }).sync).toEqual({});
+    expect(useSessionStore.getState().sessions[serverId]?.workspaces.has(parent.id)).toBe(true);
+    await reader.flush();
+    const reopened = reopen();
+    reopened.setHosts([serverId]);
+    const repaired = await reopened.readDirectory(serverId);
+    expect(repaired.workspaces.has(parent.id)).toBe(true);
+    expect(repaired.workspaces.get(child.id)?.pinPlacement).toEqual(child.pinPlacement);
+    expect(repaired.checkpoint?.workspaces).toEqual({ generation: "g", afterSeq: 10 });
+  } finally {
+    directory.dispose();
+    database.close();
+  }
+});
 
 it("fills every cached workspace beneath live updates received during the SQLite read", async () => {
   const serverId = "sqlite-directory-race";

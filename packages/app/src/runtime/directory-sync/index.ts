@@ -187,6 +187,9 @@ export class DirectorySync {
   private disposed = false;
   private satisfiedDemandSource: DirectorySourceToken | null = null;
   private cursors: DirectoryCheckpoint = {};
+  // A live update can advance only a baseline reconciled on this connection.
+  // One row cannot certify the rest of a missing or interrupted directory.
+  private readonly liveCursorEntities = new Set<keyof DirectoryCheckpoint>();
 
   constructor(
     private readonly serverId: string,
@@ -291,6 +294,7 @@ export class DirectorySync {
   }
 
   private releaseSubscriptions(): void {
+    this.liveCursorEntities.clear();
     this.demandGeneration += 1;
     this.resetDemandRetry();
     for (const subscription of [
@@ -574,6 +578,7 @@ export class DirectorySync {
       };
     }
     const { client, source } = onlineConnection;
+    this.liveCursorEntities.delete("agents");
     const transaction = this.agentTransactions.begin(source, () => ({
       entries: [],
       subscriptionId: null,
@@ -592,6 +597,7 @@ export class DirectorySync {
       }
       this.revision += 1;
       const agents = this.commitAgentSnapshot(completion.snapshot, completion.deltas);
+      this.liveCursorEntities.add("agents");
       this.persistAgentCursors(completion.snapshot, completion.deltas);
       this.persistCheckpoint();
       this.callbacks.markAgentReady();
@@ -618,6 +624,8 @@ export class DirectorySync {
     const onlineConnection = this.getOnlineConnection();
     if (!onlineConnection) return;
     const { client, source } = onlineConnection;
+    this.liveCursorEntities.delete("projects");
+    this.liveCursorEntities.delete("workspaces");
     const transaction = this.workspaceTransactions.begin(source, () => {
       const baseline = this.workspaces.snapshot();
       return {
@@ -941,7 +949,10 @@ export class DirectorySync {
     }
     this.persistWorkspaceChanges(previous, workspaceIds, projectIds);
     for (const [entity, cursor] of Object.entries(completion.snapshot.syncCursors ?? {})) {
-      if (cursor) this.writeCursor(entity as "projects" | "workspaces", cursor);
+      if (cursor) {
+        this.writeCursor(entity as "projects" | "workspaces", cursor);
+        this.liveCursorEntities.add(entity as "projects" | "workspaces");
+      }
     }
     for (const delta of completion.deltas) {
       if (delta.kind === "script_status") continue;
@@ -1000,6 +1011,8 @@ export class DirectorySync {
     payload: { generation?: string; seq?: number },
   ): void {
     if (!payload.generation || payload.seq === undefined) return;
+    if (!this.liveCursorEntities.has(entity)) return;
+    if (this.cursors[entity]?.generation !== payload.generation) return;
     this.writeCursor(entity, {
       generation: payload.generation,
       afterSeq: payload.seq,
