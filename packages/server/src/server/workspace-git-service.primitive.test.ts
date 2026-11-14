@@ -9,6 +9,7 @@ import type { CurrentPullRequestStatus, ForgeService } from "../services/forge-s
 import { defaultForgeRegistry } from "../services/forge-registry.js";
 import {
   getCheckoutDiff as getCheckoutDiffUncached,
+  getCheckoutIdentity as getCheckoutIdentityUncached,
   getCheckoutSnapshotFacts as getCheckoutSnapshotFactsUncached,
   getCheckoutStatus as getCheckoutStatusUncached,
   resolveAbsoluteGitDir as resolveAbsoluteGitDirReal,
@@ -1975,6 +1976,7 @@ describe("WorkspaceGitServiceImpl D2 read methods", () => {
     ];
     const listPaseoWorktrees = vi.fn(async () => worktrees);
     const service = createService({
+      getCheckoutIdentity: getCheckoutIdentityUncached as never,
       getCheckoutSnapshotFacts: getCheckoutSnapshotFactsUncached as never,
       getCheckoutStatus: getCheckoutStatusUncached as never,
       listPaseoWorktrees,
@@ -2027,35 +2029,45 @@ describe("WorkspaceGitServiceImpl D2 read methods", () => {
     service.dispose();
   });
 
-  test("resolveRepoRoot cold-loads, warms, forces, and coalesces through snapshots", async () => {
-    let nowMs = 0;
-    const checkoutDeferred = createDeferred<CheckoutStatusGit>();
-    const getCheckoutStatus = vi
-      .fn()
-      .mockImplementationOnce(async () => checkoutDeferred.promise)
-      .mockResolvedValue(createCheckoutStatus(REPO_CWD));
-    const service = createService({
-      getCheckoutStatus,
-      now: () => new Date(nowMs),
-    });
+  test("resolveRepoRoot reads checkout identity and never waits on an in-flight snapshot refresh", async () => {
+    const refreshDeferred = createDeferred<CheckoutStatusGit>();
+    const getCheckoutStatus = vi.fn(async () => refreshDeferred.promise);
+    const service = createService({ getCheckoutStatus });
 
-    const first = service.resolveRepoRoot(REPO_CWD);
-    const second = service.resolveRepoRoot(join(REPO_CWD, "."));
+    void service.getSnapshot(REPO_CWD).catch(() => undefined);
     await vi.waitFor(() => {
       expect(getCheckoutStatus).toHaveBeenCalledTimes(1);
     });
-    await flushPromises();
+
+    await expect(
+      Promise.all([
+        service.resolveRepoRoot(REPO_CWD),
+        service.resolveRepoRoot(join(REPO_CWD, ".")),
+      ]),
+    ).resolves.toEqual([REPO_CWD, REPO_CWD]);
     expect(getCheckoutStatus).toHaveBeenCalledTimes(1);
-    checkoutDeferred.resolve(createCheckoutStatus(REPO_CWD));
-    await expect(Promise.all([first, second])).resolves.toEqual([REPO_CWD, REPO_CWD]);
 
-    nowMs = 1_000;
-    await service.resolveRepoRoot(REPO_CWD);
-    expect(getCheckoutStatus).toHaveBeenCalledTimes(1);
+    refreshDeferred.resolve(createCheckoutStatus(REPO_CWD));
+    service.dispose();
+  });
 
-    await service.resolveRepoRoot(REPO_CWD, { force: true, reason: "test" });
-    expect(getCheckoutStatus).toHaveBeenCalledTimes(2);
+  test("resolveRepoRoot resolves a Paseo worktree to its main repository and refuses a non-Git directory", async () => {
+    const worktree = join(REPO_CWD, "..", "worktrees", "feature");
+    const service = createService({
+      getCheckoutIdentity: vi.fn(async (cwd: string) =>
+        cwd === REPO_CWD
+          ? { isGit: false }
+          : createCheckoutFacts(cwd, {
+              paseoWorktree: { isPaseoOwnedWorktree: true, worktreeRoot: cwd },
+              mainRepoRoot: "/tmp/main-repo",
+            }),
+      ),
+    });
 
+    await expect(service.resolveRepoRoot(worktree)).resolves.toBe("/tmp/main-repo");
+    await expect(service.resolveRepoRoot(REPO_CWD)).rejects.toThrow(
+      "Create worktree requires a git repository",
+    );
     service.dispose();
   });
 
