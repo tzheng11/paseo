@@ -45,6 +45,12 @@ const RecordSchema = z.object({
   inFlight: z.enum(["workspace", "agent", "prompt"]).nullable(),
 });
 type Record = z.infer<typeof RecordSchema>;
+/** Codes thrown before provisioning creates anything, so the same key can retry. */
+const REJECTED_BEFORE_PROVISION = new Set([
+  "directory_not_found",
+  "source_required",
+  "worktree_preparation_timeout",
+]);
 
 /** Owns creation across socket lifetimes. Resource owners perform work; this module commits its milestones. */
 export class CreationService {
@@ -198,10 +204,9 @@ export class CreationService {
         error instanceof Error && "code" in error && typeof error.code === "string"
           ? error.code
           : undefined;
-      const rejectedBeforeProvision = code === "directory_not_found" || code === "source_required";
       const unknown =
         stage === "prompt" ||
-        (stage === "workspace" && !rejectedBeforeProvision) ||
+        (stage === "workspace" && !REJECTED_BEFORE_PROVISION.has(code ?? "")) ||
         (resourceId !== null && (await input.exists(stage, resourceId)));
       // A failed provider startup with no registered resource can retry under the same ID.
       // A partially provisioned resource or an attempted prompt needs reconciliation.

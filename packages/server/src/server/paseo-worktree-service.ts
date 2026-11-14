@@ -8,7 +8,8 @@ import { getRealpathAwareRelativePath } from "../utils/path.js";
 import type { PersistedWorkspaceRecord } from "./workspace-registry.js";
 import type { WorkspaceProvisioningService } from "./session/workspace-provisioning/workspace-provisioning-service.js";
 import {
-  createWorktreeCore,
+  createPreparedWorktree,
+  prepareWorktreeCreation,
   type CreateWorktreeCoreDeps,
   type CreateWorktreeCoreInput,
 } from "./worktree-core.js";
@@ -68,6 +69,20 @@ export interface CreatePaseoWorktreeDeps extends CreateWorktreeCoreDeps {
   workspaceGitService: WorkspaceGitService;
   workspaceProvisioning: Pick<WorkspaceProvisioningService, "createWorkspaceForWorktree"> &
     Partial<Pick<WorkspaceProvisioningService, "assertCreationAllowed">>;
+  preparationTimeoutMs?: number;
+}
+
+export const WORKTREE_PREPARATION_TIMEOUT_MS = 2 * 60_000;
+
+/** Preparation has no Git command timeout of its own; a create must not wait on it forever. */
+export class WorktreePreparationTimeoutError extends Error {
+  readonly code = "worktree_preparation_timeout";
+  constructor(timeoutMs: number) {
+    super(
+      `Worktree creation timed out after ${Math.round(timeoutMs / 1000)}s before git worktree add started; nothing was created. Retry the create.`,
+    );
+    this.name = "WorktreePreparationTimeoutError";
+  }
 }
 
 export async function createPaseoWorktree(
@@ -82,8 +97,15 @@ async function createPaseoWorktreeWithPriority(
   input: CreatePaseoWorktreeInput,
   deps: CreatePaseoWorktreeDeps,
 ): Promise<CreatePaseoWorktreeResult> {
-  const workspaceCwdPlan = await planWorkspaceCwdForWorktree(input.cwd, deps.workspaceGitService);
-  const createdWorktree = await createWorktreeCore(input, deps);
+  const { workspaceCwdPlan, prepared } = await withPreparationDeadline(
+    (async () => ({
+      workspaceCwdPlan: await planWorkspaceCwdForWorktree(input.cwd, deps.workspaceGitService),
+      prepared: await prepareWorktreeCreation(input, deps),
+    }))(),
+    deps.preparationTimeoutMs ?? WORKTREE_PREPARATION_TIMEOUT_MS,
+  );
+  // Only reached before the deadline, so an abandoned preparation never adds a worktree late.
+  const createdWorktree = await createPreparedWorktree(prepared, input);
   try {
     if (createdWorktree.created) {
       await deps.lifecycle?.wait("worktree.create.after", {
@@ -161,6 +183,18 @@ async function createPaseoWorktreeWithPriority(
       },
       error,
     );
+  }
+}
+
+async function withPreparationDeadline<T>(preparation: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new WorktreePreparationTimeoutError(timeoutMs)), timeoutMs);
+  });
+  try {
+    return await Promise.race([preparation, deadline]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -285,7 +319,7 @@ async function findAvailableBranchName(options: {
 }
 
 async function maybeMarkFirstAgentBranchAutoNameEligible(options: {
-  createdWorktree: Awaited<ReturnType<typeof createWorktreeCore>>;
+  createdWorktree: Awaited<ReturnType<typeof createPreparedWorktree>>;
 }): Promise<void> {
   const { createdWorktree } = options;
   if (!createdWorktree.created || createdWorktree.intent.kind !== "branch-off") {
