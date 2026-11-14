@@ -50,17 +50,53 @@ export interface CreateWorktreeCoreResult {
   created: boolean;
 }
 
+export interface PreparedWorktreeCreation {
+  repoRoot: string;
+  intent: WorktreeCreationIntent;
+  slug: string;
+  path: string;
+}
+
 export async function createWorktreeCore(
   input: CreateWorktreeCoreInput,
   deps: CreateWorktreeCoreDeps,
 ): Promise<CreateWorktreeCoreResult> {
-  return runWithGitCommandPriority("high", () => createWorktreeCoreWithPriority(input, deps));
+  return runWithGitCommandPriority("high", async () =>
+    createPreparedWorktree(await prepareWorktreeCreationWithPriority(input, deps), input),
+  );
 }
 
-async function createWorktreeCoreWithPriority(
+/** Resolves everything `git worktree add` needs. Creates nothing. */
+export async function prepareWorktreeCreation(
   input: CreateWorktreeCoreInput,
   deps: CreateWorktreeCoreDeps,
+): Promise<PreparedWorktreeCreation> {
+  return runWithGitCommandPriority("high", () => prepareWorktreeCreationWithPriority(input, deps));
+}
+
+export async function createPreparedWorktree(
+  prepared: PreparedWorktreeCreation,
+  input: Pick<CreateWorktreeCoreInput, "paseoHome" | "worktreesRoot">,
 ): Promise<CreateWorktreeCoreResult> {
+  return {
+    worktree: await createWorktree({
+      cwd: prepared.repoRoot,
+      worktreeSlug: prepared.slug,
+      worktreePath: prepared.path,
+      source: prepared.intent,
+      paseoHome: input.paseoHome,
+      worktreesRoot: input.worktreesRoot,
+    }),
+    intent: prepared.intent,
+    repoRoot: prepared.repoRoot,
+    created: true,
+  };
+}
+
+async function prepareWorktreeCreationWithPriority(
+  input: CreateWorktreeCoreInput,
+  deps: CreateWorktreeCoreDeps,
+): Promise<PreparedWorktreeCreation> {
   const repoRoot = await resolveWorktreeRepoRoot(input, deps.workspaceGitService);
   const requestedWorktreeSlug = input.worktreeSlug
     ? normalizeWorktreeSlug(input.worktreeSlug)
@@ -94,7 +130,7 @@ async function createWorktreeCoreWithPriority(
   }
 
   const forge = await resolveForge(repoRoot, deps, intentInput);
-  let intent = await resolveWorktreeCreationIntent(intentInput, repoRoot, {
+  const intent = await resolveWorktreeCreationIntent(intentInput, repoRoot, {
     forge: forge.forge,
     forgeService: forge.service,
     resolveDefaultBranch: (root) => resolveDefaultBranch(root, deps),
@@ -137,21 +173,12 @@ async function createWorktreeCoreWithPriority(
   const transformed = deps.lifecycle
     ? await deps.lifecycle.before("worktree.create.before", request)
     : request;
-  normalizedSlug = validateWorktreeSlug(transformed.slug);
-  intent = creationIntentFromRequest(transformed, intent);
-
+  const slug = validateWorktreeSlug(transformed.slug);
   return {
-    worktree: await createWorktree({
-      cwd: repoRoot,
-      worktreeSlug: normalizedSlug,
-      worktreePath: transformed.path,
-      source: intent,
-      paseoHome: input.paseoHome,
-      worktreesRoot: input.worktreesRoot,
-    }),
-    intent,
     repoRoot,
-    created: true,
+    intent: creationIntentFromRequest(transformed, intent),
+    slug,
+    path: transformed.path,
   };
 }
 
