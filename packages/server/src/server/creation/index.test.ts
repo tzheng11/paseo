@@ -322,3 +322,81 @@ test("observer failures are logged without failing creation", async () => {
     }),
   );
 });
+
+test("startup fails creates a stopped daemon left in flight and never reruns them", async () => {
+  const f = await fixture();
+  const stoppedDirectory = await mkdtemp(join(tmpdir(), "creation-interrupted-"));
+  directories.push(stoppedDirectory);
+  const done = {
+    ...f.input,
+    key: "done",
+    workspaceId: undefined,
+    hasAgent: false,
+    agentId: undefined,
+  };
+  done.provision = async (id) => ({ workspace: { ...workspace, id } });
+  await f.service.create(done);
+  let provisions = 0;
+  f.input.provision = async () => {
+    provisions++;
+    // Capture the durable state a daemon leaves when it stops mid-provision.
+    await cp(f.directory, stoppedDirectory, { recursive: true });
+    return { workspace };
+  };
+  f.provider.resolve();
+  await f.service.create(f.input);
+
+  const restarted = new CreationService(stoppedDirectory, silentLogger);
+  expect(await restarted.failInterrupted()).toBe(1);
+  const interrupted = {
+    phase: "failed",
+    errorCode: "workspace_request_interrupted",
+    error: expect.stringContaining("interrupted and will not resume"),
+    failedStage: "workspace",
+    outcomeUnknown: true,
+  };
+  const subscription = await restarted.subscribe("workspace", f.input.key, () => {});
+  expect(subscription.snapshot).toMatchObject(interrupted);
+  subscription.unsubscribe();
+  expect(await restarted.create(f.input)).toMatchObject(interrupted);
+  expect(await new CreationService(stoppedDirectory, silentLogger).failInterrupted()).toBe(0);
+  expect(provisions).toBe(1);
+  const completed = await restarted.subscribe("workspace", "done", () => {});
+  expect(completed.snapshot).toMatchObject({ phase: "completed", error: null });
+  completed.unsubscribe();
+});
+
+test("the startup sweep leaves a create this daemon is still running alone", async () => {
+  const f = await fixture();
+  const running = f.service.create(f.input, f.observe);
+  await f.ready.promise;
+  expect(await f.service.failInterrupted()).toBe(0);
+  f.provider.resolve();
+  expect(await running).toMatchObject({ phase: "completed", error: null });
+});
+
+test("an unreadable record is logged and skipped without blocking the startup sweep", async () => {
+  const f = await fixture();
+  const stoppedDirectory = await mkdtemp(join(tmpdir(), "creation-unreadable-"));
+  directories.push(stoppedDirectory);
+  f.input.provision = async () => {
+    await cp(f.directory, stoppedDirectory, { recursive: true });
+    return { workspace };
+  };
+  f.provider.resolve();
+  await f.service.create(f.input);
+  const unreadable = join(stoppedDirectory, `${"0".repeat(64)}.json`);
+  await writeFile(unreadable, "{ truncated");
+  const logs: Array<{ level: number; msg: string; file?: string; err?: { message: string } }> = [];
+  const logger = pino({ level: "error" }, { write: (line) => void logs.push(JSON.parse(line)) });
+
+  expect(await new CreationService(stoppedDirectory, logger).failInterrupted()).toBe(1);
+  expect(logs).toEqual([
+    expect.objectContaining({
+      level: 50,
+      msg: "Skipped unreadable creation record at startup",
+      file: unreadable,
+      err: expect.objectContaining({ message: expect.stringContaining("JSON") }),
+    }),
+  ]);
+});
