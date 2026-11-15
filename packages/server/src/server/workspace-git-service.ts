@@ -268,7 +268,7 @@ export interface WorkspaceGitService {
   ): Promise<WorkspaceGitWorktreeInfo[]>;
   invalidateWorktrees(): void;
   getProjectSlug(cwd: string, options?: WorkspaceGitReadOptions): Promise<string>;
-  resolveRepoRoot(cwd: string, options?: WorkspaceGitReadOptions): Promise<string>;
+  resolveRepoRoot(cwd: string): Promise<string>;
   resolveDefaultBranch(cwdOrRepoRoot: string, options?: WorkspaceGitReadOptions): Promise<string>;
   resolveRepoRemoteUrl(cwd: string, options?: WorkspaceGitReadOptions): Promise<string | null>;
   refresh(cwd: string, options?: { priority?: "normal" | "high" }): Promise<void>;
@@ -1162,7 +1162,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     options?: WorkspaceGitReadOptions,
   ): Promise<WorkspaceGitWorktreeInfo[]> {
     this.assertNotDisposed();
-    const repoRoot = await this.resolveRepoRoot(cwdOrRepoRoot, options);
+    const repoRoot = await this.resolveRepoRoot(cwdOrRepoRoot);
     const key = JSON.stringify(["worktrees", repoRoot]);
     return this.readAuxiliaryCache(this.worktreeListCache, key, options, () =>
       this.deps.listPaseoWorktrees({
@@ -1173,15 +1173,14 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     );
   }
 
-  async resolveRepoRoot(cwd: string, options?: WorkspaceGitReadOptions): Promise<string> {
-    const snapshot = await this.getSnapshot(cwd, options);
-    if (!snapshot.git.isGit) {
+  async resolveRepoRoot(cwd: string): Promise<string> {
+    // Identity only: a busy checkout's snapshot refresh can stay in flight indefinitely.
+    const checkout = await this.getCheckout(cwd);
+    if (!checkout.isGit) {
       throw new Error("Create worktree requires a git repository");
     }
 
-    return snapshot.git.isPaseoOwnedWorktree
-      ? (snapshot.git.mainRepoRoot ?? snapshot.git.repoRoot ?? resolve(cwd))
-      : (snapshot.git.repoRoot ?? resolve(cwd));
+    return checkout.isPaseoOwnedWorktree ? checkout.mainRepoRoot : checkout.worktreeRoot;
   }
 
   invalidateWorktrees(): void {

@@ -1166,6 +1166,13 @@ export class VoiceAssistantWebSocketServer {
     this.connectionLifecycle = "stopping";
   }
 
+  /** Run once at startup, before connections: a restart ends every create still in flight. */
+  public async failInterruptedCreations(): Promise<void> {
+    const interrupted = await this.creationService.failInterrupted();
+    if (interrupted > 0)
+      this.logger.warn({ interrupted }, "Failed creates interrupted by the previous daemon");
+  }
+
   public beginAcceptingConnections(): void {
     if (this.connectionLifecycle === "starting") {
       this.connectionLifecycle = "accepting";

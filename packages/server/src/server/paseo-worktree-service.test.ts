@@ -17,6 +17,7 @@ import { createTestLogger } from "../test-utils/test-logger.js";
 import {
   attemptFirstAgentBranchAutoName,
   createPaseoWorktree,
+  WorktreePreparationTimeoutError,
   type CreatePaseoWorktreeDeps,
 } from "./paseo-worktree-service.js";
 import { readPaseoWorktreeMetadata } from "../utils/worktree-metadata.js";
@@ -48,6 +49,48 @@ afterEach(() => {
   for (const target of cleanupPaths.splice(0)) {
     rmSync(target, { recursive: true, force: true });
   }
+});
+
+test("a preparation that never settles fails readably and never adds the worktree late", async () => {
+  const { repoDir, tempDir } = createGitRepo();
+  cleanupPaths.push(tempDir);
+  const deps = createDeps();
+  let releaseRepoRoot!: (root: string) => void;
+  deps.workspaceGitService.resolveRepoRoot = () =>
+    new Promise((resolve) => {
+      releaseRepoRoot = resolve;
+    });
+  let preparedLate!: () => void;
+  const preparationFinished = new Promise<void>((resolve) => {
+    preparedLate = resolve;
+  });
+  deps.lifecycle = {
+    before: async (_hook, request) => {
+      preparedLate();
+      return request;
+    },
+    wait: async () => {},
+  };
+  deps.preparationTimeoutMs = 50;
+
+  const error = await createPaseoWorktree(
+    { cwd: repoDir, worktreeSlug: "late", paseoHome: path.join(tempDir, ".paseo") },
+    deps,
+  ).catch((caught: unknown) => caught);
+  expect(error).toBeInstanceOf(WorktreePreparationTimeoutError);
+  expect(error).toMatchObject({
+    code: "worktree_preparation_timeout",
+    message: expect.stringContaining("nothing was created"),
+  });
+
+  releaseRepoRoot(repoDir);
+  await preparationFinished;
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const git = (...args: string[]) =>
+    execFileSync("git", args, { cwd: repoDir, stdio: "pipe" }).toString();
+  expect(git("worktree", "list", "--porcelain").match(/^worktree /gm)).toHaveLength(1);
+  expect(git("branch", "--list", "late")).toBe("");
+  expect(deps.workspaces.size).toBe(0);
 });
 
 test("creates a worktree and registers it in the source workspace project without git snapshot lookup", async () => {
