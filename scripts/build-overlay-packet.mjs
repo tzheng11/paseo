@@ -114,17 +114,29 @@ export function assertFreshIdentity(identity, current) {
   if (sha(JSON.stringify(payload)) !== buildId)
     throw new Error("Fresh runtime build identity hash mismatch");
 }
-async function permissions(root, writable) {
+export async function setPacketPermissions(root, writable) {
+  await chmod(root, writable ? 0o755 : 0o555);
   for (const name of await readdir(root)) {
     const file = path.join(root, name);
     const info = await lstat(file);
     if (info.isSymbolicLink()) continue;
     if (info.isDirectory()) {
       await chmod(file, writable ? 0o755 : 0o555);
-      await permissions(file, writable);
-    } else if (!writable) await chmod(file, info.mode & 0o111 ? 0o555 : 0o444);
+      await setPacketPermissions(file, writable);
+    } else if (!writable) await chmod(file, info.mode & 0o555);
   }
 }
+export async function discardPacketStage(directory) {
+  try {
+    await lstat(directory);
+  } catch (error) {
+    if (error.code === "ENOENT") return;
+    throw error;
+  }
+  await setPacketPermissions(directory, true);
+  await rm(directory, { recursive: true, force: true });
+}
+
 async function command(program, args, options) {
   await new Promise((resolve, reject) => {
     const child = spawn(program, args, { ...options, stdio: "inherit", shell: false });
@@ -317,7 +329,7 @@ export async function buildOverlayPacket(options) {
   try {
     await cp(base, stage, { recursive: true, dereference: false, verbatimSymlinks: true });
     await chmod(stage, 0o755);
-    await permissions(stage, true);
+    await setPacketPermissions(stage, true);
     const freshRoots = packages.map((name) => `runtime/packages/${name}/dist`);
     for (const name of packages) {
       const destination = path.join(stage, "runtime/packages", name, "dist");
@@ -343,7 +355,7 @@ export async function buildOverlayPacket(options) {
       inside(repo, path.resolve(repo, relative));
       await verifyClosurePath(repo, path.join(stage, "runtime"), relative);
     }
-    await permissions(stage, false);
+    await setPacketPermissions(stage, false);
     const entries = await packetEntries(stage);
     const changed = entries
       .filter((entry) => JSON.stringify(entry) !== JSON.stringify(baseByPath.get(entry.path)))
@@ -399,7 +411,8 @@ export async function buildOverlayPacket(options) {
       removed: removed.length,
     };
   } finally {
-    await rm(temporary, { recursive: true, force: true });
+    // Thaw only this owned temporary tree; sealed directories otherwise mask the build error.
+    await discardPacketStage(temporary);
   }
 }
 

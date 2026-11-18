@@ -1,6 +1,16 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile, rm, symlink, cp, readlink } from "node:fs/promises";
+import {
+  mkdtemp,
+  mkdir,
+  writeFile,
+  rm,
+  symlink,
+  cp,
+  readlink,
+  chmod,
+  lstat,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -10,6 +20,8 @@ import {
   assertOverlayCompatibility,
   assertFreshIdentity,
   verifyClosurePath,
+  setPacketPermissions,
+  discardPacketStage,
 } from "./build-overlay-packet.mjs";
 
 async function fixture(action) {
@@ -25,7 +37,7 @@ async function fixture(action) {
     const manifest = { entries: await packetEntries(root) };
     await action(root, manifest);
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await discardPacketStage(root);
   }
 }
 
@@ -151,5 +163,23 @@ test("trace closure accepts directories and refuses mismatched types and link ta
     } finally {
       await rm(copied, { recursive: true, force: true });
     }
+  });
+});
+
+test("sealing preserves audited read/execute bits and cleanup cannot mask the original failure", async () => {
+  await fixture(async (root) => {
+    const file = path.join(root, "runtime/packages/example/dist/entry.js");
+    await chmod(file, 0o554);
+    const expected = await packetEntries(root);
+    await setPacketPermissions(root, false);
+    assert.equal((await lstat(file)).mode & 0o777, 0o554);
+    assert.deepEqual(await verifyPacket(root, { entries: expected }), expected);
+    await assert.rejects(async () => {
+      try {
+        throw new Error("original closure refusal");
+      } finally {
+        await discardPacketStage(root);
+      }
+    }, /original closure refusal/);
   });
 });
