@@ -114,7 +114,13 @@ export function assertFreshIdentity(identity, current) {
   if (sha(JSON.stringify(payload)) !== buildId)
     throw new Error("Fresh runtime build identity hash mismatch");
 }
+export async function assertPacketDirectory(directory) {
+  if (!(await lstat(directory)).isDirectory())
+    throw new Error("Packet root requires a nonsymlink directory");
+}
+
 export async function setPacketPermissions(root, writable) {
+  await assertPacketDirectory(root);
   await chmod(root, writable ? 0o755 : 0o555);
   for (const name of await readdir(root)) {
     const file = path.join(root, name);
@@ -126,6 +132,14 @@ export async function setPacketPermissions(root, writable) {
     } else if (!writable) await chmod(file, info.mode & 0o555);
   }
 }
+export async function publishPacketStage(stage, packet) {
+  await assertPacketDirectory(stage);
+  // Darwin needs the owned root writable for a move between parent directories.
+  await chmod(stage, 0o755);
+  await rename(stage, packet);
+  await chmod(packet, 0o555);
+}
+
 export async function discardPacketStage(directory) {
   try {
     await lstat(directory);
@@ -186,6 +200,7 @@ async function verifyWeb(directory, current) {
 async function qualifyOverlaySource(options) {
   const repo = path.resolve(options.repo);
   const base = path.resolve(options.base);
+  await assertPacketDirectory(base);
   const git = async (...args) => (await exec("git", args, { cwd: repo })).stdout.trim();
   if (await git("status", "--porcelain", "--untracked-files=normal"))
     throw new Error("Packet source must be clean");
@@ -396,7 +411,7 @@ export async function buildOverlayPacket(options) {
     await writeFile(path.join(stage, "manifest.json"), `${JSON.stringify(result, null, 2)}\n`);
     await chmod(path.join(stage, "manifest.json"), 0o444);
     await verifyPacket(stage, result);
-    await rename(stage, packet);
+    await publishPacketStage(stage, packet);
     await exec("tar", ["-czf", `${archive}.partial`, "-C", output, path.basename(packet)]);
     await rename(`${archive}.partial`, archive);
     return {

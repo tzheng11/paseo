@@ -4,6 +4,7 @@ import {
   mkdtemp,
   mkdir,
   writeFile,
+  readFile,
   rm,
   symlink,
   cp,
@@ -22,6 +23,8 @@ import {
   verifyClosurePath,
   setPacketPermissions,
   discardPacketStage,
+  assertPacketDirectory,
+  publishPacketStage,
 } from "./build-overlay-packet.mjs";
 
 async function fixture(action) {
@@ -181,5 +184,41 @@ test("sealing preserves audited read/execute bits and cleanup cannot mask the or
         await discardPacketStage(root);
       }
     }, /original closure refusal/);
+  });
+});
+
+test("sealed packets publish across parent directories and survive staging cleanup", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "paseo-overlay-publish-"));
+  try {
+    const temporary = path.join(root, "temporary");
+    const stage = path.join(temporary, "packet");
+    const published = path.join(root, "published");
+    await mkdir(stage, { recursive: true });
+    await writeFile(path.join(stage, "payload.js"), "fixture\n");
+    await chmod(path.join(stage, "payload.js"), 0o554);
+    await setPacketPermissions(stage, false);
+    const entries = await packetEntries(stage);
+    await publishPacketStage(stage, published);
+    assert.equal((await lstat(published)).mode & 0o777, 0o555);
+    assert.equal((await lstat(path.join(published, "payload.js"))).mode & 0o777, 0o554);
+    await discardPacketStage(temporary);
+    assert.equal(await readFile(path.join(published, "payload.js"), "utf8"), "fixture\n");
+    assert.deepEqual(await verifyPacket(published, { entries }), entries);
+  } finally {
+    await discardPacketStage(root);
+  }
+});
+
+test("a symlink at the base or permission root refuses before the qualified tree can change", async () => {
+  await fixture(async (root, manifest) => {
+    const alias = `${root}-alias`;
+    try {
+      await symlink(root, alias);
+      await assert.rejects(assertPacketDirectory(alias), /nonsymlink directory/);
+      await assert.rejects(setPacketPermissions(alias, true), /nonsymlink directory/);
+      assert.deepEqual(await verifyPacket(root, manifest), manifest.entries);
+    } finally {
+      await rm(alias, { force: true });
+    }
   });
 });
