@@ -4171,6 +4171,7 @@ describe("canonical sidebar moves through MCP", () => {
   let beforeNativeRead: (() => Promise<void>) | undefined;
   let nativeEpoch: string | undefined;
   let unknownOwner = false;
+  let restrictedClient: () => Promise<Client>;
   const mode = {
     role: "authority" as const,
     semanticsVersion: 2 as const,
@@ -4275,7 +4276,7 @@ describe("canonical sidebar moves through MCP", () => {
     registry = new CanonicalWorkspaceRegistry(file, logger, layout, "local");
     await registry.initialize();
     const { agentManager, agentStorage } = createTestDeps();
-    const server = await createAgentMcpServer({
+    const serverOptions: Parameters<typeof createAgentMcpServer>[0] = {
       agentManager,
       agentStorage,
       serverId: "local",
@@ -4343,7 +4344,16 @@ describe("canonical sidebar moves through MCP", () => {
         },
       }),
       logger,
-    });
+    };
+    const server = await createAgentMcpServer(serverOptions);
+    restrictedClient = async () =>
+      connectInMemoryMcpClient(
+        await createAgentMcpServer({
+          ...serverOptions,
+          callerAgentId: "restricted-caller",
+          resolveCallerContext: () => ({ lockedCwd: home }),
+        }),
+      );
     client = await connectInMemoryMcpClient(server);
   });
   afterEach(async () => {
@@ -4365,6 +4375,46 @@ describe("canonical sidebar moves through MCP", () => {
     if (!found) throw new Error(`Missing fixture ${key}`);
     return found;
   }
+
+  it("preserves locked caller scope before canonical remote-source or parent reads and writes", async () => {
+    const restricted = await restrictedClient();
+    const before = await layout.inspect();
+    const commit = vi.spyOn(layout, "commit");
+    const inspect = vi.spyOn(layout, "inspect");
+    try {
+      const remote = await restricted.callTool({
+        name: "move_workspace",
+        arguments: {
+          serverId: "peer",
+          workspaceId: "coordinator",
+          parentWorkspaceKey: null,
+          siblingOrder: 2048,
+        },
+      });
+      expect(remote).toMatchObject({
+        isError: true,
+        structuredContent: {
+          error: expect.stringContaining("restricted to its local working directory"),
+        },
+      });
+      expect(inspect).not.toHaveBeenCalled();
+      const remoteParent = await restricted.callTool({
+        name: "move_workspace",
+        arguments: { workspaceId: "worker", parentWorkspaceKey: "peer:coordinator" },
+      });
+      expect(remoteParent).toMatchObject({
+        isError: true,
+        structuredContent: {
+          error: expect.stringContaining("restricted to its local working directory"),
+        },
+      });
+      expect(commit).not.toHaveBeenCalled();
+      expect(reads).toEqual([]);
+      expect(await layout.inspect()).toEqual(before);
+    } finally {
+      await restricted.close();
+    }
+  });
 
   it("moves an online worker below a coordinator on another host with an unrelated enabled host offline, atomically inheriting the subtree section", async () => {
     const before = await layout.inspect();

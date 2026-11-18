@@ -961,6 +961,7 @@ function createToolCatalog(
     destination: string | undefined,
     context: PaseoToolExecutionContext,
   ): Promise<PaseoToolResult> {
+    hostResolver.assertAllowed(destination);
     const layout = options.workspaceLayoutService!;
     // inspect reaches the pinned authority; a last replica snapshot is never move authority.
     const snapshot = await layout.inspect();
@@ -1024,6 +1025,8 @@ function createToolCatalog(
     context: PaseoToolExecutionContext,
   ) {
     const self = options.serverId ?? "self";
+    for (const owner of new Set(affected.map((entry) => entry.ref.serverId)))
+      hostResolver.assertAllowed(owner);
     const hosts = options.hosts?.();
     const directory = await hosts?.directory();
     assertCanonicalCoverage(snapshot, directory);
