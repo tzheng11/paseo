@@ -326,6 +326,7 @@ const StoredWorkspaceSchema = z.strictObject({
   title: z.string().nullable(),
   pinnedAt: z.string().nullable(),
   superpinnedAt: z.string().nullable().optional(),
+  effectiveSection: z.enum(["unpinned", "pinned", "superpinned"]).nullable().optional(),
   // Optional because entries written before labels existed have none. A cached workspace that
   // dropped them painted its row without its chips and stayed that way: the directory cursor is
   // current on reconnect, so the daemon has nothing newer to send back.
@@ -744,6 +745,9 @@ function serializeWorkspace(workspace: WorkspaceDescriptor): StoredWorkspace {
     title: workspace.title ?? null,
     pinnedAt: workspace.pinnedAt ?? null,
     superpinnedAt: workspace.superpinnedAt ?? null,
+    ...(workspace.effectiveSection !== undefined
+      ? { effectiveSection: workspace.effectiveSection }
+      : {}),
     labels: workspace.labels,
     fieldValues: workspace.fieldValues ?? {},
     status: workspace.status,

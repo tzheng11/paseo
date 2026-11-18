@@ -3,6 +3,17 @@ import { z } from "zod";
 const IdSchema = z.string().min(1).max(512);
 const RevisionSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const TimestampSchema = z.string().datetime({ offset: true });
+const SectionSchema = z.enum(["unpinned", "pinned", "superpinned"]);
+export const WorkspaceSectionIntentSchema = z.object({
+  mode: z.enum(["legacy", "inherit", "explicit"]),
+  baselineSection: SectionSchema,
+  baselineParentWorkspaceKey: IdSchema.nullable(),
+});
+export const WorkspaceOwnerDomainSchema = z.object({
+  serverId: IdSchema,
+  state: z.enum(["unknown", "adopted"]),
+  revision: RevisionSchema,
+});
 
 export const WorkspaceReferenceSchema = z.object({
   serverId: IdSchema,
@@ -17,12 +28,16 @@ export const WorkspaceLayoutConfigSchema = WorkspaceLayoutIdentitySchema.extend(
   role: z.enum(["authority", "replica"]),
   // SHA256 of the UTF-8 daemonPublicKeyB64 string in the key-bound relay offer.
   authorityKeySha256: z.string().regex(/^[a-f0-9]{64}$/),
+  semanticsVersion: z.literal(2).optional(),
 });
 export const WORKSPACE_LAYOUT_MODE_FILENAME = "workspace-layout-mode.json";
 export const WorkspaceLayoutHomeMarkerSchema = WorkspaceLayoutConfigSchema.extend({
-  schemaVersion: z.literal(1),
+  schemaVersion: z.union([z.literal(1), z.literal(2)]),
   destructiveRetirement: z.literal("refuse"),
-});
+}).refine(
+  (marker) => (marker.schemaVersion === 2) === (marker.semanticsVersion === 2),
+  "layout_semantics_marker_mismatch",
+);
 export const WorkspaceLayoutStampSchema = WorkspaceLayoutIdentitySchema.extend({
   revision: RevisionSchema,
   phase: z.enum(["importing", "active"]),
@@ -50,6 +65,7 @@ export const WorkspaceLayoutEntrySchema = z.object({
   pinPlacement: WorkspacePinPlacementSchema.nullable(),
   archivedAt: TimestampSchema.nullable(),
   revision: RevisionSchema,
+  sectionIntent: WorkspaceSectionIntentSchema.optional(),
 });
 export const WorkspaceLayoutImportSourceSchema = z.object({
   serverId: IdSchema,
@@ -94,6 +110,8 @@ export const WorkspaceNavigationSchema = z.object({
   resolutionSha256: DigestSchema,
 });
 export const WorkspaceLayoutSnapshotSchema = z.object({
+  semanticsVersion: z.literal(2).optional(),
+  ownerDomains: z.array(WorkspaceOwnerDomainSchema).optional(),
   stamp: WorkspaceLayoutStampSchema,
   entries: z.array(WorkspaceLayoutEntrySchema),
   imports: z.array(WorkspaceLayoutImportSourceSchema),
@@ -107,7 +125,9 @@ export const WorkspaceLayoutMutationSchema = z.discriminatedUnion("kind", [
     kind: z.literal("activate"),
     requiredImports: z.array(WorkspaceLayoutImportSourceSchema).min(1),
     requiredClientImports: z.array(WorkspaceLayoutClientSourceSchema).optional(),
+    requiredOwnerDomains: z.array(WorkspaceOwnerDomainSchema).optional(),
   }),
+  z.object({ kind: z.literal("declare-unknown-owner"), serverId: IdSchema }),
   z.object({
     kind: z.literal("import-host"),
     source: WorkspaceLayoutImportSourceSchema,
@@ -117,6 +137,7 @@ export const WorkspaceLayoutMutationSchema = z.discriminatedUnion("kind", [
       .regex(/^[a-f0-9]{64}$/)
       .nullable(),
     entries: z.array(WorkspaceLayoutEntrySchema),
+    expectedDomainRevision: RevisionSchema.optional(),
   }),
   z.object({
     kind: z.literal("import-client"),
@@ -136,6 +157,7 @@ export const WorkspaceLayoutMutationSchema = z.discriminatedUnion("kind", [
   }),
 ]);
 export const WorkspaceLayoutCommitSchema = z.object({
+  writerVersion: z.literal(2).optional(),
   requestId: z.string().min(1).max(256),
   expected: WorkspaceLayoutStampSchema,
   mutations: z.array(WorkspaceLayoutMutationSchema).min(1).max(10000),
@@ -239,3 +261,178 @@ export function parseWorkspaceNavigationKey(key: string): WorkspaceReference {
     workspaceId: key.slice(separator + 1),
   });
 }
+
+export type WorkspaceLayoutSection = z.infer<typeof SectionSchema>;
+export interface EffectiveWorkspaceLayout {
+  section: WorkspaceLayoutSection | null;
+  parentWorkspaceKey: string | null;
+  sectionSourceKey: string | null;
+  unresolvedParentKey: string | null;
+  pinnedAt: string | null;
+  superpinnedAt: string | null;
+}
+
+export function workspaceLayoutSection(
+  entry: Pick<WorkspaceLayoutEntry, "pinnedAt" | "superpinnedAt">,
+): WorkspaceLayoutSection {
+  if (entry.superpinnedAt) return "superpinned";
+  return entry.pinnedAt ? "pinned" : "unpinned";
+}
+
+export function workspaceLayoutParentKey(entry: WorkspaceLayoutEntry): string | null {
+  if (entry.pinPlacement) return entry.pinPlacement.parentWorkspaceKey;
+  return entry.parent ? `${entry.parent.serverId}:${entry.parent.workspaceId}` : null;
+}
+
+/** Captured raw section/edge provenance stays immutable when later moves or root pins change intent. */
+export function qualifyLegacyWorkspaceLayoutEntries(
+  entries: readonly WorkspaceLayoutEntry[],
+): WorkspaceLayoutEntry[] {
+  return entries.map((entry) => ({
+    ...entry,
+    sectionIntent: entry.sectionIntent ?? {
+      mode: "legacy",
+      baselineSection: workspaceLayoutSection(entry),
+      baselineParentWorkspaceKey: workspaceLayoutParentKey(entry),
+    },
+  }));
+}
+
+/** One graph projection for daemon and client. Missing owners stay unknown; no descendant write is needed. */
+export function resolveEffectiveWorkspaceLayout(
+  snapshot: WorkspaceLayoutSnapshot,
+): Map<string, EffectiveWorkspaceLayout> {
+  const entries = new Map(
+    snapshot.entries.map((entry) => [`${entry.ref.serverId}:${entry.ref.workspaceId}`, entry]),
+  );
+  if (entries.size !== snapshot.entries.length) throw new Error("duplicate_workspace_identity");
+  const resolved = new Map<string, EffectiveWorkspaceLayout>();
+  for (const key of entries.keys()) {
+    const path: string[] = [];
+    const visiting = new Set<string>();
+    let current: string | null = key;
+    while (current !== null && !resolved.has(current)) {
+      if (visiting.has(current)) throw new Error("workspace_layout_cycle");
+      visiting.add(current);
+      const entry = entries.get(current);
+      if (!entry) {
+        resolved.set(current, {
+          section: null,
+          parentWorkspaceKey: null,
+          sectionSourceKey: null,
+          unresolvedParentKey: current,
+          pinnedAt: null,
+          superpinnedAt: null,
+        });
+        break;
+      }
+      path.push(current);
+      current = workspaceLayoutParentKey(entry);
+    }
+    for (const item of path.toReversed()) {
+      const entry = entries.get(item)!;
+      const parentKey = workspaceLayoutParentKey(entry);
+      const parent = parentKey ? entries.get(parentKey) : undefined;
+      const parentView = parentKey ? resolved.get(parentKey) : undefined;
+      resolved.set(item, effectiveLayoutEntry(snapshot, entry, item, parent, parentView));
+    }
+  }
+  return new Map([...entries.keys()].map((key) => [key, resolved.get(key)!]));
+}
+
+function effectiveLayoutEntry(
+  snapshot: WorkspaceLayoutSnapshot,
+  entry: WorkspaceLayoutEntry,
+  key: string,
+  parent: WorkspaceLayoutEntry | undefined,
+  parentView: EffectiveWorkspaceLayout | undefined,
+): EffectiveWorkspaceLayout {
+  const intent = entry.sectionIntent;
+  const parentKey = workspaceLayoutParentKey(entry);
+  const activeParent = parent && !parent.archivedAt && !entry.archivedAt;
+  const inherits =
+    snapshot.semanticsVersion === 2 && activeParent && inheritsWorkspaceSection(entry, parent);
+  const unresolvedParentKey = parentView?.unresolvedParentKey ?? null;
+  let section: WorkspaceLayoutSection | null = workspaceLayoutSection(entry);
+  let sectionSourceKey: string | null = key;
+  let pinnedAt = entry.pinnedAt;
+  let superpinnedAt = entry.superpinnedAt;
+  if (inherits && parentView) {
+    section = parentView.section;
+    sectionSourceKey = parentView.sectionSourceKey;
+    pinnedAt = parentView.pinnedAt;
+    superpinnedAt = parentView.superpinnedAt;
+  } else if (
+    !parent &&
+    parentKey &&
+    intent?.mode !== "explicit" &&
+    snapshot.semanticsVersion === 2
+  ) {
+    section = null;
+    sectionSourceKey = null;
+  }
+  const visibleParent = activeParent && section !== null && section === parentView?.section;
+  return {
+    section,
+    sectionSourceKey,
+    pinnedAt,
+    superpinnedAt,
+    parentWorkspaceKey: visibleParent ? parentKey : null,
+    unresolvedParentKey,
+  };
+}
+
+function inheritsWorkspaceSection(
+  entry: WorkspaceLayoutEntry,
+  parent: WorkspaceLayoutEntry,
+): boolean {
+  const intent = entry.sectionIntent;
+  if (intent?.mode === "inherit") return true;
+  return (
+    intent?.mode === "legacy" &&
+    intent.baselineParentWorkspaceKey === workspaceLayoutParentKey(entry) &&
+    intent.baselineSection === parent.sectionIntent?.baselineSection
+  );
+}
+
+interface WorkspaceSectionChange {
+  entry: WorkspaceLayoutEntry;
+  effective: EffectiveWorkspaceLayout;
+  inherit: boolean;
+  section: WorkspaceLayoutSection;
+  now: string;
+}
+
+export function withWorkspaceSectionIntent(input: WorkspaceSectionChange): WorkspaceLayoutEntry {
+  if (!input.entry.sectionIntent) throw new Error("section_intent_required");
+  let pinnedAt = input.entry.pinnedAt;
+  let superpinnedAt = input.entry.superpinnedAt;
+  if (!input.inherit) {
+    pinnedAt = input.section === "unpinned" ? null : (input.effective.pinnedAt ?? input.now);
+    superpinnedAt =
+      input.section === "superpinned" ? (input.effective.superpinnedAt ?? input.now) : null;
+  }
+  return {
+    ...input.entry,
+    pinnedAt,
+    superpinnedAt,
+    sectionIntent: { ...input.entry.sectionIntent, mode: input.inherit ? "inherit" : "explicit" },
+  };
+}
+
+/** Native operations that can create or mutate hierarchy; old clients must not launder legacy intent. */
+export const NATIVE_WORKSPACE_LAYOUT_WRITER_REQUESTS = new Set<string>([
+  "workspace.pin.set.request",
+  "workspace.superpin.set.request",
+  "workspace.pin.placement.set.request",
+  "workspace.move.request",
+  "workspace.create.request",
+  "create_paseo_worktree_request",
+  "open_project_request",
+  "agent.create.request",
+  "create_agent_request",
+  "import_agent_request",
+  "hub.execution.agent.create.request",
+  "workspace.recovery.restore.request",
+  "refresh_agent_request",
+]);

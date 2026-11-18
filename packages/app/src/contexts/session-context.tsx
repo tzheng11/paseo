@@ -214,6 +214,7 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
           authorityId: config.authorityId,
           epoch: config.epoch,
           authorityKeySha256: config.authorityKeySha256,
+          semanticsVersion: config.semanticsVersion,
         })
       : null;
   });

@@ -404,3 +404,50 @@ it("releases every group reservation when the mutation action rejects", async ()
   await runWorkspacePinChanges(workspaces, action);
   expect(action).toHaveBeenCalledTimes(1);
 });
+
+it("refuses a pin toggle while required canonical ancestry is unresolved", async () => {
+  const client = new DaemonClient({
+    url: "ws://unit.invalid",
+    clientId: "pin-unit",
+    reconnect: { enabled: false },
+  });
+  useSessionStore.getState().initializeSession("pin-unit", client);
+  const workspace = normalizeWorkspaceDescriptor({
+    id: "w1",
+    projectId: "p1",
+    projectDisplayName: "Project",
+    projectRootPath: "/repo",
+    workspaceDirectory: "/repo",
+    projectKind: "git",
+    workspaceKind: "checkout",
+    name: "Workspace",
+    status: "done",
+    statusEnteredAt: null,
+    activityAt: null,
+    archivingAt: null,
+    diffStat: null,
+    scripts: [],
+    pinnedAt: null,
+    superpinnedAt: null,
+    effectiveSection: null,
+  });
+  useSessionStore.getState().setWorkspaces("pin-unit", new Map([[workspace.id, workspace]]));
+  const queryClient = new QueryClient();
+  function wrapper({ children }: PropsWithChildren) {
+    return createElement(QueryClientProvider, { client: queryClient }, children);
+  }
+  const { result } = renderHook(() => useSidebarWorkspacePinController(), { wrapper });
+  act(() =>
+    result.current({
+      serverId: "pin-unit",
+      workspaceId: "w1",
+      workspaceKey: "pin-unit:w1",
+      pinnedAt: null,
+      superpinnedAt: null,
+    }),
+  );
+  await waitFor(() => expect(mocks.error).toHaveBeenCalled());
+  expect(mocks.pin).not.toHaveBeenCalled();
+  expect(mocks.superpin).not.toHaveBeenCalled();
+  await client.close();
+});

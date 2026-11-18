@@ -1,3 +1,4 @@
+import { NATIVE_WORKSPACE_LAYOUT_WRITER_REQUESTS } from "@getpaseo/protocol/workspace-layout";
 import type {
   WorkspaceLayoutIdentity,
   WorkspaceLayoutCommit,
@@ -2306,7 +2307,16 @@ export class DaemonClient {
   }): Promise<T> {
     let wire: ReturnType<ConnectionSubscriptions["prepareRequest"]>;
     try {
-      wire = this.owned.prepareRequest(params.message);
+      let message = params.message;
+      if (
+        NATIVE_WORKSPACE_LAYOUT_WRITER_REQUESTS.has(message.type) &&
+        this.lastServerInfoMessage?.workspaceLayout?.semanticsVersion === 2
+      ) {
+        if (this.lastServerInfoMessage.features?.workspaceLayoutDerivedSections !== true)
+          throw new Error("Update this host before changing the derived workspace hierarchy.");
+        message = { ...message, layoutWriterVersion: 2 } as SessionInboundMessage;
+      }
+      wire = this.owned.prepareRequest(message);
     } catch (error) {
       if (params.message.type === "workspace.layout.commit.request")
         throw new DaemonRequestNotSentError(error);
@@ -5902,6 +5912,11 @@ export class DaemonClient {
     try {
       this.requireWorkspaceLayout();
       const { requestId, ...fields } = input;
+      if (
+        input.writerVersion === 2 &&
+        this.lastServerInfoMessage?.features?.workspaceLayoutDerivedSections !== true
+      )
+        throw new Error("Update this host to use derived workspace section inheritance.");
       return this.sendNamespacedCorrelatedSessionRequest<"workspace.layout.commit.response">({
         requestId,
         message: { type: "workspace.layout.commit.request", ...fields },

@@ -1,3 +1,8 @@
+import {
+  qualifyLegacyWorkspaceLayoutEntries,
+  type WorkspaceLayoutSnapshot,
+} from "@getpaseo/protocol/workspace-layout";
+import { buildPinnedSidebarKeys, splitPinnedSidebarGroups } from "../hooks/use-sidebar-pins";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
@@ -8,6 +13,7 @@ import type {
 
 import {
   normalizeWorkspaceDescriptor,
+  applyCanonicalWorkspaceLayout,
   selectAgentSentMessages,
   selectAgentTurnPresentation,
   selectAgentTimelineState,
@@ -89,6 +95,7 @@ function createWorkspace(
 }
 
 afterEach(() => {
+  applyCanonicalWorkspaceLayout(null);
   useSessionStore.getState().clearSession("test-server");
 });
 
@@ -983,5 +990,96 @@ describe("removeWorkspace", () => {
     expect(after.sessions).toBe(before.sessions);
     expect(after.session).toBe(before.session);
     expect(after.workspaces).toBe(before.workspaces);
+  });
+});
+
+it("projects canonical inherited pins through the actual app directory/grouping read model and ignores stale native pin observations", () => {
+  initializeTestSession();
+  const raw = {
+    ...createWorkspace({ id: "y" }),
+    pinnedAt: null,
+    superpinnedAt: null,
+    pinPlacement: { parentWorkspaceKey: "worker:x", siblingOrder: 1024, revision: 1 },
+  };
+  useSessionStore.getState().setWorkspaces("test-server", new Map([["y", raw]]));
+  const at = "2026-11-01T00:00:00.000Z";
+  const make = (serverId: string, workspaceId: string, parentWorkspaceKey: string | null) => ({
+    ref: { serverId, workspaceId },
+    projectId: "project",
+    pinnedAt: null,
+    superpinnedAt: null,
+    parent: null,
+    siblingOrder: 0,
+    pinPlacement: { parentWorkspaceKey, siblingOrder: 1024, revision: 1 },
+    archivedAt: null,
+    revision: 1,
+  });
+  const snapshot: WorkspaceLayoutSnapshot = {
+    semanticsVersion: 2,
+    ownerDomains: [],
+    imports: [],
+    stamp: {
+      authorityServerId: "authority",
+      authorityId: "00000000-0000-4000-8000-000000000001",
+      epoch: "00000000-0000-4000-8000-000000000002",
+      phase: "active",
+      revision: 1,
+    },
+    entries: qualifyLegacyWorkspaceLayoutEntries([
+      make("worker", "x", null),
+      { ...make("peer", "p", null), pinnedAt: at, superpinnedAt: at },
+      make("test-server", "y", "worker:x"),
+    ]),
+  };
+  applyCanonicalWorkspaceLayout(snapshot);
+  snapshot.entries[0].pinPlacement = {
+    parentWorkspaceKey: "peer:p",
+    siblingOrder: 1024,
+    revision: 2,
+  };
+  snapshot.entries[0].sectionIntent = { ...snapshot.entries[0].sectionIntent!, mode: "inherit" };
+  snapshot.stamp.revision++;
+  applyCanonicalWorkspaceLayout(snapshot);
+  useSessionStore
+    .getState()
+    .mergeWorkspaces("test-server", [
+      { ...raw, pinPlacement: { parentWorkspaceKey: null, siblingOrder: 999, revision: 999 } },
+    ]);
+  const workspaces = useSessionStore.getState().sessions["test-server"].workspaces;
+  expect(workspaces.get("y")).toMatchObject({
+    effectiveSection: "superpinned",
+    pinPlacement: { parentWorkspaceKey: "worker:x", revision: 1 },
+    pinnedAt: at,
+    superpinnedAt: at,
+  });
+  const placement = {
+    workspaceKey: "test-server:y",
+    workspaceId: "y",
+    serverId: "test-server",
+    projectViewKey: "view",
+    projectName: "Project",
+    projectKind: "git" as const,
+    workspaceKind: "worktree" as const,
+    name: "Y",
+  };
+  const projects = [
+    {
+      viewKey: "view",
+      projectName: "Project",
+      projectKind: "git" as const,
+      iconWorkingDir: "",
+      hosts: [],
+      workspaces: [placement],
+    },
+  ];
+  const keys = buildPinnedSidebarKeys(projects, new Map([["test-server", workspaces]]));
+  const groups = splitPinnedSidebarGroups({ projects, keys, pinnedWorkspaceOrder: [] });
+  expect(groups.superpinnedChats.map((workspace) => workspace.workspaceKey)).toEqual([
+    "test-server:y",
+  ]);
+  expect(raw).toMatchObject({
+    pinnedAt: null,
+    superpinnedAt: null,
+    pinPlacement: { parentWorkspaceKey: "worker:x" },
   });
 });

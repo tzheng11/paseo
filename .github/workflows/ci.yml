@@ -95,7 +95,7 @@ jobs:
 
       - name: Test lint rules
         if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.quality != 'false') }}
-        run: node --test scripts/oxlint/paseo-plugin.test.mjs
+        run: node --test scripts/oxlint/paseo-plugin.test.mjs scripts/build-overlay-packet.test.mjs
 
       - name: Build relay
         if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.relay != 'false') }}

@@ -206,6 +206,10 @@ function useWorkspacePinController(kind: "pin" | "superpin"): ToggleSidebarWorks
         .getState()
         .sessions[workspace.serverId]?.workspaces.get(workspace.workspaceId);
       const fields = current ?? workspace;
+      if (current?.effectiveSection === null)
+        throw new Error(
+          "The workspace's required parent is unavailable; reconnect or adopt its owner before changing its section.",
+        );
       try {
         if (kind === "superpin")
           await client.setWorkspaceSuperpinned(workspace.workspaceId, fields.superpinnedAt == null);

@@ -2,6 +2,191 @@ import type {
   WorkspaceSidebarPlacement,
   WorkspaceSidebarSection,
 } from "./workspace-pin-placement.js";
+import { workspaceSidebarSection } from "./workspace-pin-placement.js";
+import {
+  resolveEffectiveWorkspaceLayout,
+  workspaceLayoutParentKey,
+  withWorkspaceSectionIntent,
+  type EffectiveWorkspaceLayout,
+  type WorkspaceLayoutEntry,
+  type WorkspaceLayoutMutation,
+  type WorkspaceLayoutSnapshot,
+} from "@getpaseo/protocol/workspace-layout";
+import { validateLayoutGraph } from "./workspace-layout-store.js";
+
+export interface SidebarAutomationMove {
+  workspaceKey: string;
+  parentWorkspaceKey?: string | null;
+  section?: WorkspaceSidebarSection;
+  siblingOrder?: number;
+  beforeWorkspaceKey?: string | null;
+}
+
+/** A fresh active authority proves the exact move dependencies without treating unknown owners as empty. */
+export function planCanonicalSidebarMove(
+  snapshot: WorkspaceLayoutSnapshot,
+  input: SidebarAutomationMove,
+  now: string,
+) {
+  if (snapshot.stamp.phase !== "active") throw new Error("Workspace layout import is not active.");
+  validateLayoutGraph(snapshot);
+  const entries = new Map(
+    snapshot.entries.map((entry) => [`${entry.ref.serverId}:${entry.ref.workspaceId}`, entry]),
+  );
+  const effective = resolveEffectiveWorkspaceLayout(snapshot);
+  const rows = resolveSidebarAutomationCatalog(
+    snapshot.entries
+      .filter((entry) => !entry.archivedAt)
+      .map((entry) =>
+        canonicalSidebarWorkspace(
+          entry,
+          snapshot.semanticsVersion === 2
+            ? effective.get(`${entry.ref.serverId}:${entry.ref.workspaceId}`)
+            : undefined,
+        ),
+      ),
+  );
+  const source = rows.find((row) => row.workspaceKey === input.workspaceKey);
+  if (!source)
+    throw new Error(`Source workspace ${input.workspaceKey} is not active in the authority.`);
+  const sourceView = effective.get(input.workspaceKey);
+  if (snapshot.semanticsVersion === 2 && sourceView?.unresolvedParentKey)
+    throw new Error(`Required source ancestry ${sourceView.unresolvedParentKey} is unavailable.`);
+  const parentWorkspaceKey =
+    input.parentWorkspaceKey === undefined
+      ? workspaceLayoutParentKey(entries.get(source.workspaceKey)!)
+      : input.parentWorkspaceKey;
+  const sectionRows = rows.filter((row) => row.section === source.section);
+  const subtree = sidebarAutomationSubtree(sectionRows, source.workspaceKey);
+  const affected = collectCanonicalMoveAffected({
+    snapshot,
+    entries,
+    source,
+    subtree,
+    parentWorkspaceKey,
+    input,
+  });
+  const placement = resolveSidebarAutomationPlacement({
+    ...input,
+    workspaces: rows,
+    movingWorkspaceKey: source.workspaceKey,
+    parentWorkspaceKey,
+    section: input.section ?? (parentWorkspaceKey === null ? source.section : undefined),
+  });
+  const moving =
+    snapshot.semanticsVersion === 2 || placement.section === source.section ? [source] : subtree;
+  const mutations = canonicalMoveMutations({
+    snapshot,
+    moving,
+    entries,
+    sourceKey: source.workspaceKey,
+    placement,
+    now,
+    effective,
+  });
+  return { affected, mutations, placement };
+}
+
+interface CanonicalMoveScope {
+  snapshot: WorkspaceLayoutSnapshot;
+  entries: ReadonlyMap<string, WorkspaceLayoutEntry>;
+  source: SidebarAutomationWorkspace;
+  subtree: SidebarAutomationWorkspace[];
+  parentWorkspaceKey: string | null;
+  input: SidebarAutomationMove;
+}
+function collectCanonicalMoveAffected(context: CanonicalMoveScope): WorkspaceLayoutEntry[] {
+  const { snapshot, entries, source, subtree, parentWorkspaceKey, input } = context;
+  const affected = new Map<string, WorkspaceLayoutEntry>();
+  for (const row of snapshot.semanticsVersion === 2 ? [source] : subtree)
+    affected.set(row.workspaceKey, entries.get(row.workspaceKey)!);
+  const oldParentKey = workspaceLayoutParentKey(entries.get(source.workspaceKey)!);
+  if (snapshot.semanticsVersion === 2 && oldParentKey) {
+    const oldParent = entries.get(oldParentKey);
+    if (!oldParent || oldParent.archivedAt)
+      throw new Error(`Required old parent ${oldParentKey} is unavailable.`);
+    affected.set(oldParentKey, oldParent);
+  }
+  // Walk stored edges too: dormant links still participate in the authority's cycle checks.
+  const visited = new Set([source.workspaceKey]);
+  let ancestor = parentWorkspaceKey;
+  while (ancestor !== null) {
+    if (visited.has(ancestor)) throw new Error("A workspace cannot be its own parent or ancestor.");
+    visited.add(ancestor);
+    const entry = entries.get(ancestor);
+    if (!entry || entry.archivedAt)
+      throw new Error(`Required parent ancestry ${ancestor} is not active in the authority.`);
+    affected.set(ancestor, entry);
+    ancestor = entry.pinPlacement
+      ? entry.pinPlacement.parentWorkspaceKey
+      : entry.parent && `${entry.parent.serverId}:${entry.parent.workspaceId}`;
+  }
+  if (input.beforeWorkspaceKey) {
+    const before = entries.get(input.beforeWorkspaceKey);
+    if (!before) throw new Error(`Destination sibling ${input.beforeWorkspaceKey} is unknown.`);
+    affected.set(input.beforeWorkspaceKey, before);
+  }
+  return [...affected.values()];
+}
+interface CanonicalMoveMutationInput {
+  snapshot: WorkspaceLayoutSnapshot;
+  moving: SidebarAutomationWorkspace[];
+  entries: ReadonlyMap<string, WorkspaceLayoutEntry>;
+  sourceKey: string;
+  placement: WorkspaceSidebarPlacement & { siblingOrder: number };
+  now: string;
+  effective: ReadonlyMap<string, EffectiveWorkspaceLayout>;
+}
+function canonicalMoveMutations(input: CanonicalMoveMutationInput): WorkspaceLayoutMutation[] {
+  const { snapshot, moving, entries, sourceKey, placement, now, effective } = input;
+  return moving.map((row) => {
+    const entry = entries.get(row.workspaceKey)!;
+    const parent = row.workspaceKey === sourceKey ? placement : row.pinPlacement;
+    let updated = entry;
+    if (snapshot.semanticsVersion === 2)
+      updated = withWorkspaceSectionIntent({
+        entry,
+        effective: effective.get(row.workspaceKey)!,
+        inherit: placement.parentWorkspaceKey !== null,
+        section: placement.section,
+        now,
+      });
+    else
+      updated = {
+        ...entry,
+        pinnedAt: placement.section === "unpinned" ? null : (row.pinnedAt ?? now),
+        superpinnedAt: placement.section === "superpinned" ? (row.superpinnedAt ?? now) : null,
+      };
+    return {
+      kind: "put",
+      entry: {
+        ...updated,
+        pinPlacement: {
+          parentWorkspaceKey: parent?.parentWorkspaceKey ?? null,
+          siblingOrder: parent?.siblingOrder ?? 0,
+          revision: (entry.pinPlacement?.revision ?? 0) + 1,
+        },
+      },
+    };
+  });
+}
+
+export function canonicalSidebarWorkspace(
+  entry: WorkspaceLayoutEntry,
+  effective?: EffectiveWorkspaceLayout,
+): SidebarAutomationWorkspace {
+  return {
+    workspaceKey: `${entry.ref.serverId}:${entry.ref.workspaceId}`,
+    workspaceId: entry.ref.workspaceId,
+    projectId: entry.projectId,
+    parentWorkspaceId: entry.parent?.workspaceId ?? null,
+    siblingOrder: entry.siblingOrder ?? undefined,
+    section: effective?.section ?? workspaceSidebarSection(entry),
+    pinnedAt: effective ? effective.pinnedAt : entry.pinnedAt,
+    superpinnedAt: effective ? effective.superpinnedAt : entry.superpinnedAt,
+    pinPlacement: entry.pinPlacement ?? undefined,
+  };
+}
 
 export interface SidebarAutomationWorkspace {
   workspaceKey: string;

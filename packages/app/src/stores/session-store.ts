@@ -2,6 +2,52 @@ import equal from "fast-deep-equal";
 import { create } from "zustand";
 import { subscribeWithSelector } from "zustand/middleware";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import {
+  resolveEffectiveWorkspaceLayout,
+  type WorkspaceLayoutSnapshot,
+  type WorkspaceLayoutEntry,
+  type EffectiveWorkspaceLayout,
+} from "@getpaseo/protocol/workspace-layout";
+
+let canonicalWorkspaceReadView: Map<
+  string,
+  { entry: WorkspaceLayoutEntry; view: EffectiveWorkspaceLayout }
+> | null = null;
+
+/** Directory caches remain native observations; only the shared read view is projected into UI state. */
+export function applyCanonicalWorkspaceLayout(snapshot: WorkspaceLayoutSnapshot | null): void {
+  if (snapshot?.semanticsVersion === 2 && snapshot.stamp.phase === "active") {
+    const effective = resolveEffectiveWorkspaceLayout(snapshot);
+    canonicalWorkspaceReadView = new Map(
+      snapshot.entries.map((entry) => {
+        const key = `${entry.ref.serverId}:${entry.ref.workspaceId}`;
+        return [key, { entry, view: effective.get(key)! }];
+      }),
+    );
+  } else canonicalWorkspaceReadView = null;
+  const state = useSessionStore.getState();
+  for (const [serverId, session] of Object.entries(state.sessions))
+    state.setWorkspaces(serverId, session.workspaces);
+}
+
+function projectCanonicalWorkspace(
+  serverId: string,
+  workspace: WorkspaceDescriptor,
+): WorkspaceDescriptor {
+  if (!canonicalWorkspaceReadView) return workspace;
+  const projected = canonicalWorkspaceReadView.get(`${serverId}:${workspace.id}`);
+  if (!projected) return { ...workspace, effectiveSection: null };
+  const { entry, view } = projected;
+  return {
+    ...workspace,
+    pinnedAt: view.section === null ? entry.pinnedAt : view.pinnedAt,
+    superpinnedAt: view.section === null ? entry.superpinnedAt : view.superpinnedAt,
+    effectiveSection: view.section,
+    pinPlacement: entry.pinPlacement ?? undefined,
+    parentWorkspaceId: entry.parent?.workspaceId ?? null,
+    siblingOrder: entry.siblingOrder ?? undefined,
+  };
+}
 import type { ViewedTimelineOwner } from "@/timeline/viewed-timeline-sync";
 import type { AgentDirectoryEntry } from "@/types/agent-directory";
 import {
@@ -124,6 +170,7 @@ export interface WorkspaceDescriptor {
   title?: string | null;
   pinnedAt?: string | null;
   superpinnedAt?: string | null;
+  effectiveSection?: "unpinned" | "pinned" | "superpinned" | null;
   labels?: string[];
   fieldValues?: WorkspaceDescriptorPayload["fieldValues"];
   status: WorkspaceDescriptorPayload["status"];
@@ -135,6 +182,11 @@ export interface WorkspaceDescriptor {
   githubRuntime?: WorkspaceDescriptorPayload["githubRuntime"];
   forge?: WorkspaceDescriptorPayload["forge"];
   project?: ProjectPlacementPayload;
+}
+
+function workspaceEffectiveSection(payload: WorkspaceDescriptorPayload) {
+  if (payload.effectiveSection === undefined) return {};
+  return { effectiveSection: payload.effectiveSection };
 }
 
 export function normalizeWorkspaceDescriptor(
@@ -172,6 +224,7 @@ export function normalizeWorkspaceDescriptor(
     name: payload.name,
     title: payload.title ?? null,
     pinnedAt: payload.pinnedAt ?? null,
+    ...workspaceEffectiveSection(payload),
     // COMPAT(workspaceSuperpinning): older daemons omit the field.
     superpinnedAt: payload.superpinnedAt ?? null,
     // COMPAT(workspaceLabels): old daemons omit assignments.
@@ -219,9 +272,11 @@ export function normalizeProjectDescriptor(
 function preserveWorkspaceDescriptorIdentity(
   incoming: WorkspaceDescriptor,
   existing?: WorkspaceDescriptor | null,
+  canonicalPlacement = false,
 ): WorkspaceDescriptor {
   // An RPC acknowledgement may arrive before an older directory snapshot.
   if (
+    !canonicalPlacement &&
     existing?.pinPlacement &&
     existing.pinPlacement.revision > (incoming.pinPlacement?.revision ?? 0)
   ) {
@@ -1602,7 +1657,11 @@ export const useSessionStore = create<SessionStore>()(
           const reconciledWorkspaces = new Map(
             Array.from(nextWorkspaces, ([id, workspace]) => [
               id,
-              preserveWorkspaceDescriptorIdentity(workspace, session.workspaces.get(id)),
+              preserveWorkspaceDescriptorIdentity(
+                projectCanonicalWorkspace(serverId, workspace),
+                session.workspaces.get(id),
+                canonicalWorkspaceReadView?.has(`${serverId}:${id}`) === true,
+              ),
             ]),
           );
           const preservedWorkspaces = preserveMapIdentity(session.workspaces, reconciledWorkspaces);
@@ -1730,7 +1789,11 @@ export const useSessionStore = create<SessionStore>()(
               changed = true;
             }
             const existing = next.get(workspace.id);
-            const nextWorkspace = preserveWorkspaceDescriptorIdentity(workspace, existing);
+            const nextWorkspace = preserveWorkspaceDescriptorIdentity(
+              projectCanonicalWorkspace(serverId, workspace),
+              existing,
+              canonicalWorkspaceReadView?.has(`${serverId}:${workspace.id}`) === true,
+            );
             if (existing === nextWorkspace) {
               continue;
             }

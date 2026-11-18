@@ -1,6 +1,7 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { createStore } from "zustand/vanilla";
 import { useStore } from "zustand";
+import { applyCanonicalWorkspaceLayout } from "./session-store";
 import type { StateStorage } from "zustand/middleware";
 import type {
   WorkspaceNavigationPreferences,
@@ -33,7 +34,10 @@ export const canonicalSidebar = new CanonicalSidebarLayout({
     return digestStringAsync(CryptoDigestAlgorithm.SHA256, bytes);
   },
   requestId: () => globalThis.crypto.randomUUID(),
-  changed: (state) => canonicalSidebarState.setState(state),
+  changed: (state) => {
+    canonicalSidebarState.setState(state);
+    applyCanonicalWorkspaceLayout(state.snapshot);
+  },
 });
 
 export function useCanonicalSidebarState() {

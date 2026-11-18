@@ -21,6 +21,7 @@ import {
   canonicalLayoutJson,
   hashLayoutValue,
   projectConfirmedLayout,
+  validateLayoutGraph,
 } from "./workspace-layout-store.js";
 
 export interface WorkspaceLayoutTransport {
@@ -58,6 +59,7 @@ export class WorkspaceLayoutService {
             paseoHome: options.home,
             identity: options.config,
             serverId: options.serverId,
+            semanticsVersion: options.config.semanticsVersion,
           })
         : null;
     if (!this.store && options.serverId === options.config.authorityServerId)
@@ -79,6 +81,9 @@ export class WorkspaceLayoutService {
         JSON.parse(await readFile(this.cachePath(), "utf8")),
       );
       this.assertIdentity(snapshot.stamp);
+      if (snapshot.semanticsVersion !== this.options.config.semanticsVersion)
+        throw new WorkspaceLayoutRefusal("layout_semantics_mismatch");
+      validateLayoutGraph(snapshot);
       this.cache = snapshot;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT")
@@ -219,6 +224,9 @@ export class WorkspaceLayoutService {
   private accept(raw: WorkspaceLayoutSnapshot, readStartedAtRevision?: number): Promise<void> {
     const snapshot = WorkspaceLayoutSnapshotSchema.parse(raw);
     this.assertIdentity(snapshot.stamp);
+    if (snapshot.semanticsVersion !== this.options.config.semanticsVersion)
+      throw new WorkspaceLayoutRefusal("layout_semantics_mismatch");
+    validateLayoutGraph(snapshot);
     const result = this.cacheQueue.then(async () => {
       if (this.cache && snapshot.stamp.revision < this.cache.stamp.revision) {
         if (readStartedAtRevision !== undefined && snapshot.stamp.revision >= readStartedAtRevision)

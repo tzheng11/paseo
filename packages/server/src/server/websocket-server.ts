@@ -2099,6 +2099,8 @@ export class VoiceAssistantWebSocketServer {
         // COMPAT(mainHost): added in v0.11.3; remove gate after 2027-04-18.
         mainHost: this.mainHostStore !== undefined,
         workspaceLayout: this.workspaceLayoutService !== undefined,
+        workspaceLayoutDerivedSections:
+          this.workspaceLayoutService?.status().semanticsVersion === 2,
         connectedHosts: true,
         hostMultiplexing: true,
         // COMPAT(relayProtectedSecurity): added in v0.13.0, remove gate after 2027-04-21.

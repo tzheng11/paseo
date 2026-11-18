@@ -440,7 +440,7 @@ export function createHostResolver(input: {
     },
   };
 }
-function workspaceSummary(workspace: FetchWorkspacesEntry, serverId?: string) {
+export function workspaceSummary(workspace: FetchWorkspacesEntry, serverId?: string) {
   return {
     workspaceId: workspace.id,
     ...(serverId ? { workspaceKey: `${serverId}:${workspace.id}` } : {}),
@@ -450,7 +450,10 @@ function workspaceSummary(workspace: FetchWorkspacesEntry, serverId?: string) {
     kind: workspace.workspaceKind === "checkout" ? "local_checkout" : workspace.workspaceKind,
     title: workspace.title,
     background: workspace.background,
-    section: workspaceSidebarSection(workspace),
+    section:
+      workspace.effectiveSection !== undefined
+        ? workspace.effectiveSection
+        : workspaceSidebarSection(workspace),
     ...(workspace.pinPlacement ? { pinPlacement: workspace.pinPlacement } : {}),
     // COMPAT(workspaceHierarchy): old connected hosts omit hierarchy; remove after 2027-04-21.
     parentWorkspaceId: workspace.parentWorkspaceId ?? null,
