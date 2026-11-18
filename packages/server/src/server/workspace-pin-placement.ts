@@ -165,8 +165,14 @@ async function commitWorkspacePinPlacement(
         (!input.sectionState ||
           (workspace.pinnedAt === input.sectionState.pinnedAt &&
             workspace.superpinnedAt === input.sectionState.superpinnedAt))
-      )
+      ) {
+        if (workspace.effectiveSection !== undefined) {
+          if (current.revision !== input.expectedRevision)
+            throw new Error("This workspace moved in another client. Refresh and try again.");
+          return { ...workspace, pinPlacement: { ...current, revision: current.revision + 1 } };
+        }
         return workspace;
+      }
       if ((current?.revision ?? 0) !== input.expectedRevision)
         throw new Error("This workspace moved in another client. Refresh and try again.");
       return {
@@ -178,7 +184,11 @@ async function commitWorkspacePinPlacement(
         updatedAt: new Date().toISOString(),
       };
     },
-    { requestId: input.requestId, layoutWrite: true },
+    {
+      requestId: input.requestId,
+      layoutWrite: true,
+      sectionIntent: input.placement.parentWorkspaceKey === null ? "explicit" : "inherit",
+    },
   );
   if (!updated?.pinPlacement) throw new Error("Workspace not found.");
   return updated.pinPlacement;

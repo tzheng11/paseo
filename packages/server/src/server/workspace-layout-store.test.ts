@@ -10,13 +10,18 @@ import type {
   WorkspaceLayoutMutation,
   WorkspaceLayoutSnapshot,
 } from "@getpaseo/protocol/workspace-layout";
-import { emptyWorkspaceNavigationPreferences } from "@getpaseo/protocol/workspace-layout";
+import {
+  emptyWorkspaceNavigationPreferences,
+  qualifyLegacyWorkspaceLayoutEntries,
+  resolveEffectiveWorkspaceLayout,
+} from "@getpaseo/protocol/workspace-layout";
 import {
   WorkspaceLayoutStore,
   writeLayoutFileDurably,
   validateLayoutGraph,
 } from "./workspace-layout-store.js";
 import { resolvePinnedWorkspaceTree } from "../../../app/src/components/sidebar/workspace-tree/pinned-layout.js";
+import { planCanonicalSidebarMove } from "./workspace-sidebar-automation.js";
 
 const identity: WorkspaceLayoutIdentity = {
   authorityServerId: "srv_hub",
@@ -125,6 +130,37 @@ describe("canonical workspace layout authority", () => {
       entries: [],
     });
     expect(await store.initialize(identity)).toEqual(snapshot);
+  });
+
+  it("commits a planned cross-host sidebar subtree once and refuses stale global and entry revisions", async () => {
+    const source = entry("srv_worker", "worker");
+    const child = {
+      ...entry("srv_child", "child"),
+      pinPlacement: { parentWorkspaceKey: "srv_worker:worker", siblingOrder: 1024, revision: 1 },
+    };
+    const parent = { ...entry("srv_coordinator", "coordinator"), superpinnedAt: timestamp };
+    const baseline = await seed([source, child, parent]);
+    const input = {
+      workspaceKey: "srv_worker:worker",
+      parentWorkspaceKey: "srv_coordinator:coordinator",
+    };
+    const plan = planCanonicalSidebarMove(baseline, input, timestamp);
+    expect(plan.affected.map((item) => item.ref.serverId).sort()).toEqual([
+      "srv_child",
+      "srv_coordinator",
+      "srv_worker",
+    ]);
+    const committed = await store.commit(request(baseline, plan.mutations));
+    expect(committed.stamp.revision).toBe(baseline.stamp.revision + 1);
+    const fresh = await store.inspect();
+    expect(fresh.entries.filter((item) => item.superpinnedAt === timestamp)).toHaveLength(3);
+    await expect(store.commit(request(baseline, plan.mutations))).rejects.toMatchObject({
+      code: "stale_revision",
+    });
+    await expect(store.commit(request(fresh, plan.mutations))).rejects.toMatchObject({
+      code: "stale_entry_revision",
+    });
+    expect(await store.inspect()).toEqual(fresh);
   });
 
   it("binds the exact authority server, identity and epoch", async () => {
@@ -627,5 +663,239 @@ describe("canonical workspace layout authority", () => {
     failing = false;
     await failureStore.commit(input);
     expect((await store.inspect()).entries[0].pinnedAt).toBeNull();
+  });
+});
+
+describe("scoped derived layout authority", () => {
+  let home: string;
+  let store: WorkspaceLayoutStore;
+  beforeEach(async () => {
+    home = await mkdtemp(path.join(os.tmpdir(), "paseo-derived-authority-"));
+    store = new WorkspaceLayoutStore({
+      paseoHome: home,
+      serverId: identity.authorityServerId,
+      identity,
+      semanticsVersion: 2,
+    });
+  });
+  afterEach(async () => {
+    await rm(home, { recursive: true, force: true });
+  });
+  function derivedRequest(
+    snapshot: WorkspaceLayoutSnapshot,
+    mutations: WorkspaceLayoutMutation[],
+  ): WorkspaceLayoutCommit {
+    return { ...request(snapshot, mutations), writerVersion: 2 };
+  }
+  async function seedDerived(extra: WorkspaceLayoutEntry[] = []) {
+    const initial = await store.initialize(identity);
+    const rows = qualifyLegacyWorkspaceLayoutEntries([
+      { ...entry("worker", "x"), pinnedAt: null },
+      { ...entry("coordinator", "p"), superpinnedAt: timestamp },
+      ...extra,
+    ]);
+    const groups = Map.groupBy(rows, (row) => row.ref.serverId);
+    await store.commit(
+      derivedRequest(initial, [
+        { kind: "declare-unknown-owner", serverId: "unknown" },
+        ...[...groups].map(([host, values]) => imported(host, values)),
+        resolveEmptyNavigation(),
+      ]),
+    );
+    const importing = await store.inspect();
+    await store.commit(
+      derivedRequest(importing, [
+        {
+          kind: "activate",
+          requiredImports: importing.imports,
+          requiredOwnerDomains: importing.ownerDomains,
+        },
+      ]),
+    );
+    return store.inspect();
+  }
+  function reparent(state: WorkspaceLayoutSnapshot): WorkspaceLayoutEntry {
+    const source = state.entries.find((row) => row.ref.serverId === "worker")!;
+    return {
+      ...source,
+      pinPlacement: { parentWorkspaceKey: "coordinator:p", siblingOrder: 1024, revision: 1 },
+      sectionIntent: { ...source.sectionIntent!, mode: "inherit" },
+    };
+  }
+  it("keeps a structural parent when a move changes only rank without an explicit parent argument", async () => {
+    const state = await seedDerived([
+      {
+        ...entry("worker", "child"),
+        pinnedAt: null,
+        parent: { serverId: "worker", workspaceId: "x" },
+        pinPlacement: null,
+      },
+    ]);
+    const planned = planCanonicalSidebarMove(
+      state,
+      { workspaceKey: "worker:child", siblingOrder: 2048 },
+      timestamp,
+    );
+    expect(planned.mutations).toMatchObject([
+      {
+        kind: "put",
+        entry: { pinPlacement: { parentWorkspaceKey: "worker:x", siblingOrder: 2048 } },
+      },
+    ]);
+    await store.commit(derivedRequest(state, planned.mutations));
+    expect(
+      resolveEffectiveWorkspaceLayout(await store.inspect()).get("worker:child"),
+    ).toMatchObject({ parentWorkspaceKey: "worker:x", section: "unpinned" });
+  });
+  it("fences old writers and immutable legacy baselines before any mutation", async () => {
+    const state = await seedDerived();
+    await expect(
+      store.commit(request(state, [{ kind: "put", entry: reparent(state) }])),
+    ).rejects.toMatchObject({ code: "writer_version_required" });
+    const modified = reparent(state);
+    modified.sectionIntent!.baselineSection = "pinned";
+    await expect(
+      store.commit(derivedRequest(state, [{ kind: "put", entry: modified }])),
+    ).rejects.toMatchObject({ code: "section_baseline_changed" });
+    expect(await store.inspect()).toEqual(state);
+  });
+  it("admits an unknown owner once against its domain revision and preserves the moved parent", async () => {
+    const initial = await seedDerived();
+    await store.commit(derivedRequest(initial, [{ kind: "put", entry: reparent(initial) }]));
+    const moved = await store.inspect();
+    const domain = moved.ownerDomains!.find((row) => row.serverId === "unknown")!;
+    const late = qualifyLegacyWorkspaceLayoutEntries([
+      {
+        ...entry("unknown", "y"),
+        pinnedAt: null,
+        pinPlacement: { parentWorkspaceKey: "worker:x", siblingOrder: 0, revision: 1 },
+      },
+    ]);
+    const admission: WorkspaceLayoutMutation = {
+      ...imported("unknown", late),
+      expectedDomainRevision: domain.revision,
+    };
+    const wrong: WorkspaceLayoutMutation = {
+      ...imported("unknown", late),
+      expectedDomainRevision: domain.revision + 1,
+    };
+    await expect(store.commit(derivedRequest(moved, [wrong]))).rejects.toMatchObject({
+      code: "import_closed",
+    });
+    const original = derivedRequest(moved, [admission]);
+    const receipt = await store.commit(original);
+    expect(await store.commit(original)).toEqual(receipt);
+    const joined = await store.inspect();
+    expect(resolveEffectiveWorkspaceLayout(joined).get("unknown:y")).toMatchObject({
+      section: "superpinned",
+      parentWorkspaceKey: "worker:x",
+    });
+    expect(joined.entries.find((row) => row.ref.workspaceId === "y")).toMatchObject({
+      pinnedAt: null,
+      superpinnedAt: null,
+    });
+    expect(joined.entries.find((row) => row.ref.workspaceId === "x")).toEqual(
+      moved.entries.find((row) => row.ref.workspaceId === "x"),
+    );
+    await expect(store.commit(derivedRequest(joined, [admission]))).rejects.toMatchObject({
+      code: "import_closed",
+    });
+  });
+  it("refuses unknown new ancestry and unknown old ancestry at the raw store boundary", async () => {
+    let state = await seedDerived();
+    const missing = reparent(state);
+    missing.pinPlacement!.parentWorkspaceKey = "unknown:missing";
+    await expect(
+      store.commit(derivedRequest(state, [{ kind: "put", entry: missing }])),
+    ).rejects.toThrow("required_parent_unavailable:unknown:missing");
+    // An original imported edge may truthfully reach an unknown owner, but editing that component needs its ancestry.
+    const importedChild = qualifyLegacyWorkspaceLayoutEntries([
+      {
+        ...entry("other", "child"),
+        pinnedAt: null,
+        pinPlacement: { parentWorkspaceKey: "unknown:missing", siblingOrder: 0, revision: 1 },
+      },
+    ]);
+    const otherHome = await mkdtemp(path.join(home, "other-"));
+    const other = new WorkspaceLayoutStore({
+      paseoHome: otherHome,
+      serverId: identity.authorityServerId,
+      identity,
+      semanticsVersion: 2,
+    });
+    const first = await other.initialize(identity);
+    await other.commit(
+      derivedRequest(first, [
+        { kind: "declare-unknown-owner", serverId: "unknown" },
+        imported("other", importedChild),
+        imported("coordinator", qualifyLegacyWorkspaceLayoutEntries([entry("coordinator", "p")])),
+        resolveEmptyNavigation(),
+      ]),
+    );
+    state = await other.inspect();
+    await other.commit(
+      derivedRequest(state, [
+        {
+          kind: "activate",
+          requiredImports: state.imports,
+          requiredOwnerDomains: state.ownerDomains,
+        },
+      ]),
+    );
+    state = await other.inspect();
+    const child = state.entries.find((row) => row.ref.workspaceId === "child")!;
+    const changed = {
+      ...child,
+      pinPlacement: { parentWorkspaceKey: "coordinator:p", siblingOrder: 0, revision: 2 },
+      sectionIntent: { ...child.sectionIntent!, mode: "inherit" as const },
+    };
+    await expect(
+      other.commit(derivedRequest(state, [{ kind: "put", entry: changed }])),
+    ).rejects.toThrow("required_old_parent_unavailable:unknown:missing");
+    expect(await other.inspect()).toEqual(state);
+  });
+  it("refuses cycles discovered on late owner admission while keeping that owner unknown", async () => {
+    const initial = await store.initialize(identity);
+    const x = qualifyLegacyWorkspaceLayoutEntries([
+      {
+        ...entry("worker", "x"),
+        pinnedAt: null,
+        pinPlacement: { parentWorkspaceKey: "unknown:y", siblingOrder: 0, revision: 1 },
+      },
+    ]);
+    await store.commit(
+      derivedRequest(initial, [
+        { kind: "declare-unknown-owner", serverId: "unknown" },
+        imported("worker", x),
+        resolveEmptyNavigation(),
+      ]),
+    );
+    let state = await store.inspect();
+    await store.commit(
+      derivedRequest(state, [
+        {
+          kind: "activate",
+          requiredImports: state.imports,
+          requiredOwnerDomains: state.ownerDomains,
+        },
+      ]),
+    );
+    state = await store.inspect();
+    const late = qualifyLegacyWorkspaceLayoutEntries([
+      {
+        ...entry("unknown", "y"),
+        pinnedAt: null,
+        pinPlacement: { parentWorkspaceKey: "worker:x", siblingOrder: 0, revision: 1 },
+      },
+    ]);
+    const domain = state.ownerDomains!.find((row) => row.serverId === "unknown")!;
+    await expect(
+      store.commit(
+        derivedRequest(state, [
+          { ...imported("unknown", late), expectedDomainRevision: domain.revision },
+        ]),
+      ),
+    ).rejects.toThrow();
+    expect(await store.inspect()).toEqual(state);
   });
 });

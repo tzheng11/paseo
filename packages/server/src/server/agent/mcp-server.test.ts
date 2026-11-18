@@ -8,6 +8,16 @@ import {
 } from "./finish-subscriptions/index.js";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { setWorkspacePinPlacement } from "../workspace-pin-placement.js";
+import { WorkspaceLayoutService } from "../workspace-layout-service.js";
+import { CanonicalWorkspaceRegistry } from "../workspace-layout-registry.js";
+import { createStub } from "../test-utils/class-mocks.js";
+import {
+  emptyWorkspaceNavigationPreferences,
+  qualifyLegacyWorkspaceLayoutEntries,
+  resolveEffectiveWorkspaceLayout,
+  type WorkspaceLayoutEntry,
+  type WorkspaceLayoutSnapshot,
+} from "@getpaseo/protocol/workspace-layout";
 import type { AgentMessageDelivery } from "./agent-messages/index.js";
 import { createTestAgentMessages } from "../test-utils/agent-messages.js";
 import { type PromptDispatchDisposition } from "./agent-prompt.js";
@@ -2994,7 +3004,9 @@ describe("create_agent MCP tool", () => {
     });
     expect(moved).toMatchObject({
       isError: true,
-      structuredContent: { error: expect.stringContaining("Reconnect all registered hosts") },
+      structuredContent: {
+        error: expect.stringContaining("legacy hierarchy owners Offline (offline)"),
+      },
     });
     expect(writes).not.toHaveBeenCalled();
   });
@@ -4145,6 +4157,624 @@ class HeldTurnAgentClient implements AgentClient {
     return await this.createSession();
   }
 }
+
+describe("canonical sidebar moves through MCP", () => {
+  const logger = createTestLogger();
+  let home: string;
+  let layout: WorkspaceLayoutService;
+  let registry: CanonicalWorkspaceRegistry;
+  let client: Client;
+  const timestamp = "2026-11-01T00:00:00.000Z";
+  const owners = ["local", "peer", "child-owner", "unrelated"];
+  const status = new Map<string, "online" | "offline">();
+  const reads: string[] = [];
+  let beforeNativeRead: (() => Promise<void>) | undefined;
+  let nativeEpoch: string | undefined;
+  let unknownOwner = false;
+  let restrictedClient: () => Promise<Client>;
+  const mode = {
+    role: "authority" as const,
+    semanticsVersion: 2 as const,
+    authorityServerId: "local",
+    authorityKeySha256: "a".repeat(64),
+    authorityId: "00000000-0000-4000-8000-000000000001",
+    epoch: "00000000-0000-4000-8000-000000000002",
+  };
+
+  beforeEach(async () => {
+    home = await mkdtemp(join(tmpdir(), "paseo-mcp-canonical-move-"));
+    reads.length = 0;
+    beforeNativeRead = undefined;
+    nativeEpoch = undefined;
+    unknownOwner = false;
+    for (const owner of owners) status.set(owner, owner === "unrelated" ? "offline" : "online");
+    layout = new WorkspaceLayoutService({
+      home,
+      serverId: "local",
+      config: mode,
+      failed: (error) => {
+        throw error;
+      },
+    });
+    const initial = await layout.initialize(mode);
+    const make = (
+      serverId: string,
+      workspaceId: string,
+      parentWorkspaceKey: string | null,
+    ): WorkspaceLayoutEntry => ({
+      ref: { serverId, workspaceId },
+      projectId: "project",
+      pinnedAt: null,
+      superpinnedAt: null,
+      parent: null,
+      siblingOrder: 0,
+      pinPlacement: { parentWorkspaceKey, siblingOrder: 1024, revision: 1 },
+      archivedAt: null,
+      revision: 0,
+    });
+    const entries = [
+      make("local", "worker", null),
+      { ...make("peer", "coordinator", null), pinnedAt: timestamp, superpinnedAt: timestamp },
+      make("child-owner", "descendant", "local:worker"),
+    ];
+    const groups = Map.groupBy(entries, (row) => row.ref.serverId);
+    await layout.commit({
+      writerVersion: 2,
+      requestId: "import-fixtures",
+      expected: initial.stamp,
+      mutations: [
+        { kind: "declare-unknown-owner", serverId: "unrelated" },
+        ...owners
+          .filter((owner) => owner !== "unrelated")
+          .map((owner) => ({
+            kind: "import-host" as const,
+            source: {
+              serverId: owner,
+              sourceSha256: "a".repeat(64),
+              resolutionSha256: "b".repeat(64),
+            },
+            previousSourceSha256: null,
+            entries: qualifyLegacyWorkspaceLayoutEntries(groups.get(owner)!),
+          })),
+        {
+          kind: "put-navigation",
+          expectedRevision: 0,
+          preferences: emptyWorkspaceNavigationPreferences(),
+          importResolution: { clientSources: [], resolutionSha256: "c".repeat(64) },
+        },
+      ],
+    });
+    const imported = await layout.inspect();
+    await layout.commit({
+      writerVersion: 2,
+      requestId: "activate-fixtures",
+      expected: imported.stamp,
+      mutations: [
+        {
+          kind: "activate",
+          requiredImports: imported.imports,
+          requiredOwnerDomains: imported.ownerDomains,
+        },
+      ],
+    });
+    const file = join(home, "workspaces.json");
+    const legacy = new FileBackedWorkspaceRegistry(file, logger);
+    await legacy.initialize();
+    await legacy.upsert(
+      createPersistedWorkspaceRecord({
+        workspaceId: "worker",
+        projectId: "project",
+        cwd: home,
+        kind: "directory",
+        displayName: "Worker",
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        pinnedAt: null,
+        pinPlacement: { parentWorkspaceKey: null, siblingOrder: 1024, revision: 1 },
+      }),
+    );
+    registry = new CanonicalWorkspaceRegistry(file, logger, layout, "local");
+    await registry.initialize();
+    const { agentManager, agentStorage } = createTestDeps();
+    const serverOptions: Parameters<typeof createAgentMcpServer>[0] = {
+      agentManager,
+      agentStorage,
+      serverId: "local",
+      providerSnapshotManager: createOpenCodeManager().manager,
+      workspaceRegistry: registry,
+      workspaceLayoutService: layout,
+      hosts: () => ({
+        directory: async () => ({
+          self: { serverId: "local", label: "Local" },
+          hosts: [...owners, ...(unknownOwner ? ["unknown-owner"] : [])]
+            .filter((owner) => owner !== "local")
+            .map((owner) => ({
+              serverId: owner,
+              registrationId: owner,
+              label: owner,
+              source: { id: "user", key: owner },
+              metadata: {},
+              enabled: true,
+              status: status.get(owner)!,
+              targetDescription: "fixture",
+              lastOnlineAt: null,
+              nextRetryAt: null,
+              error: null,
+            })),
+        }),
+        use: async (owner, action) => {
+          reads.push(owner);
+          if (status.get(owner) !== "online")
+            throw new Error(`Offline owner ${owner} must not be contacted`);
+          const snapshot = await layout.inspect();
+          await beforeNativeRead?.();
+          const native = createStub<DaemonClient>({
+            getLastServerInfoMessage: () => ({
+              serverId: owner,
+              features: { workspaceLayoutDerivedSections: true },
+              workspaceLayout: {
+                ...layout.status(),
+                role: "replica",
+                epoch: nativeEpoch ?? mode.epoch,
+              },
+            }),
+            fetchWorkspaces: async () => ({
+              entries: snapshot.entries
+                .filter((entry) => entry.ref.serverId === owner && !entry.archivedAt)
+                .map((entry) => ({
+                  id: entry.ref.workspaceId,
+                  projectId: entry.projectId,
+                  workspaceDirectory: `/fixture/${owner}`,
+                  workspaceKind: "directory",
+                  title: null,
+                  parentWorkspaceId: entry.parent?.workspaceId ?? null,
+                  siblingOrder: entry.siblingOrder ?? undefined,
+                  pinnedAt: resolveEffectiveWorkspaceLayout(snapshot).get(
+                    `${owner}:${entry.ref.workspaceId}`,
+                  )!.pinnedAt,
+                  superpinnedAt: resolveEffectiveWorkspaceLayout(snapshot).get(
+                    `${owner}:${entry.ref.workspaceId}`,
+                  )!.superpinnedAt,
+                  pinPlacement: entry.pinPlacement ?? undefined,
+                })),
+              pageInfo: { hasMore: false, nextCursor: null },
+            }),
+          });
+          return action(native);
+        },
+      }),
+      logger,
+    };
+    const server = await createAgentMcpServer(serverOptions);
+    restrictedClient = async () =>
+      connectInMemoryMcpClient(
+        await createAgentMcpServer({
+          ...serverOptions,
+          callerAgentId: "restricted-caller",
+          resolveCallerContext: () => ({ lockedCwd: home }),
+        }),
+      );
+    client = await connectInMemoryMcpClient(server);
+  });
+  afterEach(async () => {
+    await client?.close();
+    await registry?.close();
+    await layout?.close();
+    await rm(home, { recursive: true, force: true });
+  });
+  function move(parentWorkspaceKey: string | null = "peer:coordinator") {
+    return client.callTool({
+      name: "move_workspace",
+      arguments: { workspaceId: "worker", parentWorkspaceKey },
+    });
+  }
+  function findEntry(snapshot: WorkspaceLayoutSnapshot, key: string) {
+    const found = snapshot.entries.find(
+      (row) => `${row.ref.serverId}:${row.ref.workspaceId}` === key,
+    );
+    if (!found) throw new Error(`Missing fixture ${key}`);
+    return found;
+  }
+
+  it("preserves locked caller scope before canonical remote-source or parent reads and writes", async () => {
+    const restricted = await restrictedClient();
+    const before = await layout.inspect();
+    const commit = vi.spyOn(layout, "commit");
+    const inspect = vi.spyOn(layout, "inspect");
+    try {
+      const remote = await restricted.callTool({
+        name: "move_workspace",
+        arguments: {
+          serverId: "peer",
+          workspaceId: "coordinator",
+          parentWorkspaceKey: null,
+          siblingOrder: 2048,
+        },
+      });
+      expect(remote).toMatchObject({
+        isError: true,
+        structuredContent: {
+          error: expect.stringContaining("restricted to its local working directory"),
+        },
+      });
+      expect(inspect).not.toHaveBeenCalled();
+      const remoteParent = await restricted.callTool({
+        name: "move_workspace",
+        arguments: { workspaceId: "worker", parentWorkspaceKey: "peer:coordinator" },
+      });
+      expect(remoteParent).toMatchObject({
+        isError: true,
+        structuredContent: {
+          error: expect.stringContaining("restricted to its local working directory"),
+        },
+      });
+      expect(commit).not.toHaveBeenCalled();
+      expect(reads).toEqual([]);
+      expect(await layout.inspect()).toEqual(before);
+    } finally {
+      await restricted.close();
+    }
+  });
+
+  it("moves an online worker below a coordinator on another host with an unrelated enabled host offline, atomically inheriting the subtree section", async () => {
+    const before = await layout.inspect();
+    const result = await move();
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      workspaceId: "worker",
+      section: "superpinned",
+      pinPlacement: { parentWorkspaceKey: "peer:coordinator", revision: 2 },
+    });
+    const after = await layout.inspect();
+    expect(after.stamp.revision).toBe(before.stamp.revision + 1);
+    expect(findEntry(after, "local:worker").superpinnedAt).toBeNull();
+    expect(resolveEffectiveWorkspaceLayout(after).get("local:worker")?.section).toBe("superpinned");
+    expect(findEntry(after, "child-owner:descendant")).toMatchObject({
+      superpinnedAt: null,
+      pinPlacement: { parentWorkspaceKey: "local:worker" },
+    });
+    expect(after.ownerDomains?.find((domain) => domain.serverId === "unrelated")?.state).toBe(
+      "unknown",
+    );
+    expect(resolveEffectiveWorkspaceLayout(after).get("child-owner:descendant")?.section).toBe(
+      "superpinned",
+    );
+    expect(reads).toEqual(["peer"]);
+  });
+
+  it.each(["peer"])(
+    "names affected offline owner %s without a write or contacting that owner",
+    async (owner) => {
+      status.set(owner, "offline");
+      const before = await layout.inspect();
+      const result = await move();
+      expect(result).toMatchObject({
+        isError: true,
+        structuredContent: {
+          error: expect.stringContaining(
+            `Affected hierarchy owner ${owner} (${owner}) is unavailable`,
+          ),
+        },
+      });
+      expect(await layout.inspect()).toEqual(before);
+      expect(reads).not.toContain(owner);
+    },
+  );
+
+  it("refuses a cycle and unknown required parent ancestry before mutation", async () => {
+    const before = await layout.inspect();
+    const cycle = await move("child-owner:descendant");
+    expect(cycle).toMatchObject({
+      isError: true,
+      structuredContent: { error: expect.stringContaining("own parent or ancestor") },
+    });
+    const unknown = await move("unknown:parent");
+    expect(unknown).toMatchObject({
+      isError: true,
+      structuredContent: {
+        error: expect.stringContaining("Required parent ancestry unknown:parent"),
+      },
+    });
+    expect(await layout.inspect()).toEqual(before);
+  });
+
+  it("keeps unknown descendants unknown, then derives their section on qualified late admission without changing their raw pins", async () => {
+    status.set("child-owner", "offline");
+    expect((await move()).isError).not.toBe(true);
+    const before = await layout.inspect();
+    const domain = before.ownerDomains!.find((item) => item.serverId === "unrelated")!;
+    const late: WorkspaceLayoutEntry[] = ["late-child", "late-grandchild"].map(
+      (workspaceId, index) => ({
+        ref: { serverId: "unrelated", workspaceId },
+        projectId: "project",
+        pinnedAt: null,
+        superpinnedAt: null,
+        parent: null,
+        siblingOrder: 0,
+        archivedAt: null,
+        revision: 0,
+        pinPlacement: {
+          parentWorkspaceKey: index === 0 ? "local:worker" : "unrelated:late-child",
+          siblingOrder: 1024,
+          revision: 1,
+        },
+      }),
+    );
+    await layout.commit({
+      writerVersion: 2,
+      requestId: "qualified-late-owner",
+      expected: before.stamp,
+      mutations: [
+        {
+          kind: "import-host",
+          source: {
+            serverId: "unrelated",
+            sourceSha256: "d".repeat(64),
+            resolutionSha256: "e".repeat(64),
+          },
+          previousSourceSha256: null,
+          expectedDomainRevision: domain.revision,
+          entries: qualifyLegacyWorkspaceLayoutEntries(late),
+        },
+      ],
+    });
+    const after = await layout.inspect();
+    for (const item of late) {
+      const key = `unrelated:${item.ref.workspaceId}`;
+      expect(findEntry(after, key)).toMatchObject({
+        pinnedAt: null,
+        superpinnedAt: null,
+        pinPlacement: item.pinPlacement,
+      });
+      expect(resolveEffectiveWorkspaceLayout(after).get(key)).toMatchObject({
+        section: "superpinned",
+        parentWorkspaceKey: item.pinPlacement!.parentWorkspaceKey,
+      });
+    }
+    expect(findEntry(after, "local:worker")).toEqual(findEntry(before, "local:worker"));
+    const rawFile = join(home, "late-workspaces.json");
+    const raw = new FileBackedWorkspaceRegistry(rawFile, logger);
+    await raw.initialize();
+    await raw.upsert(
+      createPersistedWorkspaceRecord({
+        workspaceId: "late-child",
+        projectId: "project",
+        cwd: home,
+        kind: "directory",
+        displayName: "Late child",
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        pinnedAt: null,
+        superpinnedAt: null,
+        pinPlacement: late[0].pinPlacement!,
+      }),
+    );
+    const joined = new CanonicalWorkspaceRegistry(rawFile, logger, layout, "unrelated");
+    await joined.initialize();
+    expect(await joined.get("late-child")).toMatchObject({
+      effectiveSection: "superpinned",
+      pinnedAt: timestamp,
+      superpinnedAt: timestamp,
+    });
+    const captured = JSON.parse(await readFile(rawFile, "utf8"));
+    expect(captured[0]).toMatchObject({ pinnedAt: null, superpinnedAt: null });
+    await joined.close();
+  });
+
+  it("records both fields for explicit pin overrides of inherited membership", async () => {
+    expect((await move()).isError).not.toBe(true);
+    const pinned = await registry.update(
+      "worker",
+      (current) => ({ ...current, superpinnedAt: null }),
+      { layoutWrite: true, sectionIntent: "explicit" },
+    );
+    expect(pinned).toMatchObject({
+      pinnedAt: timestamp,
+      superpinnedAt: null,
+      effectiveSection: "pinned",
+    });
+    const superpinned = await registry.update(
+      "worker",
+      (current) => ({ ...current, superpinnedAt: timestamp }),
+      { layoutWrite: true, sectionIntent: "explicit" },
+    );
+    expect(superpinned).toMatchObject({
+      pinnedAt: timestamp,
+      superpinnedAt: timestamp,
+      effectiveSection: "superpinned",
+    });
+  });
+
+  it("persists an explicit no-op unpin so a later parent pin does not override the choice", async () => {
+    expect((await move()).isError).not.toBe(true);
+    let snapshot = await layout.inspect();
+    const parent = findEntry(snapshot, "peer:coordinator");
+    await layout.commit({
+      writerVersion: 2,
+      requestId: "parent-unpin",
+      expected: snapshot.stamp,
+      mutations: [
+        {
+          kind: "put",
+          entry: {
+            ...parent,
+            pinnedAt: null,
+            superpinnedAt: null,
+            sectionIntent: { ...parent.sectionIntent!, mode: "explicit" },
+          },
+        },
+      ],
+    });
+    expect(await registry.get("worker")).toMatchObject({ effectiveSection: "unpinned" });
+    await registry.update(
+      "worker",
+      (current) => ({ ...current, pinnedAt: null, superpinnedAt: null }),
+      { layoutWrite: true, sectionIntent: "explicit" },
+    );
+    snapshot = await layout.inspect();
+    await layout.commit({
+      writerVersion: 2,
+      requestId: "parent-repin",
+      expected: snapshot.stamp,
+      mutations: [
+        {
+          kind: "put",
+          entry: {
+            ...findEntry(snapshot, "peer:coordinator"),
+            pinnedAt: timestamp,
+            superpinnedAt: timestamp,
+          },
+        },
+      ],
+    });
+    expect(await registry.get("worker")).toMatchObject({
+      effectiveSection: "unpinned",
+      pinnedAt: null,
+      superpinnedAt: null,
+    });
+  });
+
+  it("detaches inherited membership as an explicit root and saves the same raw protection fields", async () => {
+    expect((await move()).isError).not.toBe(true);
+    expect((await move(null)).isError).not.toBe(true);
+    const canonical = findEntry(await layout.inspect(), "local:worker");
+    expect(canonical).toMatchObject({
+      pinnedAt: timestamp,
+      superpinnedAt: timestamp,
+      sectionIntent: { mode: "explicit" },
+      pinPlacement: { parentWorkspaceKey: null },
+    });
+    const disk = JSON.parse(await readFile(join(home, "workspaces.json"), "utf8"));
+    expect(disk[0]).toMatchObject({
+      pinnedAt: timestamp,
+      superpinnedAt: timestamp,
+      pinPlacement: canonical.pinPlacement,
+    });
+  });
+
+  it("refuses an unadopted owner domain instead of treating its missing import as empty", async () => {
+    unknownOwner = true;
+    const before = await layout.inspect();
+    expect(await move()).toMatchObject({
+      isError: true,
+      structuredContent: {
+        error: expect.stringContaining("coverage for unknown-owner (unknown-owner)"),
+      },
+    });
+    expect(await layout.inspect()).toEqual(before);
+    expect(reads).toEqual([]);
+  });
+
+  it("rejects an affected owner on another authority epoch", async () => {
+    nativeEpoch = "00000000-0000-4000-8000-000000000003";
+    const before = await layout.inspect();
+    expect(await move()).toMatchObject({
+      isError: true,
+      structuredContent: {
+        error: expect.stringContaining("not synchronized with this active layout authority"),
+      },
+    });
+    expect(await layout.inspect()).toEqual(before);
+  });
+
+  it("refuses an unreachable authority despite retaining a complete last snapshot", async () => {
+    const before = await layout.inspect();
+    const inspect = vi
+      .spyOn(layout, "inspect")
+      .mockRejectedValueOnce(new Error("authority_unreachable"));
+    expect(await move()).toMatchObject({
+      isError: true,
+      structuredContent: { error: expect.stringContaining("authority_unreachable") },
+    });
+    inspect.mockRestore();
+    expect(await layout.inspect()).toEqual(before);
+    expect(reads).toEqual([]);
+  });
+
+  it("retains an uncertain committed request for receipt reconciliation and never replays it", async () => {
+    const commit = layout.commit.bind(layout);
+    const writes = vi.spyOn(layout, "commit").mockImplementationOnce(async (request) => {
+      await commit(request);
+      throw Object.assign(new Error("lost acknowledgement"), { code: "DAEMON_REQUEST_TIMEOUT" });
+    });
+    const before = await layout.inspect();
+    const response = await move();
+    expect(response).toMatchObject({
+      isError: true,
+      structuredContent: { error: expect.stringContaining("Original request:") },
+    });
+    expect(writes).toHaveBeenCalledTimes(1);
+    const original = writes.mock.calls[0]![0];
+    expect(await layout.findReceipt(original.requestId)).toMatchObject({
+      requestId: original.requestId,
+      stamp: { revision: before.stamp.revision + 1 },
+    });
+    expect(findEntry(await layout.inspect(), "local:worker").pinPlacement?.parentWorkspaceKey).toBe(
+      "peer:coordinator",
+    );
+    writes.mockRestore();
+  });
+
+  it("refuses a concurrent authority revision instead of retrying a move against a different graph", async () => {
+    let competing = false;
+    beforeNativeRead = async () => {
+      if (competing) return;
+      competing = true;
+      const snapshot = await layout.inspect();
+      await layout.commit({
+        writerVersion: 2,
+        requestId: "competing-move",
+        expected: snapshot.stamp,
+        mutations: [
+          {
+            kind: "put",
+            entry: {
+              ...findEntry(snapshot, "local:worker"),
+              pinPlacement: { parentWorkspaceKey: null, siblingOrder: 4096, revision: 2 },
+            },
+          },
+        ],
+      });
+    };
+    const result = await move();
+    expect(result).toMatchObject({
+      isError: true,
+      structuredContent: { error: expect.stringContaining("stale_revision") },
+    });
+    expect(findEntry(await layout.inspect(), "local:worker").pinPlacement).toMatchObject({
+      parentWorkspaceKey: null,
+      siblingOrder: 4096,
+    });
+  });
+
+  it("preserves the committed placement across stale registry reconciliation and a fresh canonical registry connection", async () => {
+    const old = await registry.get("worker");
+    expect((await move()).isError).not.toBe(true);
+    await registry.upsert(old!);
+    await registry.close();
+    registry = new CanonicalWorkspaceRegistry(
+      join(home, "workspaces.json"),
+      logger,
+      layout,
+      "local",
+    );
+    await registry.initialize();
+    expect(await registry.get("worker")).toMatchObject({
+      pinPlacement: { parentWorkspaceKey: "peer:coordinator", revision: 2 },
+      superpinnedAt: expect.any(String),
+    });
+    const reconnected = new WorkspaceLayoutService({
+      home,
+      serverId: "local",
+      config: mode,
+      failed: (error) => {
+        throw error;
+      },
+    });
+    expect(await reconnected.inspect()).toEqual(await layout.inspect());
+    await reconnected.close();
+  });
+});
 
 describe("send_agent_prompt MCP tool", () => {
   it.each([

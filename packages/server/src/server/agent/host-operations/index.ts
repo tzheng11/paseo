@@ -227,16 +227,21 @@ export function createHostResolver(input: {
   callerAgentId?: string;
   lockedCwd?: string;
 }) {
+  function assertAllowed(serverId: string | undefined): string {
+    const destination = serverId ?? input.serverId;
+    if (destination !== input.serverId && input.lockedCwd)
+      throw new Error("This caller is restricted to its local working directory");
+    return destination;
+  }
   return {
+    assertAllowed,
     directory: () => input.hosts().directory(),
     async use<T>(
       serverId: string | undefined,
       action: (host: HostOperations) => Promise<T>,
     ): Promise<T> {
-      const destination = serverId ?? input.serverId;
+      const destination = assertAllowed(serverId);
       if (destination === input.serverId) return action(input.local);
-      if (input.lockedCwd)
-        throw new Error("This caller is restricted to its local working directory");
       return input.hosts().use(destination, async (client) =>
         action({
           async createAgent(args) {
@@ -440,7 +445,7 @@ export function createHostResolver(input: {
     },
   };
 }
-function workspaceSummary(workspace: FetchWorkspacesEntry, serverId?: string) {
+export function workspaceSummary(workspace: FetchWorkspacesEntry, serverId?: string) {
   return {
     workspaceId: workspace.id,
     ...(serverId ? { workspaceKey: `${serverId}:${workspace.id}` } : {}),
@@ -450,7 +455,10 @@ function workspaceSummary(workspace: FetchWorkspacesEntry, serverId?: string) {
     kind: workspace.workspaceKind === "checkout" ? "local_checkout" : workspace.workspaceKind,
     title: workspace.title,
     background: workspace.background,
-    section: workspaceSidebarSection(workspace),
+    section:
+      workspace.effectiveSection !== undefined
+        ? workspace.effectiveSection
+        : workspaceSidebarSection(workspace),
     ...(workspace.pinPlacement ? { pinPlacement: workspace.pinPlacement } : {}),
     // COMPAT(workspaceHierarchy): old connected hosts omit hierarchy; remove after 2027-04-21.
     parentWorkspaceId: workspace.parentWorkspaceId ?? null,

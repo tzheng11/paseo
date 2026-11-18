@@ -27,14 +27,21 @@ import {
   type WorkspaceLayoutMutation,
   type WorkspaceLayoutReceipt,
   type WorkspaceLayoutSnapshot,
+  workspaceLayoutParentKey,
+  resolveEffectiveWorkspaceLayout,
 } from "@getpaseo/protocol/workspace-layout";
 export { canonicalLayoutJson } from "@getpaseo/protocol/workspace-layout";
 
-const StoreSchema = z.strictObject({
-  schemaVersion: z.literal(3),
-  snapshot: WorkspaceLayoutSnapshotSchema,
-  receipts: z.record(z.string().regex(/^[a-f0-9]{64}$/), WorkspaceLayoutReceiptSchema),
-});
+const StoreSchema = z
+  .strictObject({
+    schemaVersion: z.union([z.literal(3), z.literal(4)]),
+    snapshot: WorkspaceLayoutSnapshotSchema,
+    receipts: z.record(z.string().regex(/^[a-f0-9]{64}$/), WorkspaceLayoutReceiptSchema),
+  })
+  .refine(
+    (file) => (file.schemaVersion === 4) === (file.snapshot.semanticsVersion === 2),
+    "layout_semantics_format_mismatch",
+  );
 type StoreFile = z.infer<typeof StoreSchema>;
 const GuardSchema = WorkspaceLayoutIdentitySchema.extend({
   schemaVersion: z.literal(1),
@@ -86,6 +93,8 @@ export function parseCapturedWorkspaceLayout(input: CapturedWorkspaceLayoutInput
       throw new WorkspaceLayoutRefusal("layout_role_data_mismatch");
     if (replica.state === "present") {
       identity(replica.value.stamp);
+      if (replica.value.semanticsVersion !== mode.semanticsVersion)
+        throw new WorkspaceLayoutRefusal("layout_semantics_mismatch");
       validateCapturedSnapshot(replica.value);
     }
     return { role: "replica" as const, mode, marker, cache: replica };
@@ -108,6 +117,8 @@ export function parseCapturedWorkspaceLayout(input: CapturedWorkspaceLayoutInput
   if (guard.state !== "present" || !guard.value.initialized)
     throw new WorkspaceLayoutRefusal("initialized_guard_required");
   identity(store.value.snapshot.stamp);
+  if (store.value.snapshot.semanticsVersion !== mode.semanticsVersion)
+    throw new WorkspaceLayoutRefusal("layout_semantics_mismatch");
   validateCapturedSnapshot(store.value.snapshot);
   validateCapturedReceipts(store.value);
   validateInitialCapturedLayout(store.value);
@@ -140,6 +151,8 @@ function resolveCapturedMode(input: {
       throw new WorkspaceLayoutRefusal("home_authority_binding_changed");
     mode = bound;
   }
+  if (mode?.semanticsVersion === 2 && input.marker.state !== "present")
+    throw new WorkspaceLayoutRefusal("derived_layout_marker_required");
   return mode;
 }
 
@@ -196,6 +209,7 @@ function validateInitialCapturedLayout(file: StoreFile): void {
       file.snapshot.entries.length ||
       file.snapshot.imports.length ||
       file.snapshot.clientImports?.length ||
+      file.snapshot.ownerDomains?.length ||
       file.snapshot.navigation !== null)
   )
     throw new WorkspaceLayoutRefusal("invalid_initial_layout");
@@ -213,6 +227,8 @@ function validateCapturedSnapshot(snapshot: WorkspaceLayoutSnapshot): void {
   // Navigation has its own counter: a commit may contain several navigation mutations.
   if (snapshot.entries.some((entry) => entry.revision > snapshot.stamp.revision))
     throw new WorkspaceLayoutRefusal("invalid_layout_revision");
+  if (snapshot.ownerDomains?.some((domain) => domain.revision > snapshot.stamp.revision))
+    throw new WorkspaceLayoutRefusal("invalid_owner_domain_revision");
   validateLayoutGraph(snapshot);
 }
 
@@ -220,6 +236,7 @@ export interface WorkspaceLayoutStoreOptions {
   paseoHome: string;
   identity: WorkspaceLayoutIdentity;
   serverId: string;
+  semanticsVersion?: 2;
   write?: (file: string, value: unknown) => Promise<void>;
 }
 
@@ -280,8 +297,11 @@ export class WorkspaceLayoutStore {
         initialized: false,
       });
       const file: StoreFile = {
-        schemaVersion: 3,
+        schemaVersion: this.options.semanticsVersion === 2 ? 4 : 3,
         snapshot: {
+          ...(this.options.semanticsVersion === 2
+            ? { semanticsVersion: 2 as const, ownerDomains: [] }
+            : {}),
           stamp: { ...this.identity, revision: 0, phase: "importing" },
           entries: [],
           imports: [],
@@ -309,6 +329,7 @@ export class WorkspaceLayoutStore {
           throw new WorkspaceLayoutRefusal("request_id_conflict");
         return structuredClone(prior);
       }
+      assertLayoutWriter(current.snapshot, input);
       if (canonicalLayoutJson(input.expected) !== canonicalLayoutJson(current.snapshot.stamp))
         throw new WorkspaceLayoutRefusal("stale_revision");
       if (input.expected.revision === Number.MAX_SAFE_INTEGER)
@@ -373,6 +394,8 @@ export class WorkspaceLayoutStore {
       );
     }
     const file = StoreSchema.parse(JSON.parse(text));
+    if (file.snapshot.semanticsVersion !== this.options.semanticsVersion)
+      throw new WorkspaceLayoutRefusal("layout_semantics_migration_required");
     this.requireIdentity(file.snapshot.stamp);
     validateLayoutGraph(file.snapshot);
     if (!guard?.initialized) await this.markInitialized();
@@ -410,6 +433,14 @@ function applyMutation(
   revision: number,
 ) {
   switch (mutation.kind) {
+    case "declare-unknown-owner": {
+      if (snapshot.semanticsVersion !== 2 || snapshot.stamp.phase !== "importing")
+        throw new WorkspaceLayoutRefusal("owner_declaration_closed");
+      if (snapshot.ownerDomains?.some((domain) => domain.serverId === mutation.serverId))
+        throw new WorkspaceLayoutRefusal("owner_already_declared");
+      snapshot.ownerDomains!.push({ serverId: mutation.serverId, state: "unknown", revision });
+      return;
+    }
     case "put":
       return putLayoutEntry(snapshot, mutation, revision);
     case "import-host":
@@ -432,6 +463,7 @@ function putLayoutEntry(
   const key = workspaceReferenceKey(mutation.entry.ref);
   const index = snapshot.entries.findIndex((entry) => workspaceReferenceKey(entry.ref) === key);
   const prior = index < 0 ? null : snapshot.entries[index];
+  if (snapshot.semanticsVersion === 2) validateDerivedPut(snapshot, mutation.entry, prior);
   if ((prior?.revision ?? 0) !== mutation.entry.revision)
     throw new WorkspaceLayoutRefusal("stale_entry_revision");
   const next = { ...mutation.entry, revision };
@@ -440,12 +472,29 @@ function putLayoutEntry(
   return;
 }
 
+function assertOwnerAdmission(
+  snapshot: WorkspaceLayoutSnapshot,
+  mutation: Extract<WorkspaceLayoutMutation, { kind: "import-host" }>,
+): void {
+  const domain = snapshot.ownerDomains?.find((item) => item.serverId === mutation.source.serverId);
+  if (snapshot.stamp.phase !== "importing") {
+    const joiningUnknown =
+      snapshot.semanticsVersion === 2 &&
+      domain?.state === "unknown" &&
+      domain.revision === mutation.expectedDomainRevision &&
+      mutation.previousSourceSha256 === null &&
+      !snapshot.imports.some((source) => source.serverId === mutation.source.serverId) &&
+      !snapshot.entries.some((entry) => entry.ref.serverId === mutation.source.serverId);
+    if (!joiningUnknown) throw new WorkspaceLayoutRefusal("import_closed");
+  }
+}
+
 function importLayoutHost(
   snapshot: WorkspaceLayoutSnapshot,
   mutation: Extract<WorkspaceLayoutMutation, { kind: "import-host" }>,
   revision: number,
 ) {
-  if (snapshot.stamp.phase !== "importing") throw new WorkspaceLayoutRefusal("import_closed");
+  assertOwnerAdmission(snapshot, mutation);
   const previous = snapshot.imports.find((source) => source.serverId === mutation.source.serverId);
   if ((previous?.sourceSha256 ?? null) !== mutation.previousSourceSha256)
     throw new WorkspaceLayoutRefusal("stale_import_source");
@@ -463,6 +512,21 @@ function importLayoutHost(
     (source) => source.serverId !== mutation.source.serverId,
   );
   snapshot.imports.push(mutation.source);
+  if (snapshot.semanticsVersion === 2) {
+    for (const entry of mutation.entries) {
+      if (
+        !entry.sectionIntent ||
+        entry.sectionIntent.baselineSection !== layoutSection(entry) ||
+        (entry.sectionIntent.mode === "legacy" &&
+          entry.sectionIntent.baselineParentWorkspaceKey !== workspaceLayoutParentKey(entry))
+      )
+        throw new WorkspaceLayoutRefusal("unqualified_section_baseline");
+    }
+    snapshot.ownerDomains = (snapshot.ownerDomains ?? []).filter(
+      (item) => item.serverId !== mutation.source.serverId,
+    );
+    snapshot.ownerDomains.push({ serverId: mutation.source.serverId, state: "adopted", revision });
+  }
   return;
 }
 
@@ -471,6 +535,12 @@ function activateLayout(
   mutation: Extract<WorkspaceLayoutMutation, { kind: "activate" }>,
 ) {
   if (snapshot.stamp.phase !== "importing") throw new WorkspaceLayoutRefusal("already_active");
+  if (
+    snapshot.semanticsVersion === 2 &&
+    canonicalLayoutJson(mutation.requiredOwnerDomains) !==
+      canonicalLayoutJson(snapshot.ownerDomains)
+  )
+    throw new WorkspaceLayoutRefusal("owner_manifest_mismatch");
   const required = new Set(mutation.requiredImports.map((source) => source.serverId));
   if (
     required.size !== mutation.requiredImports.length ||
@@ -559,6 +629,78 @@ function layoutSection(entry: WorkspaceLayoutEntry): string {
   return entry.pinnedAt ? "pinned" : "unpinned";
 }
 
+function assertLayoutWriter(snapshot: WorkspaceLayoutSnapshot, input: WorkspaceLayoutCommit): void {
+  if (snapshot.semanticsVersion === 2 && input.writerVersion !== 2)
+    throw new WorkspaceLayoutRefusal("writer_version_required");
+}
+
+function validateOwnerDomains(snapshot: WorkspaceLayoutSnapshot): void {
+  if (!snapshot.ownerDomains) throw new WorkspaceLayoutRefusal("owner_coverage_required");
+  const domains = new Map(snapshot.ownerDomains.map((domain) => [domain.serverId, domain]));
+  if (domains.size !== snapshot.ownerDomains.length)
+    throw new WorkspaceLayoutRefusal("duplicate_owner_domain");
+  for (const domain of domains.values()) {
+    const imported = snapshot.imports.some((source) => source.serverId === domain.serverId);
+    if (imported !== (domain.state === "adopted"))
+      throw new WorkspaceLayoutRefusal("owner_import_mismatch");
+  }
+  for (const source of snapshot.imports)
+    if (domains.get(source.serverId)?.state !== "adopted")
+      throw new WorkspaceLayoutRefusal("owner_import_mismatch");
+  for (const entry of snapshot.entries) {
+    if (domains.get(entry.ref.serverId)?.state !== "adopted")
+      throw new WorkspaceLayoutRefusal("owner_not_adopted");
+    if (!entry.sectionIntent) throw new WorkspaceLayoutRefusal("section_intent_required");
+    if (entry.sectionIntent.mode === "inherit" && workspaceLayoutParentKey(entry) === null)
+      throw new WorkspaceLayoutRefusal("inheritance_requires_parent");
+  }
+}
+
+function validateDerivedPut(
+  snapshot: WorkspaceLayoutSnapshot,
+  entry: WorkspaceLayoutEntry,
+  prior: WorkspaceLayoutEntry | null,
+): void {
+  if (
+    snapshot.ownerDomains?.find((domain) => domain.serverId === entry.ref.serverId)?.state !==
+    "adopted"
+  )
+    throw new WorkspaceLayoutRefusal("owner_not_adopted");
+  const intent = entry.sectionIntent;
+  if (!intent) throw new WorkspaceLayoutRefusal("section_intent_required");
+  if (
+    prior?.sectionIntent &&
+    (intent.baselineSection !== prior.sectionIntent.baselineSection ||
+      intent.baselineParentWorkspaceKey !== prior.sectionIntent.baselineParentWorkspaceKey)
+  )
+    throw new WorkspaceLayoutRefusal("section_baseline_changed");
+  if (intent.mode === "inherit" && workspaceLayoutParentKey(entry) === null)
+    throw new WorkspaceLayoutRefusal("inheritance_requires_parent");
+  if (
+    prior &&
+    workspaceLayoutParentKey(prior) !== workspaceLayoutParentKey(entry) &&
+    intent.mode === "legacy"
+  )
+    throw new WorkspaceLayoutRefusal("explicit_section_intent_required");
+}
+
+function assertKnownParentChain(
+  key: string | null,
+  entries: Map<string, WorkspaceLayoutEntry>,
+  movingKey: string,
+): void {
+  const visited = new Set([movingKey]);
+  let current = key;
+  while (current !== null) {
+    if (visited.has(current)) throw new WorkspaceLayoutRefusal("workspace_layout_cycle");
+    visited.add(current);
+    const entry = entries.get(current);
+    if (!entry || entry.archivedAt)
+      throw new WorkspaceLayoutRefusal(`required_parent_unavailable:${current}`);
+    current = workspaceLayoutParentKey(entry);
+  }
+}
+
 /** A durable receipt plus its exact CAS input can advance a known full snapshot without another read. */
 export function projectConfirmedLayout(
   snapshot: WorkspaceLayoutSnapshot,
@@ -566,6 +708,7 @@ export function projectConfirmedLayout(
   receipt: WorkspaceLayoutReceipt,
 ): WorkspaceLayoutSnapshot | null {
   if (canonicalLayoutJson(snapshot.stamp) !== canonicalLayoutJson(input.expected)) return null;
+  assertLayoutWriter(snapshot, input);
   const next = structuredClone(snapshot);
   const revision = snapshot.stamp.revision + 1;
   for (const mutation of input.mutations) applyMutation(next, mutation, revision);
@@ -578,6 +721,12 @@ export function projectConfirmedLayout(
 }
 
 export function validateLayoutGraph(snapshot: WorkspaceLayoutSnapshot): void {
+  if (snapshot.semanticsVersion === 2) validateOwnerDomains(snapshot);
+  else if (
+    snapshot.ownerDomains !== undefined ||
+    snapshot.entries.some((entry) => entry.sectionIntent !== undefined)
+  )
+    throw new WorkspaceLayoutRefusal("layout_semantics_not_enabled");
   const entries = new Map<string, WorkspaceLayoutEntry>();
   for (const entry of snapshot.entries) {
     const key = workspaceReferenceKey(entry.ref);
@@ -588,15 +737,21 @@ export function validateLayoutGraph(snapshot: WorkspaceLayoutSnapshot): void {
   }
   const structural = new Map<string, string | null>();
   const navigation = new Map<string, string | null>();
+  const unknown = new Set(
+    snapshot.ownerDomains
+      ?.filter((domain) => domain.state === "unknown")
+      .map((domain) => domain.serverId),
+  );
   for (const [key, entry] of entries) {
-    const parent = structuralParent(entry, entries, snapshot.stamp.phase);
+    const parent = structuralParent(entry, entries, snapshot.stamp.phase, unknown);
     structural.set(key, parent ? workspaceReferenceKey(parent.ref) : null);
-    const placement = navigationParent(entry, parent, entries, snapshot.stamp.phase);
+    const placement = navigationParent(entry, parent, entries, snapshot.stamp.phase, unknown);
     navigation.set(key, placement ? workspaceReferenceKey(placement.ref) : null);
   }
   assertAcyclic(structural);
   assertAcyclic(navigation);
   validateNavigation(snapshot, entries);
+  if (snapshot.semanticsVersion === 2) resolveEffectiveWorkspaceLayout(snapshot);
 }
 
 function validateNavigation(
@@ -628,7 +783,16 @@ function validateNavigation(
     for (const keys of orders) {
       unique(keys);
       for (const key of keys)
-        findParent(parseWorkspaceNavigationKey(key), entries, snapshot.stamp.phase);
+        findParent(
+          parseWorkspaceNavigationKey(key),
+          entries,
+          snapshot.stamp.phase,
+          new Set(
+            snapshot.ownerDomains
+              ?.filter((domain) => domain.state === "unknown")
+              .map((domain) => domain.serverId),
+          ),
+        );
     }
   };
   if (snapshot.navigation) validate(snapshot.navigation.preferences);
@@ -640,11 +804,12 @@ function structuralParent(
   entry: WorkspaceLayoutEntry,
   entries: Map<string, WorkspaceLayoutEntry>,
   phase: string,
+  unknownOwners?: ReadonlySet<string>,
 ) {
   if (!entry.parent) return null;
   if (entry.parent.serverId !== entry.ref.serverId)
     throw new WorkspaceLayoutRefusal("structural_parent_host_mismatch");
-  const parent = findParent(entry.parent, entries, phase);
+  const parent = findParent(entry.parent, entries, phase, unknownOwners);
   if (parent && parent.projectId !== entry.projectId)
     throw new WorkspaceLayoutRefusal("structural_parent_project_mismatch");
   return parent;
@@ -655,6 +820,7 @@ function navigationParent(
   structural: WorkspaceLayoutEntry | null,
   entries: Map<string, WorkspaceLayoutEntry>,
   phase: string,
+  unknownOwners?: ReadonlySet<string>,
 ) {
   if (!entry.pinPlacement) {
     // Validate stored edges, including dormant ones, so later reactivation
@@ -663,7 +829,7 @@ function navigationParent(
   }
   const key = entry.pinPlacement.parentWorkspaceKey;
   if (key === null) return null;
-  const parent = findParent(parseWorkspaceNavigationKey(key), entries, phase);
+  const parent = findParent(parseWorkspaceNavigationKey(key), entries, phase, unknownOwners);
   return parent;
 }
 
@@ -676,9 +842,23 @@ function validateNewNavigationParents(
     previous.entries.map((entry) => [workspaceReferenceKey(entry.ref), entry]),
   );
   const after = new Map(next.entries.map((entry) => [workspaceReferenceKey(entry.ref), entry]));
+  const navigationEntries = new Map(
+    next.entries.map((entry) => [`${entry.ref.serverId}:${entry.ref.workspaceId}`, entry]),
+  );
+  const effective = next.semanticsVersion === 2 ? resolveEffectiveWorkspaceLayout(next) : null;
+  const priorNavigationEntries = new Map(
+    previous.entries.map((entry) => [`${entry.ref.serverId}:${entry.ref.workspaceId}`, entry]),
+  );
   for (const mutation of mutations) {
     if (mutation.kind !== "put") continue;
     const entry = mutation.entry;
+    if (next.semanticsVersion === 2)
+      assertDerivedMoveAncestry(
+        before.get(workspaceReferenceKey(entry.ref)),
+        entry,
+        priorNavigationEntries,
+        navigationEntries,
+      );
     const parentKey = entry.pinPlacement?.parentWorkspaceKey;
     if (
       parentKey == null ||
@@ -688,9 +868,42 @@ function validateNewNavigationParents(
     const parent = findParent(parseWorkspaceNavigationKey(parentKey), after, next.stamp.phase);
     if (
       parent &&
-      (parent.archivedAt || entry.archivedAt || layoutSection(parent) !== layoutSection(entry))
+      (parent.archivedAt ||
+        entry.archivedAt ||
+        (effective
+          ? effective.get(parentKey)?.section !==
+            effective.get(`${entry.ref.serverId}:${entry.ref.workspaceId}`)?.section
+          : layoutSection(parent) !== layoutSection(entry)))
     )
       throw new WorkspaceLayoutRefusal("parent_section_mismatch");
+  }
+}
+
+function assertDerivedMoveAncestry(
+  prior: WorkspaceLayoutEntry | undefined,
+  entry: WorkspaceLayoutEntry,
+  priorNavigationEntries: Map<string, WorkspaceLayoutEntry>,
+  navigationEntries: Map<string, WorkspaceLayoutEntry>,
+): void {
+  const parentChanged =
+    !prior ||
+    workspaceLayoutParentKey(prior) !== workspaceLayoutParentKey(entry) ||
+    prior.sectionIntent?.mode !== entry.sectionIntent?.mode;
+  if (parentChanged) {
+    const oldParent = prior && workspaceLayoutParentKey(prior);
+    if (oldParent && !navigationEntries.has(oldParent))
+      throw new WorkspaceLayoutRefusal(`required_old_parent_unavailable:${oldParent}`);
+    if (prior)
+      assertKnownParentChain(
+        workspaceLayoutParentKey(prior),
+        priorNavigationEntries,
+        `${entry.ref.serverId}:${entry.ref.workspaceId}`,
+      );
+    assertKnownParentChain(
+      workspaceLayoutParentKey(entry),
+      navigationEntries,
+      `${entry.ref.serverId}:${entry.ref.workspaceId}`,
+    );
   }
 }
 
@@ -698,9 +911,11 @@ function findParent(
   ref: WorkspaceLayoutEntry["ref"],
   entries: Map<string, WorkspaceLayoutEntry>,
   phase: string,
+  unknownOwners?: ReadonlySet<string>,
 ) {
   const parent = entries.get(workspaceReferenceKey(ref)) ?? null;
-  if (!parent && phase !== "importing") throw new WorkspaceLayoutRefusal("unresolved_parent");
+  if (!parent && phase !== "importing" && !unknownOwners?.has(ref.serverId))
+    throw new WorkspaceLayoutRefusal("unresolved_parent");
   return parent;
 }
 

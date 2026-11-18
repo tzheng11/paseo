@@ -2,6 +2,8 @@ import {
   resolveSidebarAutomationPlacement,
   resolveSidebarAutomationCatalog,
   sidebarAutomationSubtree,
+  planCanonicalSidebarMove,
+  canonicalSidebarWorkspace,
   type SidebarAutomationWorkspace,
 } from "../../workspace-sidebar-automation.js";
 import {
@@ -18,7 +20,20 @@ import {
   type HostOperation,
   type HostOperations,
   type ToolHosts,
+  workspaceSummary,
 } from "../host-operations/index.js";
+import { randomUUID } from "node:crypto";
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import type { HostDirectory } from "@getpaseo/protocol/hosts";
+import { isDeepStrictEqual } from "node:util";
+import type { WorkspaceLayoutService } from "../../workspace-layout-service.js";
+import { WorkspaceLayoutRefusal } from "../../workspace-layout-store.js";
+import {
+  canonicalLayoutJson,
+  resolveEffectiveWorkspaceLayout,
+  type WorkspaceLayoutEntry,
+  type WorkspaceLayoutSnapshot,
+} from "@getpaseo/protocol/workspace-layout";
 import { AgentDirectory } from "../directory.js";
 import { stat } from "node:fs/promises";
 import { z } from "zod";
@@ -167,6 +182,7 @@ export interface PaseoToolHostDependencies {
   archiveWorkspaceRecord?: ArchiveDependencies["archiveWorkspaceRecord"];
   emitWorkspaceUpdatesForWorkspaceIds?: ArchiveDependencies["emitWorkspaceUpdatesForWorkspaceIds"];
   workspaceRegistry?: Pick<WorkspaceRegistry, "get" | "list" | "upsert" | "move">;
+  workspaceLayoutService?: Pick<WorkspaceLayoutService, "inspect" | "commit" | "status">;
   setWorkspaceFieldValue?: (
     input: Parameters<typeof setWorkspaceFieldValueTransaction>[1],
   ) => Promise<string>;
@@ -242,7 +258,7 @@ const WorkspaceAutomationSummarySchema = z.object({
   parentWorkspaceId: z.string().nullable(),
   siblingOrder: z.number().finite(),
   workspaceKey: z.string().optional(),
-  section: WorkspaceSidebarSectionSchema.optional(),
+  section: WorkspaceSidebarSectionSchema.nullable().optional(),
   pinPlacement: WorkspacePinPlacementSchema.optional(),
 });
 
@@ -250,7 +266,10 @@ function toWorkspaceAutomationSummary(workspace: PersistedWorkspaceRecord, serve
   return {
     workspaceId: workspace.workspaceId,
     ...(serverId ? { workspaceKey: `${serverId}:${workspace.workspaceId}` } : {}),
-    section: workspaceSidebarSection(workspace),
+    section:
+      workspace.effectiveSection !== undefined
+        ? workspace.effectiveSection
+        : workspaceSidebarSection(workspace),
     ...(workspace.pinPlacement ? { pinPlacement: workspace.pinPlacement } : {}),
     projectId: workspace.projectId,
     cwd: workspace.cwd,
@@ -813,7 +832,12 @@ function createToolCatalog(
     );
     if (requireComplete && destinations.some((host) => host.status !== "online"))
       throw new PaseoToolInputError(
-        "Reconnect all registered hosts before moving the shared workspace hierarchy.",
+        `Cannot verify the moved subtree: legacy hierarchy owners ${destinations
+          .filter((host) => host.status !== "online")
+          .map((host) => `${host.label} (${host.serverId})`)
+          .join(
+            ", ",
+          )} are unavailable and may own descendants. An active canonical layout authority is required to prove they are outside the affected scope.`,
       );
     const remote = await Promise.all(
       destinations
@@ -876,6 +900,8 @@ function createToolCatalog(
     destination: string | undefined,
     context: PaseoToolExecutionContext,
   ) {
+    if (options.workspaceLayoutService)
+      return executeCanonicalSidebarMove(input, destination, context);
     const rows = await loadSidebarCatalog();
     const sourceKey = `${destination ?? options.serverId ?? "self"}:${input.workspaceId}`;
     const source = rows.find((row) => row.workspaceKey === sourceKey);
@@ -928,6 +954,233 @@ function createToolCatalog(
       }
     }
     return commitSidebarMoves(updates, context);
+  }
+
+  async function executeCanonicalSidebarMove(
+    input: Record<string, unknown>,
+    destination: string | undefined,
+    context: PaseoToolExecutionContext,
+  ): Promise<PaseoToolResult> {
+    hostResolver.assertAllowed(destination);
+    const layout = options.workspaceLayoutService!;
+    // inspect reaches the pinned authority; a last replica snapshot is never move authority.
+    const snapshot = await layout.inspect();
+    const self = options.serverId ?? "self";
+    const sourceKey = `${destination ?? self}:${input.workspaceId}`;
+    const plan = planCanonicalSidebarMove(
+      snapshot,
+      {
+        workspaceKey: sourceKey,
+        parentWorkspaceKey: input.parentWorkspaceKey as string | null | undefined,
+        section: input.section as WorkspaceSidebarPlacement["section"] | undefined,
+        siblingOrder: input.siblingOrder as number | undefined,
+        beforeWorkspaceKey: input.beforeWorkspaceKey as string | null | undefined,
+      },
+      new Date().toISOString(),
+    );
+    const summaries = await verifyCanonicalSidebarOwners(snapshot, plan.affected, context);
+    const source = plan.mutations.find(
+      (mutation) =>
+        mutation.kind === "put" &&
+        `${mutation.entry.ref.serverId}:${mutation.entry.ref.workspaceId}` === sourceKey,
+    );
+    if (source?.kind !== "put") throw new Error("Canonical move did not include its source.");
+    const request = {
+      requestId: randomUUID(),
+      expected: snapshot.stamp,
+      mutations: plan.mutations,
+      ...(snapshot.semanticsVersion === 2 ? { writerVersion: 2 as const } : {}),
+    };
+    // Retain the exact original request for receipt reconciliation after an uncertain acknowledgement.
+    options.logger.info({ workspaceLayoutMove: request }, "Committing canonical sidebar move");
+    try {
+      await layout.commit(request);
+    } catch (error) {
+      const definitelyRefused =
+        error instanceof WorkspaceLayoutRefusal ||
+        (error instanceof Error &&
+          "code" in error &&
+          ["stale_revision", "stale_entry_revision", "authority_request_not_sent"].includes(
+            String(error.code),
+          ));
+      if (definitelyRefused) throw error;
+      throw new Error(
+        `Workspace move outcome requires reconciliation for request ${request.requestId}. Do not replay the move. Original request: ${canonicalLayoutJson(request)}`,
+        { cause: error },
+      );
+    }
+    return {
+      content: [],
+      structuredContent: ensureValidJson({
+        ...summaries.get(sourceKey)!,
+        section: plan.placement.section,
+        pinPlacement: source.entry.pinPlacement,
+      }),
+    };
+  }
+
+  async function verifyCanonicalSidebarOwners(
+    snapshot: WorkspaceLayoutSnapshot,
+    affected: WorkspaceLayoutEntry[],
+    context: PaseoToolExecutionContext,
+  ) {
+    const self = options.serverId ?? "self";
+    for (const owner of new Set(affected.map((entry) => entry.ref.serverId)))
+      hostResolver.assertAllowed(owner);
+    const hosts = options.hosts?.();
+    const directory = await hosts?.directory();
+    assertCanonicalCoverage(snapshot, directory);
+    const summaries = new Map<string, z.infer<typeof WorkspaceAutomationSummarySchema>>();
+    for (const owner of new Set(affected.map((entry) => entry.ref.serverId))) {
+      const ownerEntries = affected.filter((entry) => entry.ref.serverId === owner);
+      if (owner === self) {
+        const local = await observeLocalCanonicalWorkspaces(ownerEntries, snapshot);
+        for (const [key, summary] of local) summaries.set(key, summary);
+        continue;
+      }
+      const host = directory?.hosts.find((item) => item.serverId === owner);
+      if (!hosts || !host?.enabled || host.status !== "online")
+        throw new PaseoToolInputError(
+          `Affected hierarchy owner ${host?.label ?? owner} (${owner}) is unavailable; required workspaces: ${ownerEntries.map((entry) => entry.ref.workspaceId).join(", ")}.`,
+        );
+      await hosts.use(
+        owner,
+        async (client) => {
+          assertCanonicalOwner(client, owner, snapshot);
+          const rows = await fetchAllAutomationWorkspaces(client);
+          for (const entry of ownerEntries) {
+            const row = rows.find((item) => item.id === entry.ref.workspaceId);
+            if (!row)
+              throw new PaseoToolInputError(
+                `Affected workspace ${owner}:${entry.ref.workspaceId} is unavailable.`,
+              );
+            assertCanonicalObservation(
+              entry,
+              {
+                ...row,
+                workspaceId: row.id,
+                workspaceKey: `${owner}:${row.id}`,
+                section: workspaceSidebarSection(row),
+              },
+              snapshot,
+            );
+            const summary = WorkspaceAutomationSummarySchema.parse(workspaceSummary(row, owner));
+            summaries.set(`${owner}:${row.id}`, summary);
+          }
+        },
+        context.signal,
+      );
+    }
+    return summaries;
+  }
+
+  function assertCanonicalCoverage(
+    snapshot: WorkspaceLayoutSnapshot,
+    directory: HostDirectory | undefined,
+  ) {
+    const self = options.serverId ?? "self";
+    // An unimported owner is an unknown domain, not an empty authoritative domain.
+    if (!snapshot.imports.some((item) => item.serverId === self))
+      throw new PaseoToolInputError(
+        `Cannot verify subtree coverage for this owner (${self}): its hierarchy has not been adopted by this authority.`,
+      );
+    for (const host of directory?.hosts ?? []) {
+      if (host.enabled && !host.serverId)
+        throw new PaseoToolInputError(
+          `Cannot verify subtree coverage for ${host.label} (registration ${host.registrationId}): its owner identity is unknown.`,
+        );
+      if (
+        host.enabled &&
+        host.serverId &&
+        !(snapshot.semanticsVersion === 2
+          ? snapshot.ownerDomains?.some((domain) => domain.serverId === host.serverId)
+          : snapshot.imports.some((item) => item.serverId === host.serverId))
+      )
+        throw new PaseoToolInputError(
+          `Cannot verify subtree coverage for ${host.label} (${host.serverId}): its hierarchy has not been adopted by this authority.`,
+        );
+    }
+  }
+
+  async function observeLocalCanonicalWorkspaces(
+    ownerEntries: WorkspaceLayoutEntry[],
+    snapshot: WorkspaceLayoutSnapshot,
+  ) {
+    const owner = options.serverId ?? "self";
+    const summaries = new Map<string, z.infer<typeof WorkspaceAutomationSummarySchema>>();
+    const rows = await options.workspaceRegistry?.list();
+    for (const entry of ownerEntries) {
+      const row = rows?.find(
+        (item) => item.workspaceId === entry.ref.workspaceId && !item.archivedAt,
+      );
+      if (!row)
+        throw new PaseoToolInputError(
+          `Affected workspace ${owner}:${entry.ref.workspaceId} is unavailable.`,
+        );
+      assertCanonicalObservation(
+        entry,
+        {
+          ...row,
+          workspaceKey: `${owner}:${row.workspaceId}`,
+          section: workspaceSidebarSection(row),
+        },
+        snapshot,
+      );
+      summaries.set(`${owner}:${row.workspaceId}`, toWorkspaceAutomationSummary(row, owner));
+    }
+    return summaries;
+  }
+
+  function assertCanonicalOwner(
+    client: DaemonClient,
+    owner: string,
+    snapshot: WorkspaceLayoutSnapshot,
+  ) {
+    const info = client.getLastServerInfoMessage();
+    const mode = info?.workspaceLayout;
+    if (
+      info?.serverId !== owner ||
+      !mode?.synchronized ||
+      mode.authorityServerId !== snapshot.stamp.authorityServerId ||
+      mode.authorityId !== snapshot.stamp.authorityId ||
+      mode.epoch !== snapshot.stamp.epoch ||
+      mode.authorityKeySha256 !== options.workspaceLayoutService!.status().authorityKeySha256 ||
+      mode.stamp?.phase !== "active" ||
+      (snapshot.semanticsVersion === 2 &&
+        (mode.semanticsVersion !== 2 || info.features?.workspaceLayoutDerivedSections !== true))
+    )
+      throw new PaseoToolInputError(
+        `Affected owner ${owner} is not synchronized with this active layout authority.`,
+      );
+  }
+
+  function assertCanonicalObservation(
+    entry: WorkspaceLayoutEntry,
+    observed: SidebarAutomationWorkspace,
+    snapshot: WorkspaceLayoutSnapshot,
+  ) {
+    const view =
+      snapshot.semanticsVersion === 2
+        ? resolveEffectiveWorkspaceLayout(snapshot).get(
+            `${entry.ref.serverId}:${entry.ref.workspaceId}`,
+          )
+        : undefined;
+    const expected = canonicalSidebarWorkspace(entry, view);
+    const actual = {
+      workspaceKey: observed.workspaceKey,
+      workspaceId: observed.workspaceId,
+      projectId: observed.projectId,
+      parentWorkspaceId: observed.parentWorkspaceId ?? null,
+      siblingOrder: observed.siblingOrder,
+      section: observed.section,
+      pinnedAt: observed.pinnedAt,
+      superpinnedAt: observed.superpinnedAt,
+      pinPlacement: observed.pinPlacement,
+    };
+    if (!isDeepStrictEqual(actual, expected))
+      throw new PaseoToolInputError(
+        `Affected workspace ${expected.workspaceKey} differs from the current authority revision. Refresh before moving it.`,
+      );
   }
 
   async function commitSidebarMoves(

@@ -1369,3 +1369,17 @@ it("retains semantic agent messages across disk-cache reconstruction", async () 
   await writer.flush();
   expect(await createCache(storage).readTimeline(SERVER_ID, "agent-1")).toEqual(value);
 });
+
+it("retains unknown effective membership across cache hydration instead of inventing a raw section", async () => {
+  const storage = new MemoryStorage();
+  const writer = createCache(storage);
+  const value = directory();
+  value.workspaces.set(
+    "workspace-1",
+    normalizeWorkspaceDescriptor({ ...workspacePayload(), effectiveSection: null }),
+  );
+  writer.replaceDirectoryBaseline(SERVER_ID, value);
+  await writer.flush();
+  const restored = await createCache(storage).readDirectory(SERVER_ID);
+  expect(restored.workspaces.get("workspace-1")?.effectiveSection).toBeNull();
+});

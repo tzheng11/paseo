@@ -153,6 +153,7 @@ export class CanonicalSidebarLayout {
     if (mutations.some((mutation) => mutation.kind !== "put" && mutation.kind !== "put-navigation"))
       throw new Error("Client layout edits cannot initialize, import or activate the authority.");
     const input = WorkspaceLayoutCommitSchema.parse({
+      ...(snapshot.semanticsVersion === 2 ? { writerVersion: 2 } : {}),
       requestId: this.deps.requestId(),
       expected: snapshot.stamp,
       mutations,
@@ -411,6 +412,13 @@ export class CanonicalSidebarLayout {
     if (!this.replica) return null;
     const snapshot = WorkspaceLayoutSnapshotSchema.parse(raw);
     this.requireIdentity(snapshot.stamp);
+    if (snapshot.semanticsVersion !== this.replica.config.semanticsVersion)
+      throw new Error("Connected hosts disagree about workspace inheritance semantics.");
+    if (
+      snapshot.semanticsVersion === 2 &&
+      (!snapshot.ownerDomains || snapshot.entries.some((entry) => !entry.sectionIntent))
+    )
+      throw new Error("Update this host to use complete workspace inheritance provenance.");
     const prior = this.replica.snapshot;
     if (prior && snapshot.stamp.revision < prior.stamp.revision) return null;
     if (snapshot.stamp.revision < (this.replica.minimumRevision ?? 0))
@@ -468,12 +476,20 @@ export class CanonicalSidebarLayout {
 
 function sameAuthority(
   a: WorkspaceLayoutConfig,
-  b: { authorityServerId: string; authorityId: string; epoch: string; authorityKeySha256?: string },
+  b: {
+    authorityServerId: string;
+    authorityId: string;
+    epoch: string;
+    authorityKeySha256?: string;
+    role?: string;
+    semanticsVersion?: 2;
+  },
 ): boolean {
   return (
     a.authorityServerId === b.authorityServerId &&
     a.authorityId === b.authorityId &&
     a.epoch === b.epoch &&
+    (b.role === undefined || a.semanticsVersion === b.semanticsVersion) &&
     (b.authorityKeySha256 === undefined || a.authorityKeySha256 === b.authorityKeySha256)
   );
 }
@@ -497,12 +513,22 @@ const COMMIT_REFUSALS = new Set([
   "duplicate_navigation_reference",
   "navigation_not_resolved",
   "global_sort_not_resolved",
+  "writer_version_required",
+  "layout_semantics_mismatch",
+  "layout_semantics_not_enabled",
+  "owner_not_adopted",
+  "section_intent_required",
+  "section_baseline_changed",
+  "explicit_section_intent_required",
+  "owner_coverage_required",
+  "owner_manifest_mismatch",
 ]);
 function isDefiniteLayoutRefusal(error: unknown): boolean {
   return (
     error instanceof Error &&
     "code" in error &&
     (COMMIT_REFUSALS.has(String(error.code)) ||
+      String(error.code).startsWith("required_parent_unavailable:") ||
       (error.code === "DAEMON_REQUEST_NOT_SENT" &&
         "outcome" in error &&
         error.outcome === "not-sent"))

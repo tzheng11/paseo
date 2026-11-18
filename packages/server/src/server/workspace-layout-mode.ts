@@ -52,6 +52,8 @@ export async function resolveWorkspaceLayoutMode(
   const file = path.join(home, WORKSPACE_LAYOUT_MODE_FILENAME);
   const previous = await readMarker(file);
   if (previous) {
+    if ((previous.schemaVersion === 2) !== (previous.semanticsVersion === 2))
+      throw new WorkspaceLayoutRefusal("layout_semantics_marker_mismatch");
     const { schemaVersion: _version, destructiveRetirement: _retirement, ...mode } = previous;
     if (configured && canonicalLayoutJson(mode) !== canonicalLayoutJson(configured))
       throw new WorkspaceLayoutRefusal("home_authority_binding_changed");
@@ -70,7 +72,11 @@ export async function resolveWorkspaceLayoutMode(
   }
   try {
     await descriptor.writeFile(
-      JSON.stringify({ schemaVersion: 1, ...mode, destructiveRetirement: "refuse" }),
+      JSON.stringify({
+        schemaVersion: mode.semanticsVersion === 2 ? 2 : 1,
+        ...mode,
+        destructiveRetirement: "refuse",
+      }),
     );
     await descriptor.sync();
   } finally {

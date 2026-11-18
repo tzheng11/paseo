@@ -65,3 +65,33 @@ epoch/revision and the write generation. That is source-level coverage only.
 Actual packaged writer/reader qualification and terminal/process recovery remain
 required. `minimumRecoveryVersion` is a lower bound, not automatic compatibility
 approval for every version above it.
+
+## Audited overlay packets
+
+When the original packet assembler is unavailable, `scripts/build-overlay-packet.mjs`
+produces the same version-4 packet consumed by the custom-daemon installer. Run it
+from the exact clean merged source commit, using an independently verified base
+archive and its extracted manifest:
+
+```sh
+node scripts/build-overlay-packet.mjs --repo "$PWD" --commit "<merged-sha>" \
+  --base "<extracted-base-packet>" --base-archive "<base.tar.gz>" \
+  --base-archive-sha256 "<verified-archive-sha256>" \
+  --base-manifest-sha256 "<verified-manifest-sha256>" --output "<owned-output-dir>"
+```
+
+The base archive and manifest digests are trust inputs, not values discovered from
+the candidate. The builder checks every base entry, platform, Node ABI, dependency
+lock and unchanged packaging inputs, then uses the audited packet Node to freshly
+build protocol, client, server, CLI and the app/web assets. Runtime tracing must
+match the candidate bytes and dependency closure. The final manifest inventories
+actual bytes and records reused versus rebuilt files and the base-to-candidate
+entry diff; generated runtime and browser identities bind the clean commit/tree.
+Tests cover tampering, incompatible inputs, missing output, source identity, and
+relative links and directory types in the traced closure. Credentials and private
+configuration are never inputs.
+
+A new packet can retain `0.15.0-impower`; the normal installer therefore needs
+`--restart` as well as the verified archive `--sha256`. Run its dry run first,
+then follow the one-host-at-a-time deployment procedure. Packet assembly alone
+does not activate canonical authority or qualify an offline owner's return.

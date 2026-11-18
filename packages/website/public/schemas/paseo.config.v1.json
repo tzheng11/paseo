@@ -287,6 +287,10 @@
         "authorityKeySha256": {
           "type": "string",
           "pattern": "^[a-f0-9]{64}$"
+        },
+        "semanticsVersion": {
+          "type": "number",
+          "const": 2
         }
       },
       "required": ["authorityServerId", "authorityId", "epoch", "role", "authorityKeySha256"],

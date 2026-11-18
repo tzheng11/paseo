@@ -333,3 +333,23 @@ it("a route rejected before entering its authority client is a definite no-send 
   ).rejects.toMatchObject({ code: "authority_request_not_sent" });
   expect(value.cached().snapshot).toBeNull();
 });
+
+it("discards a derived replica cache lacking mandatory owner coverage rather than publishing it as current", async () => {
+  const failed = vi.fn();
+  const value = new WorkspaceLayoutService({
+    home,
+    serverId: "srv_replica",
+    config: { ...config, semanticsVersion: 2 },
+    failed,
+  });
+  services.push(value);
+  await writeFile(
+    path.join(home, "workspace-layout-replica.json"),
+    JSON.stringify({ ...snapshot(8), semanticsVersion: 2 }),
+  );
+  await value.load();
+  expect(value.cached()).toEqual({ snapshot: null, fresh: false });
+  expect(failed).toHaveBeenCalledWith(
+    expect.objectContaining({ code: "replica_cache_unreadable" }),
+  );
+});

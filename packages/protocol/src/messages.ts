@@ -1075,6 +1075,7 @@ export const WorkspaceSidebarPlacementSchema = z.object({
 
 export const WorkspacePinPlacementSetRequestSchema = z.object({
   type: z.literal("workspace.pin.placement.set.request"),
+  layoutWriterVersion: z.literal(2).optional(),
   workspaceId: z.string(),
   placement: WorkspacePinPlacementSchema.omit({ revision: true }),
   section: WorkspaceSidebarSectionSchema.optional(),
@@ -1087,6 +1088,7 @@ export const WorkspacePinPlacementSetRequestSchema = z.object({
 
 export const WorkspaceMoveRequestSchema = z.object({
   type: z.literal("workspace.move.request"),
+  layoutWriterVersion: z.literal(2).optional(),
   workspaceId: z.string(),
   parentWorkspaceId: z.string().nullable(),
   beforeWorkspaceId: z.string().nullable().optional(),
@@ -1095,6 +1097,7 @@ export const WorkspaceMoveRequestSchema = z.object({
 
 export const WorkspacePinSetRequestSchema = z.object({
   type: z.literal("workspace.pin.set.request"),
+  layoutWriterVersion: z.literal(2).optional(),
   workspaceId: z.string(),
   pinned: z.boolean(),
   requestId: z.string(),
@@ -1102,6 +1105,7 @@ export const WorkspacePinSetRequestSchema = z.object({
 
 export const WorkspaceSuperpinSetRequestSchema = z.object({
   type: z.literal("workspace.superpin.set.request"),
+  layoutWriterVersion: z.literal(2).optional(),
   workspaceId: z.string(),
   superpinned: z.boolean(),
   requestId: z.string(),
@@ -1161,6 +1165,7 @@ export const WorkspaceRecoveryInspectRequestSchema = z.object({
 
 export const WorkspaceRecoveryRestoreRequestSchema = z.object({
   type: z.literal("workspace.recovery.restore.request"),
+  layoutWriterVersion: z.literal(2).optional(),
   workspaceId: z.string(),
   requestId: z.string(),
 });
@@ -1838,6 +1843,7 @@ export type CreateAgentWorktreeTarget = z.infer<typeof CreateAgentWorktreeTarget
 
 export const CreateAgentRequestMessageSchema = z.object({
   type: z.literal("create_agent_request"),
+  layoutWriterVersion: z.literal(2).optional(),
   // Legacy create_agent_request uses a separate initial-message receipt when keyed.
   idempotencyKey: z.string().min(1).max(512).optional(),
   config: AgentSessionConfigSchema,
@@ -1955,6 +1961,7 @@ export const ResumeAgentRequestMessageSchema = z.object({
 
 export const ImportAgentRequestMessageSchema = z.object({
   type: z.literal("import_agent_request"),
+  layoutWriterVersion: z.literal(2).optional(),
   provider: AgentProviderSchema.optional(),
   providerId: z.string().optional(),
   sessionId: z.string().optional(),
@@ -1967,6 +1974,7 @@ export const ImportAgentRequestMessageSchema = z.object({
 
 export const RefreshAgentRequestMessageSchema = z.object({
   type: z.literal("refresh_agent_request"),
+  layoutWriterVersion: z.literal(2).optional(),
   agentId: z.string(),
   requestId: z.string(),
 });
@@ -2774,6 +2782,7 @@ export const FirstAgentContextSchema = z.object({
 
 export const CreatePaseoWorktreeRequestSchema = z.object({
   type: z.literal("create_paseo_worktree_request"),
+  layoutWriterVersion: z.literal(2).optional(),
   cwd: z.string(),
   projectId: z.string().optional(),
   worktreeSlug: z.string().optional(),
@@ -2825,6 +2834,7 @@ export const LegacyOpenInEditorRequestSchema = z.object({
 
 export const OpenProjectRequestSchema = z.object({
   type: z.literal("open_project_request"),
+  layoutWriterVersion: z.literal(2).optional(),
   // Path used only for workspace lookup/creation. Use the returned workspace.id for all subsequent references.
   cwd: z.string(),
   requestId: z.string(),
@@ -2884,6 +2894,7 @@ export const ArchiveWorkspaceRequestSchema = z.object({
 // between an existing local directory and a newly created paseo worktree.
 export const WorkspaceCreateRequestSchema = z.object({
   type: z.literal("workspace.create.request"),
+  layoutWriterVersion: z.literal(2).optional(),
   workspaceId: z
     .string()
     .regex(/^wks_[a-f0-9]{16}$/)
@@ -3326,6 +3337,7 @@ export const CaptureTerminalRequestSchema = z.object({
 
 export const HubExecutionAgentCreateRequestSchema = z.object({
   type: z.literal("hub.execution.agent.create.request"),
+  layoutWriterVersion: z.literal(2).optional(),
   requestId: z.string(),
   executionId: z.string(),
   provider: z.string(),
@@ -3867,6 +3879,7 @@ export const ServerInfoStatusPayloadSchema = z
         // COMPAT(mainHost): added in v0.11.3; remove gate after 2027-04-18.
         mainHost: z.boolean().optional(),
         workspaceLayout: z.boolean().optional(),
+        workspaceLayoutDerivedSections: z.boolean().optional(),
         // COMPAT(agentRequestReceipts): added in v0.8.0; remove gate after 2027-03-05.
         agentRequestReceipts: z.boolean().optional(),
         // COMPAT(workspaceRequestReceipts): added in v0.8.0; remove gate after 2027-03-07.
@@ -4437,6 +4450,7 @@ export const WorkspaceDescriptorPayloadSchema = z
     // COMPAT(workspaceFields): added in v0.11.3; remove optional after 2027-04-14.
     fieldValues: z.record(z.string(), z.string()).optional(),
     pinnedAt: z.string().nullable().optional(),
+    effectiveSection: WorkspaceSidebarSectionSchema.nullable().optional(),
     // COMPAT(workspaceSuperpinning): old daemons omit this; remove optional after 2027-04-18.
     superpinnedAt: z.string().nullable().optional(),
     // COMPAT(workspaceLabels): added in v0.5.0, remove optional after 2027-08-14.

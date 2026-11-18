@@ -159,7 +159,10 @@ function assertUniqueCapturedIds(ids: string[]): void {
 }
 
 export type PersistedProjectRecord = z.infer<typeof PersistedProjectRecordSchema>;
-export type PersistedWorkspaceRecord = z.infer<typeof PersistedWorkspaceRecordSchema>;
+export type PersistedWorkspaceRecord = z.infer<typeof PersistedWorkspaceRecordSchema> & {
+  /** Read projection only; the file schema deliberately does not persist it. */
+  effectiveSection?: "unpinned" | "pinned" | "superpinned" | null;
+};
 
 export interface WorkspaceMutation {
   kind: "upsert" | "archive" | "remove";
@@ -169,6 +172,7 @@ export interface WorkspaceMutation {
 }
 
 export interface WorkspaceMutationContext {
+  sectionIntent?: "inherit" | "explicit";
   expectsInitialAgent?: boolean;
   requestId?: string;
   /** Explicit layout RPCs also need fresh validation when the cached value looks unchanged. */

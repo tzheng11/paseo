@@ -81,7 +81,11 @@ import {
   saveSidebarLayout,
   useCanonicalSidebarState,
 } from "@/stores/canonical-sidebar-runtime";
-import { canonicalWorkspaceDrop } from "@/components/sidebar/workspace-tree/canonical-drop";
+import {
+  canonicalWorkspaceDrop,
+  verifyCanonicalWorkspaceDrop,
+} from "@/components/sidebar/workspace-tree/canonical-drop";
+import { canonicalLayoutJson } from "@getpaseo/protocol/workspace-layout";
 import { CanonicalSidebarNotice } from "@/components/sidebar/canonical-sidebar-notice";
 import { useSidebarViewStore, type SidebarGroupMode } from "@/stores/sidebar-view-store";
 import { useShowShortcutBadges } from "@/hooks/use-show-shortcut-badges";
@@ -2100,16 +2104,26 @@ export function SidebarWorkspaceList({
         const project = allProjects.find(
           (candidate) => candidate.viewKey === source?.projectViewKey,
         );
-        await saveSidebarLayout((snapshot) =>
-          canonicalWorkspaceDrop({
-            snapshot,
-            drop,
-            catalog: fullHierarchyWorkspaces,
-            projectOrder: project?.workspaces.map((item) => item.workspaceKey) ?? [],
-            projects: pinnedGroups.unpinnedProjects,
-            now: new Date().toISOString(),
-          }),
-        );
+        const displayed = canonicalSidebar.state().snapshot;
+        if (!displayed) throw new Error("Shared layout is not ready.");
+        const intent = {
+          snapshot: displayed,
+          drop,
+          catalog: fullHierarchyWorkspaces,
+          projectOrder: project?.workspaces.map((item) => item.workspaceKey) ?? [],
+          projects: pinnedGroups.unpinnedProjects,
+          now: new Date().toISOString(),
+        };
+        const verifiedStamp = await verifyCanonicalWorkspaceDrop({
+          ...intent,
+          ownerServerIds: serverIds,
+          getClient: (serverId) => getHostRuntimeStore().getClient(serverId),
+        });
+        await saveSidebarLayout((snapshot) => {
+          if (canonicalLayoutJson(snapshot.stamp) !== verifiedStamp)
+            throw new Error("Shared layout changed. Refresh before moving the workspace.");
+          return canonicalWorkspaceDrop({ ...intent, snapshot });
+        });
         return;
       }
       if (!useSidebarOrderStore.persist.hasHydrated())
@@ -2362,6 +2376,7 @@ export function SidebarWorkspaceList({
       hierarchyWorkspaces,
       pinnedWorkspaceTree,
       pinnedGroups.unpinnedProjects,
+      serverIds,
     ],
   );
   // One fetch, one map, every mode — project mode paints icons on its headers and status mode

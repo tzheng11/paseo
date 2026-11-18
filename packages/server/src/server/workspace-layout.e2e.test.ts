@@ -7,7 +7,10 @@ import pino from "pino";
 import { hashSync } from "bcryptjs";
 import { createHostClient } from "@getpaseo/client/node";
 import type { WorkspaceLayoutEntry } from "@getpaseo/protocol/workspace-layout";
-import { emptyWorkspaceNavigationPreferences } from "@getpaseo/protocol/workspace-layout";
+import {
+  emptyWorkspaceNavigationPreferences,
+  qualifyLegacyWorkspaceLayoutEntries,
+} from "@getpaseo/protocol/workspace-layout";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { loadOrCreateDaemonKeyPair } from "./daemon-keypair.js";
 import { createTestPaseoDaemon } from "./test-utils/paseo-daemon.js";
@@ -272,4 +275,114 @@ test("password admission protects actual layout RPCs; two authenticated clients 
     expect(line).not.toContain(verifier);
     expect(line).not.toContain("wrong-fixture-password");
   }
+}, 30_000);
+
+test("derived authority fences legacy native writers before effects while the current SDK creates and pins a fresh leaf", async () => {
+  const home = path.join(root, ".paseo");
+  await mkdir(home);
+  const serverId = "srv_derived_fixture";
+  await writeFile(path.join(home, "server-id"), serverId);
+  const logger = pino({ level: "silent" });
+  const keys = await loadOrCreateDaemonKeyPair(home, logger);
+  const mode = {
+    role: "authority" as const,
+    semanticsVersion: 2 as const,
+    authorityServerId: serverId,
+    authorityKeySha256: createHash("sha256").update(keys.publicKeyB64).digest("hex"),
+    authorityId: randomUUID(),
+    epoch: randomUUID(),
+  };
+  const password = "fixture-derived-only";
+  const fixture = await createTestPaseoDaemon({
+    paseoHomeRoot: root,
+    cleanup: false,
+    workspaceLayout: mode,
+    auth: { password: hashSync(password, 4) },
+    pluginsEnabled: false,
+    logger,
+  });
+  cleanup.push(() => fixture.close());
+  const client = createHostClient(`tcp://127.0.0.1:${fixture.port}?password=${password}`, {
+    clientId: randomUUID(),
+    reconnect: { enabled: false },
+  });
+  cleanup.push(() => client.close());
+  await client.connect();
+  expect(client.getLastServerInfoMessage()?.features?.workspaceLayoutDerivedSections).toBe(true);
+  const initial = (await client.initializeWorkspaceLayout(mode)).snapshot;
+  await client.commitWorkspaceLayout({
+    requestId: "derived-import",
+    writerVersion: 2,
+    expected: initial.stamp,
+    mutations: [
+      {
+        kind: "import-host",
+        previousSourceSha256: null,
+        source: { serverId, sourceSha256: "a".repeat(64), resolutionSha256: "b".repeat(64) },
+        entries: qualifyLegacyWorkspaceLayoutEntries([]),
+      },
+      { kind: "declare-unknown-owner", serverId: "offline-owner" },
+      {
+        kind: "put-navigation",
+        expectedRevision: 0,
+        preferences: emptyWorkspaceNavigationPreferences(),
+        importResolution: { clientSources: [], resolutionSha256: "c".repeat(64) },
+      },
+    ],
+  });
+  const imported = await client.getWorkspaceLayout();
+  await client.commitWorkspaceLayout({
+    requestId: "derived-activate",
+    writerVersion: 2,
+    expected: imported.stamp,
+    mutations: [
+      {
+        kind: "activate",
+        requiredImports: imported.imports,
+        requiredOwnerDomains: imported.ownerDomains,
+      },
+    ],
+  });
+  const baseline = await client.getWorkspaceLayout();
+  const legacy = client as unknown as {
+    sendRequest(options: {
+      requestId: string;
+      message: unknown;
+      select: (msg: unknown) => unknown;
+    }): Promise<unknown>;
+  };
+  // Emulate an old SDK's wire envelope: it neither understands nor sends the new field.
+  const advertised = client.getLastServerInfoMessage()!;
+  const derivedMode = advertised.workspaceLayout!;
+  advertised.workspaceLayout = { ...derivedMode, semanticsVersion: undefined };
+  for (const type of [
+    "workspace.pin.set.request",
+    "workspace.move.request",
+    "workspace.create.request",
+    "workspace.recovery.restore.request",
+  ]) {
+    await expect(
+      legacy.sendRequest({
+        requestId: `legacy-${type}`,
+        message: {
+          type,
+          requestId: `legacy-${type}`,
+          ...(type === "workspace.create.request" ? {} : { workspaceId: "missing" }),
+          pinned: true,
+          parentWorkspaceId: null,
+          source: { kind: "directory", path: root },
+        },
+        select: () => null,
+      }),
+    ).rejects.toMatchObject({ code: "writer_version_required" });
+  }
+  advertised.workspaceLayout = derivedMode;
+  expect((await client.getWorkspaceLayout()).stamp).toEqual(baseline.stamp);
+  const created = await client.createWorkspace({ source: { kind: "directory", path: root } });
+  expect(created.workspace).not.toBeNull();
+  const id = created.workspace!.id;
+  await client.setWorkspacePinned(id, true);
+  expect(
+    (await client.getWorkspaceLayout()).entries.find((e) => e.ref.workspaceId === id),
+  ).toMatchObject({ sectionIntent: { mode: "explicit" }, pinnedAt: expect.any(String) });
 }, 30_000);

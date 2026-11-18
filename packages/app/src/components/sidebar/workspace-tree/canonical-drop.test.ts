@@ -1,6 +1,8 @@
 import { expect, test } from "vitest";
 import {
   emptyWorkspaceNavigationPreferences,
+  qualifyLegacyWorkspaceLayoutEntries,
+  resolveEffectiveWorkspaceLayout,
   type WorkspaceLayoutEntry,
   type WorkspaceLayoutSnapshot,
 } from "@getpaseo/protocol/workspace-layout";
@@ -244,4 +246,67 @@ test("switching global sort for one project preserves every other visible unsave
       },
     },
   });
+});
+
+test("derived app drag changes one parent intent while delayed descendants inherit from unchanged raw pins", () => {
+  const snapshot = state(
+    qualifyLegacyWorkspaceLayoutEntries([
+      entry("worker", "x"),
+      { ...entry("peer", "p"), pinnedAt: now, superpinnedAt: now },
+      {
+        ...entry("worker", "structural-child"),
+        parent: { serverId: "worker", workspaceId: "x" },
+        pinPlacement: null,
+      },
+      { ...entry("other", "unplaced-root"), pinPlacement: null },
+    ]),
+  );
+  snapshot.semanticsVersion = 2;
+  snapshot.ownerDomains = [{ serverId: "late", state: "unknown", revision: 1 }];
+  const mutations = canonicalWorkspaceDrop({
+    snapshot,
+    now,
+    catalog: [
+      { workspaceKey: "worker:x", sidebarSection: "unpinned" },
+      { workspaceKey: "peer:p", sidebarSection: "superpinned" },
+      { workspaceKey: "worker:structural-child", sidebarSection: "unpinned" },
+      { workspaceKey: "other:unplaced-root", sidebarSection: "unpinned" },
+    ],
+    projectOrder: [],
+    drop: {
+      workspaceKey: "worker:x",
+      targetWorkspaceKey: "peer:p",
+      position: "inside",
+      pinSection: "superpinned",
+      parentWorkspaceKey: "peer:p",
+      parentWorkspaceId: null,
+      beforeWorkspaceId: null,
+    },
+  });
+  const puts = mutations.filter((mutation) => mutation.kind === "put");
+  expect(puts).toHaveLength(1);
+  const source = puts[0].entry;
+  expect(source).toMatchObject({
+    pinnedAt: null,
+    superpinnedAt: null,
+    sectionIntent: {
+      mode: "inherit",
+      baselineSection: "unpinned",
+      baselineParentWorkspaceKey: null,
+    },
+    pinPlacement: { parentWorkspaceKey: "peer:p" },
+  });
+  snapshot.entries[0] = source;
+  const late = qualifyLegacyWorkspaceLayoutEntries([
+    {
+      ...entry("late", "y"),
+      pinPlacement: { parentWorkspaceKey: "worker:x", siblingOrder: 0, revision: 1 },
+    },
+  ]);
+  snapshot.entries.push(...late);
+  expect(resolveEffectiveWorkspaceLayout(snapshot).get("late:y")).toMatchObject({
+    section: "superpinned",
+    parentWorkspaceKey: "worker:x",
+  });
+  expect(late[0]).toMatchObject({ pinnedAt: null, superpinnedAt: null });
 });

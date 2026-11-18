@@ -1,3 +1,4 @@
+import { NATIVE_WORKSPACE_LAYOUT_WRITER_REQUESTS } from "@getpaseo/protocol/workspace-layout";
 import type { WorkspaceLayoutService } from "./workspace-layout-service.js";
 import { WorkspaceLayoutSession } from "./session/workspace-layout-session.js";
 import { WorkspaceFieldError } from "@getpaseo/protocol/workspace-fields";
@@ -862,6 +863,7 @@ export class Session {
   private readonly daemonSession: DaemonSession;
   private readonly fleetSession: FleetSession;
   private readonly workspaceLayoutSession: WorkspaceLayoutSession;
+  private readonly workspaceLayoutService: WorkspaceLayoutService | undefined;
   private readonly hubExecutionController: HubExecutionController | null;
   private readonly pinServerId: string | undefined;
   private readonly workspaceScripts: WorkspaceScriptsService;
@@ -965,6 +967,7 @@ export class Session {
       clientId: this.clientId,
       sessionId: this.sessionId,
     });
+    this.workspaceLayoutService = options.workspaceLayoutService;
     this.workspaceLayoutSession = new WorkspaceLayoutSession(
       options.workspaceLayoutService,
       this.delivery,
@@ -2315,7 +2318,7 @@ export class Session {
                 requestId,
                 requestType: msg.type,
                 error: `Request failed: ${err.message}`,
-                code: "handler_error",
+                code: err instanceof SessionRequestError ? err.code : "handler_error",
               },
             });
           } catch (emitError) {
@@ -2512,7 +2515,20 @@ export class Session {
     return undefined;
   }
 
+  private assertNativeLayoutWriter(msg: SessionInboundMessage): void {
+    if (
+      this.workspaceLayoutService?.status().semanticsVersion === 2 &&
+      NATIVE_WORKSPACE_LAYOUT_WRITER_REQUESTS.has(msg.type) &&
+      (!("layoutWriterVersion" in msg) || msg.layoutWriterVersion !== 2)
+    )
+      throw new SessionRequestError(
+        "writer_version_required",
+        "Derived hierarchy requires a version 2 native writer; update this caller before changing layout.",
+      );
+  }
+
   private async dispatchInboundMessage(msg: SessionInboundMessage, source?: object): Promise<void> {
+    this.assertNativeLayoutWriter(msg);
     const promise =
       this.connectedHostSession?.dispatch(msg) ??
       this.dispatchSubscriptionMessage(msg, source) ??
@@ -4171,7 +4187,7 @@ export class Session {
           superpinnedAt: pinned ? existing.superpinnedAt : null,
           updatedAt,
         }),
-        { requestId, layoutWrite: true },
+        { requestId, layoutWrite: true, sectionIntent: "explicit" },
       );
       if (!updated) {
         emitResponse(false, null, "Workspace not found");
@@ -4226,7 +4242,7 @@ export class Session {
           superpinnedAt: superpinned ? timestamp : null,
           updatedAt: timestamp,
         }),
-        { requestId, layoutWrite: true },
+        { requestId, layoutWrite: true, sectionIntent: "explicit" },
       );
     } catch (error) {
       this.sessionLogger.error(
@@ -6109,6 +6125,7 @@ export class Session {
       name: resolveWorkspaceDisplayName(workspace),
       title: workspace.title,
       pinnedAt: workspace.pinnedAt,
+      effectiveSection: workspace.effectiveSection,
       superpinnedAt: workspace.superpinnedAt,
       fieldValues: workspace.fieldValues ?? {},
       ...(workspace.labels && workspace.labels.length > 0 ? { labels: workspace.labels } : {}),
@@ -6210,6 +6227,7 @@ export class Session {
       }),
       title: result.workspace.title,
       pinnedAt: result.workspace.pinnedAt,
+      effectiveSection: result.workspace.effectiveSection,
       superpinnedAt: result.workspace.superpinnedAt,
       ...(result.workspace.labels && result.workspace.labels.length > 0
         ? { labels: result.workspace.labels }

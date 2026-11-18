@@ -7,8 +7,10 @@ histories, project names and workspace titles remain on their owning hosts.
 ## Configuration and trust
 
 `config.json.workspaceLayout` contains `role` (`authority` or `replica`),
-`authorityServerId`, `authorityId`, `epoch` and `authorityKeySha256`. The last
-field is SHA256 of the **UTF-8 base64 text** `daemonPublicKeyB64`, not of its
+`authorityServerId`, `authorityId`, `epoch` and `authorityKeySha256`.
+The scoped inheritance contract additionally sets `semanticsVersion: 2` on
+the authority and each adopted replica. `authorityKeySha256`
+is SHA256 of the **UTF-8 base64 text** `daemonPublicKeyB64`, not of its
 decoded bytes. IDs and epoch are explicit deployment inputs. A restart does not
 create a new epoch or substitute another authority.
 
@@ -98,8 +100,11 @@ cross-file hierarchy or filesystem-closure proof.
 ## Durable identity and transactions
 
 The authority owns `workspace-layout.json` relative to its qualified Paseo home.
-The store format is version 3; earlier experimental 0.15 readers must refuse it,
-not strip shared-view fields during recovery. The version label alone never
+Existing complete-layout mode retains store format 3. Scoped derived inheritance
+uses store format 4, snapshot `semanticsVersion: 2`, and a schema-2 sticky home
+marker. Earlier readers must refuse these homes rather than strip owner or
+section state. Existing initialized format-3 stores are not silently converted;
+a separately qualified import/adoption preserves their source and receipts. The version label alone never
 qualifies a recovery reader.
 `workspace-layout-initialized.json` prevents an initialized but missing store
 from being recreated empty. A corrupt store, mismatched identity, stale epoch or
@@ -242,6 +247,49 @@ client/build/transport and cross-client restart acceptance still require release
 verification; stock packaged renderers that lack this client code are not
 qualified by daemon feature flags alone.
 
+With `semanticsVersion: 2`, MCP and app moves use a fresh authority read and
+one global/entry CAS, with no per-owner writes or rollback. They verify the moved
+workspace, its required old ancestry, destination parent chain and explicit
+ordering dependencies against online adopted owners. An unknown owner remains
+explicitly unknown; a move does not claim its descendant set is empty. A missing
+required ancestor names the unresolved key and refuses that component.
+
+Each entry retains raw pin timestamps and immutable `sectionIntent` adoption
+baselines: `baselineSection` and `baselineParentWorkspaceKey`. `mode: inherit`
+follows the stored parent graph; `explicit` keeps the entry's own section.
+Qualified legacy links inherit when their immutable section baselines match.
+Originally mismatched links retain their personal section and dormant edge.
+Archived parents lift their children until the link becomes eligible again.
+Baselines survive later root pin changes, explicit overrides and reparenting.
+
+A reparent to a linked parent changes the moved entry's relation and inherited
+intent, leaving raw descendant pins unchanged. When an unknown owner later joins,
+its qualified child baselines resolve through the current canonical graph. Thus
+raw-unpinned Y→X inherits a superpinned P after X→P without replaying an old parent
+or rewriting Y. A root move or pin command records explicit section intent;
+detaching preserves the currently effective priority timestamps. A no-op explicit
+pin choice still records intent so a later ancestor change cannot override it.
+
+`resolveEffectiveWorkspaceLayout` is shared by daemon and app. Native directory,
+MCP and CLI reads publish the effective membership; raw canonical/protection
+fields remain separate. App directory caches remain native observations, while
+the canonical read projection also updates offline cached descendants whenever
+the authority revision changes. Unknown ancestry is represented explicitly, not
+as an empty or fresh owner. The CLI's project-local structural move remains a
+separate operation and uses the same canonical registry projection.
+
+New format-4 mutations include `writerVersion: 2`; durable matching receipts are
+checked before the writer fence. The `workspaceLayoutDerivedSections` capability
+and sticky schema-2 marker prevent older clients/daemons from overwriting or
+silently stripping the new semantics. Old clients may parse additive wire fields
+but cannot submit legacy-shaped writes to the new authority. An uncertain MCP
+commit retains its exact original request in the daemon log and reports that
+request for receipt reconciliation; it never retries against a newer graph.
+
+Legacy per-owner placement has no complete cross-host descendant authority.
+Universal MCP moves name unavailable owners and refuse incomplete coverage until
+supported canonical adoption is active. Fresh-leaf creation keeps working.
+
 ## Bootstrap and import
 
 The RPCs and SDK methods are:
@@ -283,6 +331,27 @@ without being treated as new cross-section assignments. The
 controller must verify that manifest against the entire intended fleet and client
 source inventory; the store does not hardcode a host roster.
 
+Scoped adoption declares every intended owner in `ownerDomains` as `adopted`
+or `unknown`. `declare-unknown-owner` is an importing-only mutation; it stores no
+invented workspace rows. `import-host` atomically records an adopted domain and
+its source provenance. Activation binds the exact `requiredOwnerDomains` as well
+as host/client manifests. Missing references may remain only when they name a
+declared unknown owner; graph and section projection retain that uncertainty.
+Import qualification adds immutable raw section/edge baselines using
+`qualifyLegacyWorkspaceLayoutEntries`; ambiguous conflict rulings remain the
+controller's explicit, source-bound responsibility.
+
+An active unknown owner joins through one `import-host` with its exact
+`expectedDomainRevision`, no prior imported source, qualified complete entries
+and preserved source/resolution hashes. Admission validates the combined stored
+graph, including dormant edges. A discovered cycle refuses the admission and
+keeps the owner unknown until conflict reconciliation. It never replaces an
+already adopted owner's current entries or reopens importing globally. Before
+its legacy writers resume, the joining home must be fenced on the new capability
+and its current raw capture reconciled under the existing deployment custody.
+No dated backup, last-online timestamp or creation-time estimate establishes that
+an unknown owner lacks descendants.
+
 During importing, legacy layout edits and new workspace creation are refused.
 Creation checks run before plugin creation hooks, project writes and worktree
 provisioning. A connection loss after that check may still leave a partial
@@ -294,8 +363,15 @@ during this phase are not canonical acceptance.
 
 ## Replicas and existing writers
 
-The canonical registry routes legacy pin, superpin, placement, move, workspace
-creation and lifecycle updates through the same authority. Whole-record
+The canonical registry routes pin, superpin, placement, move, workspace
+creation and lifecycle updates through the same authority. Derived mode requires
+`layoutWriterVersion: 2` on native layout and potential workspace-creation or
+restore envelopes, including agent creation/import. The current SDK sends this
+only after the host advertises `workspaceLayoutDerivedSections`; older native
+callers are refused before dispatch, provisioning or hooks. Generic layout CAS
+requires the caller's explicit `writerVersion: 2`, preserving its request digest.
+This fences legacy clients as well as old owner daemons; direct edits to raw state
+remain outside the supported API. Whole-record
 reconciliation preserves canonical layout fields instead of restoring stale
 copies. Directory publications project canonical values. A background owned
 subscription updates replicas; reconnect obtains a new identity-bound snapshot.
@@ -323,7 +399,8 @@ Canonical boot writes the sticky `workspace-layout-mode.json` marker:
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
+  "semanticsVersion": 2,
   "role": "replica",
   "authorityServerId": "<configured server>",
   "authorityId": "<configured UUID>",
