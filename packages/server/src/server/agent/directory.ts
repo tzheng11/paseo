@@ -1,5 +1,5 @@
 import type { AgentSnapshotPayload } from "../messages.js";
-import type { WorkspaceRegistry } from "../workspace-registry.js";
+import type { WorkspaceRegistry, PersistedWorkspaceRecord } from "../workspace-registry.js";
 import type { AgentManager, ManagedAgent } from "./agent-manager.js";
 import type { AgentStorage, StoredAgentRecord } from "./agent-storage.js";
 
@@ -46,19 +46,22 @@ export class AgentDirectory {
     return !(await this.deps.workspaces.get(agent.workspaceId))?.background;
   }
 
-  async list(filter?: {
-    labels?: Record<string, string>;
-    includeArchived?: boolean;
-    includeBackground?: boolean;
-    includeUnavailablePersisted?: boolean;
-  }): Promise<AgentSnapshotPayload[]> {
+  async list(
+    filter?: {
+      labels?: Record<string, string>;
+      includeArchived?: boolean;
+      includeBackground?: boolean;
+      includeUnavailablePersisted?: boolean;
+    },
+    workspaceRecords?: readonly PersistedWorkspaceRecord[],
+  ): Promise<AgentSnapshotPayload[]> {
     const live = this.deps.manager.listAgents();
     const liveIds = new Set(live.map((agent) => agent.id));
     const labels = Object.entries(filter?.labels ?? {});
     const backgroundIds = new Set(
       filter?.includeBackground
         ? []
-        : (await this.deps.workspaces.list())
+        : (workspaceRecords ?? (await this.deps.workspaces.list()))
             .filter((workspace) => workspace.background)
             .map((workspace) => workspace.workspaceId),
     );

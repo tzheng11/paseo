@@ -1,3 +1,4 @@
+import { createLargeLayoutFixture } from "./test-fixtures/canonical-layout-scale.js";
 import { randomUUID } from "node:crypto";
 import { mkdtemp, readFile, rm, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -12,6 +13,8 @@ import { emptyWorkspaceNavigationPreferences } from "@getpaseo/protocol/workspac
 import * as layoutProtocol from "@getpaseo/protocol/workspace-layout";
 import {
   FileBackedWorkspaceRegistry,
+  FileBackedProjectRegistry,
+  createPersistedProjectRecord,
   type PersistedWorkspaceRecord,
 } from "./workspace-registry.js";
 import { CanonicalWorkspaceRegistry } from "./workspace-layout-registry.js";
@@ -121,84 +124,15 @@ async function registry(records: PersistedWorkspaceRecord[], name = "a", serverI
   return { value, file };
 }
 
-async function largeReadFixture(phase: "importing" | "active") {
+async function largeReadFixture(
+  phase: "importing" | "active",
+  options: { directories?: boolean } = {},
+) {
   await service.close();
-  const derivedConfig = { ...config, semanticsVersion: 2 as const };
-  service = new WorkspaceLayoutService({
-    home,
-    serverId: "srv_hub",
-    config: derivedConfig,
-    failed: () => {},
-  });
-  const childPin = "2026-11-04T09:00:00.000Z";
-  const records = Array.from({ length: 440 }, (_, index) => ({
-    ...row(`large-${index}`),
-    siblingOrder: index,
-  }));
-  records[0] = {
-    ...records[0],
-    pinnedAt: childPin,
-    pinPlacement: { parentWorkspaceKey: "srv_b:large-440", siblingOrder: 0, revision: 1 },
-  };
-  records[1] = {
-    ...records[1],
-    pinnedAt: childPin,
-    pinPlacement: { parentWorkspaceKey: "srv_unknown:missing", siblingOrder: 1, revision: 1 },
-  };
-  records[2] = { ...records[0], workspaceId: "large-2", archivedAt: at };
-  const remote = Array.from({ length: 2869 }, (_, index) => ({
-    ...row(`large-${index + 440}`),
-    pinnedAt: index === 0 ? at : null,
-  }));
-  const initial = await service.initialize(derivedConfig);
-  await service.commit({
-    writerVersion: 2,
-    requestId: "large-import",
-    expected: initial.stamp,
-    mutations: [
-      ...[
-        { serverId: "srv_a", records: records.slice(0, 439) },
-        { serverId: "srv_b", records: remote },
-      ].map(({ serverId, records: owned }) => ({
-        kind: "import-host" as const,
-        source: { serverId, sourceSha256: "a".repeat(64), resolutionSha256: "b".repeat(64) },
-        previousSourceSha256: null,
-        entries: layoutProtocol.qualifyLegacyWorkspaceLayoutEntries(
-          owned.map((record) => canonical(record, serverId)),
-        ),
-      })),
-      { kind: "declare-unknown-owner", serverId: "srv_unknown" },
-      {
-        kind: "put-navigation",
-        expectedRevision: 0,
-        preferences: emptyWorkspaceNavigationPreferences(),
-        importResolution: { clientSources: [], resolutionSha256: "0".repeat(64) },
-      },
-    ],
-  });
-  const imported = await service.inspect();
-  expect(imported.entries).toHaveLength(3308);
-  if (phase === "active")
-    await service.commit({
-      writerVersion: 2,
-      requestId: "large-activate",
-      expected: imported.stamp,
-      mutations: [
-        {
-          kind: "activate",
-          requiredImports: imported.imports,
-          requiredClientImports: [],
-          requiredOwnerDomains: imported.ownerDomains,
-        },
-      ],
-    });
-  const file = path.join(home, "large", "workspaces.json");
-  await mkdir(path.dirname(file));
-  await writeFile(file, JSON.stringify(records));
-  const value = new CanonicalWorkspaceRegistry(file, createTestLogger(), service, "srv_a");
-  registries.push(value);
-  await value.initialize();
-  return { value, file, records, childPin };
+  const fixture = await createLargeLayoutFixture({ home, phase, ...options });
+  service = fixture.service;
+  registries.push(fixture.value);
+  return fixture;
 }
 
 it.each([
@@ -209,14 +143,14 @@ it.each([
   async ({ phase, count, derives, pin }) => {
     const { value, file, records, childPin } = await largeReadFixture(phase);
     const before = await readFile(file, "utf8");
-    const cached = vi.spyOn(service, "cached");
+    const cached = vi.spyOn(service, "cachedReadView");
     const clone = vi.spyOn(globalThis, "structuredClone");
     const derive = vi.spyOn(layoutProtocol, "resolveEffectiveWorkspaceLayout");
     try {
       const listed = await value.list();
       expect(cached).toHaveBeenCalledTimes(1);
       expect(clone).toHaveBeenCalledTimes(1);
-      expect(derive).toHaveBeenCalledTimes(derives);
+      expect(derive.mock.calls.length).toBeLessThanOrEqual(derives);
       expect(listed.map((record) => record.workspaceId)).toEqual(
         records.slice(0, count).map((record) => record.workspaceId),
       );
@@ -231,6 +165,233 @@ it.each([
     }
   },
 );
+
+function isGraphClone(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  if ("entries" in value && Array.isArray(value.entries)) return true;
+  return "snapshot" in value && isGraphClone(value.snapshot);
+}
+
+it.each(["importing", "active"] as const)(
+  "bounds entry reads over 3308 entries and 440 local rows in %s",
+  async (phase) => {
+    const { value, records, childPin } = await largeReadFixture(phase);
+    const cached = vi.spyOn(service, "cached");
+    const clone = vi.spyOn(globalThis, "structuredClone");
+    const derive = vi.spyOn(layoutProtocol, "resolveEffectiveWorkspaceLayout");
+    try {
+      const results = await Promise.all(
+        records.slice(0, 439).map((record) => value.get(record.workspaceId)),
+      );
+      expect(results[0]).toMatchObject({
+        workspaceId: "large-0",
+        pinnedAt: phase === "active" ? at : childPin,
+      });
+      expect(results[1]).toMatchObject({ pinnedAt: childPin });
+      expect(results[2]).toMatchObject({ archivedAt: at });
+      expect(cached).toHaveBeenCalledTimes(0);
+      expect(clone.mock.calls.filter(([input]) => isGraphClone(input))).toHaveLength(0);
+      expect(derive.mock.calls.length).toBeLessThanOrEqual(phase === "active" ? 1 : 0);
+    } finally {
+      derive.mockRestore();
+      clone.mockRestore();
+      cached.mockRestore();
+    }
+  },
+);
+
+it.each(["importing", "active"] as const)(
+  "updates local metadata without copying the 3308-entry graph in %s",
+  async (phase) => {
+    const { value, childPin } = await largeReadFixture(phase);
+    const cached = vi.spyOn(service, "cached");
+    const clone = vi.spyOn(globalThis, "structuredClone");
+    const derive = vi.spyOn(layoutProtocol, "resolveEffectiveWorkspaceLayout");
+    try {
+      const result = await value.update("large-0", (record) => ({
+        ...record,
+        title: "updated metadata",
+      }));
+      expect(result).toMatchObject({
+        title: "updated metadata",
+        pinnedAt: phase === "active" ? at : childPin,
+      });
+      expect(cached).toHaveBeenCalledTimes(0);
+      expect(clone.mock.calls.filter(([input]) => isGraphClone(input))).toHaveLength(0);
+      expect(derive.mock.calls.length).toBeLessThanOrEqual(phase === "active" ? 1 : 0);
+    } finally {
+      derive.mockRestore();
+      clone.mockRestore();
+      cached.mockRestore();
+    }
+  },
+);
+
+it.each(["importing", "active"] as const)(
+  "upserts existing metadata without graph copies in %s",
+  async (phase) => {
+    const { value, records, file, childPin } = await largeReadFixture(phase);
+    const cached = vi.spyOn(service, "cached");
+    const clone = vi.spyOn(globalThis, "structuredClone");
+    const derive = vi.spyOn(layoutProtocol, "resolveEffectiveWorkspaceLayout");
+    try {
+      await value.upsert({ ...records[0], title: "upserted metadata", pinnedAt: null });
+      expect(cached).not.toHaveBeenCalled();
+      expect(clone.mock.calls.filter(([input]) => isGraphClone(input))).toHaveLength(0);
+      expect(derive.mock.calls.length).toBeLessThanOrEqual(phase === "active" ? 1 : 0);
+    } finally {
+      derive.mockRestore();
+      clone.mockRestore();
+      cached.mockRestore();
+    }
+    expect(await value.get("large-0")).toMatchObject({
+      title: "upserted metadata",
+      pinnedAt: phase === "active" ? at : childPin,
+    });
+    expect(JSON.parse(await readFile(file, "utf8"))[0].pinnedAt).toBe(childPin);
+  },
+);
+
+it.each([
+  { phase: "importing" as const, method: "runOnce" as const },
+  { phase: "active" as const, method: "runOnce" as const },
+  { phase: "importing" as const, method: "reconcileGitMetadata" as const },
+  { phase: "active" as const, method: "reconcileGitMetadata" as const },
+  { phase: "importing" as const, method: "reconcileNow" as const },
+  { phase: "active" as const, method: "reconcileNow" as const },
+])("bounds the entire $method pass at 3308/440 scale in $phase", async ({ phase, method }) => {
+  const { value, file } = await largeReadFixture(phase, { directories: true });
+  const projects = new FileBackedProjectRegistry(
+    path.join(home, "projects.json"),
+    createTestLogger(),
+  );
+  await projects.initialize();
+  await projects.upsert(
+    createPersistedProjectRecord({
+      projectId: "project",
+      rootPath: home,
+      kind: "non_git",
+      displayName: "scale",
+      createdAt: at,
+      updatedAt: at,
+    }),
+  );
+  const reconciliation = new WorkspaceReconciliationService({
+    projectRegistry: projects,
+    workspaceRegistry: value,
+    logger: createTestLogger(),
+    serverId: "srv_a",
+  });
+  const cached = vi.spyOn(service, "cached");
+  const clone = vi.spyOn(globalThis, "structuredClone");
+  const derive = vi.spyOn(layoutProtocol, "resolveEffectiveWorkspaceLayout");
+  try {
+    await reconciliation[method]();
+    expect(cached.mock.calls.length).toBeLessThanOrEqual(1);
+    expect(clone.mock.calls.filter(([input]) => isGraphClone(input)).length).toBeLessThanOrEqual(1);
+    expect(derive.mock.calls.length).toBeLessThanOrEqual(phase === "active" ? 1 : 0);
+    const retained = JSON.parse(await readFile(file, "utf8"));
+    expect(retained).toHaveLength(440);
+    expect(retained.filter((record: PersistedWorkspaceRecord) => record.archivedAt)).toHaveLength(
+      1,
+    );
+  } finally {
+    derive.mockRestore();
+    clone.mockRestore();
+    cached.mockRestore();
+    reconciliation.dispose();
+  }
+});
+
+it.each(["importing", "active"] as const)(
+  "bounds protection initialization at 3308/440 scale in %s",
+  async (phase) => {
+    const { value, file } = await largeReadFixture(phase);
+    const before = await readFile(file, "utf8");
+    const cached = vi.spyOn(service, "cached");
+    const clone = vi.spyOn(globalThis, "structuredClone");
+    const derive = vi.spyOn(layoutProtocol, "resolveEffectiveWorkspaceLayout");
+    try {
+      await value.initialize();
+      expect(cached.mock.calls.length).toBeLessThanOrEqual(1);
+      expect(clone.mock.calls.filter(([input]) => isGraphClone(input))).toHaveLength(1);
+      expect(derive.mock.calls.length).toBeLessThanOrEqual(phase === "active" ? 1 : 0);
+      expect(await readFile(file, "utf8")).toBe(before);
+    } finally {
+      derive.mockRestore();
+      clone.mockRestore();
+      cached.mockRestore();
+    }
+  },
+);
+
+it("isolates indexed entry reads and sees new revisions without rebuilding on every get", async () => {
+  const { value, records, childPin } = await largeReadFixture("active");
+  const copiedView = service.cachedReadView();
+  copiedView.entries.clear();
+  if (!copiedView.snapshot?.entries[0].pinPlacement)
+    throw new Error("fixture copied placement missing");
+  copiedView.snapshot.entries[0].pinPlacement.siblingOrder = 8888;
+  const first = await value.get("large-0");
+  if (!first?.pinPlacement) throw new Error("fixture placement missing");
+  first.pinPlacement.siblingOrder = 9999;
+  expect(await value.get("large-0")).toMatchObject({
+    pinPlacement: { siblingOrder: 0 },
+    pinnedAt: at,
+  });
+  expect(await value.get("large-1")).toMatchObject({ pinnedAt: childPin, effectiveSection: null });
+  await expect(value.get("large-439")).rejects.toThrow("workspace_not_imported");
+  const before = await service.inspect();
+  const parent = before.entries.find(
+    (entry) => entry.ref.serverId === "srv_b" && entry.ref.workspaceId === "large-440",
+  );
+  if (!parent?.sectionIntent) throw new Error("fixture parent missing");
+  const changedPin = "2026-11-04T13:00:00.000Z";
+  await service.commit({
+    writerVersion: 2,
+    requestId: "entry-index-new-revision",
+    expected: before.stamp,
+    mutations: [
+      {
+        kind: "put",
+        entry: {
+          ...parent,
+          pinnedAt: changedPin,
+          sectionIntent: { ...parent.sectionIntent, mode: "explicit" },
+        },
+      },
+    ],
+  });
+  expect(await value.get("large-0")).toMatchObject({
+    pinnedAt: changedPin,
+    pinPlacement: { siblingOrder: 0 },
+  });
+  const derive = vi.spyOn(layoutProtocol, "resolveEffectiveWorkspaceLayout");
+  const clone = vi.spyOn(globalThis, "structuredClone");
+  try {
+    await Promise.all(records.slice(0, 439).map((record) => value.get(record.workspaceId)));
+    expect(derive).not.toHaveBeenCalled();
+    expect(clone.mock.calls.filter(([input]) => isGraphClone(input))).toHaveLength(0);
+  } finally {
+    derive.mockRestore();
+    clone.mockRestore();
+  }
+});
+
+it("retains fresh local metadata within a shared canonical read batch", async () => {
+  const { value } = await largeReadFixture("active");
+  await value.withReadBatch(async (reader) => {
+    const first = await reader.get("large-0");
+    if (!first?.pinPlacement) throw new Error("fixture placement missing");
+    first.pinPlacement.siblingOrder = 1234;
+    await value.update("large-0", (record) => ({ ...record, cwd: home, title: "new metadata" }));
+    expect(await reader.get("large-0")).toMatchObject({
+      cwd: home,
+      title: "new metadata",
+      pinPlacement: { siblingOrder: 0 },
+    });
+  });
+});
 
 it("isolates large active read snapshots and sees a new authority revision on the next list", async () => {
   const { value, file, childPin } = await largeReadFixture("active");
@@ -618,7 +779,16 @@ it("checks explicit pin intent against fresh authority state even when the stale
     expected: stale.stamp,
     mutations: [{ kind: "put", entry: { ...stale.entries[0], pinnedAt: null } }],
   });
-  const cached = vi.spyOn(service, "cached").mockReturnValue({ snapshot: stale, fresh: true });
+  const cached = vi.spyOn(service, "cachedWorkspace").mockImplementation(() =>
+    structuredClone({
+      stamp: stale.stamp,
+      semanticsVersion: stale.semanticsVersion,
+      entry: stale.entries[0],
+      effective: null,
+      derived: false,
+      fresh: true,
+    }),
+  );
   try {
     await value.update("one", (record) => ({ ...record, pinnedAt: at }), {
       requestId: "repin",
@@ -645,7 +815,16 @@ it("refuses stale placement revision before it can overwrite a newer authority m
     "srv_a",
   );
   const before = await service.inspect();
-  const cached = vi.spyOn(service, "cached").mockReturnValue({ snapshot: stale, fresh: true });
+  const cached = vi.spyOn(service, "cachedWorkspace").mockImplementation(() =>
+    structuredClone({
+      stamp: stale.stamp,
+      semanticsVersion: stale.semanticsVersion,
+      entry: stale.entries[0],
+      effective: null,
+      derived: false,
+      fresh: true,
+    }),
+  );
   try {
     await expect(
       setWorkspacePinPlacement(

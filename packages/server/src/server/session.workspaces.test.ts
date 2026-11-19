@@ -1,3 +1,5 @@
+import { createLargeLayoutFixture } from "./test-fixtures/canonical-layout-scale.js";
+import * as layoutProtocol from "@getpaseo/protocol/workspace-layout";
 import {
   createWorkspaceRuntimeStore,
   type WorkspaceRuntimeStore,
@@ -595,6 +597,7 @@ function createSessionForWorkspaceTests(
     agentStorage?: { [K in keyof SessionOptions["agentStorage"]]?: unknown };
     projectRegistry?: SessionOptions["projectRegistry"];
     workspaceRegistry?: SessionOptions["workspaceRegistry"];
+    providerSnapshotManager?: SessionOptions["providerSnapshotManager"];
     github?: ForgeService;
     paseoHome?: string;
     worktreesRoot?: string;
@@ -674,7 +677,8 @@ function createSessionForWorkspaceTests(
     remove: async () => {},
   };
   const workspaceGitService = options.workspaceGitService ?? createNoopWorkspaceGitService();
-  const providerSnapshotManager = createProviderSnapshotManagerStub().manager;
+  const providerSnapshotManager =
+    options.providerSnapshotManager ?? createProviderSnapshotManagerStub().manager;
 
   const session = asTestSession(
     new Session({
@@ -2773,6 +2777,7 @@ test("workspace placements preserve checkout facts independently from the projec
       (workspace) => workspace.workspaceId === workspaceId,
     ) ?? null;
   session.projectRegistry.get = async () => project;
+  session.projectRegistry.list = async () => [project];
   session.workspaceRuntimeStore.get = (cwd: string) =>
     cwd === paseoSubdirectory.cwd
       ? createWorkspaceRuntimeSnapshot(cwd, {
@@ -2964,6 +2969,7 @@ test("active-scoped fetch_agents pages within active scope instead of global his
 
   session.projectRegistry.list = async () => [project];
   session.projectRegistry.get = async () => project;
+  session.projectRegistry.list = async () => [project];
   session.workspaceRegistry.list = async () => [activeOne, activeTwo, archivedWorkspace];
   session.listAgentPayloads = async () => [
     makeAgent({
@@ -3008,6 +3014,117 @@ test("active-scoped fetch_agents pages within active scope instead of global his
   expect(secondPage.pageInfo.hasMore).toBe(false);
 });
 
+function clonesLayoutGraph(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  if ("entries" in value && Array.isArray(value.entries)) return true;
+  return "snapshot" in value && clonesLayoutGraph(value.snapshot);
+}
+
+test.each([
+  { phase: "importing" as const, includeBackground: undefined },
+  { phase: "active" as const, includeBackground: undefined },
+  { phase: "importing" as const, includeBackground: true },
+  { phase: "active" as const, includeBackground: true },
+])(
+  "batches unscoped agent pages at 3308/440 scale in $phase, background=$includeBackground",
+  async ({ phase, includeBackground }) => {
+    const home = mkdtempSync(path.join(tmpdir(), "paseo-agent-layout-scale-"));
+    const fixture = await createLargeLayoutFixture({ home, phase });
+    await fixture.value.update("large-4", (record) => ({ ...record, background: true }));
+    const projects = new FileBackedProjectRegistry(
+      path.join(home, "projects.json"),
+      createTestLogger(),
+    );
+    await projects.initialize();
+    await projects.upsert(
+      createPersistedProjectRecord({
+        projectId: "project",
+        rootPath: home,
+        kind: "non_git",
+        displayName: "scale",
+        createdAt: "2026-11-04T10:00:00.000Z",
+        updatedAt: "2026-11-04T10:00:00.000Z",
+      }),
+    );
+    const providers = createProviderSnapshotManagerStub();
+    providers.listRegisteredProviderIds.mockReturnValue(["codex"]);
+    const emitted: SessionOutboundMessage[] = [];
+    const session = createSessionForWorkspaceTests({
+      workspaceRegistry: fixture.value,
+      projectRegistry: projects,
+      paseoHome: home,
+      providerSnapshotManager: providers.manager,
+      onMessage: (message) => emitted.push(message),
+      agentStorage: {
+        list: async () =>
+          (phase === "active" ? fixture.records.slice(0, 439) : fixture.records).map(
+            (record, index) =>
+              makeStoredAgent({
+                id: "scale-agent-" + String(index).padStart(4, "0"),
+                cwd: record.cwd,
+                workspaceId: record.workspaceId,
+                updatedAt: "2026-11-04T10:00:00.000Z",
+              }),
+          ),
+      },
+    });
+    const cached = vi.spyOn(fixture.service, "cached");
+    const clone = vi.spyOn(globalThis, "structuredClone");
+    const derive = vi.spyOn(layoutProtocol, "resolveEffectiveWorkspaceLayout");
+    const ids: string[] = [];
+    let cursor: string | undefined;
+    try {
+      for (let page = 0; page < 4; page++) {
+        cached.mockClear();
+        clone.mockClear();
+        derive.mockClear();
+        emitted.length = 0;
+        await session.handleMessage({
+          type: "fetch_agents_request",
+          requestId: "scale-page-" + page,
+          ...(includeBackground ? { includeBackground } : {}),
+          page: { limit: 200, ...(cursor ? { cursor } : {}) },
+        });
+        const response = findByType(emitted, "fetch_agents_response");
+        expect(response).toBeDefined();
+        if (!response) throw new Error("missing agent response");
+        ids.push(...agentIdsFromEntries(response.payload.entries));
+        expect(cached.mock.calls.length).toBeLessThanOrEqual(1);
+        expect(
+          clone.mock.calls.filter(([input]) => clonesLayoutGraph(input)).length,
+        ).toBeLessThanOrEqual(1);
+        expect(derive.mock.calls.length).toBeLessThanOrEqual(phase === "active" ? 1 : 0);
+        if (!response.payload.pageInfo.hasMore) break;
+        const next = response.payload.pageInfo.nextCursor;
+        if (!next) throw new Error("missing next cursor");
+        cursor = next;
+      }
+      expect(ids).toHaveLength((phase === "active" ? 439 : 440) - (includeBackground ? 0 : 1));
+      expect(ids).toContain("scale-agent-0002"); // Archived workspace, live retained agent.
+      expect(ids.includes("scale-agent-0004")).toBe(includeBackground === true);
+      expect(new Set(ids).size).toBe(ids.length);
+      if (phase === "active") {
+        fixture.records[0] = fixture.records[439];
+        emitted.length = 0;
+        await session.handleMessage({
+          type: "fetch_agents_request",
+          requestId: "quarantined-agent",
+          page: { limit: 200 },
+        });
+        expect(findByType(emitted, "rpc_error")?.payload.requestId).toBe("quarantined-agent");
+      }
+    } finally {
+      derive.mockRestore();
+      clone.mockRestore();
+      cached.mockRestore();
+      await session.cleanup();
+      await fixture.value.close();
+      await fixture.service.close();
+      rmSync(home, { recursive: true, force: true });
+    }
+  },
+);
+
 test("legacy unscoped fetch_agents keeps global workspace behavior", async () => {
   const session = createSessionForWorkspaceTests();
   const legacyRoot = path.resolve("/tmp/legacy");
@@ -3042,6 +3159,7 @@ test("legacy unscoped fetch_agents keeps global workspace behavior", async () =>
   });
 
   session.projectRegistry.get = async () => project;
+  session.projectRegistry.list = async () => [project];
   session.workspaceRegistry.list = async () => [activeWorkspace, archivedWorkspace];
   session.workspaceRegistry.get = async (workspaceId: string) =>
     [activeWorkspace, archivedWorkspace].find(
@@ -3102,6 +3220,7 @@ test("fetch_agent_history_request pages archived historical rows separately", as
     if (isSessionOutboundMessage(message)) emitted.push(message);
   };
   session.projectRegistry.get = async () => project;
+  session.projectRegistry.list = async () => [project];
   session.workspaceRegistry.list = async () => [workspace];
   session.workspaceRegistry.get = async () => workspace;
   session.listAgentPayloads = async () => [
@@ -3170,6 +3289,7 @@ test("fetch_agent_history_request filters across history and paginates chronolog
     if (isSessionOutboundMessage(message)) emitted.push(message);
   };
   session.projectRegistry.get = async () => project;
+  session.projectRegistry.list = async () => [project];
   session.workspaceRegistry.list = async () => [workspace];
   session.workspaceRegistry.get = async () => workspace;
   session.listAgentPayloads = async () => [
@@ -3256,6 +3376,7 @@ test("fetch_agent_history_request rejects a malformed search cursor", async () =
     if (isSessionOutboundMessage(message)) emitted.push(message);
   };
   session.projectRegistry.get = async () => project;
+  session.projectRegistry.list = async () => [project];
   session.workspaceRegistry.list = async () => [workspace];
   session.workspaceRegistry.get = async () => workspace;
   session.listAgentPayloads = async () => [
@@ -3328,6 +3449,8 @@ test("fetch_agent_history_request skips rows whose workspace project record is m
   };
   session.projectRegistry.get = async (projectId: string) =>
     projectId === stableProject.projectId ? stableProject : null;
+  session.projectRegistry.list = async () => [stableProject];
+  session.workspaceRegistry.list = async () => [stableWorkspace, orphanWorkspace];
   session.workspaceRegistry.get = async (workspaceId: string) =>
     [stableWorkspace, orphanWorkspace].find((workspace) => workspace.workspaceId === workspaceId) ??
     null;
@@ -8202,6 +8325,7 @@ test("project.rename.request updates a project with no workspaces", async () => 
     updatedAt: "2026-07-20T12:00:00.000Z",
   });
   session.projectRegistry.get = async () => project;
+  session.projectRegistry.list = async () => [project];
   session.projectRegistry.upsert = async () => project;
   session.workspaceRegistry.list = async () => [];
 
