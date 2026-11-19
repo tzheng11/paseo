@@ -149,7 +149,7 @@ it.each([
     try {
       const listed = await value.list();
       expect(cached).toHaveBeenCalledTimes(1);
-      expect(clone).toHaveBeenCalledTimes(1);
+      expect(clone.mock.calls.filter(([input]) => isGraphClone(input))).toHaveLength(1);
       expect(derive.mock.calls.length).toBeLessThanOrEqual(derives);
       expect(listed.map((record) => record.workspaceId)).toEqual(
         records.slice(0, count).map((record) => record.workspaceId),
@@ -260,7 +260,7 @@ it.each([
   { phase: "importing" as const, method: "reconcileNow" as const },
   { phase: "active" as const, method: "reconcileNow" as const },
 ])("bounds the entire $method pass at 3308/440 scale in $phase", async ({ phase, method }) => {
-  const { value, file } = await largeReadFixture(phase, { directories: true });
+  const { value, file, records, childPin } = await largeReadFixture(phase, { directories: true });
   const projects = new FileBackedProjectRegistry(
     path.join(home, "projects.json"),
     createTestLogger(),
@@ -276,11 +276,24 @@ it.each([
       updatedAt: at,
     }),
   );
+  const changes = vi.fn();
+  const workspacesChanged = vi.fn(async () => {});
+  const git = createNoopWorkspaceGitService();
   const reconciliation = new WorkspaceReconciliationService({
     projectRegistry: projects,
     workspaceRegistry: value,
     logger: createTestLogger(),
     serverId: "srv_a",
+    workspaceGitService: createNoopWorkspaceGitService({
+      getCheckout: async (cwd) => ({
+        ...(await git.getCheckout(cwd)),
+        ...(cwd === records[0].cwd || cwd === records[1].cwd
+          ? { isGit: true, currentBranch: "observed-branch", worktreeRoot: cwd }
+          : {}),
+      }),
+    }),
+    onChanges: changes,
+    onWorkspacesChanged: workspacesChanged,
   });
   const cached = vi.spyOn(service, "cached");
   const clone = vi.spyOn(globalThis, "structuredClone");
@@ -290,11 +303,32 @@ it.each([
     expect(cached.mock.calls.length).toBeLessThanOrEqual(1);
     expect(clone.mock.calls.filter(([input]) => isGraphClone(input)).length).toBeLessThanOrEqual(1);
     expect(derive.mock.calls.length).toBeLessThanOrEqual(phase === "active" ? 1 : 0);
-    const retained = JSON.parse(await readFile(file, "utf8"));
-    expect(retained).toHaveLength(440);
-    expect(retained.filter((record: PersistedWorkspaceRecord) => record.archivedAt)).toHaveLength(
-      1,
+    expect(changes).toHaveBeenCalledTimes(1);
+    expect(changes.mock.calls[0][0]).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "workspace_updated", workspaceId: "large-0" }),
+        expect.objectContaining({ kind: "workspace_updated", workspaceId: "large-1" }),
+      ]),
     );
+    if (method === "reconcileNow")
+      expect(workspacesChanged).toHaveBeenCalledWith(
+        expect.arrayContaining(["large-0", "large-1"]),
+      );
+    const retained: PersistedWorkspaceRecord[] = JSON.parse(await readFile(file, "utf8"));
+    expect(retained).toHaveLength(440);
+    expect(retained.filter((record) => record.archivedAt)).toHaveLength(1);
+    expect(retained[0]).toMatchObject({
+      branch: "observed-branch",
+      kind: "local_checkout",
+      pinnedAt: childPin,
+      pinPlacement: { parentWorkspaceKey: "srv_b:large-440", siblingOrder: 0 },
+    });
+    expect(retained[1]).toMatchObject({
+      branch: "observed-branch",
+      pinnedAt: childPin,
+      pinPlacement: { parentWorkspaceKey: "srv_unknown:missing" },
+    });
+    expect(retained[439]).toMatchObject({ branch: null, archivedAt: null });
   } finally {
     derive.mockRestore();
     clone.mockRestore();
@@ -378,20 +412,23 @@ it("isolates indexed entry reads and sees new revisions without rebuilding on ev
   }
 });
 
-it("retains fresh local metadata within a shared canonical read batch", async () => {
-  const { value } = await largeReadFixture("active");
-  await value.withReadBatch(async (reader) => {
-    const first = await reader.get("large-0");
-    if (!first?.pinPlacement) throw new Error("fixture placement missing");
-    first.pinPlacement.siblingOrder = 1234;
-    await value.update("large-0", (record) => ({ ...record, cwd: home, title: "new metadata" }));
-    expect(await reader.get("large-0")).toMatchObject({
-      cwd: home,
-      title: "new metadata",
-      pinPlacement: { siblingOrder: 0 },
+it.each(["importing", "active"] as const)(
+  "retains fresh local metadata within a shared %s canonical read batch",
+  async (phase) => {
+    const { value } = await largeReadFixture(phase);
+    await value.withReadBatch(async (reader) => {
+      const first = await reader.get("large-0");
+      if (!first?.pinPlacement) throw new Error("fixture placement missing");
+      first.pinPlacement.siblingOrder = 1234;
+      await value.update("large-0", (record) => ({ ...record, cwd: home, title: "new metadata" }));
+      expect(await reader.get("large-0")).toMatchObject({
+        cwd: home,
+        title: "new metadata",
+        pinPlacement: { siblingOrder: 0 },
+      });
     });
-  });
-});
+  },
+);
 
 it("isolates large active read snapshots and sees a new authority revision on the next list", async () => {
   const { value, file, childPin } = await largeReadFixture("active");

@@ -494,10 +494,12 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
     phase: WorkspaceLayoutSnapshot["stamp"]["phase"] | undefined,
     entry: WorkspaceLayoutEntry | null | undefined,
   ): PersistedWorkspaceRecord {
-    if (phase !== "active") return record;
+    // Neither a batch nor a point read may expose mutable local registry state.
+    const local = structuredClone(record);
+    if (phase !== "active") return local;
     if (!entry) throw new WorkspaceLayoutRefusal("workspace_not_imported");
     return {
-      ...record,
+      ...local,
       pinnedAt: entry.pinnedAt,
       superpinnedAt: entry.superpinnedAt,
       parentWorkspaceId: entry.parent?.workspaceId ?? null,
