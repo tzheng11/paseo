@@ -1,5 +1,11 @@
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { Session } from "node:inspector/promises";
+import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, test } from "vitest";
+import vm from "node:vm";
+import { afterAll, describe, expect, test } from "vitest";
 import {
   CPU_PROFILE_MAX_DURATION_MS,
   CPU_PROFILE_MAX_FRAMES,
@@ -13,7 +19,16 @@ import {
   sanitizeCpuProfile,
 } from "./cpu-profile.js";
 
-const PACKET_ROOT = "/opt/paseo/runtime";
+// A real packet root: packet frames must name an existing regular file under it.
+const PACKET_ROOT = realpathSync(mkdtempSync(path.join(tmpdir(), "cpu-profile-packet-")));
+for (const relative of [
+  "packages/server/dist/server/server/workspace-layout-service.js",
+  "packages/server/dist/a.js",
+]) {
+  mkdirSync(path.dirname(path.join(PACKET_ROOT, relative)), { recursive: true });
+  writeFileSync(path.join(PACKET_ROOT, relative), "");
+}
+afterAll(() => rmSync(PACKET_ROOT, { recursive: true, force: true }));
 
 function packetUrl(relative: string): string {
   return `file://${PACKET_ROOT}/${relative}`;
@@ -331,7 +346,7 @@ describe("sanitizeCpuProfile", () => {
     "..%2F",
   ];
 
-  test("emits only packet-relative positions, fixed kinds, counts and time deltas", () => {
+  test("emits only packet-relative positions, fixed kinds, counts and time deltas", async () => {
     const profile = rawProfile(
       [
         node(1, [2, 3, 4, 5, 6, 7, 8, 9, 10, 11], { functionName: "(root)", scriptId: "0" }),
@@ -354,7 +369,7 @@ describe("sanitizeCpuProfile", () => {
       [2, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
     );
 
-    const summary = sanitizeCpuProfile(profile, {
+    const summary = await sanitizeCpuProfile(profile, {
       packetRoot: PACKET_ROOT,
       pid: 1,
       requestedDurationMs: 100,
@@ -390,7 +405,7 @@ describe("sanitizeCpuProfile", () => {
     expect(summary.truncated).toEqual({ frames: false, samples: false, bytes: false });
   });
 
-  test("emits node: frames only for real builtins and bounded internals", () => {
+  test("emits node: frames only for real builtins and bounded internals", async () => {
     const urls = [
       "node:fs",
       "node:fs/promises",
@@ -415,7 +430,7 @@ describe("sanitizeCpuProfile", () => {
       ],
       urls.map((_, index) => index + 2),
     );
-    const summary = sanitizeCpuProfile(profile, {
+    const summary = await sanitizeCpuProfile(profile, {
       packetRoot: PACKET_ROOT,
       pid: 1,
       requestedDurationMs: 10,
@@ -456,7 +471,7 @@ describe("sanitizeCpuProfile", () => {
     }
   });
 
-  test("caps frames to an ancestor-closed subset and marks truncation", () => {
+  test("caps frames to an ancestor-closed subset and marks truncation", async () => {
     const count = CPU_PROFILE_MAX_FRAMES * 2;
     const children = Array.from({ length: count }, (_, index) => index + 2);
     const nodes = [
@@ -465,7 +480,7 @@ describe("sanitizeCpuProfile", () => {
         node(id, [], { url: packetUrl("packages/server/dist/a.js"), lineNumber: id }),
       ),
     ];
-    const summary = sanitizeCpuProfile(rawProfile(nodes, children), {
+    const summary = await sanitizeCpuProfile(rawProfile(nodes, children), {
       packetRoot: PACKET_ROOT,
       pid: 1,
       requestedDurationMs: 100,
@@ -481,7 +496,7 @@ describe("sanitizeCpuProfile", () => {
     expect(summary.totalNodeCount).toBe(count + 1);
   });
 
-  test("caps the serialized response bytes", () => {
+  test("caps the serialized response bytes", async () => {
     const children = Array.from({ length: 200 }, (_, index) => index + 2);
     const nodes = [
       node(1, children, { functionName: "(root)", scriptId: "0" }),
@@ -489,7 +504,7 @@ describe("sanitizeCpuProfile", () => {
         node(id, [], { url: packetUrl("packages/server/dist/a.js"), lineNumber: id }),
       ),
     ];
-    const summary = sanitizeCpuProfile(rawProfile(nodes, children), {
+    const summary = await sanitizeCpuProfile(rawProfile(nodes, children), {
       packetRoot: PACKET_ROOT,
       pid: 1,
       requestedDurationMs: 100,
@@ -500,6 +515,57 @@ describe("sanitizeCpuProfile", () => {
     expect(Buffer.byteLength(JSON.stringify(summary))).toBeLessThanOrEqual(4_000);
     expect(summary.truncated.bytes).toBe(true);
     expect(summary.frames.length).toBeGreaterThan(0);
+  });
+});
+
+describe("packet frames from a real V8 profile", () => {
+  test("only an existing file under the packet root is a packet frame; crafted script names are unknown", async () => {
+    const realFile = path.join(PACKET_ROOT, "real-packet-file.js");
+    writeFileSync(
+      realFile,
+      "module.exports = function spin(ms) { const end = performance.now() + ms; while (performance.now() < end) {} };\n",
+    );
+    const spinReal = createRequire(import.meta.url)(realFile) as (ms: number) => void;
+    const spinSource =
+      "(function spin() { const end = performance.now() + 40; while (performance.now() < end) {} })()";
+
+    const session = new Session();
+    session.connect();
+    let raw: RawCpuProfile;
+    try {
+      await session.post("Profiler.enable");
+      await session.post("Profiler.setSamplingInterval", { interval: 100 });
+      await session.post("Profiler.start");
+      spinReal(40);
+      vm.runInThisContext(spinSource, {
+        filename: path.join(PACKET_ROOT, "sk-SECRET-in-packet.js"),
+      });
+      vm.runInThisContext(spinSource, { filename: `file://${PACKET_ROOT}/token_secret_url.js` });
+      (0, eval)(`${spinSource}\n//# sourceURL=${PACKET_ROOT}/eval_sourceurl_secret.js`);
+      raw = ((await session.post("Profiler.stop")) as { profile: RawCpuProfile }).profile;
+    } finally {
+      await session.post("Profiler.disable");
+      session.disconnect();
+    }
+
+    const summary = await sanitizeCpuProfile(raw, {
+      packetRoot: PACKET_ROOT,
+      pid: 1,
+      requestedDurationMs: 200,
+      actualDurationMs: 200,
+    });
+    const json = JSON.stringify(summary);
+
+    for (const leaked of ["SECRET", "token", "eval_sourceurl", PACKET_ROOT]) {
+      expect(json).not.toContain(leaked);
+    }
+    const packetFiles = new Set(
+      summary.frames.filter((frame) => frame.kind === "packet").map((frame) => frame.file),
+    );
+    expect([...packetFiles]).toEqual(["real-packet-file.js"]);
+    const real = summary.frames.find((frame) => frame.file === "real-packet-file.js");
+    expect(real?.line).toBe(1);
+    expect(real?.column).toBeGreaterThan(1);
   });
 });
 

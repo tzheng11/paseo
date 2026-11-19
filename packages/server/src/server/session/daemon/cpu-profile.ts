@@ -1,3 +1,4 @@
+import { realpath, stat } from "node:fs/promises";
 import { builtinModules } from "node:module";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -213,7 +214,7 @@ export class CpuProfiler {
       throwIfCancelled(active);
       const profile = (result as { profile?: RawCpuProfile } | undefined)?.profile;
       if (!profile) throw new CpuProfileError("profiler_failed");
-      return sanitizeCpuProfile(profile, {
+      return await sanitizeCpuProfile(profile, {
         packetRoot: this.packetRoot,
         pid: runtime.pid,
         requestedDurationMs: durationMs,
@@ -280,9 +281,46 @@ interface FrameIdentity {
 
 const UNKNOWN_FRAME: FrameIdentity = { kind: "unknown", file: null, positioned: false };
 
+/**
+ * A script can claim any path with a vm filename or sourceURL, so a packet
+ * frame needs an existing regular file under the packet root (a symlink only
+ * if its target is under it too). Resolves each distinct candidate URL once,
+ * after the profiler has stopped.
+ */
+async function resolvePacketUrls(urls: Iterable<string>, packetRoot: string): Promise<Set<string>> {
+  const packetUrls = new Set<string>();
+  const realRoot = await realpathOrNull(packetRoot);
+  if (realRoot === null) return packetUrls;
+  await Promise.all(
+    [...new Set(urls)].map(async (url) => {
+      const packet = packetRelativePath(url, packetRoot);
+      if (!packet) return;
+      const real = await realpathOrNull(packet.absolute);
+      if (real === null || !isInside(realRoot, real)) return;
+      const stats = await stat(real).catch(() => null);
+      if (stats?.isFile()) packetUrls.add(url);
+    }),
+  );
+  return packetUrls;
+}
+
+async function realpathOrNull(target: string): Promise<string | null> {
+  try {
+    return await realpath(target);
+  } catch {
+    return null;
+  }
+}
+
+function isInside(root: string, target: string): boolean {
+  const relative = path.relative(root, target);
+  return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
 function classifyFrame(
   callFrame: RawCpuProfile["nodes"][number]["callFrame"],
   packetRoot: string,
+  packetUrls: ReadonlySet<string>,
 ): FrameIdentity {
   const url = callFrame.url ?? "";
   if (url === "") {
@@ -298,11 +336,15 @@ function classifyFrame(
       ? { kind: "node", file: url, positioned: true }
       : UNKNOWN_FRAME;
   }
-  const file = packetRelativePath(url, packetRoot);
-  return file ? { kind: "packet", file, positioned: true } : UNKNOWN_FRAME;
+  const packet = packetRelativePath(url, packetRoot);
+  if (!packet || !packetUrls.has(url)) return UNKNOWN_FRAME;
+  return { kind: "packet", file: packet.relative, positioned: true };
 }
 
-function packetRelativePath(url: string, packetRoot: string): string | null {
+function packetRelativePath(
+  url: string,
+  packetRoot: string,
+): { absolute: string; relative: string } | null {
   let absolute: string;
   if (url.startsWith("file://")) {
     try {
@@ -320,7 +362,7 @@ function packetRelativePath(url: string, packetRoot: string): string | null {
   const normalized = relative.split(path.sep).join("/");
   if (normalized.length > MAX_PACKET_PATH_LENGTH || !SAFE_PACKET_PATH.test(normalized)) return null;
   if (normalized.split("/").some((segment) => segment === "." || segment === "..")) return null;
-  return normalized;
+  return { absolute, relative: normalized };
 }
 
 export interface SanitizeCpuProfileOptions {
@@ -405,11 +447,11 @@ function toFrame(
   node: RawNode,
   index: number,
   parent: number | null,
-  packetRoot: string,
+  classify: (callFrame: RawNode["callFrame"]) => FrameIdentity,
   samples: SampleTotals,
   totals: Map<number, number>,
 ): DiagnosticsCpuProfileFrame {
-  const identity = classifyFrame(node.callFrame, packetRoot);
+  const identity = classify(node.callFrame);
   const { positioned } = identity;
   return {
     id: index,
@@ -429,10 +471,10 @@ function roundMs(value: number): number {
 }
 
 /** Reduce a raw V8 profile in memory to bounded positions, kinds, counts and time deltas. */
-export function sanitizeCpuProfile(
+export async function sanitizeCpuProfile(
   profile: RawCpuProfile,
   options: SanitizeCpuProfileOptions,
-): DiagnosticsCpuProfileSummary {
+): Promise<DiagnosticsCpuProfileSummary> {
   const maxFrames = options.maxFrames ?? CPU_PROFILE_MAX_FRAMES;
   const maxResponseBytes = options.maxResponseBytes ?? CPU_PROFILE_MAX_RESPONSE_BYTES;
   const nodes = profile.nodes ?? [];
@@ -456,6 +498,14 @@ export function sanitizeCpuProfile(
         orderIndex.get(a.id)! - orderIndex.get(b.id)!,
     );
   const overrunMs = Math.max(0, options.actualDurationMs - options.requestedDurationMs);
+  // Every frame any build below can keep is within the first `limit` ranked.
+  const limit = Math.min(ranked.length, maxFrames);
+  const packetUrls = await resolvePacketUrls(
+    ranked.slice(0, limit).map((entry) => byId.get(entry.id)!.callFrame.url ?? ""),
+    options.packetRoot,
+  );
+  const classify = (callFrame: RawNode["callFrame"]) =>
+    classifyFrame(callFrame, options.packetRoot, packetUrls);
 
   const build = (keep: number, bytesTruncated: boolean): DiagnosticsCpuProfileSummary => {
     const kept = ranked
@@ -465,14 +515,7 @@ export function sanitizeCpuProfile(
     const frames = kept.map((entry, index) => {
       const parent = parentOf.get(entry.id);
       const emittedParent = parent === undefined ? null : (emittedId.get(parent) ?? null);
-      return toFrame(
-        byId.get(entry.id)!,
-        index,
-        emittedParent,
-        options.packetRoot,
-        samples,
-        totals,
-      );
+      return toFrame(byId.get(entry.id)!, index, emittedParent, classify, samples, totals);
     });
     return {
       pid: options.pid,
@@ -495,7 +538,6 @@ export function sanitizeCpuProfile(
 
   const fits = (summary: DiagnosticsCpuProfileSummary) =>
     Buffer.byteLength(JSON.stringify(summary)) <= maxResponseBytes;
-  const limit = Math.min(ranked.length, maxFrames);
   const full = build(limit, false);
   if (fits(full)) return full;
   let low = 0;
