@@ -1557,6 +1557,15 @@ export const DiagnosticsRequestSchema = z.object({
   requestId: z.string(),
 });
 
+/** Upper bound for one in-process CPU profile. The daemon also enforces it. */
+export const DIAGNOSTICS_CPU_PROFILE_MAX_DURATION_MS = 4000;
+
+export const DiagnosticsCpuProfileRequestSchema = z.object({
+  type: z.literal("diagnostics.cpu_profile.request"),
+  requestId: z.string(),
+  durationMs: z.number().int().min(1).max(DIAGNOSTICS_CPU_PROFILE_MAX_DURATION_MS),
+});
+
 export const PluginCatalogGetRequestSchema = z.object({
   type: z.literal("plugin.catalog.get.request"),
   requestId: z.string(),
@@ -3527,6 +3536,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   HubManagementDaemonDisconnectRequestSchema,
   HubManagementDaemonPermissionsUpdateRequestSchema,
   DiagnosticsRequestSchema,
+  DiagnosticsCpuProfileRequestSchema,
   PluginCatalogGetRequestSchema,
   PluginListRequestSchema,
   PluginLogsGetRequestSchema,
@@ -3943,6 +3953,8 @@ export const ServerInfoStatusPayloadSchema = z
         hostStats: z.boolean().optional(),
         // COMPAT(daemonConfigReload): added in v0.4.0, remove gate after 2027-02-14.
         daemonConfigReload: z.boolean().optional(),
+        // COMPAT(diagnosticsCpuProfile): added in v0.15.0-impower, remove gate after 2027-05-19.
+        diagnosticsCpuProfile: z.boolean().optional(),
         // COMPAT(speechSettings): added in v0.12.0, remove gate after 2027-04-18.
         speechSettings: z.boolean().optional(),
         // COMPAT(relayConfig): added in v0.2.6, remove gate after 2027-01-31.
@@ -5592,6 +5604,61 @@ export const DiagnosticsResponseSchema = z.object({
     .object({
       requestId: z.string(),
       diagnostic: z.string(),
+    })
+    .passthrough(),
+});
+
+export const DiagnosticsCpuProfileFrameKindSchema = z.enum([
+  "root",
+  "program",
+  "idle",
+  "gc",
+  "native",
+  "node",
+  "packet",
+  "unknown",
+]);
+
+/**
+ * One sanitized profile node. `file` is set only for packet-relative and
+ * `node:` builtin frames; function names and other URLs are never sent.
+ */
+export const DiagnosticsCpuProfileFrameSchema = z.object({
+  id: z.number().int(),
+  parent: z.number().int().nullable(),
+  kind: DiagnosticsCpuProfileFrameKindSchema,
+  file: z.string().nullable(),
+  line: z.number().int().nullable(),
+  column: z.number().int().nullable(),
+  selfSamples: z.number().int(),
+  totalSamples: z.number().int(),
+  selfMicros: z.number(),
+});
+
+export const DiagnosticsCpuProfileSummarySchema = z.object({
+  pid: z.number().int(),
+  samplingIntervalUs: z.number().int(),
+  requestedDurationMs: z.number().int(),
+  actualDurationMs: z.number(),
+  overrunMs: z.number(),
+  overrun: z.boolean(),
+  profileSpanMicros: z.number(),
+  sampleCount: z.number().int(),
+  totalNodeCount: z.number().int(),
+  frames: z.array(DiagnosticsCpuProfileFrameSchema),
+  truncated: z.object({
+    frames: z.boolean(),
+    samples: z.boolean(),
+    bytes: z.boolean(),
+  }),
+});
+
+export const DiagnosticsCpuProfileResponseSchema = z.object({
+  type: z.literal("diagnostics.cpu_profile.response"),
+  payload: z
+    .object({
+      requestId: z.string(),
+      profile: DiagnosticsCpuProfileSummarySchema,
     })
     .passthrough(),
 });
@@ -7485,6 +7552,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   HubManagementDaemonDisconnectResponseSchema,
   HubManagementDaemonPermissionsUpdateResponseSchema,
   DiagnosticsResponseSchema,
+  DiagnosticsCpuProfileResponseSchema,
   GetDaemonConfigResponseMessageSchema,
   SetDaemonConfigResponseMessageSchema,
   ReadProjectConfigResponseMessageSchema,
@@ -7748,6 +7816,9 @@ export type DaemonGetHostStatsResponse = z.infer<typeof DaemonGetHostStatsRespon
 export type DaemonGetPairingOfferResponse = z.infer<typeof DaemonGetPairingOfferResponseSchema>;
 export type DaemonConfigReloadResponse = z.infer<typeof DaemonConfigReloadResponseSchema>;
 export type DiagnosticsResponse = z.infer<typeof DiagnosticsResponseSchema>;
+export type DiagnosticsCpuProfileResponse = z.infer<typeof DiagnosticsCpuProfileResponseSchema>;
+export type DiagnosticsCpuProfileSummary = z.infer<typeof DiagnosticsCpuProfileSummarySchema>;
+export type DiagnosticsCpuProfileFrame = z.infer<typeof DiagnosticsCpuProfileFrameSchema>;
 export type GetProvidersSnapshotResponseMessage = z.infer<
   typeof GetProvidersSnapshotResponseMessageSchema
 >;

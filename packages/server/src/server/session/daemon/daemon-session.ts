@@ -16,6 +16,12 @@ import {
 } from "./diagnostics.js";
 import { DaemonSelfUpdateSessionController } from "./daemon-self-update-session-controller.js";
 import { collectHostStats } from "./host-stats.js";
+import {
+  CpuProfileError,
+  type CpuProfiler,
+  getProcessCpuProfiler,
+  getProcessCpuProfilerIfLoaded,
+} from "./cpu-profile.js";
 import type { ManagedAgent } from "../../agent/agent-manager.js";
 import type { PersistedProjectRecord, PersistedWorkspaceRecord } from "../../workspace-registry.js";
 import type { HubRelationshipManagement } from "../../hub/relationship-controller.js";
@@ -71,6 +77,8 @@ export interface DaemonSessionOptions {
   logger: pino.Logger;
   hubRelationships?: HubRelationshipManagement;
   reloadConfig: () => Promise<DaemonConfigReloadResult>;
+  /** Defaults to the process-wide profiler; tests inject their own. */
+  cpuProfiler?: CpuProfiler;
 }
 
 /**
@@ -100,6 +108,7 @@ export class DaemonSession {
   private readonly selfUpdate: DaemonSelfUpdateSessionController;
   private readonly hubRelationships: HubRelationshipManagement | null;
   private readonly reloadConfig: () => Promise<DaemonConfigReloadResult>;
+  private readonly injectedCpuProfiler: CpuProfiler | undefined;
 
   constructor(options: DaemonSessionOptions) {
     this.host = options.host;
@@ -120,6 +129,7 @@ export class DaemonSession {
     this.logger = options.logger;
     this.hubRelationships = options.hubRelationships ?? null;
     this.reloadConfig = options.reloadConfig;
+    this.injectedCpuProfiler = options.cpuProfiler;
     this.selfUpdate = new DaemonSelfUpdateSessionController({
       clientId: this.clientId,
       daemonVersion: this.daemonVersion ?? null,
@@ -309,6 +319,55 @@ export class DaemonSession {
         },
       });
     }
+  }
+
+  /**
+   * One bounded main-thread CPU profile. The session has already checked
+   * daemon.manage. `owner` is the physical socket the request arrived on.
+   */
+  async handleCpuProfileRequest(
+    msg: Extract<SessionInboundMessage, { type: "diagnostics.cpu_profile.request" }>,
+    owner: object,
+  ): Promise<void> {
+    try {
+      const profile = await this.cpuProfiler.capture({
+        durationMs: msg.durationMs,
+        owner,
+        scope: this,
+      });
+      this.host.emit({
+        type: "diagnostics.cpu_profile.response",
+        payload: { requestId: msg.requestId, profile },
+      });
+    } catch (error) {
+      // Never log or reply with an untyped error's message or stack.
+      const failure =
+        error instanceof CpuProfileError ? error : new CpuProfileError("profiler_failed");
+      this.logger.warn({ code: failure.code }, "CPU profile request failed");
+      this.host.emit({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: failure.message,
+          code: `cpu_profile_${failure.code}`,
+        },
+      });
+    }
+  }
+
+  cancelCpuProfileForSocket(owner: object): void {
+    this.injectedCpuProfiler?.cancelOwner(owner);
+    if (!this.injectedCpuProfiler) getProcessCpuProfilerIfLoaded()?.cancelOwner(owner);
+  }
+
+  cancelCpuProfiles(): void {
+    this.injectedCpuProfiler?.cancelScope(this);
+    if (!this.injectedCpuProfiler) getProcessCpuProfilerIfLoaded()?.cancelScope(this);
+  }
+
+  private get cpuProfiler(): CpuProfiler {
+    return this.injectedCpuProfiler ?? getProcessCpuProfiler();
   }
 
   async handleDiagnosticsRequest(

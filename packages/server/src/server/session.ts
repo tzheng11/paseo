@@ -1394,6 +1394,11 @@ export class Session {
     }
   }
 
+  /** A physical socket closed: stop the CPU profile it started, if any. */
+  cancelCpuProfileForSocket(source: object): void {
+    this.daemonSession.cancelCpuProfileForSocket(source);
+  }
+
   clearAgentTimelineSubscription(source: object): void {
     void this.delivery
       .detach(source)
@@ -2540,6 +2545,7 @@ export class Session {
       this.dispatchHubExecutionMessage(msg) ??
       this.dispatchCreationMessage(msg, source) ??
       this.dispatchAgentLifecycleMessage(msg) ??
+      this.dispatchCpuProfileMessage(msg, source) ??
       this.dispatchAgentConfigMessage(msg) ??
       this.dispatchCheckoutMessage(msg) ??
       this.dispatchWorkspaceLifecycleMessage(msg) ??
@@ -3035,6 +3041,15 @@ export class Session {
       default:
         return undefined;
     }
+  }
+
+  private dispatchCpuProfileMessage(
+    msg: SessionInboundMessage,
+    source?: object,
+  ): Promise<void> | undefined {
+    if (msg.type !== "diagnostics.cpu_profile.request") return undefined;
+    // The physical socket owns the capture; without one, this session does.
+    return this.daemonSession.handleCpuProfileRequest(msg, source ?? this);
   }
 
   private dispatchAgentConfigMessage(msg: SessionInboundMessage): Promise<void> | undefined {
@@ -9335,6 +9350,7 @@ export class Session {
   public async cleanup(): Promise<void> {
     this.sessionLogger.trace({}, "agent.session.lifecycle.cleanup");
     this.isCleanedUp = true;
+    this.daemonSession.cancelCpuProfiles();
     this.unsubscribeSetupObservation();
     await this.delivery.close();
 
