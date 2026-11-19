@@ -45,6 +45,22 @@ export interface WorkspaceLayoutReadView {
   entries: Map<string, WorkspaceLayoutEntry>;
   effective: Map<string, EffectiveWorkspaceLayout> | null;
 }
+/** Detached fields needed by native read projection; the graph and its Maps stay private. */
+export type WorkspaceLayoutReadPlacement = Pick<
+  WorkspaceLayoutEntry,
+  "pinnedAt" | "superpinnedAt" | "parent" | "siblingOrder" | "pinPlacement"
+>;
+export interface WorkspaceLayoutReadProjection {
+  readonly phase: WorkspaceLayoutSnapshot["stamp"]["phase"] | undefined;
+  readonly revision: number | undefined;
+  readonly derived: boolean;
+  readonly has: (ref: WorkspaceLayoutEntry["ref"]) => boolean;
+  readonly read: (ref: WorkspaceLayoutEntry["ref"]) => {
+    entry: WorkspaceLayoutReadPlacement | null;
+    effective: Pick<EffectiveWorkspaceLayout, "section" | "pinnedAt" | "superpinnedAt"> | null;
+  };
+}
+
 interface IndexedWorkspaceLayout {
   entries: Map<string, WorkspaceLayoutEntry>;
   effective: Map<string, EffectiveWorkspaceLayout> | null;
@@ -55,6 +71,10 @@ export class WorkspaceLayoutService {
   private readonly store: WorkspaceLayoutStore | null;
   private cache: WorkspaceLayoutSnapshot | null = null;
   private readonly indexedCache = new WeakMap<WorkspaceLayoutSnapshot, IndexedWorkspaceLayout>();
+  private readonly projectionCache = new WeakMap<
+    WorkspaceLayoutSnapshot,
+    WorkspaceLayoutReadProjection
+  >();
   private readonly listeners = new Set<() => void>();
   private transport: WorkspaceLayoutTransport | null = null;
   private readonly lifetime = new AbortController();
@@ -146,6 +166,46 @@ export class WorkspaceLayoutService {
       entries: index?.entries ?? new Map<string, WorkspaceLayoutEntry>(),
       effective: index?.effective ?? null,
     });
+  }
+
+  /** A generation-bound reader, not a public alias to a snapshot, Map or entry. */
+  cachedReadProjection(): WorkspaceLayoutReadProjection {
+    const snapshot = this.cache;
+    const existing = snapshot === null ? undefined : this.projectionCache.get(snapshot);
+    if (existing) return existing;
+    const index = snapshot === null ? null : this.index(snapshot);
+    const projection = Object.freeze({
+      phase: snapshot?.stamp.phase,
+      revision: snapshot?.stamp.revision,
+      derived: index?.effective != null,
+      has: (ref: WorkspaceLayoutEntry["ref"]) =>
+        index?.entries.has(workspaceReferenceKey(ref)) ?? false,
+      read: (ref: WorkspaceLayoutEntry["ref"]) => {
+        const key = workspaceReferenceKey(ref);
+        const entry = index?.entries.get(key);
+        const effective = index?.effective?.get(`${ref.serverId}:${ref.workspaceId}`);
+        return {
+          entry: entry
+            ? {
+                pinnedAt: entry.pinnedAt,
+                superpinnedAt: entry.superpinnedAt,
+                parent: entry.parent ? { ...entry.parent } : null,
+                siblingOrder: entry.siblingOrder,
+                pinPlacement: entry.pinPlacement ? { ...entry.pinPlacement } : null,
+              }
+            : null,
+          effective: effective
+            ? {
+                section: effective.section,
+                pinnedAt: effective.pinnedAt,
+                superpinnedAt: effective.superpinnedAt,
+              }
+            : null,
+        };
+      },
+    });
+    if (snapshot) this.projectionCache.set(snapshot, projection);
+    return projection;
   }
 
   cachedWorkspace(ref: WorkspaceLayoutEntry["ref"]) {

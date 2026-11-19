@@ -3193,7 +3193,7 @@ test.each([
         expect(response).toBeDefined();
         if (!response) throw new Error("missing agent response");
         ids.push(...agentIdsFromEntries(response.payload.entries));
-        expect(measured.counts.graphClones).toBe(1);
+        expect(measured.counts.graphClones).toBe(0);
         expect(measured.counts.derivations).toBe(phase === "active" && page === 0 ? 1 : 0);
         expect(measured.counts.jsonCopies + measured.counts.mapCopies).toBe(0);
         if (!response.payload.pageInfo.hasMore) break;

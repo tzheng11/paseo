@@ -19,6 +19,8 @@ import {
 import type {
   WorkspaceLayoutService,
   WorkspaceLayoutReadView,
+  WorkspaceLayoutReadProjection,
+  WorkspaceLayoutReadPlacement,
 } from "./workspace-layout-service.js";
 import { WorkspaceLayoutRefusal } from "./workspace-layout-store.js";
 
@@ -38,6 +40,7 @@ interface SectionEntryIntent {
   view: ActiveWorkspaceLayoutReadView;
   sectionMode: "inherit" | "explicit" | undefined;
 }
+type WorkspaceReadProjection = WorkspaceLayoutReadView | WorkspaceLayoutReadProjection;
 interface ActiveWorkspaceLayoutReadView extends WorkspaceLayoutReadView {
   snapshot: WorkspaceLayoutSnapshot;
 }
@@ -82,7 +85,7 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
 
   override async list(): Promise<PersistedWorkspaceRecord[]> {
     const records = await super.list();
-    const view = this.layout.cachedReadView();
+    const view = this.layout.cachedReadProjection();
     return records.flatMap((record) => {
       const projected = this.projectOrQuarantine(record, view);
       return projected ? [projected] : [];
@@ -94,18 +97,12 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
   }
 
   async withReadBatch<T>(run: (reader: WorkspaceReadBatch) => Promise<T>): Promise<T> {
-    const view = this.layout.cachedReadView();
+    const view = this.layout.cachedReadProjection();
     const readViewFor = (record: PersistedWorkspaceRecord) => {
-      const key = workspaceReferenceKey({
-        serverId: this.serverId,
-        workspaceId: record.workspaceId,
-      });
+      const ref = { serverId: this.serverId, workspaceId: record.workspaceId };
       // An await can admit a newly created workspace. Refresh only that missing
-      // entry, retaining the batch's single graph copy for existing members.
-      if (
-        !view.entries.has(key) &&
-        this.layout.status().stamp?.revision !== view.snapshot?.stamp.revision
-      )
+      // entry, retaining the batch's private generation for existing members.
+      if (!view.has(ref) && this.layout.status().stamp?.revision !== view.revision)
         return undefined;
       return view;
     };
@@ -450,7 +447,7 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
 
   private publish(
     record: PersistedWorkspaceRecord,
-    view?: WorkspaceLayoutReadView,
+    view?: WorkspaceReadProjection,
   ): PersistedWorkspaceRecord {
     if (!view) {
       const cached = this.layout.cachedWorkspace({
@@ -460,6 +457,21 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
       const raw = this.projectEntry(record, cached.stamp?.phase, cached.entry);
       if (!cached.derived) return raw;
       const membership = cached.effective;
+      if (!membership) throw new WorkspaceLayoutRefusal("workspace_not_imported");
+      return membership.section === null
+        ? { ...raw, effectiveSection: null }
+        : {
+            ...raw,
+            pinnedAt: membership.pinnedAt,
+            superpinnedAt: membership.superpinnedAt,
+            effectiveSection: membership.section,
+          };
+    }
+    if ("read" in view) {
+      const projected = view.read({ serverId: this.serverId, workspaceId: record.workspaceId });
+      const raw = this.projectEntry(record, view.phase, projected.entry);
+      if (!view.derived) return raw;
+      const membership = projected.effective;
       if (!membership) throw new WorkspaceLayoutRefusal("workspace_not_imported");
       return membership.section === null
         ? { ...raw, effectiveSection: null }
@@ -486,7 +498,7 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
 
   private project(
     record: PersistedWorkspaceRecord,
-    view?: WorkspaceLayoutReadView,
+    view?: WorkspaceReadProjection,
   ): PersistedWorkspaceRecord {
     if (!view) {
       const cached = this.layout.cachedWorkspace({
@@ -494,6 +506,10 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
         workspaceId: record.workspaceId,
       });
       return this.projectEntry(record, cached.stamp?.phase, cached.entry);
+    }
+    if ("read" in view) {
+      const { entry } = view.read({ serverId: this.serverId, workspaceId: record.workspaceId });
+      return this.projectEntry(record, view.phase, entry);
     }
     // Import is a declared read-only staging phase. Existing local facts remain
     // visible, but neither a legacy RPC nor a reconcile can import them by writing.
@@ -506,7 +522,7 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
   private projectEntry(
     record: PersistedWorkspaceRecord,
     phase: WorkspaceLayoutSnapshot["stamp"]["phase"] | undefined,
-    entry: WorkspaceLayoutEntry | null | undefined,
+    entry: WorkspaceLayoutReadPlacement | null | undefined,
   ): PersistedWorkspaceRecord {
     // Neither a batch nor a point read may expose mutable local registry state.
     const local = structuredClone(record);
@@ -532,7 +548,7 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
     };
   }
 
-  private projectOrQuarantine(record: PersistedWorkspaceRecord, view?: WorkspaceLayoutReadView) {
+  private projectOrQuarantine(record: PersistedWorkspaceRecord, view?: WorkspaceReadProjection) {
     try {
       return this.publish(record, view);
     } catch (error) {
@@ -547,9 +563,8 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
   }
 
   private async syncProtectionProjection(): Promise<void> {
-    const view = this.layout.cachedReadView();
-    const { snapshot } = view;
-    if (!snapshot || snapshot.stamp.phase !== "active") return;
+    const view = this.layout.cachedReadProjection();
+    if (view.phase !== "active") return;
     for (const raw of await super.list()) {
       const visible = this.projectOrQuarantine(raw, view);
       const next = visible ? this.project(raw, view) : null;
