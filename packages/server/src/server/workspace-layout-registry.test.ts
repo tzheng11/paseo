@@ -130,7 +130,12 @@ async function registry(records: PersistedWorkspaceRecord[], name = "a", serverI
 
 async function largeReadFixture(
   phase: "importing" | "active",
-  options: { directories?: boolean } = {},
+  options: {
+    directories?: boolean;
+    entryCount?: number;
+    localCount?: number;
+    nestedFields?: boolean;
+  } = {},
 ) {
   await service.close();
   const fixture = await createLargeLayoutFixture({ home, phase, ...options });
@@ -148,13 +153,13 @@ it.each([
   async ({ phase, count, derives, pin }) => {
     const { value, file, records, childPin } = await largeReadFixture(phase);
     const before = await readFile(file, "utf8");
-    const cached = vi.spyOn(service, "cachedReadView");
+    const cached = vi.spyOn(service, "cachedReadProjection");
     const measured = measureLayoutReads();
     const clone = vi.spyOn(globalThis, "structuredClone");
     try {
       const listed = await value.list();
       expect(cached).toHaveBeenCalledTimes(1);
-      expect(clone.mock.calls.filter(([input]) => isGraphClone(input))).toHaveLength(1);
+      expect(clone.mock.calls.filter(([input]) => isGraphClone(input))).toHaveLength(0);
       expect(measured.counts.derivations).toBe(derives);
       expect(measured.counts.jsonCopies + measured.counts.mapCopies).toBe(0);
       expect(listed.map((record) => record.workspaceId)).toEqual(
@@ -169,6 +174,264 @@ it.each([
       measured.restore();
       cached.mockRestore();
     }
+  },
+);
+
+// ISS-9919: the public list path must not copy unrelated owner records.
+it.each([
+  { phase: "importing" as const, entryCount: 3308, localCount: 440 },
+  { phase: "active" as const, entryCount: 3308, localCount: 440 },
+  { phase: "importing" as const, entryCount: 211, localCount: 57 },
+  { phase: "active" as const, entryCount: 211, localCount: 57 },
+])(
+  "lists without full-layout copies at $entryCount/$localCount $phase on cold and repeated generations",
+  async ({ phase, entryCount, localCount }) => {
+    const fixture = await largeReadFixture(phase, { entryCount, localCount });
+    const measured = measureLayoutReads(entryCount);
+    const observed: Array<{
+      generation: number;
+      call: string;
+      graphClones: number;
+      jsonCopies: number;
+      mapCopies: number;
+      derivations: number;
+      entryClones: number;
+      indexBuilds: number;
+      projectionBuilds: number;
+      arrayWalks: number;
+    }> = [];
+    try {
+      for (let generation = 0; generation < 2; generation++) {
+        if (generation) {
+          await coldLayoutGeneration(fixture);
+          registries.push(fixture.value);
+        }
+        for (const call of ["cold", "repeat-1", "repeat-2"]) {
+          measured.reset();
+          const rows = await fixture.value.list();
+          expect(rows).toHaveLength(phase === "active" ? localCount - 1 : localCount);
+          observed.push({ generation, call, ...measured.counts });
+        }
+      }
+      console.info(
+        "ISS9919_LIST_COUNTS",
+        JSON.stringify({ phase, entryCount, localCount, observed }),
+      );
+      expect(observed.map((c) => c.graphClones)).toEqual([0, 0, 0, 0, 0, 0]);
+      expect(observed.every((c) => c.jsonCopies === 0 && c.mapCopies === 0)).toBe(true);
+      expect(observed.map((c) => c.entryClones)).toEqual(Array(6).fill(localCount));
+      expect(observed.map((c) => c.indexBuilds)).toEqual([1, 0, 0, 1, 0, 0]);
+      expect(observed.map((c) => c.projectionBuilds)).toEqual([1, 0, 0, 1, 0, 0]);
+      expect(observed.map((c) => c.arrayWalks)).toEqual([2, 0, 0, 2, 0, 0]);
+      expect(observed.map((c) => c.derivations)).toEqual(
+        phase === "active" ? [1, 0, 0, 1, 0, 0] : [0, 0, 0, 0, 0, 0],
+      );
+    } finally {
+      measured.restore();
+    }
+  },
+);
+
+it.each([
+  { phase: "importing" as const, entryCount: 3308, localCount: 440 },
+  { phase: "active" as const, entryCount: 3308, localCount: 440 },
+  { phase: "importing" as const, entryCount: 211, localCount: 57 },
+  { phase: "active" as const, entryCount: 211, localCount: 57 },
+])(
+  "matches the full-view oracle at $entryCount/$localCount $phase",
+  async ({ phase, entryCount, localCount }) => {
+    const { value } = await largeReadFixture(phase, { entryCount, localCount });
+    const full = await service.inspectReadView();
+    const records = await FileBackedWorkspaceRegistry.prototype.list.call(value);
+    const legacy = value as unknown as {
+      publish: (record: PersistedWorkspaceRecord, view: typeof full) => PersistedWorkspaceRecord;
+    };
+    const quarantined: string[] = [];
+    const expected = records.flatMap((record) => {
+      try {
+        return [legacy.publish(record, full)];
+      } catch (error) {
+        if (
+          !(error instanceof Error) ||
+          error.message !== "Workspace layout refused: workspace_not_imported"
+        )
+          throw error;
+        quarantined.push(record.workspaceId);
+        return [];
+      }
+    });
+    expect(await value.list()).toEqual(expected);
+    expect(quarantined).toEqual(phase === "active" ? [`large-${localCount - 1}`] : []);
+    const absent = records[localCount - 1];
+    if (phase === "active")
+      await expect(value.get(absent.workspaceId)).rejects.toThrow("workspace_not_imported");
+    else expect(await value.get(absent.workspaceId)).toEqual(legacy.publish(absent, full));
+  },
+);
+
+it.each(["importing", "active"] as const)(
+  "keeps nested list/get/batch values isolated in %s",
+  async (phase) => {
+    const { value } = await largeReadFixture(phase, {
+      entryCount: 211,
+      localCount: 57,
+      nestedFields: true,
+    });
+    const expected = await value.list();
+    const snapshot = await service.inspect();
+    const mutate = (record: PersistedWorkspaceRecord) => {
+      if (!record.pinPlacement || !record.labels || !record.fieldValues || !record.untrustedSource)
+        throw new Error("nested fixture missing");
+      Object.assign(record.pinPlacement, {
+        parentWorkspaceKey: "changed:parent",
+        siblingOrder: 987,
+        revision: 999,
+      });
+      record.labels[0] = "changed";
+      record.labels.push("new");
+      record.fieldValues["fixture-metadata"] = "changed";
+      Object.assign(record.untrustedSource, {
+        kind: "invalid",
+        forge: "changed",
+        number: 999,
+        headRepository: "changed/repo",
+      });
+    };
+    mutate((await value.list())[0]);
+    expect(await value.list()).toEqual(expected);
+    const point = await value.get("large-0");
+    if (!point) throw new Error("missing point");
+    mutate(point);
+    expect(await value.list()).toEqual(expected);
+    await value.withReadBatch(async (reader) => {
+      mutate((await reader.list())[0]);
+      expect(await reader.list()).toEqual(expected);
+      const batchPoint = await reader.get("large-0");
+      if (!batchPoint) throw new Error("missing batch point");
+      mutate(batchPoint);
+      expect(await reader.list()).toEqual(expected);
+    });
+    expect(await value.list()).toEqual(expected);
+    expect(await service.inspect()).toEqual(snapshot);
+    // Test the actual private cache identity, not a clone returned by inspect().
+    const cache = (service as unknown as { cache: WorkspaceLayoutSnapshot }).cache;
+    const projection = service.cachedReadProjection();
+    expect(Object.isFrozen(projection)).toBe(true);
+    expect(service.cachedReadProjection()).toBe(projection);
+    expect(Object.keys(projection).sort()).toEqual(["derived", "has", "phase", "read", "revision"]);
+    const original = cache.entries.find(
+      (entry) => entry.ref.serverId === "srv_a" && entry.ref.workspaceId === "large-0",
+    );
+    const detached = projection.read({ serverId: "srv_a", workspaceId: "large-0" });
+    expect(detached.entry).not.toBe(original);
+    expect(detached.entry?.pinPlacement).not.toBe(original?.pinPlacement);
+    if (!detached.entry?.pinPlacement) throw new Error("detached fixture missing");
+    Object.assign(detached.entry.pinPlacement, {
+      parentWorkspaceKey: "changed:parent",
+      siblingOrder: 9999,
+      revision: 9999,
+    });
+    expect(
+      projection.read({ serverId: "srv_a", workspaceId: "large-0" }).entry?.pinPlacement
+        ?.siblingOrder,
+    ).toBe(0);
+    const parent = projection.read({ serverId: "srv_a", workspaceId: "large-3" });
+    const cachedParent = cache.entries.find(
+      (entry) => entry.ref.serverId === "srv_a" && entry.ref.workspaceId === "large-3",
+    );
+    expect(parent.entry?.parent).not.toBe(cachedParent?.parent);
+    if (!parent.entry?.parent) throw new Error("parent fixture missing");
+    parent.entry.parent.workspaceId = "changed";
+    parent.entry.parent.serverId = "changed-server";
+    expect(
+      projection.read({ serverId: "srv_a", workspaceId: "large-3" }).entry?.parent?.workspaceId,
+    ).toBe("large-4");
+    if (phase === "active") {
+      const privateIndex = (
+        service as unknown as {
+          indexedCache: WeakMap<
+            WorkspaceLayoutSnapshot,
+            { effective: Map<string, unknown> | null }
+          >;
+        }
+      ).indexedCache.get(cache);
+      expect(privateIndex).toBeDefined();
+      expect(detached.effective).not.toBe(privateIndex?.effective?.get("srv_a:large-0"));
+      if (!detached.effective) throw new Error("effective fixture missing");
+      Object.assign(detached.effective, {
+        section: "superpinned",
+        pinnedAt: null,
+        superpinnedAt: at,
+      });
+      expect(projection.read({ serverId: "srv_a", workspaceId: "large-0" }).effective).toEqual({
+        section: "pinned",
+        pinnedAt: at,
+        superpinnedAt: null,
+      });
+    }
+    expect(
+      projection.read({ serverId: "srv_a", workspaceId: "large-3" }).entry?.parent?.serverId,
+    ).toBe("srv_a");
+    expect((await service.inspect()).entries).toEqual(snapshot.entries);
+  },
+);
+
+it.each(["importing", "active"] as const)(
+  "advances opaque readers by layout generation and keeps native metadata fresh in %s",
+  async (phase) => {
+    const { value } = await largeReadFixture(phase, { entryCount: 211, localCount: 57 });
+    const old = service.cachedReadProjection();
+    const stamp = await service.inspect();
+    if (!stamp.navigation) throw new Error("navigation missing");
+    await service.commit({
+      writerVersion: 2,
+      requestId: "reader-next-generation",
+      expected: stamp.stamp,
+      mutations: [
+        {
+          kind: "put-navigation",
+          expectedRevision: stamp.navigation.revision,
+          preferences: stamp.navigation.preferences,
+          ...(phase === "importing"
+            ? {
+                importResolution: {
+                  clientSources: stamp.navigation.clientSources,
+                  resolutionSha256: stamp.navigation.resolutionSha256,
+                },
+              }
+            : {}),
+        },
+      ],
+    });
+    const current = service.cachedReadProjection();
+    expect(current).not.toBe(old);
+    expect(current.revision).toBe((old.revision ?? 0) + 1);
+    expect(old.revision).toBe(stamp.stamp.revision);
+    const first = await value.list();
+    await value.update("large-0", (record) => ({ ...record, title: "current native metadata" }));
+    const next = await value.list();
+    expect(next[0]).toMatchObject({
+      title: "current native metadata",
+      pinPlacement: first[0].pinPlacement,
+      pinnedAt: first[0].pinnedAt,
+    });
+    expect(service.cachedReadProjection()).toBe(current);
+    await value.withReadBatch(async (reader) => {
+      const measured = measureLayoutReads(211);
+      try {
+        const rows = await reader.list();
+        expect(rows[0].title).toBe("current native metadata");
+        expect(
+          measured.counts.graphClones +
+            measured.counts.jsonCopies +
+            measured.counts.mapCopies +
+            measured.counts.arrayWalks,
+        ).toBe(0);
+        expect(measured.counts.entryClones).toBe(57);
+      } finally {
+        measured.restore();
+      }
+    });
   },
 );
 
@@ -324,7 +587,7 @@ it.each([
   const clone = vi.spyOn(globalThis, "structuredClone");
   try {
     await reconciliation[method]();
-    expect(measured.counts.graphClones).toBe(1);
+    expect(measured.counts.graphClones).toBe(0);
     expect(measured.counts.jsonCopies + measured.counts.mapCopies).toBe(0);
     expect(clone.mock.calls.filter(([input]) => isGraphClone(input)).length).toBeLessThanOrEqual(1);
     expect(measured.counts.derivations).toBe(phase === "active" ? 1 : 0);
@@ -370,9 +633,9 @@ it.each(["importing", "active"] as const)(
     const clone = vi.spyOn(globalThis, "structuredClone");
     try {
       await value.initialize();
-      expect(measured.counts.graphClones).toBe(1);
+      expect(measured.counts.graphClones).toBe(0);
       expect(measured.counts.jsonCopies + measured.counts.mapCopies).toBe(0);
-      expect(clone.mock.calls.filter(([input]) => isGraphClone(input))).toHaveLength(1);
+      expect(clone.mock.calls.filter(([input]) => isGraphClone(input))).toHaveLength(0);
       expect(measured.counts.derivations).toBe(phase === "active" ? 1 : 0);
       expect(await readFile(file, "utf8")).toBe(before);
     } finally {

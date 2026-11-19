@@ -60,8 +60,15 @@ export async function createLargeLayoutFixture(input: {
   home: string;
   phase: "importing" | "active";
   directories?: boolean;
+  entryCount?: number;
+  localCount?: number;
+  nestedFields?: boolean;
 }) {
   const { home, phase } = input;
+  const entryCount = input.entryCount ?? 3308;
+  const localCount = input.localCount ?? 440;
+  if (localCount < 3 || entryCount < localCount)
+    throw new Error("invalid scale fixture dimensions");
   const derivedConfig = { ...config, semanticsVersion: 2 as const };
   const service = new WorkspaceLayoutService({
     home,
@@ -70,14 +77,14 @@ export async function createLargeLayoutFixture(input: {
     failed: () => {},
   });
   const childPin = "2026-11-04T09:00:00.000Z";
-  const records = Array.from({ length: 440 }, (_, index) => ({
+  const records = Array.from({ length: localCount }, (_, index) => ({
     ...row(`large-${index}`),
     siblingOrder: index,
   }));
   records[0] = {
     ...records[0],
     pinnedAt: childPin,
-    pinPlacement: { parentWorkspaceKey: "srv_b:large-440", siblingOrder: 0, revision: 1 },
+    pinPlacement: { parentWorkspaceKey: `srv_b:large-${localCount}`, siblingOrder: 0, revision: 1 },
   };
   records[1] = {
     ...records[1],
@@ -85,8 +92,22 @@ export async function createLargeLayoutFixture(input: {
     pinPlacement: { parentWorkspaceKey: "srv_unknown:missing", siblingOrder: 1, revision: 1 },
   };
   records[2] = { ...records[0], workspaceId: "large-2", archivedAt: at };
-  const remote = Array.from({ length: 2869 }, (_, index) => ({
-    ...row(`large-${index + 440}`),
+  if (input.nestedFields) {
+    records[0] = {
+      ...records[0],
+      labels: ["fixture-label"],
+      fieldValues: { "fixture-metadata": "original" },
+      untrustedSource: {
+        kind: "change_request",
+        forge: "github",
+        number: 7,
+        headRepository: "fixture/repo",
+      },
+    };
+    records[3] = { ...records[3], parentWorkspaceId: records[4].workspaceId };
+  }
+  const remote = Array.from({ length: entryCount - localCount + 1 }, (_, index) => ({
+    ...row(`large-${index + localCount}`),
     pinnedAt: index === 0 ? at : null,
   }));
   const initial = await service.initialize(derivedConfig);
@@ -96,7 +117,7 @@ export async function createLargeLayoutFixture(input: {
     expected: initial.stamp,
     mutations: [
       ...[
-        { serverId: "srv_a", records: records.slice(0, 439) },
+        { serverId: "srv_a", records: records.slice(0, localCount - 1) },
         { serverId: "srv_b", records: remote },
       ].map(({ serverId, records: owned }) => ({
         kind: "import-host" as const,
@@ -116,7 +137,7 @@ export async function createLargeLayoutFixture(input: {
     ],
   });
   const imported = await service.inspect();
-  if (imported.entries.length !== 3308) throw new Error("wrong scale fixture size");
+  if (imported.entries.length !== entryCount) throw new Error("wrong scale fixture size");
   if (phase === "active")
     await service.commit({
       writerVersion: 2,
