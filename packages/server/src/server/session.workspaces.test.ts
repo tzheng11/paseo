@@ -1,5 +1,8 @@
-import { createLargeLayoutFixture } from "./test-fixtures/canonical-layout-scale.js";
-import * as layoutProtocol from "@getpaseo/protocol/workspace-layout";
+import { measureLayoutReads } from "./test-utils/layout-read-counts.js";
+import {
+  createLargeLayoutFixture,
+  coldLayoutGeneration,
+} from "./test-fixtures/canonical-layout-scale.js";
 import {
   createWorkspaceRuntimeStore,
   type WorkspaceRuntimeStore,
@@ -3014,11 +3017,115 @@ test("active-scoped fetch_agents pages within active scope instead of global his
   expect(secondPage.pageInfo.hasMore).toBe(false);
 });
 
-function clonesLayoutGraph(value: unknown): boolean {
-  if (typeof value !== "object" || value === null) return false;
-  if ("entries" in value && Array.isArray(value.entries)) return true;
-  return "snapshot" in value && clonesLayoutGraph(value.snapshot);
+async function canonicalFetchFixture(
+  list: (
+    fixture: Awaited<ReturnType<typeof createLargeLayoutFixture>>,
+  ) => Promise<StoredAgentRecord[]>,
+) {
+  const home = mkdtempSync(path.join(tmpdir(), "paseo-agent-layout-concurrency-"));
+  const fixture = await createLargeLayoutFixture({ home, phase: "active" });
+  const projects = new FileBackedProjectRegistry(
+    path.join(home, "projects.json"),
+    createTestLogger(),
+  );
+  await projects.initialize();
+  await projects.upsert(
+    createPersistedProjectRecord({
+      projectId: "project",
+      rootPath: home,
+      kind: "non_git",
+      displayName: "scale",
+      createdAt: "2026-11-04T10:00:00.000Z",
+      updatedAt: "2026-11-04T10:00:00.000Z",
+    }),
+  );
+  const providers = createProviderSnapshotManagerStub();
+  providers.listRegisteredProviderIds.mockReturnValue(["codex"]);
+  const emitted: SessionOutboundMessage[] = [];
+  const session = createSessionForWorkspaceTests({
+    workspaceRegistry: fixture.value,
+    projectRegistry: projects,
+    paseoHome: home,
+    providerSnapshotManager: providers.manager,
+    onMessage: (message) => emitted.push(message),
+    agentStorage: { list: () => list(fixture) },
+  });
+  return {
+    fixture,
+    session,
+    emitted,
+    dispose: async () => {
+      await session.cleanup();
+      await fixture.value.close();
+      await fixture.service.close();
+      rmSync(home, { recursive: true, force: true });
+    },
+  };
 }
+
+test("unscoped agent fetch sees a workspace created after its batch capture", async () => {
+  const context = await canonicalFetchFixture(async (fixture) => {
+    const late = {
+      ...fixture.records[3],
+      workspaceId: "late-workspace",
+      cwd: "/fixture/late-workspace",
+    };
+    await fixture.value.upsert(late);
+    return [
+      makeStoredAgent({
+        id: "late-agent",
+        workspaceId: late.workspaceId,
+        cwd: late.cwd,
+        updatedAt: "2026-11-04T10:00:00.000Z",
+      }),
+    ];
+  });
+  try {
+    await context.session.handleMessage({ type: "fetch_agents_request", requestId: "late-fetch" });
+    expect(findByType(context.emitted, "rpc_error")).toBeUndefined();
+    const response = findByType(context.emitted, "fetch_agents_response");
+    expect(response).toBeDefined();
+    expect(response?.payload.entries.map((entry) => entry.agent.id)).toEqual(["late-agent"]);
+  } finally {
+    await context.dispose();
+  }
+});
+
+test.each([
+  { history: false, background: false, logs: 1 },
+  { history: false, background: true, logs: 0 },
+  { history: true, background: false, logs: 1 },
+  { history: true, background: true, logs: 0 },
+])(
+  "matches base quarantine logging: history=$history background=$background",
+  async ({ history, background, logs }) => {
+    const context = await canonicalFetchFixture(async (fixture) => [
+      makeStoredAgent({
+        id: "visible-agent",
+        workspaceId: fixture.records[3].workspaceId,
+        cwd: fixture.records[3].cwd,
+        updatedAt: "2026-11-04T10:00:00.000Z",
+      }),
+    ]);
+    const errors = vi.spyOn(context.fixture.logger, "error");
+    try {
+      await context.session.handleMessage(
+        history
+          ? {
+              type: "fetch_agent_history_request",
+              requestId: "history-log",
+              filter: { includeBackground: background },
+            }
+          : { type: "fetch_agents_request", requestId: "fetch-log", includeBackground: background },
+      );
+      expect(findByType(context.emitted, "rpc_error")).toBeUndefined();
+      expect(errors).toHaveBeenCalledTimes(logs);
+    } finally {
+      errors.mockRestore();
+      await context.dispose();
+    }
+  },
+);
 
 test.each([
   { phase: "importing" as const, includeBackground: undefined },
@@ -3031,6 +3138,7 @@ test.each([
     const home = mkdtempSync(path.join(tmpdir(), "paseo-agent-layout-scale-"));
     const fixture = await createLargeLayoutFixture({ home, phase });
     await fixture.value.update("large-4", (record) => ({ ...record, background: true }));
+    await coldLayoutGeneration(fixture);
     const projects = new FileBackedProjectRegistry(
       path.join(home, "projects.json"),
       createTestLogger(),
@@ -3068,16 +3176,12 @@ test.each([
           ),
       },
     });
-    const cached = vi.spyOn(fixture.service, "cached");
-    const clone = vi.spyOn(globalThis, "structuredClone");
-    const derive = vi.spyOn(layoutProtocol, "resolveEffectiveWorkspaceLayout");
+    const measured = measureLayoutReads();
     const ids: string[] = [];
     let cursor: string | undefined;
     try {
       for (let page = 0; page < 4; page++) {
-        cached.mockClear();
-        clone.mockClear();
-        derive.mockClear();
+        measured.reset();
         emitted.length = 0;
         await session.handleMessage({
           type: "fetch_agents_request",
@@ -3089,11 +3193,9 @@ test.each([
         expect(response).toBeDefined();
         if (!response) throw new Error("missing agent response");
         ids.push(...agentIdsFromEntries(response.payload.entries));
-        expect(cached.mock.calls.length).toBeLessThanOrEqual(1);
-        expect(
-          clone.mock.calls.filter(([input]) => clonesLayoutGraph(input)).length,
-        ).toBeLessThanOrEqual(1);
-        expect(derive.mock.calls.length).toBeLessThanOrEqual(phase === "active" ? 1 : 0);
+        expect(measured.counts.graphClones).toBe(1);
+        expect(measured.counts.derivations).toBe(phase === "active" && page === 0 ? 1 : 0);
+        expect(measured.counts.jsonCopies + measured.counts.mapCopies).toBe(0);
         if (!response.payload.pageInfo.hasMore) break;
         const next = response.payload.pageInfo.nextCursor;
         if (!next) throw new Error("missing next cursor");
@@ -3114,9 +3216,7 @@ test.each([
         expect(findByType(emitted, "rpc_error")?.payload.requestId).toBe("quarantined-agent");
       }
     } finally {
-      derive.mockRestore();
-      clone.mockRestore();
-      cached.mockRestore();
+      measured.restore();
       await session.cleanup();
       await fixture.value.close();
       await fixture.service.close();

@@ -1,5 +1,6 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import {
   type WorkspaceLayoutEntry,
@@ -137,7 +138,44 @@ export async function createLargeLayoutFixture(input: {
   const file = path.join(home, "large", "workspaces.json");
   await mkdir(path.dirname(file));
   await writeFile(file, JSON.stringify(records));
-  const value = new CanonicalWorkspaceRegistry(file, createTestLogger(), service, "srv_a");
+  const logger = createTestLogger();
+  const value = new CanonicalWorkspaceRegistry(file, logger, service, "srv_a");
   await value.initialize();
-  return { value, file, records, childPin, service };
+  return { value, file, records, childPin, service, logger };
+}
+
+/** Advance real durable state without a protection subscriber warming the new index. */
+export async function coldLayoutGeneration(
+  fixture: Awaited<ReturnType<typeof createLargeLayoutFixture>>,
+) {
+  await fixture.value.close();
+  const snapshot = await fixture.service.inspect();
+  if (!snapshot.navigation) throw new Error("fixture navigation missing");
+  await fixture.service.commit({
+    writerVersion: 2,
+    requestId: randomUUID(),
+    expected: snapshot.stamp,
+    mutations: [
+      {
+        kind: "put-navigation",
+        expectedRevision: snapshot.navigation.revision,
+        preferences: snapshot.navigation.preferences,
+        ...(snapshot.stamp.phase === "importing"
+          ? {
+              importResolution: {
+                clientSources: snapshot.navigation.clientSources,
+                resolutionSha256: snapshot.navigation.resolutionSha256,
+              },
+            }
+          : {}),
+      },
+    ],
+  });
+  // File-backed reads initialize lazily. Do not eagerly warm canonical projection here.
+  fixture.value = new CanonicalWorkspaceRegistry(
+    fixture.file,
+    fixture.logger,
+    fixture.service,
+    "srv_a",
+  );
 }

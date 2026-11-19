@@ -5973,6 +5973,17 @@ export class Session {
     );
   }
 
+  private async readAgentPlacementWorkspaces(
+    reader: WorkspaceReadBatch,
+    activeOnly: boolean,
+    includeBackground: boolean | undefined,
+  ): Promise<PersistedWorkspaceRecord[] | undefined> {
+    // Background-inclusive history/listing used point reads on the base. Avoid
+    // enumerating unrelated quarantined rows solely to resolve visible agents.
+    if (activeOnly || !includeBackground) return reader.list();
+    return undefined;
+  }
+
   private async listFetchAgentsEntriesInBatch(
     request: AgentDirectoryRequestMessage,
     reader: WorkspaceReadBatch,
@@ -5989,22 +6000,29 @@ export class Session {
     const scope = request.type === "fetch_agents_request" ? request.scope : undefined;
     const sort = this.agentsPager.normalizeSort(request.sort);
 
-    const workspaces = await reader.list();
+    const includeBackground =
+      filter?.includeBackground ||
+      (request.type === "fetch_agents_request" && request.includeBackground);
+    const workspaces = await this.readAgentPlacementWorkspaces(
+      reader,
+      scope === "active",
+      includeBackground,
+    );
     let agents = await this.listAgentPayloads(
       {
         labels: filter?.labels,
         includeArchived: filter?.includeArchived,
-        includeBackground:
-          filter?.includeBackground ||
-          (request.type === "fetch_agents_request" && request.includeBackground),
+        includeBackground,
         includeUnavailablePersisted: request.type === "fetch_agent_history_request",
       },
       workspaces,
     );
-    const placementsByWorkspaceId = await this.buildProjectPlacementsByWorkspaceId({
-      workspaces,
-      activeOnly: scope === "active",
-    });
+    const placementsByWorkspaceId = workspaces
+      ? await this.buildProjectPlacementsByWorkspaceId({
+          workspaces,
+          activeOnly: scope === "active",
+        })
+      : new Map<string, ProjectPlacementPayload>();
     if (scope === "active") {
       agents = agents.filter(
         (agent) =>

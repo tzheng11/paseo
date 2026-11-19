@@ -95,15 +95,29 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
 
   async withReadBatch<T>(run: (reader: WorkspaceReadBatch) => Promise<T>): Promise<T> {
     const view = this.layout.cachedReadView();
+    const readViewFor = (record: PersistedWorkspaceRecord) => {
+      const key = workspaceReferenceKey({
+        serverId: this.serverId,
+        workspaceId: record.workspaceId,
+      });
+      // An await can admit a newly created workspace. Refresh only that missing
+      // entry, retaining the batch's single graph copy for existing members.
+      if (
+        !view.entries.has(key) &&
+        this.layout.status().stamp?.revision !== view.snapshot?.stamp.revision
+      )
+        return undefined;
+      return view;
+    };
     return run({
       list: async () =>
         (await super.list()).flatMap((record) => {
-          const projected = this.projectOrQuarantine(record, view);
+          const projected = this.projectOrQuarantine(record, readViewFor(record));
           return projected ? [projected] : [];
         }),
       get: async (id) => {
         const record = await super.get(id);
-        return record ? this.publish(record, view) : null;
+        return record ? this.publish(record, readViewFor(record)) : null;
       },
     });
   }
