@@ -8456,3 +8456,31 @@ describe("local durable finish subscription MCP wiring", () => {
     }
   });
 });
+
+it("archive_workspace refuses outside lockedCwd before building any teardown dependency", async () => {
+  const { agentManager, agentStorage } = createTestDeps();
+  const archiveWorkspaceRecord = vi.fn(async () => {});
+  const server = await createAgentMcpServer({
+    agentManager,
+    agentStorage,
+    providerSnapshotManager: createOpenCodeManager().manager,
+    callerAgentId: "fixture-caller",
+    resolveCallerContext: () => ({ lockedCwd: "/fixture/allowed" }),
+    listActiveWorkspaces: async () => [
+      {
+        workspaceId: "outside",
+        cwd: "/fixture/outside",
+        kind: "directory",
+        worktreeRoot: null,
+        mainRepoRoot: null,
+        isPaseoOwnedWorktree: false,
+      },
+    ],
+    archiveWorkspaceRecord,
+    logger: createTestLogger(),
+  });
+  await expect(
+    registeredTool(server, "archive_workspace").handler({ workspaceId: "outside" }),
+  ).rejects.toThrow("outside the caller scope");
+  expect(archiveWorkspaceRecord).not.toHaveBeenCalled();
+});

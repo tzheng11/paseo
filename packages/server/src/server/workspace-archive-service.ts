@@ -1,3 +1,15 @@
+import { stat } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import {
+  retireCanonicalWorkspace,
+  type RetirementAuthority,
+  nativeGeneration,
+  commitWorkspaceRetirementArchive,
+  hasWorkspaceRetirement,
+  workspaceRetirementStep,
+} from "./workspace-retirement.js";
+import { serializeWorkspaceBacking, nativeTransitionKey } from "./workspace-retirement-context.js";
 import { resolve } from "node:path";
 
 import type { Logger } from "pino";
@@ -32,6 +44,8 @@ export type ActiveWorkspaceRef = Pick<
 >;
 
 export interface ArchiveDependencies {
+  retirementAuthority?: RetirementAuthority;
+  listRetirementRecords?: () => Promise<PersistedWorkspaceRecord[]>;
   paseoHome?: string;
   // Base directory that may hold worktrees across repositories.
   paseoWorktreesBaseRoot?: string;
@@ -67,9 +81,17 @@ export interface KillTerminalsForWorkspaceDependencies {
 
 export type ArchiveScope =
   | { kind: "workspace"; workspaceId: string }
-  | { kind: "worktree"; targetPath: string };
+  | { kind: "worktree"; targetPath: string; expectedBackingGeneration?: string }
+  | {
+      kind: "project";
+      projectId: string;
+      workspaceIds?: string[];
+      expectedBackingGeneration?: string;
+    };
 
 export interface ArchiveResult {
+  slotKept?: boolean;
+  retirement?: import("./workspace-retirement.js").RetirementResult["retirement"];
   archivedAgentIds: string[];
   archivedWorkspaceIds: string[];
   removedDirectory: boolean;
@@ -141,6 +163,79 @@ export async function archiveByScope(
   dependencies: ArchiveDependencies,
   request: ArchiveByScopeRequest,
 ): Promise<ArchiveResult> {
+  if (dependencies.retirementAuthority) {
+    const nativeInventory = dependencies.listRetirementRecords;
+    if (!nativeInventory || !dependencies.getWorkspace)
+      throw new Error("canonical_native_inventory_required");
+    const initial = await resolveArchiveTarget(dependencies, request.scope);
+    const initialInventory = await nativeInventory();
+    const initialIds =
+      request.scope.kind === "workspace" ? [request.scope.workspaceId] : initial.workspaceIds;
+    const initialRecords = initialInventory.filter((record) =>
+      initialIds.includes(record.workspaceId),
+    );
+    return serializeWorkspaceBacking(
+      {
+        paths: initialRecords.flatMap((record) => [record.cwd, record.worktreeRoot ?? record.cwd]),
+        keys: [
+          ...initialIds.map((id) =>
+            nativeTransitionKey(dependencies.retirementAuthority!.options.home, "workspace", id),
+          ),
+          ...(request.scope.kind === "project"
+            ? [
+                nativeTransitionKey(
+                  dependencies.retirementAuthority!.options.home,
+                  "project",
+                  request.scope.projectId,
+                ),
+              ]
+            : []),
+        ],
+      },
+      async () => {
+        const target = await resolveArchiveTarget(dependencies, request.scope);
+        if (request.scope.kind === "worktree" && !target.workspaceIds.length)
+          throw new Error("Canonical retirement requires an exact native workspace footprint");
+        const ids =
+          request.scope.kind === "workspace" ? [request.scope.workspaceId] : target.workspaceIds;
+        const inventory = await nativeInventory();
+        const records = await Promise.all(
+          ids.map(async (id) => {
+            const record =
+              inventory.find((candidate) => candidate.workspaceId === id) ??
+              (await dependencies.getWorkspace?.(id));
+            if (!record)
+              throw new Error("Canonical retirement requires native identity and creation time");
+            return record;
+          }),
+        );
+        if (nativeGeneration(records) !== nativeGeneration(initialRecords))
+          throw new Error("retirement_native_footprint_changed");
+        if (
+          (request.scope.kind === "worktree" ||
+            (request.scope.kind === "project" && request.scope.workspaceIds)) &&
+          request.scope.expectedBackingGeneration !== nativeGeneration(records)
+        )
+          throw new Error("canonical_backing_generation_required_or_changed");
+        const backing = target.backing?.path ?? records[0].cwd;
+        return retireCanonicalWorkspace({
+          expectedProjectId: request.scope.kind === "project" ? request.scope.projectId : undefined,
+          authority: dependencies.retirementAuthority!,
+          records,
+          backing,
+          nativeInventory,
+          getRecord: async (id) => (await dependencies.getWorkspace?.(id)) ?? null,
+          assertHolds: async (id) => {
+            await dependencies.assertWorkspaceAutomationAllowed?.(id);
+          },
+          run: () =>
+            runWithGitCommandPriority("high", () =>
+              archiveResolvedTarget(dependencies, request, target),
+            ),
+        });
+      },
+    );
+  }
   if (dependencies.paseoHome) await assertWorkspaceRetirementAllowed(dependencies.paseoHome);
   return runWithGitCommandPriority("high", () => archiveByScopeWithPriority(dependencies, request));
 }
@@ -150,9 +245,19 @@ async function archiveByScopeWithPriority(
   request: ArchiveByScopeRequest,
 ): Promise<ArchiveResult> {
   const target = await resolveArchiveTarget(dependencies, request.scope);
+  return archiveResolvedTarget(dependencies, request, target);
+}
+
+async function archiveResolvedTarget(
+  dependencies: ArchiveDependencies,
+  request: ArchiveByScopeRequest,
+  target: ArchiveTarget,
+): Promise<ArchiveResult> {
   const targetWorkspaceIds = target.workspaceIds;
 
-  await stopWorkspaceSetups(dependencies, target.setupWorkspaceIds, request.requestId);
+  await workspaceRetirementStep("stop-setups", () =>
+    stopWorkspaceSetups(dependencies, target.setupWorkspaceIds, request.requestId),
+  );
 
   if (targetWorkspaceIds.length > 0) {
     dependencies.markWorkspaceArchiving(targetWorkspaceIds, new Date().toISOString());
@@ -171,6 +276,12 @@ async function archiveByScopeWithPriority(
       targetWorkspaceIds,
       request.requestId,
     );
+
+    if (hasWorkspaceRetirement()) {
+      if (archivedWorkspaceIds.length !== targetWorkspaceIds.length)
+        throw new Error("Retirement native teardown remains partial");
+      await commitWorkspaceRetirementArchive();
+    }
 
     if (target.backing?.mainRepoRoot) {
       try {
@@ -207,6 +318,18 @@ async function archiveByScopeWithPriority(
       archivedAgentIds: Array.from(archivedAgents),
       archivedWorkspaceIds,
       removedDirectory,
+      ...(hasWorkspaceRetirement() && target.backing !== null
+        ? {
+            slotKept:
+              !removedDirectory &&
+              (await stat(target.backing.path)
+                .then(() => true)
+                .catch((error) => {
+                  if (error.code === "ENOENT") return false;
+                  throw error;
+                })),
+          }
+        : {}),
       ...(directoryLeftBehind ? { directoryLeftBehind } : {}),
     };
   } finally {
@@ -217,11 +340,21 @@ async function archiveByScopeWithPriority(
   }
 }
 
+async function activeNativeReferences(
+  dependencies: Pick<ArchiveDependencies, "listRetirementRecords" | "listActiveWorkspaces">,
+): Promise<ActiveWorkspaceRef[]> {
+  const records =
+    (await dependencies.listRetirementRecords?.()) ?? (await dependencies.listActiveWorkspaces());
+  return records.filter((record) => !("archivedAt" in record && record.archivedAt));
+}
+
 async function resolveArchiveTarget(
   dependencies: ArchiveDependencies,
   scope: ArchiveScope,
 ): Promise<ArchiveTarget> {
-  const activeWorkspaces = await dependencies.listActiveWorkspaces();
+  const activeWorkspaces = await activeNativeReferences(dependencies);
+  if (scope.kind === "project")
+    return resolveProjectArchiveTarget(dependencies, scope, activeWorkspaces);
 
   if (scope.kind === "workspace") {
     const workspaceId = scope.workspaceId;
@@ -276,6 +409,37 @@ async function resolveArchiveTarget(
   };
 }
 
+async function resolveProjectArchiveTarget(
+  dependencies: ArchiveDependencies,
+  scope: Extract<ArchiveScope, { kind: "project" }>,
+  activeWorkspaces: ActiveWorkspaceRef[],
+): Promise<ArchiveTarget> {
+  if (scope.workspaceIds) {
+    const inventory = await dependencies.listRetirementRecords?.();
+    if (!inventory) throw new Error("canonical_native_inventory_required");
+    for (const id of scope.workspaceIds)
+      if (
+        !inventory.some(
+          (record) => record.workspaceId === id && record.projectId === scope.projectId,
+        )
+      )
+        throw new Error("project_retirement_footprint_changed");
+    return {
+      backing: null,
+      teardownTargets: [],
+      setupWorkspaceIds: scope.workspaceIds,
+      workspaceIds: scope.workspaceIds,
+    };
+  }
+  const records = await Promise.all(
+    activeWorkspaces.map((workspace) => dependencies.getWorkspace?.(workspace.workspaceId)),
+  );
+  const ids = records.flatMap((record) =>
+    record?.projectId === scope.projectId ? [record.workspaceId] : [],
+  );
+  return { backing: null, teardownTargets: [], setupWorkspaceIds: ids, workspaceIds: ids };
+}
+
 async function stopWorkspaceSetups(
   dependencies: ArchiveDependencies,
   workspaceIds: string[],
@@ -289,6 +453,7 @@ async function stopWorkspaceSetups(
   );
   for (const [index, result] of results.entries()) {
     if (result?.status === "rejected") {
+      if (hasWorkspaceRetirement()) throw result.reason;
       dependencies.sessionLogger?.warn(
         { err: result.reason, workspaceId: workspaceIds[index], requestId },
         "Failed to stop workspace setup during archive; continuing",
@@ -371,7 +536,9 @@ async function archiveTargetRecords(
   const results = await Promise.allSettled(
     targetWorkspaceIds.map(async (workspaceId) => {
       const agents = await archiveWorkspaceContents(dependencies, workspaceId);
-      await dependencies.archiveWorkspaceRecord(workspaceId);
+      await workspaceRetirementStep(`native-archive:${workspaceId}`, () =>
+        dependencies.archiveWorkspaceRecord(workspaceId),
+      );
       return { workspaceId, agents };
     }),
   );
@@ -428,17 +595,34 @@ async function maybeRemoveDirectory(
       teardownTarget.workspaceId === null || archivedWorkspaceIdSet.has(teardownTarget.workspaceId),
   );
 
+  if (hasWorkspaceRetirement()) {
+    const active = await dependencies.listActiveWorkspaces();
+    if (
+      !(await isDirectoryUnreferenced(active, backing.path, archivedWorkspaceIdSet, dependencies))
+    )
+      return {
+        removedDirectory: false,
+        directoryLeftBehind: { path: backing.path, reason: "shared_backing_retained" },
+      };
+    if (!(await retirementSourceIsCleanAndLanded(backing.path, backing.mainRepoRoot)))
+      return {
+        removedDirectory: false,
+        directoryLeftBehind: { path: backing.path, reason: "source_preserved" },
+      };
+  }
   try {
     const allowedTeardownTargets = await filterAllowedTeardownTargets(
       dependencies,
       teardownTargets,
     );
     for (const teardownTarget of uniqueTeardownTargets(allowedTeardownTargets)) {
-      await runWorktreeTeardownCommands({
-        worktreePath: backing.path,
-        teardownCwd: teardownTarget.cwd,
-        repoRootPath: backing.mainRepoRoot ?? undefined,
-      });
+      await workspaceRetirementStep(`path-teardown:${teardownTarget.cwd}`, () =>
+        runWorktreeTeardownCommands({
+          worktreePath: backing.path,
+          teardownCwd: teardownTarget.cwd,
+          repoRootPath: backing.mainRepoRoot ?? undefined,
+        }),
+      );
     }
   } catch (error) {
     if (error instanceof WorktreeTeardownError) {
@@ -464,15 +648,26 @@ async function maybeRemoveDirectory(
   }
 
   try {
-    await deletePaseoWorktree({
-      cwd: backing.mainRepoRoot,
-      worktreePath: backing.path,
-      teardownCwds: [],
-      worktreesRoot: backing.paseoWorktreesRoot ?? undefined,
-      paseoHome: dependencies.paseoHome,
-      worktreesBaseRoot: dependencies.paseoWorktreesBaseRoot,
-      registryProven: backing.registryProven,
-    });
+    if (
+      hasWorkspaceRetirement() &&
+      !(await retirementSourceIsCleanAndLanded(backing.path, backing.mainRepoRoot))
+    )
+      return {
+        removedDirectory: false,
+        directoryLeftBehind: { path: backing.path, reason: "source_changed_before_removal" },
+      };
+    await workspaceRetirementStep("remove-directory", () =>
+      deletePaseoWorktree({
+        cwd: backing.mainRepoRoot,
+        worktreePath: backing.path,
+        teardownCwds: [],
+        worktreesRoot: backing.paseoWorktreesRoot ?? undefined,
+        paseoHome: dependencies.paseoHome,
+        worktreesBaseRoot: dependencies.paseoWorktreesBaseRoot,
+        registryProven: backing.registryProven,
+        ...(hasWorkspaceRetirement() ? { requireCleanRemoval: true as const } : {}),
+      }),
+    );
     dependencies.workspaceGitService.invalidateWorktrees();
     dependencies.github.invalidate({ cwd: backing.path });
     return { removedDirectory: true };
@@ -542,6 +737,7 @@ export async function archiveWorkspaceContents(
   try {
     storedRecords = await dependencies.agentStorage.listByWorkspace(workspaceId);
   } catch (error) {
+    if (hasWorkspaceRetirement()) throw error;
     dependencies.sessionLogger?.warn(
       { err: error, workspaceId },
       "Failed to list stored agents during workspace archive; continuing",
@@ -560,10 +756,16 @@ export async function archiveWorkspaceContents(
   const archiveResults = await Promise.allSettled([
     ...[...agentIdsToArchive].map((agentId) =>
       dependencies.agentManager.getAgent(agentId)
-        ? dependencies.agentManager.archiveAgent(agentId)
-        : dependencies.agentManager.archiveSnapshot(agentId, archivedAt),
+        ? workspaceRetirementStep(`agent:${agentId}`, () =>
+            dependencies.agentManager.archiveAgent(agentId),
+          )
+        : workspaceRetirementStep(`snapshot:${agentId}`, () =>
+            dependencies.agentManager.archiveSnapshot(agentId, archivedAt),
+          ),
     ),
-    dependencies.killTerminalsForWorkspace(workspaceId),
+    workspaceRetirementStep(`terminals:${workspaceId}`, () =>
+      dependencies.killTerminalsForWorkspace(workspaceId),
+    ),
   ]);
 
   for (const result of archiveResults) {
@@ -581,6 +783,10 @@ export async function archiveWorkspaceContents(
     .slice(0, agentIdsToArchive.size)
     .find((result) => result.status === "rejected");
   if (failedArchive?.status === "rejected") throw failedArchive.reason;
+  if (hasWorkspaceRetirement()) {
+    const failed = archiveResults.find((result) => result.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
+  }
 
   return archivedAgents;
 }
@@ -678,4 +884,31 @@ export async function archivePersistedWorkspaceRecord(input: {
   await input.workspaceRegistry.archive(input.workspaceId, archivedAt, input.context);
 
   return existingWorkspace;
+}
+
+const execFileAsync = promisify(execFile);
+async function retirementSourceIsCleanAndLanded(
+  worktree: string,
+  mainRepo: string | null,
+): Promise<boolean> {
+  if (!mainRepo) return false;
+  try {
+    const { stdout: status } = await execFileAsync(
+      "git",
+      ["-C", worktree, "status", "--porcelain", "--untracked-files=all"],
+      { timeout: 10000, maxBuffer: 1024 * 1024 },
+    );
+    if (status.trim()) return false;
+    const { stdout: base } = await execFileAsync("git", ["-C", mainRepo, "rev-parse", "HEAD"], {
+      timeout: 10000,
+    });
+    await execFileAsync(
+      "git",
+      ["-C", worktree, "merge-base", "--is-ancestor", "HEAD", base.trim()],
+      { timeout: 10000 },
+    );
+    return true;
+  } catch {
+    return false;
+  } // Failure retains the directory; it never authorizes forced deletion.
 }

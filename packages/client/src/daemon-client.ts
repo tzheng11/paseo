@@ -5240,6 +5240,7 @@ export class DaemonClient {
       repoRoot?: string;
       branchName?: string;
       workspaceId?: string;
+      expectedBackingGeneration?: string;
       scope?: "workspace" | "worktree";
     },
     requestId?: string,
@@ -5248,6 +5249,9 @@ export class DaemonClient {
       requestId,
       message: {
         type: "paseo_worktree_archive_request",
+        ...(input.expectedBackingGeneration
+          ? { expectedBackingGeneration: input.expectedBackingGeneration }
+          : {}),
         worktreePath: input.worktreePath,
         repoRoot: input.repoRoot,
         branchName: input.branchName,
@@ -5887,7 +5891,7 @@ export class DaemonClient {
     const result =
       await this.sendNamespacedCorrelatedSessionRequest<"workspace.layout.inspect.response">({
         requestId,
-        message: { type: "workspace.layout.inspect.request" },
+        message: { type: "workspace.layout.inspect.request", retirementVersion: 1 },
       });
     return result.snapshot;
   }
@@ -5915,10 +5919,15 @@ export class DaemonClient {
       this.requireWorkspaceLayout();
       const { requestId, ...fields } = input;
       if (
-        input.writerVersion === 2 &&
+        (input.writerVersion === 2 || input.writerVersion === 3) &&
         this.lastServerInfoMessage?.features?.workspaceLayoutDerivedSections !== true
       )
         throw new Error("Update this host to use derived workspace section inheritance.");
+      if (
+        input.writerVersion === 3 &&
+        this.lastServerInfoMessage?.features?.workspaceLayoutRetirement !== true
+      )
+        throw new Error("Update the layout authority to use workspace retirement.");
       return this.sendNamespacedCorrelatedSessionRequest<"workspace.layout.commit.response">({
         requestId,
         message: { type: "workspace.layout.commit.request", ...fields },
@@ -5932,7 +5941,7 @@ export class DaemonClient {
     this.requireWorkspaceLayout();
     return this.owned.observe(async (accept) => {
       const result = await this.sendCorrelatedSessionRequest({
-        message: { type: "workspace.layout.inspect.request", observe: true },
+        message: { type: "workspace.layout.inspect.request", observe: true, retirementVersion: 1 },
         responseType: "workspace.layout.inspect.response",
       });
       if (!result.subscriptionId) throw new Error("Authority omitted layout subscription identity");

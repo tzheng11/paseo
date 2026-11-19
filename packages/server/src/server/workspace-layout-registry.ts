@@ -1,3 +1,10 @@
+import {
+  assertWorkspaceBackingAvailable,
+  workspaceRetirementArchiveTimestamp,
+  refuseRetirementObservationConflict,
+  nativeGeneration,
+} from "./workspace-retirement.js";
+import { serializeWorkspaceBacking, nativeTransitionKey } from "./workspace-retirement-context.js";
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import type { Logger } from "pino";
@@ -34,6 +41,13 @@ const LAYOUT_FIELDS = [
   "archivedAt",
 ] as const;
 
+const BACKING_FIELDS = [
+  "cwd",
+  "worktreeRoot",
+  "mainRepoRoot",
+  "kind",
+  "isPaseoOwnedWorktree",
+] as const;
 interface SectionEntryIntent {
   entry: WorkspaceLayoutEntry;
   previous: WorkspaceLayoutEntry | undefined;
@@ -122,112 +136,210 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
   async assertLayoutWriteAllowed(): Promise<void> {
     await this.freshActive();
   }
+  async assertBackingWriteAllowed(cwd: string): Promise<void> {
+    const { snapshot } = await this.freshActive();
+    await assertWorkspaceBackingAvailable(this.layout.options.home, cwd, snapshot, this.serverId);
+  }
+  async assertWorkspaceRestoreAllowed(id: string): Promise<void> {
+    const { snapshot } = await this.freshActive();
+    if (
+      snapshot.retirements?.some((op) =>
+        op.targets.some(
+          (target) => target.ref.serverId === this.serverId && target.ref.workspaceId === id,
+        ),
+      )
+    )
+      throw new WorkspaceLayoutRefusal("retired_workspace_identity");
+  }
 
-  override update(
+  override async update(
     id: string,
     updater: (record: PersistedWorkspaceRecord) => PersistedWorkspaceRecord,
     context?: WorkspaceMutationContext,
   ): Promise<PersistedWorkspaceRecord | null> {
+    const observed = await super.get(id);
+    if (!observed) return null;
     const sectionMode =
       this.layout.status().semanticsVersion === 2 ? context?.sectionIntent : undefined;
     const layoutWrite = context?.layoutWrite;
-    return this.serial(async (requestId) => {
-      const raw = await super.get(id);
-      if (!raw) return null;
-      const initialView = layoutWrite ? await this.freshActive() : undefined;
-      const current = this.publish(raw, initialView);
-      let next = updater(structuredClone(current));
-      let changed = changedFields(current, next);
-      let layoutChanged = LAYOUT_FIELDS.filter((field) => Object.hasOwn(changed, field));
-      if (sectionMode) layoutChanged = [...new Set([...layoutChanged, "pinPlacement" as const])];
-      let projected = this.project(raw, initialView);
-      if (layoutChanged.length) {
-        const activeView = initialView ?? (await this.freshActive());
-        const active = activeView.snapshot;
-        const fresh = this.publish(raw, activeView);
-        // Re-run pure updater guards (notably expected placement revision) on
-        // the authority value, rather than accepting a stale replica's check.
-        next = initialView ? next : updater(structuredClone(fresh));
-        changed = changedFields(fresh, next);
-        layoutChanged = LAYOUT_FIELDS.filter((field) => Object.hasOwn(changed, field));
-        if (sectionMode) layoutChanged = [...new Set([...layoutChanged, "pinPlacement" as const])];
-        const intent = Object.fromEntries(layoutChanged.map((field) => [field, next[field]]));
-        projected = Object.assign({}, this.project(raw, activeView), intent);
-        const explicitSection = isExplicitSectionIntent(sectionMode, layoutChanged);
-        if (explicitSection) {
-          projected.pinnedAt = next.pinnedAt;
-          projected.superpinnedAt = next.superpinnedAt;
-        }
-        if (sectionMode === "inherit") {
-          const canonical = this.project(raw, activeView);
-          projected.pinnedAt = canonical.pinnedAt;
-          projected.superpinnedAt = canonical.superpinnedAt;
-        }
-        if (layoutChanged.length)
-          await this.put(
-            active,
-            [
-              this.asEntry(
-                projected,
-                activeView,
-                sectionMode ?? (explicitSection ? "explicit" : undefined),
-              ),
-            ],
-            requestId,
+    return serializeWorkspaceBacking(
+      {
+        paths: [observed.cwd, observed.worktreeRoot ?? observed.cwd],
+        keys: [nativeTransitionKey(this.layout.options.home, "workspace", id)],
+      },
+      () =>
+        this.serial(async (requestId) => {
+          const raw = await super.get(id);
+          if (!raw) return null;
+          if (nativeGeneration([raw]) !== nativeGeneration([observed]))
+            throw new WorkspaceLayoutRefusal("retirement_native_generation_changed");
+          const initialView = layoutWrite ? await this.freshActive() : undefined;
+          const current = this.publish(raw, initialView);
+          let next = updater(structuredClone(current));
+          let changed = changedFields(current, next);
+          await this.assertNativeMutationAllowed({ id, raw, current, next, changed });
+          let layoutChanged = LAYOUT_FIELDS.filter((field) => Object.hasOwn(changed, field));
+          if (sectionMode)
+            layoutChanged = [...new Set([...layoutChanged, "pinPlacement" as const])];
+          let projected = this.project(raw, initialView);
+          if (layoutChanged.length) {
+            const activeView = initialView ?? (await this.freshActive());
+            const active = activeView.snapshot;
+            const fresh = this.publish(raw, activeView);
+            // Re-run pure updater guards (notably expected placement revision) on
+            // the authority value, rather than accepting a stale replica's check.
+            next = initialView ? next : updater(structuredClone(fresh));
+            changed = changedFields(fresh, next);
+            await this.assertNativeMutationAllowed({ id, raw, current: fresh, next, changed });
+            layoutChanged = LAYOUT_FIELDS.filter((field) => Object.hasOwn(changed, field));
+            if (sectionMode)
+              layoutChanged = [...new Set([...layoutChanged, "pinPlacement" as const])];
+            const intent = Object.fromEntries(layoutChanged.map((field) => [field, next[field]]));
+            projected = Object.assign({}, this.project(raw, activeView), intent);
+            const explicitSection = isExplicitSectionIntent(sectionMode, layoutChanged);
+            if (explicitSection) {
+              projected.pinnedAt = next.pinnedAt;
+              projected.superpinnedAt = next.superpinnedAt;
+            }
+            if (sectionMode === "inherit") {
+              const canonical = this.project(raw, activeView);
+              projected.pinnedAt = canonical.pinnedAt;
+              projected.superpinnedAt = canonical.superpinnedAt;
+            }
+            if (layoutChanged.length)
+              await this.put(
+                active,
+                [
+                  this.asEntry(
+                    projected,
+                    activeView,
+                    sectionMode ?? (explicitSection ? "explicit" : undefined),
+                  ),
+                ],
+                requestId,
+              );
+            projected = this.project(projected);
+          }
+          const localChanges = Object.fromEntries(
+            Object.entries(changed).filter(
+              ([field]) =>
+                field === "projectId" ||
+                field === "archivedAt" ||
+                !LAYOUT_FIELDS.includes(field as (typeof LAYOUT_FIELDS)[number]),
+            ),
           );
-        projected = this.project(projected);
-      }
-      const localChanges = Object.fromEntries(
-        Object.entries(changed).filter(
-          ([field]) =>
-            field === "projectId" ||
-            field === "archivedAt" ||
-            !LAYOUT_FIELDS.includes(field as (typeof LAYOUT_FIELDS)[number]),
-        ),
-      );
-      const result = await super.update(id, (latest) =>
-        Object.assign({}, latest, localChanges, this.protectionFields(projected)),
-      );
-      return result ? this.publish(result) : null;
-    }, context?.requestId);
+          const result = await super.update(id, (latest) =>
+            Object.assign({}, latest, localChanges, this.protectionFields(projected)),
+          );
+          return result ? this.publish(result) : null;
+        }, context?.requestId),
+    );
   }
 
-  override upsert(
+  private async assertNativeMutationAllowed(input: {
+    id: string;
+    raw: PersistedWorkspaceRecord;
+    current: PersistedWorkspaceRecord;
+    next: PersistedWorkspaceRecord;
+    changed: Partial<PersistedWorkspaceRecord>;
+  }): Promise<void> {
+    const { id, raw, current, next, changed } = input;
+    if (next.createdAt !== current.createdAt)
+      throw new WorkspaceLayoutRefusal("native_workspace_identity_immutable");
+    if (
+      BACKING_FIELDS.some((field) => Object.hasOwn(changed, field)) ||
+      Object.hasOwn(changed, "projectId")
+    ) {
+      await serializeWorkspaceBacking(
+        {
+          paths: [next.cwd, next.worktreeRoot ?? next.cwd],
+          keys: [current.projectId, next.projectId].map((projectId) =>
+            nativeTransitionKey(this.layout.options.home, "project", projectId),
+          ),
+        },
+        async () => {},
+      );
+      if (this.layout.cachedRetirementTarget({ serverId: this.serverId, workspaceId: id }))
+        throw new WorkspaceLayoutRefusal("retired_workspace_identity");
+      await refuseRetirementObservationConflict(this.layout.options.home, id, [
+        raw.worktreeRoot ?? raw.cwd,
+        next.worktreeRoot ?? next.cwd,
+      ]);
+    }
+  }
+
+  override async upsert(
     record: PersistedWorkspaceRecord,
     context?: WorkspaceMutationContext,
   ): Promise<void> {
-    return this.serial(async (requestId) => {
-      const previous = await super.get(record.workspaceId);
-      if (previous) {
-        // Reconciliation passes whole records, often from an older read. It is
-        // never a second layout writer and must preserve the canonical fields.
-        await super.upsert(
-          Object.assign({}, record, this.protectionFields(this.project(previous)), {
-            projectId: previous.projectId,
-            archivedAt: previous.archivedAt,
-          }),
-          context,
-        );
-        return;
-      }
-      const view = await this.freshActive();
-      const snapshot = view.snapshot;
-      const canonical = view.entries.get(
-        workspaceReferenceKey({ serverId: this.serverId, workspaceId: record.workspaceId }),
-      );
-      if (canonical) throw new WorkspaceLayoutRefusal("local_workspace_identity_collision");
-      const initial = {
-        ...record,
-        siblingOrder: record.siblingOrder ?? this.nextOrder(snapshot, record),
-      };
-      await this.put(snapshot, [this.asEntry(initial, view)], requestId);
-      await super.upsert(initial, context);
-      // The legacy registry may allocate a rank while inserting. The local
-      // protection copy must retain the authority's already-committed rank.
-      await super.update(initial.workspaceId, (latest) =>
-        Object.assign({}, latest, this.protectionFields(initial)),
-      );
-    }, context?.requestId);
+    const observed = await super.get(record.workspaceId);
+    return serializeWorkspaceBacking(
+      {
+        paths: [
+          record.cwd,
+          record.worktreeRoot ?? record.cwd,
+          ...(observed ? [observed.cwd, observed.worktreeRoot ?? observed.cwd] : []),
+        ],
+        keys: [
+          nativeTransitionKey(this.layout.options.home, "workspace", record.workspaceId),
+          nativeTransitionKey(this.layout.options.home, "project", record.projectId),
+        ],
+      },
+      () =>
+        this.serial(async (requestId) => {
+          const previous = await super.get(record.workspaceId);
+          if (observed && previous && nativeGeneration([observed]) !== nativeGeneration([previous]))
+            throw new WorkspaceLayoutRefusal("retirement_native_generation_changed");
+          if (previous) {
+            if (record.createdAt !== previous.createdAt)
+              throw new WorkspaceLayoutRefusal("native_workspace_identity_immutable");
+            if (
+              BACKING_FIELDS.some((field) => !isDeepStrictEqual(record[field], previous[field]))
+            ) {
+              if (
+                this.layout.cachedRetirementTarget({
+                  serverId: this.serverId,
+                  workspaceId: record.workspaceId,
+                })
+              )
+                throw new WorkspaceLayoutRefusal("retired_workspace_identity");
+              await refuseRetirementObservationConflict(
+                this.layout.options.home,
+                record.workspaceId,
+                [previous.worktreeRoot ?? previous.cwd, record.worktreeRoot ?? record.cwd],
+              );
+            }
+            // Reconciliation passes whole records, often from an older read. It is
+            // never a second layout writer and must preserve the canonical fields.
+            await super.upsert(
+              Object.assign({}, record, this.protectionFields(this.project(previous)), {
+                projectId: previous.projectId,
+                archivedAt: previous.archivedAt,
+              }),
+              context,
+            );
+            return;
+          }
+          await this.assertBackingWriteAllowed(record.worktreeRoot ?? record.cwd);
+          const view = await this.freshActive();
+          const snapshot = view.snapshot;
+          const canonical = view.entries.get(
+            workspaceReferenceKey({ serverId: this.serverId, workspaceId: record.workspaceId }),
+          );
+          if (canonical) throw new WorkspaceLayoutRefusal("local_workspace_identity_collision");
+          const initial = {
+            ...record,
+            siblingOrder: record.siblingOrder ?? this.nextOrder(snapshot, record),
+          };
+          await this.put(snapshot, [this.asEntry(initial, view)], requestId);
+          await super.upsert(initial, context);
+          // The legacy registry may allocate a rank while inserting. The local
+          // protection copy must retain the authority's already-committed rank.
+          await super.update(initial.workspaceId, (latest) =>
+            Object.assign({}, latest, this.protectionFields(initial)),
+          );
+        }, context?.requestId),
+    );
   }
 
   override move(
@@ -306,8 +418,13 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
     }, context?.requestId);
   }
 
-  override async archive(): Promise<boolean> {
-    throw new WorkspaceLayoutRefusal("canonical_retirement_reservation_required");
+  override async archive(
+    id: string,
+    _archivedAt: string,
+    context?: import("./workspace-registry.js").WorkspaceArchiveContext,
+  ): Promise<boolean> {
+    const archivedAt = await workspaceRetirementArchiveTimestamp(this.layout.options.home, id);
+    return super.archive(id, archivedAt, context);
   }
   override async remove(): Promise<void> {
     throw new WorkspaceLayoutRefusal("canonical_retirement_reservation_required");
@@ -368,7 +485,9 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
     return this.layout.commit({
       requestId,
       expected: snapshot.stamp,
-      ...(snapshot.semanticsVersion === 2 ? { writerVersion: 2 as const } : {}),
+      ...(snapshot.semanticsVersion === 2
+        ? { writerVersion: snapshot.retirementVersion === 1 ? (3 as const) : (2 as const) }
+        : {}),
       mutations: entries.map((entry) => ({ kind: "put", entry })),
     });
   }

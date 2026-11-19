@@ -34,6 +34,7 @@ export interface CreateWorktreeCoreInput {
 }
 
 export interface CreateWorktreeCoreDeps {
+  assertPathAvailable?: (path: string) => Promise<void>;
   lifecycle?: Pick<PluginLifecycle, "before">;
   github: ForgeService;
   workspaceGitService?: Pick<
@@ -170,9 +171,11 @@ async function prepareWorktreeCreationWithPriority(
     slug: normalizedSlug,
     path: defaultPath,
   });
+  await deps.assertPathAvailable?.(defaultPath);
   const transformed = deps.lifecycle
     ? await deps.lifecycle.before("worktree.create.before", request)
     : request;
+  await deps.assertPathAvailable?.(transformed.path);
   const slug = validateWorktreeSlug(transformed.slug);
   return {
     repoRoot,

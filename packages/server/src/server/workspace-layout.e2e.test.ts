@@ -18,6 +18,7 @@ import { loadConfig } from "./config.js";
 import { savePersistedConfig } from "./persisted-config.js";
 import { CanonicalSidebarLayout } from "../../../app/src/stores/canonical-sidebar-layout.js";
 import { canonicalWorkspaceDrop } from "../../../app/src/components/sidebar/workspace-tree/canonical-drop.js";
+import { WorkspaceLayoutService } from "./workspace-layout-service.js";
 
 let root: string;
 const cleanup: Array<() => Promise<unknown>> = [];
@@ -385,4 +386,93 @@ test("derived authority fences legacy native writers before effects while the cu
   expect(
     (await client.getWorkspaceLayout()).entries.find((e) => e.ref.workspaceId === id),
   ).toMatchObject({ sectionIntent: { mode: "explicit" }, pinnedAt: expect.any(String) });
+  expect(client.getLastServerInfoMessage()?.features?.workspaceLayoutRetirement).toBe(true);
+  expect((await client.archiveWorkspace(id)).error).toContain("retirement_native_hold");
+  await client.setWorkspacePinned(id, false);
+  const archived = await client.archiveWorkspace(id);
+  expect(archived.error).toBeNull();
+  expect(archived.retirement?.state).toBe("complete");
+  expect(archived.removedDirectory).toBe(false);
+  expect(archived.slotKept).toBe(true);
+  const replacement = await client.createWorkspace({ source: { kind: "directory", path: root } });
+  expect(replacement.workspace?.id).not.toBe(id);
+  expect(replacement.workspace).not.toBeNull();
+  const replay = await client.archiveWorkspace(id);
+  expect(replay.retirement).toEqual(archived.retirement);
+  const final = await client.getWorkspaceLayout();
+  expect(final.entries.find((entry) => entry.ref.workspaceId === id)?.archivedAt).toBe(
+    archived.archivedAt,
+  );
+  expect(
+    final.entries.find((entry) => entry.ref.workspaceId === replacement.workspace!.id)?.archivedAt,
+  ).toBeNull();
+  expect(
+    JSON.parse(await readFile(path.join(home, "workspace-layout-mode.json"), "utf8")).schemaVersion,
+  ).toBe(3);
+  await expect(
+    legacy.sendRequest({
+      requestId: "old-retirement-reader",
+      message: { type: "workspace.layout.inspect.request", requestId: "old-retirement-reader" },
+      select: () => null,
+    }),
+  ).rejects.toMatchObject({ code: "retirement_reader_required" });
+  await expect(
+    client.commitWorkspaceLayout({
+      writerVersion: 2,
+      requestId: "old-retirement-writer",
+      expected: final.stamp,
+      mutations: [
+        {
+          kind: "put",
+          entry: final.entries.find(
+            (entry) => entry.ref.workspaceId === replacement.workspace!.id,
+          )!,
+        },
+      ],
+    }),
+  ).rejects.toMatchObject({ code: "retirement_writer_required" });
+
+  const removed = await client.removeProject(replacement.workspace!.projectId);
+  expect(removed.removedWorkspaceIds).toEqual([replacement.workspace!.id]);
+  const newProjectWorkspace = await client.createWorkspace({
+    source: { kind: "directory", path: root },
+  });
+  const projectId = newProjectWorkspace.workspace!.projectId;
+  const originalCommit = WorkspaceLayoutService.prototype.commit;
+  const failingArchive = vi
+    .spyOn(WorkspaceLayoutService.prototype, "commit")
+    .mockImplementation(function (input) {
+      if (input.mutations[0]?.kind === "archive-retirement")
+        return Promise.reject(new Error("fixture archive receipt unavailable"));
+      return originalCommit.call(this, input);
+    });
+  try {
+    await expect(client.removeProject(projectId)).rejects.toThrow(
+      "Project retirement remains fenced pending reconciliation",
+    );
+    const nativeFile = path.join(home, "projects", "workspaces.json");
+    const nativeBeforeRetry = await readFile(nativeFile, "utf8");
+    await expect(client.removeProject(projectId)).rejects.toThrow(
+      "Project retirement remains fenced pending reconciliation",
+    );
+    expect(await readFile(nativeFile, "utf8")).toBe(nativeBeforeRetry);
+    expect((await client.listProjects()).projects.some((row) => row.projectId === projectId)).toBe(
+      true,
+    );
+    const pending = (await client.getWorkspaceLayout()).retirements!.find((operation) =>
+      operation.targets.some(
+        (target) => target.ref.workspaceId === newProjectWorkspace.workspace!.id,
+      ),
+    );
+    expect(pending?.state).toBe("reserved");
+    const native = JSON.parse(nativeBeforeRetry) as Array<{
+      workspaceId: string;
+      archivedAt: string | null;
+    }>;
+    expect(
+      native.find((record) => record.workspaceId === newProjectWorkspace.workspace!.id)?.archivedAt,
+    ).toEqual(expect.any(String));
+  } finally {
+    failingArchive.mockRestore();
+  }
 }, 30_000);

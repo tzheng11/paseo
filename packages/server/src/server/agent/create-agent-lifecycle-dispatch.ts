@@ -1,3 +1,5 @@
+import type { RetirementAuthority } from "../workspace-retirement.js";
+import type { PersistedWorkspaceRecord } from "../workspace-registry.js";
 import type { CreatePaseoWorktreeInput } from "../paseo-worktree-service.js";
 import { randomUUID } from "node:crypto";
 import type pino from "pino";
@@ -19,6 +21,11 @@ import type { AgentManager, AgentSubscriber, SubscribeOptions } from "./agent-ma
 import type { AgentStorage } from "./agent-storage.js";
 
 interface CreateAgentLifecycleDispatchDependencies {
+  retirementAuthority?: RetirementAuthority;
+  getWorkspace?: (id: string) => Promise<PersistedWorkspaceRecord | null>;
+  listRetirementRecords?: () => Promise<PersistedWorkspaceRecord[]>;
+  stopWorkspaceSetup?: (id: string) => Promise<void>;
+  assertWorkspaceAutomationAllowed?: (id: string) => Promise<void>;
   paseoHome: string;
   worktreesRoot?: string;
   agentManager: AgentManager;
@@ -183,6 +190,11 @@ export class CreateAgentLifecycleDispatch {
     await archiveByScope(
       {
         paseoHome: this.dependencies.paseoHome,
+        retirementAuthority: this.dependencies.retirementAuthority,
+        getWorkspace: this.dependencies.getWorkspace,
+        listRetirementRecords: this.dependencies.listRetirementRecords,
+        stopWorkspaceSetup: this.dependencies.stopWorkspaceSetup,
+        assertWorkspaceAutomationAllowed: this.dependencies.assertWorkspaceAutomationAllowed,
         paseoWorktreesBaseRoot: this.dependencies.worktreesRoot,
         github: this.dependencies.github,
         workspaceGitService: this.dependencies.workspaceGitService,

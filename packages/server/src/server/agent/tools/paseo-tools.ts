@@ -1,3 +1,5 @@
+import { assertWorkspaceAutomationAllowedForWorkspace } from "../../workspace-automation-gate.js";
+import { WorkspaceArchiveOutcomeSchema } from "@getpaseo/protocol/workspace-layout";
 import {
   resolveSidebarAutomationPlacement,
   resolveSidebarAutomationCatalog,
@@ -161,6 +163,7 @@ type CallerSnapshot = Pick<
 const callerSnapshots = new AsyncLocalStorage<CallerSnapshot | null>();
 
 export interface PaseoToolHostDependencies {
+  stopWorkspaceSetup?: (workspaceId: string) => Promise<void>;
   agentMessages?: () => AgentMessageDelivery;
   finishSubscriptions?: () => FinishSubscriptions;
   serverId?: string;
@@ -181,8 +184,14 @@ export interface PaseoToolHostDependencies {
   listActiveWorkspaces?: ArchiveDependencies["listActiveWorkspaces"];
   archiveWorkspaceRecord?: ArchiveDependencies["archiveWorkspaceRecord"];
   emitWorkspaceUpdatesForWorkspaceIds?: ArchiveDependencies["emitWorkspaceUpdatesForWorkspaceIds"];
-  workspaceRegistry?: Pick<WorkspaceRegistry, "get" | "list" | "upsert" | "move">;
-  workspaceLayoutService?: Pick<WorkspaceLayoutService, "inspect" | "commit" | "status">;
+  workspaceRegistry?: Pick<
+    WorkspaceRegistry,
+    "get" | "list" | "upsert" | "move" | "listRetirementRecords"
+  >;
+  workspaceLayoutService?: Pick<
+    WorkspaceLayoutService,
+    "inspect" | "commit" | "status" | "findReceipt" | "options"
+  >;
   setWorkspaceFieldValue?: (
     input: Parameters<typeof setWorkspaceFieldValueTransaction>[1],
   ) => Promise<string>;
@@ -989,7 +998,9 @@ function createToolCatalog(
       requestId: randomUUID(),
       expected: snapshot.stamp,
       mutations: plan.mutations,
-      ...(snapshot.semanticsVersion === 2 ? { writerVersion: 2 as const } : {}),
+      ...(snapshot.semanticsVersion === 2
+        ? { writerVersion: snapshot.retirementVersion === 1 ? (3 as const) : (2 as const) }
+        : {}),
     };
     // Retain the exact original request for receipt reconciliation after an uncertain acknowledgement.
     options.logger.info({ workspaceLayoutMove: request }, "Committing canonical sidebar move");
@@ -2357,6 +2368,7 @@ function createToolCatalog(
       inputSchema: { workspaceId: z.string().min(1) },
       outputSchema: {
         workspaceId: z.string(),
+        ...WorkspaceArchiveOutcomeSchema.shape,
         archivedAgentIds: z.array(z.string()),
         removedDirectory: z.boolean(),
       },
@@ -2365,10 +2377,16 @@ function createToolCatalog(
       if (!options.listActiveWorkspaces) {
         throw new Error("Active workspace lister is required to archive workspaces");
       }
-      const workspace = await requireActiveWorkspaceForArchive(
-        { listActiveWorkspaces: options.listActiveWorkspaces },
-        workspaceId,
-      );
+      const workspace = options.workspaceLayoutService
+        ? await options.workspaceRegistry?.get(workspaceId)
+        : await requireActiveWorkspaceForArchive(
+            { listActiveWorkspaces: options.listActiveWorkspaces },
+            workspaceId,
+          );
+      if (!workspace) throw new PaseoToolInputError("Workspace not found");
+      const lockedCwd = callerContext?.lockedCwd?.trim();
+      if (lockedCwd && !isSameOrDescendantPath(expandUserPath(lockedCwd), workspace.cwd))
+        throw new PaseoToolInputError("Workspace is outside the caller scope");
       const result = await archiveByScope(
         archiveWorktreeDependencies(options, {
           agentManager,
@@ -2377,16 +2395,18 @@ function createToolCatalog(
           logger: childLogger,
         }),
         {
-          requestId: "mcp:archive_workspace",
+          requestId: randomUUID(),
           scope: { kind: "workspace", workspaceId: workspace.workspaceId },
         },
       );
       return {
         content: [],
+        ...(result.retirement?.state === "partial" ? { isError: true } : {}),
         structuredContent: ensureValidJson({
           workspaceId,
           archivedAgentIds: result.archivedAgentIds,
           removedDirectory: result.removedDirectory,
+          ...(result.retirement ? result : {}),
         }),
       };
     },
@@ -4142,6 +4162,12 @@ function archiveWorktreeDependencies(
   }
   return {
     paseoHome: options.paseoHome,
+    retirementAuthority: options.workspaceLayoutService,
+    listRetirementRecords:
+      options.workspaceLayoutService && options.workspaceRegistry?.listRetirementRecords
+        ? () => options.workspaceRegistry!.listRetirementRecords!()
+        : undefined,
+    getWorkspace: async (id) => (await options.workspaceRegistry?.get(id)) ?? null,
     paseoWorktreesBaseRoot: options.worktreesRoot,
     github: options.github,
     workspaceGitService: options.workspaceGitService,
@@ -4150,6 +4176,12 @@ function archiveWorktreeDependencies(
     findWorkspaceIdForCwd: options.findWorkspaceIdForCwd,
     listActiveWorkspaces: options.listActiveWorkspaces,
     archiveWorkspaceRecord: options.archiveWorkspaceRecord,
+    stopWorkspaceSetup: options.stopWorkspaceSetup,
+    assertWorkspaceAutomationAllowed:
+      options.workspaceLayoutService && options.workspaceRegistry
+        ? (workspaceId) =>
+            assertWorkspaceAutomationAllowedForWorkspace(options.workspaceRegistry!, workspaceId)
+        : undefined,
     emitWorkspaceUpdatesForWorkspaceIds: options.emitWorkspaceUpdatesForWorkspaceIds,
     markWorkspaceArchiving: options.markWorkspaceArchiving,
     clearWorkspaceArchiving: options.clearWorkspaceArchiving,

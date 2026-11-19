@@ -155,3 +155,50 @@ describe("runArchiveCommand", () => {
     });
   });
 });
+
+it("forwards the native backing generation and reports retained directories separately from archival", async () => {
+  const generation = "a".repeat(64);
+  let received: Parameters<DaemonClient["archivePaseoWorktree"]>[0] | undefined;
+  const operationId = "00000000-0000-4000-8000-000000000001";
+  const fake = createFakeDaemonClient({
+    getPaseoWorktreeList: async () => ({
+      worktrees: [
+        {
+          worktreePath: "/fixture/feature",
+          createdAt: "2026-11-19T19:00:00.000Z",
+          backingGeneration: generation,
+        },
+      ],
+      error: null,
+      requestId: "list",
+    }),
+    archivePaseoWorktree: async (input) => {
+      received = input;
+      return {
+        success: true,
+        removedAgents: [],
+        removedDirectory: false,
+        slotKept: true,
+        retirement: { operationId, state: "complete" },
+        error: null,
+        requestId: "archive",
+      };
+    },
+  });
+  const result = await runArchiveCommandWithDeps(
+    "feature",
+    { daemonTarget },
+    { connectToDaemon: async () => fake },
+  );
+  expect(received).toEqual({
+    worktreePath: "/fixture/feature",
+    scope: "worktree",
+    expectedBackingGeneration: generation,
+  });
+  expect(result.data).toMatchObject({
+    status: "archived",
+    removedDirectory: false,
+    slotKept: true,
+    retirement: { operationId, state: "complete" },
+  });
+});

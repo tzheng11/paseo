@@ -153,7 +153,9 @@ export class CanonicalSidebarLayout {
     if (mutations.some((mutation) => mutation.kind !== "put" && mutation.kind !== "put-navigation"))
       throw new Error("Client layout edits cannot initialize, import or activate the authority.");
     const input = WorkspaceLayoutCommitSchema.parse({
-      ...(snapshot.semanticsVersion === 2 ? { writerVersion: 2 } : {}),
+      ...(snapshot.semanticsVersion === 2
+        ? { writerVersion: snapshot.retirementVersion === 1 ? 3 : 2 }
+        : {}),
       requestId: this.deps.requestId(),
       expected: snapshot.stamp,
       mutations,

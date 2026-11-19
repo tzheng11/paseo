@@ -6,6 +6,7 @@ import {
   resolveWorkspaceIdAtPath,
   type ArchiveDependencies,
   type ArchiveScope,
+  type ArchiveResult,
 } from "../workspace-archive-service.js";
 import type {
   CreatePaseoWorktreeInput,
@@ -103,19 +104,22 @@ export interface ArchiveCommandInput {
   worktreeSlug?: string;
   branchName?: string;
   workspaceId?: string;
-  scope?: ArchiveScope["kind"];
+  expectedBackingGeneration?: string;
+  scope?: Exclude<ArchiveScope["kind"], "project">;
 }
 
 export type ArchiveCommandResult =
   | {
       ok: true;
       removedAgents: string[];
+      archive?: ArchiveResult;
     }
   | {
       ok: false;
       code: "NOT_ALLOWED";
+      archive?: ArchiveResult;
       message: string;
-      removedAgents: [];
+      removedAgents: string[];
     };
 
 export async function archiveCommand(
@@ -140,14 +144,15 @@ export async function archiveCommand(
     }
 
     const result = await archiveByScope(dependencies, {
-      scope: { kind: "worktree", targetPath },
+      scope: {
+        kind: "worktree",
+        targetPath,
+        expectedBackingGeneration: input.expectedBackingGeneration,
+      },
       requestId: input.requestId,
     });
 
-    return {
-      ok: true,
-      removedAgents: result.archivedAgentIds,
-    };
+    return archiveCommandOutcome(result);
   }
 
   const workspaceId =
@@ -169,9 +174,21 @@ export async function archiveCommand(
     requestId: input.requestId,
   });
 
+  return archiveCommandOutcome(result);
+}
+function archiveCommandOutcome(result: ArchiveResult): ArchiveCommandResult {
+  if (result.retirement?.state === "partial")
+    return {
+      ok: false,
+      code: "NOT_ALLOWED",
+      message: `Retirement ${result.retirement.operationId} remains fenced: ${result.retirement.code}`,
+      removedAgents: result.archivedAgentIds,
+      archive: result,
+    };
   return {
     ok: true,
     removedAgents: result.archivedAgentIds,
+    ...(result.retirement ? { archive: result } : {}),
   };
 }
 

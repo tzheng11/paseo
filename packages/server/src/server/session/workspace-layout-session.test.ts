@@ -102,3 +102,39 @@ test("an unrelated error code cannot masquerade as an authority refusal", async 
   ]);
   expect(log).toHaveBeenCalledOnce();
 });
+
+test.each([undefined, 1] as const)(
+  "retirement snapshots require an enforcing reader (version=%s)",
+  async (version) => {
+    const messages: SessionOutboundMessage[] = [];
+    const snapshot = {
+      stamp: request.expected,
+      entries: [],
+      imports: [],
+      retirementVersion: 1 as const,
+      retirements: [],
+    };
+    const service = createStub<WorkspaceLayoutService>({ inspect: async () => snapshot });
+    const session = new WorkspaceLayoutSession(
+      service,
+      createStub<SessionDelivery>({}),
+      (message) => messages.push(message),
+      createTestLogger(),
+    );
+    await session.dispatch({
+      type: "workspace.layout.inspect.request",
+      requestId: "reader",
+      ...(version ? { retirementVersion: version } : {}),
+    });
+    if (version === 1)
+      expect(messages[0]).toMatchObject({
+        type: "workspace.layout.inspect.response",
+        payload: { snapshot },
+      });
+    else
+      expect(messages[0]).toMatchObject({
+        type: "rpc_error",
+        payload: { code: "retirement_reader_required" },
+      });
+  },
+);

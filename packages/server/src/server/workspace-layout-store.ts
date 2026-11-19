@@ -27,6 +27,7 @@ import {
   type WorkspaceLayoutMutation,
   type WorkspaceLayoutReceipt,
   type WorkspaceLayoutSnapshot,
+  type EffectiveWorkspaceLayout,
   workspaceLayoutParentKey,
   resolveEffectiveWorkspaceLayout,
 } from "@getpaseo/protocol/workspace-layout";
@@ -34,12 +35,14 @@ export { canonicalLayoutJson } from "@getpaseo/protocol/workspace-layout";
 
 const StoreSchema = z
   .strictObject({
-    schemaVersion: z.union([z.literal(3), z.literal(4)]),
+    schemaVersion: z.union([z.literal(3), z.literal(4), z.literal(5)]),
     snapshot: WorkspaceLayoutSnapshotSchema,
     receipts: z.record(z.string().regex(/^[a-f0-9]{64}$/), WorkspaceLayoutReceiptSchema),
   })
   .refine(
-    (file) => (file.schemaVersion === 4) === (file.snapshot.semanticsVersion === 2),
+    (file) =>
+      file.schemaVersion >= 4 === (file.snapshot.semanticsVersion === 2) &&
+      (file.schemaVersion === 5) === (file.snapshot.retirementVersion === 1),
     "layout_semantics_format_mismatch",
   );
 type StoreFile = z.infer<typeof StoreSchema>;
@@ -337,9 +340,10 @@ export class WorkspaceLayoutStore {
       const next = structuredClone(current);
       const revision = current.snapshot.stamp.revision + 1;
       for (const mutation of input.mutations) applyMutation(next.snapshot, mutation, revision);
+      if (next.snapshot.retirementVersion === 1) next.schemaVersion = 5;
       validateNewNavigationParents(current.snapshot, next.snapshot, input.mutations);
-      validateLayoutGraph(next.snapshot);
       next.snapshot.stamp.revision = revision;
+      validateLayoutGraph(next.snapshot);
       const receipt: WorkspaceLayoutReceipt = {
         requestId: input.requestId,
         requestSha256: hash,
@@ -432,7 +436,13 @@ function applyMutation(
   mutation: WorkspaceLayoutMutation,
   revision: number,
 ) {
+  assertRetirementMutationAllowed(snapshot, mutation);
   switch (mutation.kind) {
+    case "reserve-retirement":
+      return reserveRetirement(snapshot, mutation, revision);
+    case "archive-retirement":
+    case "complete-retirement":
+      return advanceRetirement(snapshot, mutation, revision);
     case "declare-unknown-owner": {
       if (snapshot.semanticsVersion !== 2 || snapshot.stamp.phase !== "importing")
         throw new WorkspaceLayoutRefusal("owner_declaration_closed");
@@ -629,8 +639,247 @@ function layoutSection(entry: WorkspaceLayoutEntry): string {
   return entry.pinnedAt ? "pinned" : "unpinned";
 }
 
+function retirementKeys(entry: WorkspaceLayoutEntry): string[] {
+  const keys: string[] = [];
+  if (entry.parent) keys.push(workspaceReferenceKey(entry.parent));
+  if (entry.pinPlacement?.parentWorkspaceKey)
+    keys.push(
+      workspaceReferenceKey(parseWorkspaceNavigationKey(entry.pinPlacement.parentWorkspaceKey)),
+    );
+  return keys;
+}
+
+function assertRetirementMutationAllowed(
+  snapshot: WorkspaceLayoutSnapshot,
+  mutation: WorkspaceLayoutMutation,
+): void {
+  if (mutation.kind === "archive-retirement" || mutation.kind === "complete-retirement") return;
+  const operations = snapshot.retirements ?? [];
+  const targets = new Set(
+    operations.flatMap((op) => op.targets.map((t) => workspaceReferenceKey(t.ref))),
+  );
+  const fenced = new Set(
+    operations
+      .filter((op) => op.state !== "complete")
+      .flatMap((op) =>
+        [...op.targets, ...op.dependencies].map((t) => workspaceReferenceKey(t.ref)),
+      ),
+  );
+  const conflicts = (entry: WorkspaceLayoutEntry) => {
+    const key = workspaceReferenceKey(entry.ref);
+    return (
+      targets.has(key) ||
+      fenced.has(key) ||
+      retirementKeys(entry).some((k) => targets.has(k) || fenced.has(k))
+    );
+  };
+  if (
+    mutation.kind === "put" &&
+    snapshot.stamp.phase === "active" &&
+    snapshot.semanticsVersion === 2
+  ) {
+    const prior = snapshot.entries.find(
+      (row) => workspaceReferenceKey(row.ref) === workspaceReferenceKey(mutation.entry.ref),
+    );
+    if (prior && prior.archivedAt !== mutation.entry.archivedAt)
+      throw new WorkspaceLayoutRefusal("canonical_retirement_reservation_required");
+  }
+  if (mutation.kind === "put" && conflicts(mutation.entry))
+    throw new WorkspaceLayoutRefusal("retirement_conflict");
+  if (mutation.kind === "import-host" && mutation.entries.some(conflicts))
+    throw new WorkspaceLayoutRefusal("retirement_conflict");
+  if (mutation.kind === "put-navigation" && fenced.size) {
+    const before = snapshot.navigation?.preferences;
+    const after = mutation.preferences;
+    // Ordering a reserved item is a conflicting layout write, even when its entry is unchanged.
+    const positions = (preferences: typeof after | undefined) =>
+      [...fenced].map((refKey) => {
+        const [serverId, workspaceId] = JSON.parse(refKey);
+        const key = `${serverId}:${workspaceId}`;
+        const project = snapshot.entries.find(
+          (entry) => workspaceReferenceKey(entry.ref) === refKey,
+        )!.projectId;
+        return [
+          key,
+          preferences?.workspaceSort,
+          preferences?.projectOrder.indexOf(project),
+          preferences?.workspaceSortModeByProject[project],
+          preferences?.pinnedWorkspaceOrder.indexOf(key),
+          preferences?.superpinnedWorkspaceOrder.indexOf(key),
+          preferences?.pinnedWorkspaceSortMode,
+          Object.entries(preferences?.workspaceOrderByProject ?? {}).flatMap(
+            ([orderedProject, keys]) =>
+              keys.includes(key)
+                ? [
+                    [
+                      orderedProject,
+                      keys.indexOf(key),
+                      preferences?.workspaceSortModeByProject[orderedProject],
+                    ],
+                  ]
+                : [],
+          ),
+        ];
+      });
+    if (canonicalLayoutJson(positions(before)) !== canonicalLayoutJson(positions(after)))
+      throw new WorkspaceLayoutRefusal("retirement_conflict");
+  }
+}
+
+type RetirementReservation = Extract<WorkspaceLayoutMutation, { kind: "reserve-retirement" }>;
+interface RetirementGraph {
+  snapshot: WorkspaceLayoutSnapshot;
+  input: RetirementReservation;
+  entries: Map<string, WorkspaceLayoutEntry>;
+  effective: Map<string, EffectiveWorkspaceLayout>;
+}
+function requireRetirementTarget(
+  context: RetirementGraph,
+  target: RetirementReservation["targets"][number],
+): WorkspaceLayoutEntry {
+  const { snapshot, input, entries, effective } = context;
+  const entry = entries.get(workspaceReferenceKey(target.ref));
+  if (
+    target.ref.serverId !== input.ownerServerId ||
+    !snapshot.ownerDomains?.some(
+      (domain) => domain.serverId === target.ref.serverId && domain.state === "adopted",
+    )
+  )
+    throw new WorkspaceLayoutRefusal("retirement_owner_unavailable");
+  if (!entry || entry.archivedAt) throw new WorkspaceLayoutRefusal("retirement_target_unavailable");
+  if (entry.revision !== target.revision)
+    throw new WorkspaceLayoutRefusal("entry_revision_conflict");
+  const section = effective.get(`${entry.ref.serverId}:${entry.ref.workspaceId}`)?.section;
+  if (section == null) throw new WorkspaceLayoutRefusal("retirement_ancestry_unresolved");
+  if (entry.pinnedAt || entry.superpinnedAt || section !== "unpinned")
+    throw new WorkspaceLayoutRefusal("retirement_protected");
+  return entry;
+}
+function collectRetirementAncestors(
+  context: RetirementGraph,
+  entry: WorkspaceLayoutEntry,
+  dependencies: Map<string, WorkspaceLayoutEntry>,
+): void {
+  const pending = retirementKeys(entry);
+  const visited = new Set<string>();
+  while (pending.length) {
+    const ancestorKey = pending.pop()!;
+    if (visited.has(ancestorKey)) continue;
+    visited.add(ancestorKey);
+    const ancestor = context.entries.get(ancestorKey);
+    if (
+      !ancestor ||
+      ancestor.archivedAt ||
+      !context.snapshot.ownerDomains?.some(
+        (domain) => domain.serverId === ancestor.ref.serverId && domain.state === "adopted",
+      )
+    )
+      throw new WorkspaceLayoutRefusal("retirement_ancestry_unresolved");
+    if (ancestor.ref.serverId !== context.input.ownerServerId)
+      throw new WorkspaceLayoutRefusal("retirement_cross_owner_dependency");
+    dependencies.set(ancestorKey, ancestor);
+    pending.push(...retirementKeys(ancestor));
+  }
+}
+
+function reserveRetirement(
+  snapshot: WorkspaceLayoutSnapshot,
+  input: Extract<WorkspaceLayoutMutation, { kind: "reserve-retirement" }>,
+  revision: number,
+): void {
+  if (snapshot.semanticsVersion !== 2)
+    throw new WorkspaceLayoutRefusal("retirement_semantics_required");
+  if (snapshot.stamp.phase !== "active") throw new WorkspaceLayoutRefusal("layout_importing");
+  const operations = snapshot.retirements ?? [];
+  if (operations.some((op) => op.operationId === input.operationId))
+    throw new WorkspaceLayoutRefusal("retirement_operation_conflict");
+  const entries = new Map(
+    snapshot.entries.map((entry) => [workspaceReferenceKey(entry.ref), entry]),
+  );
+  const keys = new Set(input.targets.map((target) => workspaceReferenceKey(target.ref)));
+  if (keys.size !== input.targets.length)
+    throw new WorkspaceLayoutRefusal("duplicate_retirement_target");
+  const effective = resolveEffectiveWorkspaceLayout(snapshot);
+  const dependencies = new Map<string, WorkspaceLayoutEntry>();
+  const context = { snapshot, input, entries, effective };
+  for (const target of input.targets) {
+    const targetEntry = requireRetirementTarget(context, target);
+    collectRetirementAncestors(context, targetEntry, dependencies);
+  }
+  for (const entry of entries.values()) {
+    if (
+      !entry.archivedAt &&
+      !keys.has(workspaceReferenceKey(entry.ref)) &&
+      retirementKeys(entry).some((key) => keys.has(key))
+    )
+      throw new WorkspaceLayoutRefusal("retirement_live_descendant");
+  }
+  const readKeys = new Set([...keys, ...dependencies.keys()]);
+  if (
+    operations.some(
+      (op) =>
+        op.state !== "complete" &&
+        [...op.targets, ...op.dependencies].some((target) =>
+          readKeys.has(workspaceReferenceKey(target.ref)),
+        ),
+    )
+  )
+    throw new WorkspaceLayoutRefusal("retirement_conflict");
+  snapshot.retirementVersion = 1;
+  snapshot.retirements = [
+    ...operations,
+    {
+      operationId: input.operationId,
+      ownerServerId: input.ownerServerId,
+      backingGeneration: input.backingGeneration,
+      targets: input.targets,
+      dependencies: [...dependencies.values()].map((entry) => ({
+        ref: entry.ref,
+        revision: entry.revision,
+      })),
+      state: "reserved",
+      reservedRevision: revision,
+      archivedAt: null,
+    },
+  ];
+}
+
+function advanceRetirement(
+  snapshot: WorkspaceLayoutSnapshot,
+  input: Extract<WorkspaceLayoutMutation, { kind: "archive-retirement" | "complete-retirement" }>,
+  revision: number,
+): void {
+  const operation = snapshot.retirements?.find((op) => op.operationId === input.operationId);
+  if (!operation) throw new WorkspaceLayoutRefusal("retirement_not_reserved");
+  if (input.kind === "archive-retirement") {
+    if (operation.state !== "reserved")
+      throw new WorkspaceLayoutRefusal("retirement_phase_conflict");
+    for (const target of operation.targets) {
+      const entry = snapshot.entries.find(
+        (row) => workspaceReferenceKey(row.ref) === workspaceReferenceKey(target.ref),
+      );
+      if (!entry || entry.revision !== target.revision)
+        throw new WorkspaceLayoutRefusal("entry_revision_conflict");
+      entry.archivedAt = input.archivedAt;
+      entry.revision = revision;
+    }
+    operation.archivedAt = input.archivedAt;
+    operation.state = "archived";
+  } else {
+    if (operation.state !== "archived")
+      throw new WorkspaceLayoutRefusal("retirement_phase_conflict");
+    operation.state = "complete";
+  }
+}
+
 function assertLayoutWriter(snapshot: WorkspaceLayoutSnapshot, input: WorkspaceLayoutCommit): void {
-  if (snapshot.semanticsVersion === 2 && input.writerVersion !== 2)
+  if (
+    (snapshot.retirementVersion === 1 ||
+      input.mutations.some((m) => m.kind.endsWith("-retirement"))) &&
+    input.writerVersion !== 3
+  )
+    throw new WorkspaceLayoutRefusal("retirement_writer_required");
+  if (snapshot.semanticsVersion === 2 && input.writerVersion !== 2 && input.writerVersion !== 3)
     throw new WorkspaceLayoutRefusal("writer_version_required");
 }
 
@@ -720,7 +969,41 @@ export function projectConfirmedLayout(
   return next;
 }
 
+function validateRetirementState(snapshot: WorkspaceLayoutSnapshot): void {
+  if (
+    (snapshot.retirementVersion === 1) !==
+    (snapshot.retirements !== undefined && snapshot.retirements.length > 0)
+  )
+    throw new WorkspaceLayoutRefusal("retirement_format_mismatch");
+  const operationIds = new Set<string>();
+  const retiredKeys = new Set<string>();
+  for (const operation of snapshot.retirements ?? []) {
+    if (
+      operationIds.has(operation.operationId) ||
+      operation.reservedRevision > snapshot.stamp.revision
+    )
+      throw new WorkspaceLayoutRefusal("invalid_retirement_operation");
+    operationIds.add(operation.operationId);
+    for (const target of operation.targets) {
+      const key = workspaceReferenceKey(target.ref);
+      if (retiredKeys.has(key) || target.ref.serverId !== operation.ownerServerId)
+        throw new WorkspaceLayoutRefusal("invalid_retirement_target");
+      retiredKeys.add(key);
+      const entry = snapshot.entries.find((row) => workspaceReferenceKey(row.ref) === key);
+      if (
+        !entry ||
+        (operation.state === "reserved" &&
+          (entry.revision !== target.revision || entry.archivedAt !== null)) ||
+        (operation.state !== "reserved" &&
+          (!operation.archivedAt || entry.archivedAt !== operation.archivedAt))
+      )
+        throw new WorkspaceLayoutRefusal("retirement_tombstone_mismatch");
+    }
+  }
+}
+
 export function validateLayoutGraph(snapshot: WorkspaceLayoutSnapshot): void {
+  validateRetirementState(snapshot);
   if (snapshot.semanticsVersion === 2) validateOwnerDomains(snapshot);
   else if (
     snapshot.ownerDomains !== undefined ||

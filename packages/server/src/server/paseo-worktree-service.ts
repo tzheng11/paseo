@@ -1,3 +1,4 @@
+import { serializeWorkspaceBacking, nativeTransitionKey } from "./workspace-retirement-context.js";
 import type { WorkspaceSidebarPlacement } from "./workspace-pin-placement.js";
 import type { PluginLifecycle } from "./plugins/lifecycle/index.js";
 import { stat } from "node:fs/promises";
@@ -89,101 +90,128 @@ export async function createPaseoWorktree(
   input: CreatePaseoWorktreeInput,
   deps: CreatePaseoWorktreeDeps,
 ): Promise<CreatePaseoWorktreeResult> {
-  await deps.workspaceProvisioning.assertCreationAllowed?.();
-  return runWithGitCommandPriority("high", () => createPaseoWorktreeWithPriority(input, deps));
+  await deps.workspaceProvisioning.assertCreationAllowed?.(input.cwd, input.parentWorkspaceId);
+  return serializeWorkspaceBacking(
+    {
+      paths: [input.cwd],
+      keys: input.paseoHome
+        ? [
+            ...(input.projectId
+              ? [nativeTransitionKey(input.paseoHome, "project", input.projectId)]
+              : []),
+            ...(input.parentWorkspaceId
+              ? [nativeTransitionKey(input.paseoHome, "workspace", input.parentWorkspaceId)]
+              : []),
+          ]
+        : [],
+    },
+    () => runWithGitCommandPriority("high", () => createPaseoWorktreeWithPriority(input, deps)),
+  );
 }
 
 async function createPaseoWorktreeWithPriority(
   input: CreatePaseoWorktreeInput,
   deps: CreatePaseoWorktreeDeps,
 ): Promise<CreatePaseoWorktreeResult> {
+  await deps.workspaceProvisioning.assertCreationAllowed?.(input.cwd, input.parentWorkspaceId);
   const { workspaceCwdPlan, prepared } = await withPreparationDeadline(
     (async () => ({
       workspaceCwdPlan: await planWorkspaceCwdForWorktree(input.cwd, deps.workspaceGitService),
-      prepared: await prepareWorktreeCreation(input, deps),
+      prepared: await prepareWorktreeCreation(input, {
+        ...deps,
+        assertPathAvailable: (path) =>
+          deps.workspaceProvisioning.assertCreationAllowed?.(path, input.parentWorkspaceId) ??
+          Promise.resolve(),
+      }),
     }))(),
     deps.preparationTimeoutMs ?? WORKTREE_PREPARATION_TIMEOUT_MS,
   );
   // Only reached before the deadline, so an abandoned preparation never adds a worktree late.
-  const createdWorktree = await createPreparedWorktree(prepared, input);
-  try {
-    if (createdWorktree.created) {
-      await deps.lifecycle?.wait("worktree.create.after", {
-        worktree: {
-          path: createdWorktree.worktree.worktreePath,
-          branch: createdWorktree.worktree.branchName,
-          sourceCheckout: workspaceCwdPlan.sourceCheckout,
-        },
-      });
-    }
-    await maybeMarkFirstAgentBranchAutoNameEligible({ createdWorktree });
-    const workspaceCwd = mapWorkspaceRelativeCwdToWorktree({
-      relativeWorkspaceCwd: workspaceCwdPlan.relativeWorkspaceCwd,
-      targetWorktreePath: createdWorktree.worktree.worktreePath,
-    });
-    if (!(await isDirectory(workspaceCwd))) {
-      throw new Error(`Selected project directory is missing from the worktree: ${workspaceCwd}`);
-    }
-
-    if (createdWorktree.created) {
-      await seedPaseoConfigFile({
-        sourceCwd: workspaceCwdPlan.inputCwd,
-        targetCwd: workspaceCwd,
-      });
-    }
-    const workspace = await deps.workspaceProvisioning.createWorkspaceForWorktree({
-      sourceCwd: workspaceCwdPlan.inputCwd,
-      projectId: input.projectId,
-      workspaceId: input.workspaceId,
-      repoRoot: createdWorktree.repoRoot,
-      cwd: workspaceCwd,
-      worktreeRoot: createdWorktree.worktree.worktreePath,
-      branch: createdWorktree.worktree.branchName || null,
-      baseBranch: createdWorktree.worktree.comparisonBaseRef,
-      title: input.title?.trim() || resolveFirstAgentPromptTitle(input.firstAgentContext),
-      expectsInitialAgent: Boolean(input.firstAgentContext),
-      parentWorkspaceId: input.parentWorkspaceId,
-      siblingOrder: input.siblingOrder,
-      background: input.background,
-      callerWorkspaceId: input.callerWorkspaceId,
-      sidebarPlacement: input.sidebarPlacement,
-      ...(createdWorktree.intent.kind === "checkout-change-request" &&
-      createdWorktree.intent.headRepository
-        ? {
-            untrustedSource: {
-              kind: "change_request" as const,
-              forge: createdWorktree.intent.forge,
-              number: createdWorktree.intent.changeRequestNumber,
-              headRepository: createdWorktree.intent.headRepository,
-            },
-          }
-        : {}),
-    });
-
-    deps.github.invalidate({ cwd: createdWorktree.worktree.worktreePath });
-
-    return {
-      worktree: createdWorktree.worktree,
-      intent: createdWorktree.intent,
-      workspace,
-      repoRoot: createdWorktree.repoRoot,
-      created: createdWorktree.created,
-    };
-  } catch (error) {
-    if (!createdWorktree.created) {
-      throw error;
-    }
-    return rollbackCreatedPaseoWorktree(
-      {
-        cwd: createdWorktree.repoRoot,
-        worktreePath: createdWorktree.worktree.worktreePath,
-        teardownCwds: [],
-        paseoHome: input.paseoHome,
-        worktreesBaseRoot: input.worktreesRoot,
-      },
-      error,
+  return serializeWorkspaceBacking(prepared.path, async () => {
+    await deps.workspaceProvisioning.assertCreationAllowed?.(
+      prepared.path,
+      input.parentWorkspaceId,
     );
-  }
+    const createdWorktree = await createPreparedWorktree(prepared, input);
+    try {
+      if (createdWorktree.created) {
+        await deps.lifecycle?.wait("worktree.create.after", {
+          worktree: {
+            path: createdWorktree.worktree.worktreePath,
+            branch: createdWorktree.worktree.branchName,
+            sourceCheckout: workspaceCwdPlan.sourceCheckout,
+          },
+        });
+      }
+      await maybeMarkFirstAgentBranchAutoNameEligible({ createdWorktree });
+      const workspaceCwd = mapWorkspaceRelativeCwdToWorktree({
+        relativeWorkspaceCwd: workspaceCwdPlan.relativeWorkspaceCwd,
+        targetWorktreePath: createdWorktree.worktree.worktreePath,
+      });
+      if (!(await isDirectory(workspaceCwd))) {
+        throw new Error(`Selected project directory is missing from the worktree: ${workspaceCwd}`);
+      }
+
+      if (createdWorktree.created) {
+        await seedPaseoConfigFile({
+          sourceCwd: workspaceCwdPlan.inputCwd,
+          targetCwd: workspaceCwd,
+        });
+      }
+      const workspace = await deps.workspaceProvisioning.createWorkspaceForWorktree({
+        sourceCwd: workspaceCwdPlan.inputCwd,
+        projectId: input.projectId,
+        workspaceId: input.workspaceId,
+        repoRoot: createdWorktree.repoRoot,
+        cwd: workspaceCwd,
+        worktreeRoot: createdWorktree.worktree.worktreePath,
+        branch: createdWorktree.worktree.branchName || null,
+        baseBranch: createdWorktree.worktree.comparisonBaseRef,
+        title: input.title?.trim() || resolveFirstAgentPromptTitle(input.firstAgentContext),
+        expectsInitialAgent: Boolean(input.firstAgentContext),
+        parentWorkspaceId: input.parentWorkspaceId,
+        siblingOrder: input.siblingOrder,
+        background: input.background,
+        callerWorkspaceId: input.callerWorkspaceId,
+        sidebarPlacement: input.sidebarPlacement,
+        ...(createdWorktree.intent.kind === "checkout-change-request" &&
+        createdWorktree.intent.headRepository
+          ? {
+              untrustedSource: {
+                kind: "change_request" as const,
+                forge: createdWorktree.intent.forge,
+                number: createdWorktree.intent.changeRequestNumber,
+                headRepository: createdWorktree.intent.headRepository,
+              },
+            }
+          : {}),
+      });
+
+      deps.github.invalidate({ cwd: createdWorktree.worktree.worktreePath });
+
+      return {
+        worktree: createdWorktree.worktree,
+        intent: createdWorktree.intent,
+        workspace,
+        repoRoot: createdWorktree.repoRoot,
+        created: createdWorktree.created,
+      };
+    } catch (error) {
+      if (!createdWorktree.created) {
+        throw error;
+      }
+      return rollbackCreatedPaseoWorktree(
+        {
+          cwd: createdWorktree.repoRoot,
+          worktreePath: createdWorktree.worktree.worktreePath,
+          teardownCwds: [],
+          paseoHome: input.paseoHome,
+          worktreesBaseRoot: input.worktreesRoot,
+        },
+        error,
+      );
+    }
+  });
 }
 
 async function withPreparationDeadline<T>(preparation: Promise<T>, timeoutMs: number): Promise<T> {

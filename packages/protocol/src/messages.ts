@@ -1,4 +1,5 @@
 import {
+  WorkspaceArchiveOutcomeSchema,
   WorkspaceLayoutInspectRequestSchema,
   WorkspaceLayoutInitializeRequestSchema,
   WorkspaceLayoutCommitRequestSchema,
@@ -2763,6 +2764,10 @@ export const PaseoWorktreeListRequestSchema = z.object({
 export const PaseoWorktreeArchiveRequestSchema = z.object({
   type: z.literal("paseo_worktree_archive_request"),
   worktreePath: z.string().optional(),
+  expectedBackingGeneration: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .optional(),
   repoRoot: z.string().optional(),
   branchName: z.string().optional(),
   // COMPAT(worktreeArchiveWorkspaceId): added in v0.1.97, drop the optional gate when floor >= v0.1.97.
@@ -3890,6 +3895,7 @@ export const ServerInfoStatusPayloadSchema = z
         mainHost: z.boolean().optional(),
         workspaceLayout: z.boolean().optional(),
         workspaceLayoutDerivedSections: z.boolean().optional(),
+        workspaceLayoutRetirement: z.boolean().optional(),
         // COMPAT(agentRequestReceipts): added in v0.8.0; remove gate after 2027-03-05.
         agentRequestReceipts: z.boolean().optional(),
         // COMPAT(workspaceRequestReceipts): added in v0.8.0; remove gate after 2027-03-07.
@@ -5022,6 +5028,7 @@ export const ArchiveWorkspaceResponseMessageSchema = z.object({
     workspaceId: z.string(),
     archivedAt: z.string().nullable(),
     error: z.string().nullable(),
+    ...WorkspaceArchiveOutcomeSchema.shape,
   }),
 });
 
@@ -6516,6 +6523,10 @@ export const DirectorySuggestionsResponseSchema = z.object({
 
 const PaseoWorktreeSchema = z.object({
   worktreePath: z.string(),
+  backingGeneration: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .optional(),
   createdAt: z.string(),
   branchName: z.string().nullable().optional(),
   head: z.string().nullable().optional(),
@@ -6534,6 +6545,7 @@ export const PaseoWorktreeArchiveResponseSchema = z.object({
   type: z.literal("paseo_worktree_archive_response"),
   payload: z.object({
     success: z.boolean(),
+    ...WorkspaceArchiveOutcomeSchema.shape,
     removedAgents: z.array(z.string()).optional(),
     error: CheckoutErrorSchema.nullable(),
     requestId: z.string(),
