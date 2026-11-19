@@ -21,6 +21,14 @@ export const CPU_PROFILE_MAX_SAMPLES = 10_000;
 export const CPU_PROFILE_MAX_RESPONSE_BYTES = 192 * 1024;
 // The deadline is cooperative: a blocked main thread delays the stop.
 export const CPU_PROFILE_OVERRUN_TOLERANCE_MS = 250;
+// After the profiler stops, packet frames are validated against the filesystem
+// under one deadline for the whole phase and one process-wide cap on calls in
+// flight, shared by every request. On the deadline the request fails with
+// `validation_timeout`; on cancellation with `cancelled`. A call abandoned at
+// either keeps its slot until it settles, so stalled I/O limits later requests
+// instead of piling up. The kernel call itself is not cancelled.
+export const CPU_PROFILE_VALIDATION_DEADLINE_MS = 500;
+export const CPU_PROFILE_VALIDATION_MAX_IN_FLIGHT = 8;
 
 export type CpuProfileErrorCode =
   | "invalid_duration"
@@ -28,6 +36,7 @@ export type CpuProfileErrorCode =
   | "not_main_thread"
   | "inspector_in_use"
   | "profiler_failed"
+  | "validation_timeout"
   | "cancelled";
 
 const ERROR_MESSAGES: Record<CpuProfileErrorCode, string> = {
@@ -36,6 +45,7 @@ const ERROR_MESSAGES: Record<CpuProfileErrorCode, string> = {
   not_main_thread: "CPU profiling is only available on the daemon main thread",
   inspector_in_use: "An inspector debugger is already attached to this daemon",
   profiler_failed: "The CPU profiler failed",
+  validation_timeout: "CPU profile frame validation exceeded its time limit",
   cancelled: "The CPU profile was cancelled",
 };
 
@@ -81,6 +91,80 @@ export interface RawCpuProfile {
   timeDeltas?: number[];
 }
 
+/** The filesystem calls packet validation makes. */
+export interface PacketFs {
+  realpath(target: string): Promise<string>;
+  stat(target: string): Promise<{ isFile(): boolean }>;
+}
+
+const nodePacketFs: PacketFs = { realpath, stat };
+
+class ValidationStopped extends Error {}
+
+/** Resolves with `promise`, or rejects with ValidationStopped once `signal` aborts. */
+function untilStopped<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(new ValidationStopped());
+  const stopped = new Promise<never>((_resolve, reject) => {
+    signal.addEventListener("abort", () => reject(new ValidationStopped()), { once: true });
+  });
+  return Promise.race([promise, stopped]);
+}
+
+/** Caps filesystem calls in flight; a slot is held until its call settles. */
+export class FsOperationLimiter {
+  private running = 0;
+  private readonly waiting: Array<() => void> = [];
+
+  constructor(private readonly max: number) {}
+
+  get inFlight(): number {
+    return this.running;
+  }
+
+  async run<T>(operation: () => Promise<T>, signal: AbortSignal): Promise<T> {
+    await this.acquire(signal);
+    const pending = Promise.resolve().then(operation);
+    const release = () => this.release();
+    pending.then(release, release);
+    return untilStopped(pending, signal);
+  }
+
+  private async acquire(signal: AbortSignal): Promise<void> {
+    if (signal.aborted) throw new ValidationStopped();
+    if (this.running < this.max) {
+      this.running += 1;
+      return;
+    }
+    let grant!: () => void;
+    const granted = new Promise<void>((resolve) => {
+      grant = resolve;
+    });
+    this.waiting.push(grant);
+    try {
+      await untilStopped(granted, signal);
+    } catch (error) {
+      const index = this.waiting.indexOf(grant);
+      if (index >= 0) this.waiting.splice(index, 1);
+      else this.release(); // Granted as the signal aborted: hand the slot on.
+      throw error;
+    }
+  }
+
+  private release(): void {
+    const next = this.waiting.shift();
+    if (next) next();
+    else this.running -= 1;
+  }
+}
+
+const processFsLimiter = new FsOperationLimiter(CPU_PROFILE_VALIDATION_MAX_IN_FLIGHT);
+
+export interface PacketValidationOptions {
+  fs?: PacketFs;
+  limiter?: FsOperationLimiter;
+  deadlineMs?: number;
+}
+
 export async function createNodeCpuProfilerRuntime(): Promise<CpuProfilerRuntime> {
   const [inspector, workerThreads] = await Promise.all([
     import("node:inspector/promises"),
@@ -113,12 +197,18 @@ export interface CpuProfileCaptureRequest {
 export class CpuProfiler {
   private readonly packetRoot: string;
   private readonly loadRuntime: () => Promise<CpuProfilerRuntime>;
+  private readonly validation: PacketValidationOptions | undefined;
   private runtime: Promise<CpuProfilerRuntime> | null = null;
   private active: ActiveCapture | null = null;
 
-  constructor(options: { packetRoot: string; loadRuntime: () => Promise<CpuProfilerRuntime> }) {
+  constructor(options: {
+    packetRoot: string;
+    loadRuntime: () => Promise<CpuProfilerRuntime>;
+    validation?: PacketValidationOptions;
+  }) {
     this.packetRoot = options.packetRoot;
     this.loadRuntime = options.loadRuntime;
+    this.validation = options.validation;
   }
 
   get busy(): boolean {
@@ -195,6 +285,8 @@ export class CpuProfiler {
     let enabled = false;
     let started = false;
     let stopped = false;
+    let profile: RawCpuProfile | undefined;
+    let actualDurationMs = 0;
     try {
       session.connect();
       connected = true;
@@ -210,23 +302,29 @@ export class CpuProfiler {
       await waitForDeadline(durationMs, active.abort.signal);
       const result = await post(session, "Profiler.stop");
       stopped = true;
-      const actualDurationMs = runtime.now() - startedAt;
-      throwIfCancelled(active);
-      const profile = (result as { profile?: RawCpuProfile } | undefined)?.profile;
-      if (!profile) throw new CpuProfileError("profiler_failed");
-      return await sanitizeCpuProfile(profile, {
-        packetRoot: this.packetRoot,
-        pid: runtime.pid,
-        requestedDurationMs: durationMs,
-        actualDurationMs,
-      });
+      actualDurationMs = runtime.now() - startedAt;
+      profile = (result as { profile?: RawCpuProfile } | undefined)?.profile;
     } finally {
       // Stop only the profile this request started. Cleanup failures cannot
-      // replace the typed outcome above; the session is released regardless.
+      // replace the typed outcome; the session is released before any
+      // filesystem work, so a stalled call never holds the inspector.
       if (started && !stopped) await post(session, "Profiler.stop").catch(() => undefined);
       if (enabled) await post(session, "Profiler.disable").catch(() => undefined);
       if (connected) session.disconnect();
     }
+    throwIfCancelled(active);
+    if (!profile) throw new CpuProfileError("profiler_failed");
+    const summary = await sanitizeCpuProfile(profile, {
+      packetRoot: this.packetRoot,
+      pid: runtime.pid,
+      requestedDurationMs: durationMs,
+      actualDurationMs,
+      validation: this.validation,
+      signal: active.abort.signal,
+    });
+    // A cancel that lands while validation finishes still wins.
+    throwIfCancelled(active);
+    return summary;
   }
 }
 
@@ -283,44 +381,55 @@ const UNKNOWN_FRAME: FrameIdentity = { kind: "unknown", file: null, positioned: 
 
 /**
  * A script can claim any path with a vm filename or sourceURL, so a packet
- * frame needs an existing regular file under the packet root (a symlink only
- * if its target is under it too). Resolves each distinct candidate URL once,
- * after the profiler has stopped.
+ * frame needs an existing regular file under the packet root, and its identity
+ * is the resolved path relative to the resolved root, never the URL's spelling
+ * (a case variant or an in-root symlink resolves to the real file). Resolves
+ * each distinct candidate URL once, after the profiler has stopped, within the
+ * validation deadline and the shared in-flight cap.
  */
-async function resolvePacketUrls(urls: Iterable<string>, packetRoot: string): Promise<Set<string>> {
-  const packetUrls = new Set<string>();
-  const realRoot = await realpathOrNull(packetRoot);
-  if (realRoot === null) return packetUrls;
-  await Promise.all(
-    [...new Set(urls)].map(async (url) => {
-      const packet = packetRelativePath(url, packetRoot);
-      if (!packet) return;
-      const real = await realpathOrNull(packet.absolute);
-      if (real === null || !isInside(realRoot, real)) return;
-      const stats = await stat(real).catch(() => null);
-      if (stats?.isFile()) packetUrls.add(url);
-    }),
-  );
-  return packetUrls;
-}
-
-async function realpathOrNull(target: string): Promise<string | null> {
+async function resolvePacketIdentities(
+  urls: Iterable<string>,
+  packetRoot: string,
+  options: PacketValidationOptions & { signal?: AbortSignal },
+): Promise<Map<string, string>> {
+  const fs = options.fs ?? nodePacketFs;
+  const limiter = options.limiter ?? processFsLimiter;
+  const deadline = AbortSignal.timeout(options.deadlineMs ?? CPU_PROFILE_VALIDATION_DEADLINE_MS);
+  const stop = options.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
+  const attempt = async <T>(operation: () => Promise<T>): Promise<T | null> => {
+    try {
+      return await limiter.run(operation, stop);
+    } catch (error) {
+      if (error instanceof ValidationStopped) throw error;
+      return null;
+    }
+  };
+  const identities = new Map<string, string>();
   try {
-    return await realpath(target);
-  } catch {
-    return null;
+    const realRoot = await attempt(() => fs.realpath(packetRoot));
+    if (realRoot === null) return identities;
+    await Promise.all(
+      [...new Set(urls)].map(async (url) => {
+        const candidate = packetRelativePath(url, packetRoot);
+        if (!candidate) return;
+        const real = await attempt(() => fs.realpath(candidate.absolute));
+        if (real === null) return;
+        const canonical = safeRelativePath(realRoot, real);
+        if (canonical === null) return;
+        const stats = await attempt(() => fs.stat(real));
+        if (stats?.isFile()) identities.set(url, canonical);
+      }),
+    );
+    return identities;
+  } catch (error) {
+    if (!(error instanceof ValidationStopped)) throw error;
+    throw new CpuProfileError(options.signal?.aborted ? "cancelled" : "validation_timeout");
   }
-}
-
-function isInside(root: string, target: string): boolean {
-  const relative = path.relative(root, target);
-  return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
 }
 
 function classifyFrame(
   callFrame: RawCpuProfile["nodes"][number]["callFrame"],
-  packetRoot: string,
-  packetUrls: ReadonlySet<string>,
+  packetIdentities: ReadonlyMap<string, string>,
 ): FrameIdentity {
   const url = callFrame.url ?? "";
   if (url === "") {
@@ -336,9 +445,8 @@ function classifyFrame(
       ? { kind: "node", file: url, positioned: true }
       : UNKNOWN_FRAME;
   }
-  const packet = packetRelativePath(url, packetRoot);
-  if (!packet || !packetUrls.has(url)) return UNKNOWN_FRAME;
-  return { kind: "packet", file: packet.relative, positioned: true };
+  const file = packetIdentities.get(url);
+  return file ? { kind: "packet", file, positioned: true } : UNKNOWN_FRAME;
 }
 
 function packetRelativePath(
@@ -357,12 +465,18 @@ function packetRelativePath(
   } else {
     return null;
   }
-  const relative = path.relative(packetRoot, absolute);
+  const relative = safeRelativePath(packetRoot, absolute);
+  return relative === null ? null : { absolute, relative };
+}
+
+/** `absolute` relative to `root` with "/" separators, or null if outside or unsafe. */
+function safeRelativePath(root: string, absolute: string): string | null {
+  const relative = path.relative(root, absolute);
   if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return null;
   const normalized = relative.split(path.sep).join("/");
   if (normalized.length > MAX_PACKET_PATH_LENGTH || !SAFE_PACKET_PATH.test(normalized)) return null;
   if (normalized.split("/").some((segment) => segment === "." || segment === "..")) return null;
-  return { absolute, relative: normalized };
+  return normalized;
 }
 
 export interface SanitizeCpuProfileOptions {
@@ -373,6 +487,9 @@ export interface SanitizeCpuProfileOptions {
   maxFrames?: number;
   maxSamples?: number;
   maxResponseBytes?: number;
+  validation?: PacketValidationOptions;
+  /** Aborts packet validation; the capture's cancellation signal. */
+  signal?: AbortSignal;
 }
 
 type RawNode = RawCpuProfile["nodes"][number];
@@ -500,12 +617,12 @@ export async function sanitizeCpuProfile(
   const overrunMs = Math.max(0, options.actualDurationMs - options.requestedDurationMs);
   // Every frame any build below can keep is within the first `limit` ranked.
   const limit = Math.min(ranked.length, maxFrames);
-  const packetUrls = await resolvePacketUrls(
+  const packetIdentities = await resolvePacketIdentities(
     ranked.slice(0, limit).map((entry) => byId.get(entry.id)!.callFrame.url ?? ""),
     options.packetRoot,
+    { ...options.validation, signal: options.signal },
   );
-  const classify = (callFrame: RawNode["callFrame"]) =>
-    classifyFrame(callFrame, options.packetRoot, packetUrls);
+  const classify = (callFrame: RawNode["callFrame"]) => classifyFrame(callFrame, packetIdentities);
 
   const build = (keep: number, bytesTruncated: boolean): DiagnosticsCpuProfileSummary => {
     const kept = ranked

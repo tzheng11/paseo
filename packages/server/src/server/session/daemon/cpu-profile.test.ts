@@ -1,4 +1,12 @@
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { Session } from "node:inspector/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -10,11 +18,15 @@ import {
   CPU_PROFILE_MAX_DURATION_MS,
   CPU_PROFILE_MAX_FRAMES,
   CPU_PROFILE_SAMPLING_INTERVAL_US,
+  CPU_PROFILE_VALIDATION_DEADLINE_MS,
+  CPU_PROFILE_VALIDATION_MAX_IN_FLIGHT,
   CpuProfileError,
   CpuProfiler,
   type CpuProfilerRuntime,
   type InspectorSessionLike,
   type RawCpuProfile,
+  FsOperationLimiter,
+  type PacketFs,
   createNodeCpuProfilerRuntime,
   sanitizeCpuProfile,
 } from "./cpu-profile.js";
@@ -566,6 +578,237 @@ describe("packet frames from a real V8 profile", () => {
     const real = summary.frames.find((frame) => frame.file === "real-packet-file.js");
     expect(real?.line).toBe(1);
     expect(real?.column).toBeGreaterThan(1);
+  });
+});
+
+function sanitizeOptions(extra: Partial<Parameters<typeof sanitizeCpuProfile>[1]> = {}) {
+  return {
+    packetRoot: PACKET_ROOT,
+    pid: 1,
+    requestedDurationMs: 10,
+    actualDurationMs: 10,
+    ...extra,
+  };
+}
+
+function profileOfUrls(urls: string[]): RawCpuProfile {
+  return rawProfile(
+    [
+      node(
+        1,
+        urls.map((_, index) => index + 2),
+        { functionName: "(root)", scriptId: "0" },
+      ),
+      ...urls.map((url, index) => node(index + 2, [], { url, lineNumber: index })),
+    ],
+    urls.map((_, index) => index + 2),
+  );
+}
+
+describe("canonical packet identity", () => {
+  const caseInsensitive = (() => {
+    mkdirSync(path.join(PACKET_ROOT, "lib"), { recursive: true });
+    writeFileSync(path.join(PACKET_ROOT, "lib/real.js"), "");
+    return existsSync(path.join(PACKET_ROOT, "LIB/REAL.js"));
+  })();
+
+  test.skipIf(!caseInsensitive)(
+    "a case-variant URL on a case-insensitive filesystem emits the on-disk path",
+    async () => {
+      const summary = await sanitizeCpuProfile(
+        profileOfUrls([`file://${PACKET_ROOT}/LIB/REAL.js`]),
+        sanitizeOptions(),
+      );
+
+      expect(summary.frames.filter((frame) => frame.kind === "packet").map((f) => f.file)).toEqual([
+        "lib/real.js",
+      ]);
+      expect(JSON.stringify(summary)).not.toContain("LIB");
+      expect(JSON.stringify(summary)).not.toContain("REAL");
+    },
+  );
+
+  test("the identity comes from the resolved path on any filesystem", async () => {
+    const realpaths = new Map([
+      ["/fake/root", "/fake/root"],
+      ["/fake/root/Pkg/Entry.js", "/fake/root/pkg/entry.js"],
+      ["/fake/root/dir", "/fake/root/dir"],
+      ["/fake/root/out.js", "/elsewhere/out.js"],
+      ["/fake/root/odd.js", "/fake/root/od d.js"],
+    ]);
+    const fs: PacketFs = {
+      realpath: async (target) => {
+        const real = realpaths.get(target);
+        if (!real) throw new Error("missing");
+        return real;
+      },
+      stat: async (target) => ({ isFile: () => target !== "/fake/root/dir" }),
+    };
+    const summary = await sanitizeCpuProfile(
+      profileOfUrls([
+        "file:///fake/root/Pkg/Entry.js",
+        "file:///fake/root/dir",
+        "file:///fake/root/out.js",
+        "file:///fake/root/odd.js",
+        "file:///fake/root/missing.js",
+      ]),
+      sanitizeOptions({ packetRoot: "/fake/root", validation: { fs } }),
+    );
+
+    expect(summary.frames.filter((frame) => frame.kind === "packet").map((f) => f.file)).toEqual([
+      "pkg/entry.js",
+    ]);
+    expect(summary.frames.filter((frame) => frame.kind === "unknown")).toHaveLength(4);
+    const json = JSON.stringify(summary);
+    for (const leaked of ["Pkg", "Entry", "elsewhere", "od d", "missing"]) {
+      expect(json).not.toContain(leaked);
+    }
+  });
+
+  test("symlinks resolve to their in-root target; outside targets and directories are unknown", async () => {
+    const outside = realpathSync(mkdtempSync(path.join(tmpdir(), "cpu-profile-outside-")));
+    try {
+      writeFileSync(path.join(outside, "secret-outside.js"), "");
+      symlinkSync(path.join(PACKET_ROOT, "lib/real.js"), path.join(PACKET_ROOT, "link-inside.js"));
+      symlinkSync(
+        path.join(outside, "secret-outside.js"),
+        path.join(PACKET_ROOT, "link-outside.js"),
+      );
+
+      const summary = await sanitizeCpuProfile(
+        profileOfUrls([
+          `file://${PACKET_ROOT}/link-inside.js`,
+          `file://${PACKET_ROOT}/link-outside.js`,
+          `file://${PACKET_ROOT}/lib`,
+        ]),
+        sanitizeOptions(),
+      );
+
+      expect(summary.frames.filter((frame) => frame.kind === "packet").map((f) => f.file)).toEqual([
+        "lib/real.js",
+      ]);
+      expect(summary.frames.filter((frame) => frame.kind === "unknown")).toHaveLength(2);
+      const json = JSON.stringify(summary);
+      for (const leaked of ["link-inside", "link-outside", "secret-outside"]) {
+        expect(json).not.toContain(leaked);
+      }
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+});
+
+interface ControlledFs extends PacketFs {
+  calls: string[];
+  pending: number;
+  maxPending: number;
+  settleAll(): void;
+}
+
+/** A fake fs whose non-root calls never settle until settleAll(); later calls resolve at once. */
+function stallingFs(root: string, log?: string[]): ControlledFs {
+  const waiters: Array<() => void> = [];
+  let stalling = true;
+  const fs: ControlledFs = {
+    calls: [],
+    pending: 0,
+    maxPending: 0,
+    settleAll: () => {
+      stalling = false;
+      for (const settle of waiters.splice(0)) settle();
+    },
+    realpath: (target) => {
+      fs.calls.push(target);
+      log?.push("fs.realpath");
+      fs.pending += 1;
+      fs.maxPending = Math.max(fs.maxPending, fs.pending);
+      if (target === root || !stalling) {
+        fs.pending -= 1;
+        return Promise.resolve(target);
+      }
+      return new Promise((resolve) => {
+        waiters.push(() => {
+          fs.pending -= 1;
+          resolve(target);
+        });
+      });
+    },
+    stat: async () => ({ isFile: () => true }),
+  };
+  return fs;
+}
+
+function fakeRootProfile(count: number): RawCpuProfile {
+  return profileOfUrls(
+    Array.from({ length: count }, (_, index) => `file:///fake/root/f${index}.js`),
+  );
+}
+
+describe("cancellation after the profiler stops", () => {
+  for (const [label, cancel] of [
+    ["owner socket close", (profiler: CpuProfiler, owner: object) => profiler.cancelOwner(owner)],
+    ["shutdown", (profiler: CpuProfiler) => profiler.cancelAll()],
+  ] as const) {
+    test(`${label} during packet validation gives typed cancelled, never a summary`, async () => {
+      const { runtime, log } = fakeRuntime({ profile: fakeRootProfile(3) });
+      const fs = stallingFs("/fake/root", log.calls);
+      const profiler = new CpuProfiler({
+        packetRoot: "/fake/root",
+        loadRuntime: async () => runtime,
+        validation: { fs, limiter: new FsOperationLimiter(8), deadlineMs: 10_000 },
+      });
+      const owner = {};
+
+      const capture = profiler.capture({ durationMs: 5, owner, scope: {} });
+      await waitFor(() => fs.calls.length > 1);
+      // The inspector is released before any filesystem work starts.
+      expect(log.calls.indexOf("disconnect")).toBeLessThan(log.calls.indexOf("fs.realpath"));
+      const cancelledAt = performance.now();
+      cancel(profiler, owner);
+
+      await expectCode(capture, "cancelled");
+      expect(performance.now() - cancelledAt).toBeLessThan(250);
+      expect(profiler.busy).toBe(false);
+      fs.settleAll();
+    });
+  }
+});
+
+describe("bounded post-stop validation", () => {
+  test("documents a 500 ms validation deadline and 8 filesystem operations in flight", () => {
+    expect(CPU_PROFILE_VALIDATION_DEADLINE_MS).toBe(500);
+    expect(CPU_PROFILE_VALIDATION_MAX_IN_FLIGHT).toBe(8);
+  });
+
+  test("a never-settling fs ends the request within the bound and never exceeds the shared cap", async () => {
+    const { runtime, log } = fakeRuntime({ profile: fakeRootProfile(12) });
+    const fs = stallingFs("/fake/root", log.calls);
+    const limiter = new FsOperationLimiter(CPU_PROFILE_VALIDATION_MAX_IN_FLIGHT);
+    const profiler = new CpuProfiler({
+      packetRoot: "/fake/root",
+      loadRuntime: async () => runtime,
+      validation: { fs, limiter, deadlineMs: 100 },
+    });
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const started = performance.now();
+      await expectCode(
+        profiler.capture({ durationMs: 5, owner: {}, scope: {} }),
+        "validation_timeout",
+      );
+      expect(performance.now() - started).toBeLessThan(600);
+      expect(profiler.busy).toBe(false);
+      expect(fs.maxPending).toBeLessThanOrEqual(CPU_PROFILE_VALIDATION_MAX_IN_FLIGHT);
+      expect(limiter.inFlight).toBe(CPU_PROFILE_VALIDATION_MAX_IN_FLIGHT);
+    }
+    expect(log.calls.lastIndexOf("disconnect")).toBeGreaterThan(-1);
+
+    // Abandoned calls hold their slots until they settle, then free them.
+    fs.settleAll();
+    await waitFor(() => limiter.inFlight === 0);
+    const summary = await profiler.capture({ durationMs: 5, owner: {}, scope: {} });
+    expect(summary.frames.some((frame) => frame.kind === "packet")).toBe(true);
+    fs.settleAll();
   });
 });
 
