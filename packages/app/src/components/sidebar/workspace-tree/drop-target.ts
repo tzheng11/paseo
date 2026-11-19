@@ -24,6 +24,7 @@ interface WorkspaceTreeDropInput {
   workspaceKey: string;
   targetWorkspaceKey: string;
   position: WorkspaceDropPosition;
+  canonicalOrder?: boolean;
 }
 export function resolveWorkspaceTreeDrop(input: WorkspaceTreeDropInput): WorkspaceTreeDrop | null {
   return resolveWorkspaceTreeDropResult(input).drop;
@@ -41,24 +42,21 @@ export function resolveWorkspaceTreeDropResult(input: WorkspaceTreeDropInput): {
     rejection: { targetWorkspaceKey: target.workspaceKey, message },
   });
   const fullTree = resolvePinnedWorkspaceTree(input.allWorkspaces ?? input.workspaces);
-  const changingSection = source.sidebarSection !== target.sidebarSection;
-  if (
-    changingSection &&
-    Array.from(fullTree.values()).some((item) => item.parentWorkspaceKey === source.workspaceKey)
-  )
-    return reject("Move children out first before moving this workspace to another pin section");
   if (target.sidebarSection)
     return resolvePinnedDrop(input, source, target, fullTree, target.sidebarSection);
   if (input.position === "inside")
     return reject("Pin workspaces to nest them in Pinned or SuperPinned");
-  if (source.serverId !== target.serverId || source.projectViewKey !== target.projectViewKey)
+  if (
+    (!input.canonicalOrder && source.serverId !== target.serverId) ||
+    source.projectViewKey !== target.projectViewKey
+  )
     return reject(
       "Reorder within a project, or pin workspaces to arrange them across projects and hosts",
     );
   const siblings = input.workspaces.filter(
     (item) =>
       !item.sidebarSection &&
-      item.serverId === target.serverId &&
+      (input.canonicalOrder || item.serverId === target.serverId) &&
       item.projectViewKey === target.projectViewKey &&
       item.workspaceKey !== source.workspaceKey,
   );
@@ -73,6 +71,14 @@ export function resolveWorkspaceTreeDropResult(input: WorkspaceTreeDropInput): {
         input.position === "before"
           ? target.workspaceId
           : (siblings[targetIndex + 1]?.workspaceId ?? null),
+      ...(input.canonicalOrder
+        ? {
+            beforeWorkspaceKey:
+              input.position === "before"
+                ? target.workspaceKey
+                : (siblings[targetIndex + 1]?.workspaceKey ?? null),
+          }
+        : {}),
     },
     rejection: null,
   };

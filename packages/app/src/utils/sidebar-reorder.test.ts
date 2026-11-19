@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { hasVisibleOrderChanged, mergeWithRemainder } from "./sidebar-reorder";
+import {
+  captureUnmovedProjectOrders,
+  hasVisibleOrderChanged,
+  mergeWithRemainder,
+  reorderVisibleWorkspaceKeys,
+} from "./sidebar-reorder";
 
 describe("hasVisibleOrderChanged", () => {
   it("returns false when visible order is unchanged", () => {
@@ -49,4 +54,86 @@ describe("mergeWithRemainder", () => {
       }),
     ).toEqual(["stale", "hidden"]);
   });
+});
+
+describe("captureUnmovedProjectOrders", () => {
+  const project = (viewKey: string, keys: string[]) => ({
+    viewKey,
+    workspaces: keys.map((workspaceKey) => ({ workspaceKey })),
+  });
+
+  it("keeps another project's displayed order when a drag leaves automatic sorting", () => {
+    const previous = { moved: ["h:old", "h:new"], other: [] };
+    expect(
+      captureUnmovedProjectOrders({
+        projects: [project("moved", ["h:new", "h:old"]), project("other", ["h:b", "h:a"])],
+        movedProjectViewKey: "moved",
+        workspaceOrderByProject: previous,
+        workspaceSortModeByProject: {},
+      }),
+    ).toEqual([{ projectViewKey: "other", order: ["h:b", "h:a"] }]);
+    expect(previous).toEqual({ moved: ["h:old", "h:new"], other: [] });
+  });
+
+  it("preserves saved manual history, including hidden keys, and automatic project preferences", () => {
+    const previous = { manual: ["h:hidden", "h:a", "h:b"] };
+    expect(
+      captureUnmovedProjectOrders({
+        projects: [
+          project("manual", ["h:b", "h:a"]),
+          project("alphabetical", ["h:alpha", "h:zeta"]),
+          project("activity", ["h:recent", "h:old"]),
+        ],
+        movedProjectViewKey: "moved",
+        workspaceOrderByProject: previous,
+        workspaceSortModeByProject: { alphabetical: "alphabetical", activity: "activity" },
+      }),
+    ).toEqual([]);
+    expect(previous).toEqual({ manual: ["h:hidden", "h:a", "h:b"] });
+  });
+
+  it("captures an explicit Manual project but leaves absent projects and empty groups alone", () => {
+    expect(
+      captureUnmovedProjectOrders({
+        projects: [project("visible", ["h:b", "h:a"]), project("empty", [])],
+        movedProjectViewKey: "moved",
+        workspaceOrderByProject: { hidden: ["remote:retained"] },
+        workspaceSortModeByProject: { visible: "manual" },
+      }),
+    ).toEqual([{ projectViewKey: "visible", order: ["h:b", "h:a"] }]);
+  });
+});
+
+describe("reorderVisibleWorkspaceKeys", () => {
+  it.each([
+    { position: "before" as const, source: "c", target: "a", expected: ["c", "a", "b"] },
+    { position: "after" as const, source: "a", target: "b", expected: ["b", "a", "c"] },
+  ])(
+    "preserves every other visible key for $position",
+    ({ position, source, target, expected }) => {
+      const order = ["a", "b", "c"];
+      expect(
+        reorderVisibleWorkspaceKeys({
+          order,
+          workspaceKey: source,
+          targetWorkspaceKey: target,
+          position,
+        }),
+      ).toEqual(expected);
+      expect(order).toEqual(["a", "b", "c"]);
+    },
+  );
+  it.each(["source", "target"])(
+    "refuses an unavailable %s instead of inventing an order",
+    (missing) => {
+      expect(() =>
+        reorderVisibleWorkspaceKeys({
+          order: ["a", "b"],
+          workspaceKey: missing === "source" ? "missing" : "a",
+          targetWorkspaceKey: missing === "target" ? "missing" : "b",
+          position: "after",
+        }),
+      ).toThrow("no longer in view");
+    },
+  );
 });

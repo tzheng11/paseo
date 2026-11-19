@@ -1,3 +1,7 @@
+import {
+  initialWorkspaceSidebarFields,
+  type WorkspaceSidebarPlacement,
+} from "../../workspace-pin-placement.js";
 import type { PluginLifecycle } from "../../plugins/lifecycle/index.js";
 import { describeHookWorkspace } from "../../plugins/lifecycle/index.js";
 import { basename, resolve } from "node:path";
@@ -28,6 +32,7 @@ export interface ResolveOrCreateWorkspaceIdInput {
   initialTitle: string | null;
   background?: boolean;
   callerWorkspaceId?: string;
+  sidebarPlacement?: WorkspaceSidebarPlacement;
 }
 
 export interface ImportWorkspaceInput {
@@ -56,9 +61,11 @@ export interface CreateWorktreeWorkspaceInput {
   siblingOrder?: number;
   background?: boolean;
   callerWorkspaceId?: string;
+  sidebarPlacement?: WorkspaceSidebarPlacement;
 }
 
 export interface WorkspaceProvisioningService {
+  assertCreationAllowed(): Promise<void>;
   runInImportWorkspace<T>(
     input: ImportWorkspaceInput,
     operation: (workspace: PersistedWorkspaceRecord) => Promise<T>,
@@ -76,6 +83,7 @@ export interface WorkspaceProvisioningService {
       siblingOrder?: number;
       background?: boolean;
       callerWorkspaceId?: string;
+      sidebarPlacement?: WorkspaceSidebarPlacement;
     },
   ): Promise<PersistedWorkspaceRecord>;
   createWorkspaceForWorktree(
@@ -107,12 +115,16 @@ export function createWorkspaceProvisioningService(deps: {
   serverId?: string;
   workspaceRegistry: WorkspaceRegistry;
   projectRegistry: ProjectRegistry;
-  workspaceGitService: Pick<WorkspaceGitService, "getCheckout" | "getSnapshot" | "peekSnapshot">;
+  workspaceGitService: Pick<WorkspaceGitService, "getCheckout" | "getSnapshot">;
   isDirectory: (path: string) => Promise<boolean>;
   logger: Logger;
   lifecycle?: PluginLifecycle;
 }): WorkspaceProvisioningService {
   const { serverId, workspaceRegistry, projectRegistry, workspaceGitService, logger } = deps;
+
+  async function assertCreationAllowed(): Promise<void> {
+    await workspaceRegistry.assertLayoutWriteAllowed?.();
+  }
 
   /**
    * Placement facts at a workspace directory, or null when there is nothing
@@ -203,6 +215,7 @@ export function createWorkspaceProvisioningService(deps: {
   }
 
   async function findOrCreateProjectForDirectory(cwd: string): Promise<PersistedProjectRecord> {
+    await assertCreationAllowed();
     const rootPath = resolve(cwd);
     const checkout = await workspaceGitService.getCheckout(rootPath);
     const timestamp = new Date().toISOString();
@@ -231,6 +244,7 @@ export function createWorkspaceProvisioningService(deps: {
   async function resolveBackground(input?: {
     background?: boolean;
     callerWorkspaceId?: string;
+    sidebarPlacement?: WorkspaceSidebarPlacement;
   }): Promise<boolean> {
     if (input?.background !== undefined) return input.background;
     if (!input?.callerWorkspaceId) return false;
@@ -250,8 +264,10 @@ export function createWorkspaceProvisioningService(deps: {
       siblingOrder?: number;
       background?: boolean;
       callerWorkspaceId?: string;
+      sidebarPlacement?: WorkspaceSidebarPlacement;
     },
   ): Promise<PersistedWorkspaceRecord> {
+    await assertCreationAllowed();
     const normalizedCwd = resolve(cwd);
     const checkout = await workspaceGitService.getCheckout(normalizedCwd);
     projectId =
@@ -272,6 +288,7 @@ export function createWorkspaceProvisioningService(deps: {
       createdAt: timestamp,
       updatedAt: timestamp,
       background: await resolveBackground(context),
+      ...(await initialWorkspaceSidebarFields(workspaceRegistry, serverId, context)),
       parentWorkspaceId: context?.parentWorkspaceId,
       siblingOrder: context?.siblingOrder,
     });
@@ -286,6 +303,7 @@ export function createWorkspaceProvisioningService(deps: {
   async function createWorkspaceForWorktree(
     input: CreateWorktreeWorkspaceInput,
   ): Promise<PersistedWorkspaceRecord> {
+    await assertCreationAllowed();
     const sourceCwd = resolve(input.sourceCwd);
     const repoRoot = resolve(input.repoRoot);
     const cwd = resolve(input.cwd);
@@ -316,6 +334,7 @@ export function createWorkspaceProvisioningService(deps: {
       updatedAt: timestamp,
       ...(input.untrustedSource ? { untrustedSource: input.untrustedSource } : {}),
       background: await resolveBackground(input),
+      ...(await initialWorkspaceSidebarFields(workspaceRegistry, serverId, input)),
       parentWorkspaceId: input.parentWorkspaceId,
       siblingOrder: input.siblingOrder,
     });
@@ -328,7 +347,9 @@ export function createWorkspaceProvisioningService(deps: {
   }
 
   function emitWorkspaceCreated(workspace: PersistedWorkspaceRecord): void {
-    deps.lifecycle?.emit("workspace.created", { workspace: describeHookWorkspace(workspace) });
+    deps.lifecycle?.emit("workspace.create.after", {
+      workspace: describeHookWorkspace(workspace),
+    });
   }
 
   async function resolveSourceProjectForWorktree(input: {
@@ -436,20 +457,6 @@ export function createWorkspaceProvisioningService(deps: {
         : null;
     const autoArchivedChangeRequestUrl =
       await resolveRestoredAutoArchiveChangeRequestUrl(workspace);
-    let next: PersistedWorkspaceRecord | null = null;
-    if (workspace.archivedAt) {
-      const placementUpdate = reconcileWorkspacePlacement({
-        workspace,
-        checkout,
-        updatedAt: timestamp,
-      });
-      next = {
-        ...(placementUpdate?.workspace ?? workspace),
-        archivedAt: null,
-        autoArchivedChangeRequestUrl,
-        updatedAt: timestamp,
-      };
-    }
     if (project.archivedAt || workspace.archivedAt) {
       const projectCheckout =
         checkout && areEquivalentPaths(project.rootPath, workspace.cwd)
@@ -473,8 +480,28 @@ export function createWorkspaceProvisioningService(deps: {
         });
       }
     }
-    if (!next) return workspace;
-    await workspaceRegistry.upsert(next);
+    if (!workspace.archivedAt) return workspace;
+    // Restoration is an explicit lifecycle intent, not a whole-record
+    // reconciliation. Apply it to the fresh registry record so an old snapshot
+    // cannot overwrite pin/hierarchy changes made while checkout was inspected.
+    const next = await workspaceRegistry.update(
+      workspace.workspaceId,
+      (current) => {
+        const placement = reconcileWorkspacePlacement({
+          workspace: current,
+          checkout,
+          updatedAt: timestamp,
+        });
+        return {
+          ...(placement?.workspace ?? current),
+          archivedAt: null,
+          autoArchivedChangeRequestUrl,
+          updatedAt: timestamp,
+        };
+      },
+      { layoutWrite: true },
+    );
+    if (!next) throw new Error("Workspace disappeared while restoring its archive state");
     return next;
   }
 
@@ -525,6 +552,7 @@ export function createWorkspaceProvisioningService(deps: {
   }
 
   return {
+    assertCreationAllowed,
     runInImportWorkspace,
     findOrCreateWorkspaceForDirectory,
     resolveOrCreateWorkspaceIdForCreateAgent,

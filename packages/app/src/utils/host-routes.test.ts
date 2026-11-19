@@ -217,6 +217,12 @@ describe("global routes", () => {
     expect(buildNewWorkspaceRoute()).toBe("/new");
   });
 
+  it("buildNewWorkspaceRoute carries a cross-host parent independently of the creation host", () => {
+    expect(
+      buildNewWorkspaceRoute({ serverId: "child-host", parentWorkspaceKey: "parent-host:wks_1" }),
+    ).toBe("/new?serverId=child-host&parentWorkspaceKey=parent-host%3Awks_1");
+  });
+
   it("buildNewWorkspaceRoute accepts an initial host", () => {
     expect(buildNewWorkspaceRoute({ serverId: "local" })).toBe("/new?serverId=local");
   });

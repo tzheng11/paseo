@@ -74,7 +74,7 @@ export async function bootstrapWorkspaceRegistries(options: {
       continue;
     }
     try {
-      pinPaseoWorktreeBranchIdentityIfMissing(workspace.worktreeRoot, workspace.branch);
+      await pinPaseoWorktreeBranchIdentityIfMissing(workspace.worktreeRoot, workspace.branch);
     } catch (error) {
       options.logger.warn(
         { err: error, workspaceId: workspace.workspaceId },
@@ -116,7 +116,9 @@ export async function bootstrapWorkspaceRegistries(options: {
   const placements = await Promise.all(
     activeRecords.map(async (record) => {
       const normalizedCwd = path.resolve(record.cwd);
-      const checkout = await options.workspaceGitService.getCheckout(normalizedCwd);
+      const checkout = await options.workspaceGitService.getCheckout(normalizedCwd, {
+        priority: "background",
+      });
       const membership = classifyDirectoryForProjectMembership({
         cwd: normalizedCwd,
         checkout,

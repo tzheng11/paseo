@@ -26,6 +26,7 @@ class FakeAppUpdateRuntime implements AppUpdateRuntime {
     resolve(): void;
     reject(error: Error): void;
   } | null = null;
+  configureCount = 0;
   checkCount = 0;
   downloadCallCount = 0;
   requestedDownloadVersions: string[] = [];
@@ -34,6 +35,7 @@ class FakeAppUpdateRuntime implements AppUpdateRuntime {
   installModes: Array<{ targetVersion: string; isSilent: boolean; isForceRunAfter: boolean }> = [];
 
   configure(input: AppUpdateRuntimeConfiguration): void {
+    this.configureCount += 1;
     this.configuration = input;
     this.gate = input.shouldAdmitUpdate;
   }
@@ -151,11 +153,16 @@ class FakeAppUpdateRuntime implements AppUpdateRuntime {
   }
 }
 
-function createService(input?: { now?: () => number; bucket?: () => Promise<number> }) {
+function createService(input?: {
+  now?: () => number;
+  bucket?: () => Promise<number>;
+  updatesEnabled?: boolean;
+}) {
   const runtime = new FakeAppUpdateRuntime();
   const service = createAppUpdateService({
     runtime,
     isPackaged: () => true,
+    updatesEnabled: input?.updatesEnabled,
     now: input?.now ?? (() => Date.parse("2026-04-28T12:00:00.000Z")),
     bucket: input?.bucket ?? (async () => 0.99),
   });
@@ -169,6 +176,45 @@ const rolledOutUpdate = {
 };
 
 describe("app update service", () => {
+  it.each(["automatic", "manual"] as const)(
+    "keeps managed builds off the upstream updater for a %s check and either install path",
+    async (intent) => {
+      const { runtime, service } = createService({ updatesEnabled: false });
+      runtime.nextCheck({ isUpdateAvailable: true, updateInfo: { version: "0.14.1" } });
+      const check = await service.checkForAppUpdate({
+        currentVersion: "0.14.0",
+        releaseChannel: "stable",
+        intent,
+      });
+      expect(check.hasUpdate).toBe(false);
+      expect(check.readyToInstall).toBe(false);
+      expect(check.errorMessage).toBe(
+        intent === "manual" ? "Updates for this custom build are managed separately." : null,
+      );
+      let beforeQuitCalled = false;
+      const install = await service.downloadAndInstallUpdate(
+        { currentVersion: "0.14.0", releaseChannel: "stable" },
+        async () => {
+          beforeQuitCalled = true;
+        },
+      );
+      expect(install.installed).toBe(false);
+      expect(install.message).toBe("Updates for this custom build are managed separately.");
+      expect(
+        await service.installUpdateOnQuit({
+          currentVersion: "0.14.0",
+          releaseChannel: "stable",
+          signal: new AbortController().signal,
+        }),
+      ).toBe(false);
+      expect(runtime.configureCount).toBe(0);
+      expect(runtime.checkCount).toBe(0);
+      expect(runtime.downloadCallCount).toBe(0);
+      expect(runtime.installedVersions).toEqual([]);
+      expect(beforeQuitCalled).toBe(false);
+    },
+  );
+
   it("does not expose automatic stable updates before the user is admitted to rollout", async () => {
     const { runtime, service } = createService();
     runtime.nextCheck({ isUpdateAvailable: true, updateInfo: rolledOutUpdate });

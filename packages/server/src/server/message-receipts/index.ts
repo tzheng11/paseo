@@ -4,11 +4,21 @@ import path from "node:path";
 import { z } from "zod";
 import { writeJsonFileAtomic } from "../atomic-file.js";
 
-const ReceiptSchema = z.object({
+const ReceiptIdentitySchema = z.object({
   fingerprint: z.string(),
-  state: z.enum(["pending", "completed"]),
   agentId: z.string(),
 });
+const ReceiptSchema = z.discriminatedUnion("state", [
+  ReceiptIdentitySchema.extend({ state: z.enum(["pending", "completed"]) }),
+  ReceiptIdentitySchema.extend({ state: z.literal("failed"), error: z.string() }),
+]);
+
+export class MessageNotDispatchedError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "MessageNotDispatchedError";
+  }
+}
 interface SendMessageInput {
   agentId: string;
   messageId: string;
@@ -50,13 +60,21 @@ export class MessageReceipts {
     if (existing) {
       if (existing.fingerprint !== fingerprint) throw new Error("agent_request_key_conflict");
       if (existing.state === "completed") return;
+      if (existing.state === "failed") throw new MessageNotDispatchedError(existing.error);
       // A provider may have accepted the message before its receipt was committed.
       throw new Error("agent_request_outcome_unknown");
     }
     await input.prepare?.();
     const receipt = { fingerprint, agentId: input.agentId };
     await writeJsonFileAtomic(file, { ...receipt, state: "pending" });
-    await input.send();
+    try {
+      await input.send();
+    } catch (error) {
+      if (error instanceof MessageNotDispatchedError) {
+        await writeJsonFileAtomic(file, { ...receipt, state: "failed", error: error.message });
+      }
+      throw error;
+    }
     await writeJsonFileAtomic(file, { ...receipt, state: "completed" });
   }
 }

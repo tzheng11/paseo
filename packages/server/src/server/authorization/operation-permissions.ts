@@ -6,6 +6,10 @@ type OutboundOperation = SessionOutboundMessage["type"];
 export type PermissionRequirement = DaemonPermission | readonly DaemonPermission[] | null;
 
 const INBOUND_PERMISSION = {
+  "workspace.layout.inspect.request": "workspace.read",
+  "workspace.layout.receipt.request": "workspace.read",
+  "workspace.layout.initialize.request": "daemon.manage",
+  "workspace.layout.commit.request": "daemon.manage",
   "fleet.main_host.get.request": "daemon.read",
   "fleet.main_host.set.request": "daemon.manage",
   "fleet.main_host.apply.request": "daemon.manage",
@@ -86,6 +90,8 @@ const INBOUND_PERMISSION = {
   "daemon.update.request": "daemon.manage",
   delete_agent_request: "workspace.write",
   "diagnostics.request": "daemon.read",
+  // Profiling is daemon-wide operator authority, beyond the diagnostics read grant.
+  "diagnostics.cpu_profile.request": "daemon.manage",
   dictation_stream_cancel: "workspace.write",
   dictation_stream_chunk: "workspace.write",
   dictation_stream_finish: "workspace.write",
@@ -189,6 +195,9 @@ const INBOUND_PERMISSION = {
   set_agent_model_request: "workspace.write",
   set_agent_thinking_request: "workspace.write",
   set_daemon_config_request: "daemon.manage",
+  "speech.local_models.list.request": "daemon.read",
+  "speech.local_models.download.request": "daemon.manage",
+  "speech.local_models.delete.request": "daemon.manage",
   set_voice_mode: "workspace.write",
   shutdown_server_request: "daemon.manage",
   start_workspace_script_request: "workspace.write",
@@ -219,6 +228,7 @@ const INBOUND_PERMISSION = {
   "workspace.label.update.request": "workspace.manage",
   "workspace.move.request": "workspace.manage",
   "workspace.pin.set.request": "workspace.manage",
+  "workspace.pin.placement.set.request": "workspace.manage",
   "workspace.superpin.set.request": "workspace.manage",
   "workspace.recovery.inspect.request": ["workspace.read", "hub.execute"],
   "workspace.recovery.restore.request": ["workspace.manage", "hub.execute"],
@@ -234,6 +244,11 @@ const INBOUND_PERMISSION = {
 } as const satisfies Record<InboundOperation, PermissionRequirement>;
 
 const OUTBOUND_PERMISSION = {
+  "workspace.layout.inspect.response": "workspace.read",
+  "workspace.layout.receipt.response": "workspace.read",
+  "workspace.layout.changed": "workspace.read",
+  "workspace.layout.initialize.response": "daemon.manage",
+  "workspace.layout.commit.response": "daemon.manage",
   "fleet.main_host.get.response": "daemon.read",
   "fleet.main_host.set.response": "daemon.manage",
   "fleet.main_host.apply.response": "daemon.manage",
@@ -330,6 +345,7 @@ const OUTBOUND_PERMISSION = {
   "daemon.update.progress": "daemon.manage",
   "daemon.update.response": "daemon.manage",
   "diagnostics.response": "daemon.read",
+  "diagnostics.cpu_profile.response": "daemon.manage",
   dictation_stream_ack: "workspace.write",
   dictation_stream_error: "workspace.write",
   dictation_stream_final: "workspace.write",
@@ -435,6 +451,9 @@ const OUTBOUND_PERMISSION = {
   set_agent_model_response: "workspace.write",
   set_agent_thinking_response: "workspace.write",
   set_daemon_config_response: "daemon.manage",
+  "speech.local_models.list.response": "daemon.read",
+  "speech.local_models.download.response": "daemon.manage",
+  "speech.local_models.delete.response": "daemon.manage",
   set_voice_mode_response: "workspace.write",
   start_workspace_script_response: "workspace.write",
   stash_list_response: "workspace.read",
@@ -464,6 +483,7 @@ const OUTBOUND_PERMISSION = {
   "workspace.label.update": "workspace.read",
   "workspace.label.update.response": "workspace.manage",
   "workspace.move.response": "workspace.manage",
+  "workspace.pin.placement.set.response": "workspace.manage",
   "workspace.pin.set.response": "workspace.manage",
   "workspace.superpin.set.response": "workspace.manage",
   "workspace.recovery.inspect.response": ["workspace.read", "hub.execute"],

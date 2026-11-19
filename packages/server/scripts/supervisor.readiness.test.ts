@@ -5,25 +5,32 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "vitest";
 
-async function runWorker(worker: string, publicationDelay = 0) {
+async function runWorker(worker: string, publicationDelay = 0, maintenance = false) {
   const home = await mkdtemp(path.join(tmpdir(), "paseo-readiness-"));
   const workerPath = path.join(home, "worker.mjs");
   const runnerPath = path.join(home, "runner.mjs");
   const eventsPath = path.join(home, "events.jsonl");
   const supervisor = new URL("./supervisor.ts", import.meta.url).href;
+  const workerConfig = new URL("./supervisor-worker-config.ts", import.meta.url).href;
   await writeFile(workerPath, worker);
   await writeFile(
     runnerPath,
     `
     import { appendFile } from "node:fs/promises";
     import { runSupervisor } from ${JSON.stringify(supervisor)};
+    import { finishMaintenanceBootEnvironment } from ${JSON.stringify(workerConfig)};
+    const workerEnv = { ...process.env };
+    if (${maintenance}) Object.assign(workerEnv, { PASEO_MAINTENANCE_BOOT: "closed",
+      PASEO_MAINTENANCE_CONTROL_DIR: "fixture-control", PASEO_MAINTENANCE_BOOT_TIMEOUT_MS: "300000" });
     const record = (event) => appendFile(${JSON.stringify(eventsPath)}, JSON.stringify(event) + "\\n");
     runSupervisor({
       name: "ReadinessTest", startupMessage: "starting", restartOnCrash: true,
       resolveWorkerEntry: () => ${JSON.stringify(workerPath)}, workerArgs: [], workerExecArgv: [],
+      workerEnv,
       onWorkerReady: async ({ listen }) => {
         await new Promise(resolve => setTimeout(resolve, ${publicationDelay}));
         await record(listen);
+        finishMaintenanceBootEnvironment(workerEnv);
       },
       onWorkerExit: () => record(null),
     });
@@ -119,4 +126,31 @@ test("requested shutdown before first readiness exits successfully", async () =>
   `);
   expect(result.code).toBe(0);
   expect(result.events).toEqual([null]);
+});
+
+test("maintenance boot is consumed after first ready before an ordinary worker restart", async () => {
+  const result = await runWorker(
+    `
+    import { existsSync, writeFileSync } from "node:fs";
+    const marker = process.argv[1] + ".started";
+    process.on("message", message => {
+      if (message.type === "paseo:graceful-shutdown") process.exit(0);
+    });
+    if (!existsSync(marker)) {
+      if (process.env.PASEO_MAINTENANCE_BOOT !== "closed") process.exit(3);
+      writeFileSync(marker, "first");
+      process.send({ type: "paseo:ready", listen: "first", serverId: "srv_test" });
+      process.send({ type: "paseo:restart" });
+    } else {
+      if (["PASEO_MAINTENANCE_BOOT", "PASEO_MAINTENANCE_CONTROL_DIR", "PASEO_MAINTENANCE_BOOT_TIMEOUT_MS"]
+        .some(key => process.env[key] !== undefined)) process.exit(4);
+      if (process.env.PASEO_HOME !== process.env.HOME) process.exit(5);
+      process.send({ type: "paseo:ready", listen: "second", serverId: "srv_test" }, () => process.exit(0));
+    }
+  `,
+    50,
+    true,
+  );
+  expect(result.code, result.output).toBe(0);
+  expect(result.events, result.output).toEqual(["first", null, "second", null]);
 });

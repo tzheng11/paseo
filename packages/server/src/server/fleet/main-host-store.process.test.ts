@@ -6,6 +6,7 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  realpath,
   rm,
   symlink,
   writeFile,
@@ -20,12 +21,20 @@ import type { MainHostProvenance, MainHostState } from "@getpaseo/protocol/fleet
 import { getPidLockInfo } from "../pid-lock.js";
 import { DaemonClient } from "../test-utils/daemon-client.js";
 import { MainHostStore } from "./main-host-store.js";
+import { isolatedWindowsEnvironment } from "../../test-utils/isolated-windows-environment.js";
 
+// Only server and protocol source are archived. Client/plugin/relay/highlight
+// and external dependencies remain the current checkout's installations. This
+// proves the Main-store boundary below, not a complete old-installation or
+// current-home downgrade/recovery contract.
 const BASE_REVISION = "8046e550e32ac7fe9dc9720a00b35bd747950094";
 const repositoryRoot = fileURLToPath(new URL("../../../../../", import.meta.url));
 const execute = promisify(execFile);
 const allocatorSource = fileURLToPath(new URL("./main-host-store.ts", import.meta.url));
 const tsxLoader = import.meta.resolve("tsx");
+const startupObserver = fileURLToPath(
+  new URL("../../test-utils/terminal-worker-startup-observer.cjs", import.meta.url),
+);
 const children = new Map<ChildProcess, boolean>();
 let temporaryRoot: string;
 
@@ -39,6 +48,7 @@ const owner: MainHostProvenance = {
 
 beforeEach(async () => {
   temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "paseo-main-process-"));
+  await mkdir(path.join(temporaryRoot, "os-home"));
 });
 
 afterEach(async () => {
@@ -51,8 +61,9 @@ function isolatedEnvironment(home: string): NodeJS.ProcessEnv {
   // Inherit executable lookup and Windows runtime necessities, never owner credentials.
   return {
     PATH: process.env.PATH,
-    SystemRoot: process.env.SystemRoot,
-    ComSpec: process.env.ComSpec,
+    ...isolatedWindowsEnvironment(),
+    HOME: path.join(temporaryRoot, "os-home"),
+    USERPROFILE: path.join(temporaryRoot, "os-home"),
     TEMP: temporaryRoot,
     TMP: temporaryRoot,
     TMPDIR: temporaryRoot,
@@ -72,6 +83,7 @@ function isolatedEnvironment(home: string): NodeJS.ProcessEnv {
     PASEO_LOG_LEVEL: "error",
     PASEO_LOG_FORMAT: "json",
     NODE_ENV: "test",
+    NODE_OPTIONS: `--require=${JSON.stringify(startupObserver.replaceAll("\\", "/"))}`,
   };
 }
 
@@ -288,6 +300,7 @@ async function extractBaseline(): Promise<string> {
       BASE_REVISION,
       "package.json",
       "packages/server",
+      "packages/protocol",
     ],
     { cwd: repositoryRoot },
   );
@@ -297,12 +310,54 @@ async function extractBaseline(): Promise<string> {
     path.join(baseline, "node_modules"),
     process.platform === "win32" ? "junction" : "dir",
   );
-  // Hoisted installs can keep server-specific versions (for example p-limit)
-  // below this workspace; use those same versions for the archived source.
+  // Keep external dependency versions, but never run the archived server against
+  // today's protocol output. Removed exports can survive in a developer's stale
+  // dist while being absent from a clean CI build.
+  const serverModules = path.join(baseline, "packages/server/node_modules");
+  await mkdir(serverModules);
+  const installedModules = path.join(repositoryRoot, "packages/server/node_modules");
+  for (const name of await readdir(installedModules)) {
+    if (name.startsWith(".") || name === "@getpaseo") continue;
+    await symlink(
+      path.join(installedModules, name),
+      path.join(serverModules, name),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+  }
+  await mkdir(path.join(serverModules, "@getpaseo"));
+  const protocol = path.join(baseline, "packages/protocol");
   await symlink(
-    path.join(repositoryRoot, "packages/server/node_modules"),
-    path.join(baseline, "packages/server/node_modules"),
+    protocol,
+    path.join(serverModules, "@getpaseo/protocol"),
     process.platform === "win32" ? "junction" : "dir",
+  );
+  await execute(
+    process.execPath,
+    [
+      path.join(repositoryRoot, "node_modules/typescript/bin/tsc"),
+      "-p",
+      path.join(protocol, "tsconfig.json"),
+      "--noCheck",
+      "--declaration",
+      "false",
+      "--declarationMap",
+      "false",
+      "--sourceMap",
+      "false",
+    ],
+    { cwd: baseline, maxBuffer: 1024 * 1024 },
+  );
+  const resolved = await execute(
+    process.execPath,
+    [
+      "--input-type=module",
+      "--eval",
+      'console.log(import.meta.resolve("@getpaseo/protocol/terminal-snapshot"))',
+    ],
+    { cwd: path.join(baseline, "packages/server") },
+  );
+  expect(await realpath(fileURLToPath(resolved.stdout.trim()))).toBe(
+    await realpath(path.join(protocol, "dist/terminal-snapshot.js")),
   );
   await expect(
     access(path.join(baseline, "packages/server/src/server/fleet/main-host-store.ts")),
@@ -310,12 +365,80 @@ async function extractBaseline(): Promise<string> {
   return baseline;
 }
 
-async function waitForDaemon(child: ChildProcess, port: number, home: string): Promise<void> {
+function captureChildOutput(child: ChildProcess): () => string {
+  let output = "";
+  const retain = (chunk: Buffer) => {
+    output = (output + chunk.toString()).slice(-32_768);
+  };
+  child.stdout?.on("data", retain);
+  child.stderr?.on("data", retain);
+  return () => output;
+}
+
+async function daemonStartupError(
+  message: string,
+  home: string,
+  recentOutput: () => string,
+): Promise<Error> {
+  let workerOutput = "";
+  let workerRecords: string[] = [];
+  try {
+    // Only this fixture's private home is read. A detached worker's failure is
+    // written here rather than to its launcher's stderr.
+    workerOutput = (await readFile(path.join(home, "terminal-worker.log"), "utf8")).slice(-32_768);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  try {
+    // A record is persisted only after self-inspection succeeds and before ready
+    // is sent. List names only: record contents contain a private socket secret.
+    workerRecords = (await readdir(path.join(home, "terminal-worker"))).filter((name) =>
+      /^\d+\.json$/.test(name),
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  return new Error(
+    `${message}\n${recentOutput()}\nTerminal worker records: ${JSON.stringify(workerRecords.sort())}\nTerminal worker fixture log:\n${workerOutput}`,
+  );
+}
+
+test.each([false, true])(
+  "startup diagnostics retain only worker record names (present=%s)",
+  async (present) => {
+    const { home } = await createConfiguredHome();
+    if (present) {
+      await mkdir(path.join(home, "terminal-worker"));
+      await writeFile(
+        path.join(home, "terminal-worker/4242.json"),
+        '{"secret":"fixture-must-not-log"}',
+      );
+      await writeFile(path.join(home, "terminal-worker.log"), "fixture worker checkpoint");
+    }
+    const error = await daemonStartupError(
+      "fixture startup failed",
+      home,
+      () => "fixture launcher",
+    );
+    expect(error.message).toContain(`Terminal worker records: ${present ? '["4242.json"]' : "[]"}`);
+    expect(error.message.includes("fixture worker checkpoint")).toBe(present);
+    expect(error.message).not.toContain("fixture-must-not-log");
+  },
+);
+
+async function waitForDaemon(
+  child: ChildProcess,
+  port: number,
+  home: string,
+  recentOutput: () => string,
+): Promise<void> {
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
     if (child.exitCode !== null || child.signalCode !== null)
-      throw new Error(
+      throw await daemonStartupError(
         `Baseline daemon exited before listening (${child.exitCode}, ${child.signalCode})`,
+        home,
+        recentOutput,
       );
     // HTTP binds before plugin startup finishes. The supervisor publishes its
     // listen receipt only after daemon.start() has enabled WebSocket acceptance.
@@ -329,8 +452,10 @@ async function waitForDaemon(child: ChildProcess, port: number, home: string): P
     }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  throw new Error(
-    "Baseline daemon did not listen within 60 seconds; inspect only its temporary home",
+  throw await daemonStartupError(
+    "Baseline daemon did not listen within 60 seconds",
+    home,
+    recentOutput,
   );
 }
 
@@ -350,11 +475,11 @@ async function connectCurrentDaemon(home: string): Promise<{
         PASEO_NODE_ENV: "development",
       },
       detached: process.platform !== "win32",
-      stdio: ["ignore", "ignore", "ignore"],
+      stdio: ["ignore", "pipe", "pipe"],
     },
   );
   children.set(child, true);
-  await waitForDaemon(child, port, home);
+  await waitForDaemon(child, port, home, captureChildOutput(child));
   const client = new DaemonClient({
     url: `ws://127.0.0.1:${port}/ws`,
     clientId: "main-startup-process-test",
@@ -379,6 +504,10 @@ describe("DOTS2-114 · real process interruption and rollback", () => {
       const before = await readFile(fleetPath, "utf8");
       const { child, client } = await connectCurrentDaemon(home);
       try {
+        const workerLog = await readFile(path.join(home, "terminal-worker.log"), "utf8");
+        expect(workerLog).toContain("[fixture-terminal-startup] preload");
+        expect(workerLog).toContain("[fixture-terminal-startup] listening");
+        expect(workerLog).toContain("[fixture-terminal-startup] fd3-writeSync-complete");
         expect(client.getLastServerInfoMessage()?.features?.mainHost).toBe(false);
         expect((await client.getDaemonConfig()).config.autoArchiveAfterMerge).toBe(false);
         await expect(client.getMainHost()).rejects.toThrow(
@@ -476,7 +605,7 @@ describe("DOTS2-114 · real process interruption and rollback", () => {
     });
   }, 45_000);
 
-  test("the actual pre-Main baseline daemon starts and ignores fleet.json with unchanged config", async () => {
+  test("the archived pre-Main server and protocol ignore fleet.json with unchanged config", async () => {
     const { home, configBytes } = await createConfiguredHome();
     const prior = await createPriorChoice(home);
     const fleetBefore = await readFile(path.join(home, "fleet.json"), "utf8");
@@ -500,11 +629,11 @@ describe("DOTS2-114 · real process interruption and rollback", () => {
           PASEO_NODE_ENV: "development",
         },
         detached: process.platform !== "win32",
-        stdio: ["ignore", "ignore", "ignore"],
+        stdio: ["ignore", "pipe", "pipe"],
       },
     );
     children.set(child, true);
-    await waitForDaemon(child, port, home);
+    await waitForDaemon(child, port, home, captureChildOutput(child));
     const client = new DaemonClient({
       url: `ws://127.0.0.1:${port}/ws`,
       clientId: "rollback-process-test",

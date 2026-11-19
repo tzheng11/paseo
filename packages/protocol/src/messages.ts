@@ -1,3 +1,18 @@
+import {
+  WorkspaceLayoutInspectRequestSchema,
+  WorkspaceLayoutInitializeRequestSchema,
+  WorkspaceLayoutCommitRequestSchema,
+  WorkspaceLayoutInspectResponseSchema,
+  WorkspaceLayoutInitializeResponseSchema,
+  WorkspaceLayoutCommitResponseSchema,
+  WorkspaceLayoutChangedSchema,
+  WorkspaceLayoutStatusSchema,
+  WorkspaceLayoutReceiptRequestSchema,
+  WorkspaceLayoutReceiptResponseSchema,
+} from "./workspace-layout.js";
+import { WorkspacePinPlacementSchema } from "./workspace-layout.js";
+import { RuntimeBuildIdentitySchema, RuntimeWriteIntentSchema } from "./runtime-build.js";
+export { WorkspacePinPlacementSchema } from "./workspace-layout.js";
 import { AgentMessageSchema } from "./agent-message.js";
 import {
   HostsListRequestSchema,
@@ -91,6 +106,16 @@ import {
   ScheduleRunOnceResponseSchema,
   ScheduleUpdateResponseSchema,
 } from "./schedule/rpc-schemas.js";
+import {
+  SpeechLocalModelsDeleteRequestSchema,
+  SpeechLocalModelsDeleteResponseSchema,
+  SpeechLocalModelsDownloadRequestSchema,
+  SpeechLocalModelsDownloadResponseSchema,
+  SpeechLocalModelsListRequestSchema,
+  SpeechLocalModelsListResponseSchema,
+  SpeechSettingsPatchSchema,
+  SpeechSettingsSchema,
+} from "./speech/rpc-schemas.js";
 import {
   LoopRunRequestSchema,
   LoopListRequestSchema,
@@ -196,6 +221,9 @@ const MutableBrowserToolsConfigSchema = z
 const MutableRelayConfigSchema = z
   .object({
     enabled: z.boolean(),
+    // COMPAT(relayProtectedSecurity): added in v0.13.0, keep optional while old daemons are supported.
+    // When true the daemon admits only relay sessions that negotiated protected endpoint security.
+    requireProtectedSecurity: z.boolean().optional(),
   })
   .passthrough();
 
@@ -226,17 +254,28 @@ export const MutableDaemonConfigSchema = z
     app: z.object({ baseUrl: z.string() }).optional(),
     catalogRefreshTimeoutMs: z.number().int().positive().optional(),
     idleUnloadAfterMinutes: z.number().int().nonnegative().optional(),
+    // COMPAT(usageSetting): added in v0.14, remove after 2027-05-01.
+    usage: z.object({ enabled: z.boolean() }).optional(),
     browserTools: MutableBrowserToolsConfigSchema.default({ enabled: false }),
     providers: z.record(z.string(), MutableDaemonProviderConfigSchema).default({}),
     metadataGeneration: MutableMetadataGenerationConfigSchema.default({ providers: [] }),
     autoArchiveAfterMerge: z.boolean().default(false),
     enableTerminalAgentHooks: z.boolean().default(false),
+    // COMPAT(idleRuntimeCleanupSetting): added in v0.13.0, keep optional while old daemons are supported.
+    // Persisted host-wide value, applied live by the daemon.
+    idleRuntimeCleanup: z.boolean().optional(),
+    // COMPAT(restartRecovery): added in v0.14.0, keep optional for older hosts.
+    resumeOnStartup: z.boolean().optional(),
+    resumePrompt: z.string().optional(),
     appendSystemPrompt: z.string().default(""),
     terminalProfiles: z.array(TerminalProfileSchema).optional(),
     agentProfiles: z.array(AgentProfileSchema).optional(),
     skills: z.object({ selection: AgentSkillSelectionSchema.optional() }).strict().optional(),
     pluginsEnabled: z.boolean().optional(),
     plugins: z.record(PluginIdSchema, PluginSourceSchema).optional(),
+    // COMPAT(speechSettings): added in v0.12.0, optional because older daemons omit it.
+    features: SpeechSettingsSchema.optional(),
+    envOverrides: z.record(z.string(), z.string()).optional(),
   })
   .passthrough();
 
@@ -244,6 +283,7 @@ export const MutableDaemonConfigPatchSchema = z
   .object({
     relay: MutableRelayConfigSchema.partial().optional(),
     mcp: z.object({ injectIntoAgents: z.boolean().optional() }).passthrough().optional(),
+    usage: z.object({ enabled: z.boolean() }).optional(),
     browserTools: MutableBrowserToolsConfigSchema.partial().optional(),
     providers: z
       .record(z.string(), MutableDaemonProviderConfigSchema.partial().passthrough())
@@ -253,11 +293,15 @@ export const MutableDaemonConfigPatchSchema = z
     metadataGeneration: MutableMetadataGenerationConfigSchema.partial().optional(),
     autoArchiveAfterMerge: z.boolean().optional(),
     enableTerminalAgentHooks: z.boolean().optional(),
+    idleRuntimeCleanup: z.boolean().optional(),
+    resumeOnStartup: z.boolean().optional(),
+    resumePrompt: z.string().optional(),
     appendSystemPrompt: z.string().optional(),
     terminalProfiles: z.array(TerminalProfileSchema).optional(),
     agentProfiles: z.array(AgentProfileSchema).optional(),
     pluginsEnabled: z.boolean().optional(),
     plugins: z.record(PluginIdSchema, PluginSourceSchema).optional(),
+    features: SpeechSettingsPatchSchema.optional(),
   })
   .partial()
   .passthrough();
@@ -623,7 +667,9 @@ const ToolCallDetailPayloadSchema: z.ZodType<ToolCallDetail, unknown> = z.discri
       subAgentType: z.string().optional(),
       description: z.string().optional(),
       childSessionId: z.string().optional(),
-      log: z.string(),
+      // COMPAT(subagent-log): added in v0.14.1, remove after 2027-04-30. A sub-agent card is a
+      // launch marker; apps before v0.14.1 required `log`, so daemons still send it empty.
+      log: z.string().optional(),
       // Compat cruft for clients <= 0.1.65-beta.3 that required this field. Producers still
       // emit `[]`; nothing reads it. Drop the field (and the `[]` emissions) once those
       // clients are no longer in the field.
@@ -1020,8 +1066,29 @@ export const WorkspaceFieldValueSetRequestSchema = z.object({
   requestId: z.string(),
 });
 
+export const WorkspaceSidebarSectionSchema = z.enum(["unpinned", "pinned", "superpinned"]);
+export const WorkspaceSidebarPlacementSchema = z.object({
+  parentWorkspaceKey: z.string().min(1).max(512).nullable(),
+  siblingOrder: z.number().finite().optional(),
+  section: WorkspaceSidebarSectionSchema,
+});
+
+export const WorkspacePinPlacementSetRequestSchema = z.object({
+  type: z.literal("workspace.pin.placement.set.request"),
+  layoutWriterVersion: z.literal(2).optional(),
+  workspaceId: z.string(),
+  placement: WorkspacePinPlacementSchema.omit({ revision: true }),
+  section: WorkspaceSidebarSectionSchema.optional(),
+  sectionState: z
+    .object({ pinnedAt: z.string().nullable(), superpinnedAt: z.string().nullable() })
+    .optional(),
+  expectedRevision: z.number().int().nonnegative(),
+  requestId: z.string(),
+});
+
 export const WorkspaceMoveRequestSchema = z.object({
   type: z.literal("workspace.move.request"),
+  layoutWriterVersion: z.literal(2).optional(),
   workspaceId: z.string(),
   parentWorkspaceId: z.string().nullable(),
   beforeWorkspaceId: z.string().nullable().optional(),
@@ -1030,6 +1097,7 @@ export const WorkspaceMoveRequestSchema = z.object({
 
 export const WorkspacePinSetRequestSchema = z.object({
   type: z.literal("workspace.pin.set.request"),
+  layoutWriterVersion: z.literal(2).optional(),
   workspaceId: z.string(),
   pinned: z.boolean(),
   requestId: z.string(),
@@ -1037,6 +1105,7 @@ export const WorkspacePinSetRequestSchema = z.object({
 
 export const WorkspaceSuperpinSetRequestSchema = z.object({
   type: z.literal("workspace.superpin.set.request"),
+  layoutWriterVersion: z.literal(2).optional(),
   workspaceId: z.string(),
   superpinned: z.boolean(),
   requestId: z.string(),
@@ -1096,6 +1165,7 @@ export const WorkspaceRecoveryInspectRequestSchema = z.object({
 
 export const WorkspaceRecoveryRestoreRequestSchema = z.object({
   type: z.literal("workspace.recovery.restore.request"),
+  layoutWriterVersion: z.literal(2).optional(),
   workspaceId: z.string(),
   requestId: z.string(),
 });
@@ -1487,9 +1557,22 @@ export const DiagnosticsRequestSchema = z.object({
   requestId: z.string(),
 });
 
+/** Upper bound for one in-process CPU profile. The daemon also enforces it. */
+export const DIAGNOSTICS_CPU_PROFILE_MAX_DURATION_MS = 4000;
+
+export const DiagnosticsCpuProfileRequestSchema = z.object({
+  type: z.literal("diagnostics.cpu_profile.request"),
+  requestId: z.string(),
+  durationMs: z.number().int().min(1).max(DIAGNOSTICS_CPU_PROFILE_MAX_DURATION_MS),
+});
+
 export const PluginCatalogGetRequestSchema = z.object({
   type: z.literal("plugin.catalog.get.request"),
   requestId: z.string(),
+  /** Client bundles the client already holds; the daemon leaves out each one whose hash matches. */
+  cachedClientBundles: z
+    .array(z.object({ id: PluginIdSchema, clientBundleHash: z.string() }))
+    .optional(),
 });
 
 export const PluginListRequestSchema = z.object({
@@ -1769,6 +1852,7 @@ export type CreateAgentWorktreeTarget = z.infer<typeof CreateAgentWorktreeTarget
 
 export const CreateAgentRequestMessageSchema = z.object({
   type: z.literal("create_agent_request"),
+  layoutWriterVersion: z.literal(2).optional(),
   // Legacy create_agent_request uses a separate initial-message receipt when keyed.
   idempotencyKey: z.string().min(1).max(512).optional(),
   config: AgentSessionConfigSchema,
@@ -1886,6 +1970,7 @@ export const ResumeAgentRequestMessageSchema = z.object({
 
 export const ImportAgentRequestMessageSchema = z.object({
   type: z.literal("import_agent_request"),
+  layoutWriterVersion: z.literal(2).optional(),
   provider: AgentProviderSchema.optional(),
   providerId: z.string().optional(),
   sessionId: z.string().optional(),
@@ -1898,6 +1983,7 @@ export const ImportAgentRequestMessageSchema = z.object({
 
 export const RefreshAgentRequestMessageSchema = z.object({
   type: z.literal("refresh_agent_request"),
+  layoutWriterVersion: z.literal(2).optional(),
   agentId: z.string(),
   requestId: z.string(),
 });
@@ -1928,11 +2014,17 @@ export const RestartServerRequestMessageSchema = z.object({
   type: z.literal("restart_server_request"),
   reason: z.string().optional(),
   requestId: z.string(),
+  // Restart keeps terminals unless this is true. Daemons that predate
+  // `features.terminalsSurviveRestart` ignore it and close terminals anyway.
+  killTerminals: z.boolean().optional(),
 });
 
 export const ShutdownServerRequestMessageSchema = z.object({
   type: z.literal("shutdown_server_request"),
   requestId: z.string(),
+  // Shutdown closes terminals unless this is true. Gate on
+  // `features.terminalsSurviveRestart`: older daemons drop the field.
+  keepTerminals: z.boolean().optional(),
 });
 
 export const DaemonUpdateRequestMessageSchema = z.object({
@@ -1980,6 +2072,8 @@ export const AgentTimelineHistoryRequestMessageSchema = z.object({
 });
 
 export const FetchAgentTimelineRequestMessageSchema = z.object({
+  // Keep available turns whole for tail/before pages; after catch-up stays incremental.
+  wholeTurns: z.boolean().optional(),
   type: z.literal("fetch_agent_timeline_request"),
   agentId: z.string(),
   requestId: z.string(),
@@ -2222,6 +2316,17 @@ export const WorkspaceFieldValueSetResponseSchema = z.object({
     value: z.string(),
     error: z.string().nullable(),
     errorCode: z.enum(["invalid_value", "unknown_field", "not_found", "conflict"]).nullable(),
+  }),
+});
+
+export const WorkspacePinPlacementSetResponseSchema = z.object({
+  type: z.literal("workspace.pin.placement.set.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    accepted: z.boolean(),
+    placement: WorkspacePinPlacementSchema.nullable(),
+    error: z.string().nullable(),
   }),
 });
 
@@ -2686,6 +2791,7 @@ export const FirstAgentContextSchema = z.object({
 
 export const CreatePaseoWorktreeRequestSchema = z.object({
   type: z.literal("create_paseo_worktree_request"),
+  layoutWriterVersion: z.literal(2).optional(),
   cwd: z.string(),
   projectId: z.string().optional(),
   worktreeSlug: z.string().optional(),
@@ -2737,6 +2843,7 @@ export const LegacyOpenInEditorRequestSchema = z.object({
 
 export const OpenProjectRequestSchema = z.object({
   type: z.literal("open_project_request"),
+  layoutWriterVersion: z.literal(2).optional(),
   // Path used only for workspace lookup/creation. Use the returned workspace.id for all subsequent references.
   cwd: z.string(),
   requestId: z.string(),
@@ -2796,6 +2903,7 @@ export const ArchiveWorkspaceRequestSchema = z.object({
 // between an existing local directory and a newly created paseo worktree.
 export const WorkspaceCreateRequestSchema = z.object({
   type: z.literal("workspace.create.request"),
+  layoutWriterVersion: z.literal(2).optional(),
   workspaceId: z
     .string()
     .regex(/^wks_[a-f0-9]{16}$/)
@@ -2808,6 +2916,7 @@ export const WorkspaceCreateRequestSchema = z.object({
   title: z.string().optional(),
   parentWorkspaceId: z.string().nullable().optional(),
   siblingOrder: z.number().finite().optional(),
+  sidebarPlacement: WorkspaceSidebarPlacementSchema.optional(),
   // Optional prompt context for workspace-level name/branch generation.
   firstAgentContext: FirstAgentContextSchema.optional(),
   // Retained for wire parsing; public internal creation is no longer supported.
@@ -3237,6 +3346,7 @@ export const CaptureTerminalRequestSchema = z.object({
 
 export const HubExecutionAgentCreateRequestSchema = z.object({
   type: z.literal("hub.execution.agent.create.request"),
+  layoutWriterVersion: z.literal(2).optional(),
   requestId: z.string(),
   executionId: z.string(),
   provider: z.string(),
@@ -3362,6 +3472,10 @@ export const SubscriptionReleaseResponseSchema = z.object({
 });
 
 export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
+  WorkspaceLayoutInspectRequestSchema,
+  WorkspaceLayoutInitializeRequestSchema,
+  WorkspaceLayoutCommitRequestSchema,
+  WorkspaceLayoutReceiptRequestSchema,
   MainHostGetRequestSchema,
   MainHostSetRequestSchema,
   MainHostApplyRequestSchema,
@@ -3400,6 +3514,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceTitleSetRequestSchema,
   WorkspaceFieldValueSetRequestSchema,
   WorkspaceMoveRequestSchema,
+  WorkspacePinPlacementSetRequestSchema,
   WorkspacePinSetRequestSchema,
   WorkspaceSuperpinSetRequestSchema,
   WorkspaceLabelListRequestSchema,
@@ -3421,6 +3536,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   HubManagementDaemonDisconnectRequestSchema,
   HubManagementDaemonPermissionsUpdateRequestSchema,
   DiagnosticsRequestSchema,
+  DiagnosticsCpuProfileRequestSchema,
   PluginCatalogGetRequestSchema,
   PluginListRequestSchema,
   PluginLogsGetRequestSchema,
@@ -3576,6 +3692,9 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   ChatWaitRequestSchema,
   ScheduleCreateRequestSchema,
   ScheduleListRequestSchema,
+  SpeechLocalModelsListRequestSchema,
+  SpeechLocalModelsDownloadRequestSchema,
+  SpeechLocalModelsDeleteRequestSchema,
   ScheduleInspectRequestSchema,
   ScheduleLogsRequestSchema,
   SchedulePauseRequestSchema,
@@ -3748,6 +3867,9 @@ export const ServerInfoStatusPayloadSchema = z
     status: z.literal("server_info"),
     // COMPAT(mainHost): added in v0.11.3; remove optional after 2027-04-18.
     mainHost: MainHostStateSchema.optional(),
+    workspaceLayout: WorkspaceLayoutStatusSchema.optional(),
+    runtimeBuild: RuntimeBuildIdentitySchema.optional(),
+    runtimeWriteIntent: RuntimeWriteIntentSchema.optional(),
     protocolVersion: z.number().int().optional(),
     // COMPAT(workspaceFields): added in v0.11.3; remove optional after 2027-04-14.
     workspaceFieldCatalogVersion: z.number().int().positive().optional(),
@@ -3766,6 +3888,8 @@ export const ServerInfoStatusPayloadSchema = z
       .object({
         // COMPAT(mainHost): added in v0.11.3; remove gate after 2027-04-18.
         mainHost: z.boolean().optional(),
+        workspaceLayout: z.boolean().optional(),
+        workspaceLayoutDerivedSections: z.boolean().optional(),
         // COMPAT(agentRequestReceipts): added in v0.8.0; remove gate after 2027-03-05.
         agentRequestReceipts: z.boolean().optional(),
         // COMPAT(workspaceRequestReceipts): added in v0.8.0; remove gate after 2027-03-07.
@@ -3784,9 +3908,14 @@ export const ServerInfoStatusPayloadSchema = z
         // COMPAT(workspaceFields): added in v0.11.3; remove gate after 2027-04-14.
         workspaceFields: z.boolean().optional(),
         workspaceHierarchy: z.boolean().optional(),
+        // COMPAT(universalPins): added in v0.13.0-beta.1; remove gate after 2027-04-22.
+        workspacePinPlacement: z.boolean().optional(),
+        workspaceSidebarPlacement: z.boolean().optional(),
         providersSnapshot: z.boolean().optional(),
         connectedHosts: z.boolean().optional(),
         hostMultiplexing: z.boolean().optional(),
+        // COMPAT(usageSetting): added in v0.14, remove after 2027-05-01.
+        usageSetting: z.boolean().optional(),
         usageSources: z.boolean().optional(),
         // COMPAT(providersSnapshotCwd): added in v0.3.2, remove gate after 2027-02-10.
         providersSnapshotCwd: z.boolean().optional(),
@@ -3824,6 +3953,10 @@ export const ServerInfoStatusPayloadSchema = z
         hostStats: z.boolean().optional(),
         // COMPAT(daemonConfigReload): added in v0.4.0, remove gate after 2027-02-14.
         daemonConfigReload: z.boolean().optional(),
+        // COMPAT(diagnosticsCpuProfile): added in v0.15.0-impower, remove gate after 2027-05-19.
+        diagnosticsCpuProfile: z.boolean().optional(),
+        // COMPAT(speechSettings): added in v0.12.0, remove gate after 2027-04-18.
+        speechSettings: z.boolean().optional(),
         // COMPAT(relayConfig): added in v0.2.6, remove gate after 2027-01-31.
         relayConfig: z.boolean().optional(),
         // COMPAT(pushTokenRevocation): added in v0.3.2, remove gate after 2027-02-10.
@@ -3848,12 +3981,18 @@ export const ServerInfoStatusPayloadSchema = z
         pluginTimelineItems: z.boolean().optional(),
         // COMPAT(skillManagement): added in v0.4.0, remove gate after 2027-08-16.
         skillManagement: z.boolean().optional(),
+        // COMPAT(idleRuntimeCleanupSetting): added in v0.13.0, remove gate after 2027-04-26.
+        idleRuntimeCleanupSetting: z.boolean().optional(),
+        // COMPAT(restartRecovery): added in v0.14.0, remove gate after 2027-04-28.
+        resumeOnStartupSetting: z.boolean().optional(),
         // COMPAT(terminalRestoreModes): added in v0.1.81, remove gate after 2026-11-23.
         "terminal-restore-modes": z.boolean().optional(),
         // COMPAT(terminalInputModeReplay): added in v0.2.6, remove gate after 2027-02-02.
         "terminal-input-mode-replay": z.boolean().optional(),
         // COMPAT(terminalSizeOwnership): added in v0.2.6, remove gate after 2027-02-02.
         "terminal-size-ownership": z.boolean().optional(),
+        // COMPAT(terminalGraphemeWidths): added in v0.15.0, remove gate after 2027-05-01.
+        "terminal-grapheme-widths": z.boolean().optional(),
         // COMPAT(rewind): added in v0.1.X, drop the gate when floor >= v0.1.X.
         rewind: z.boolean().optional(),
         // COMPAT(agentTimelinePromptIndex): added in v0.2.X, drop the gate when floor >= v0.2.X.
@@ -3886,6 +4025,8 @@ export const ServerInfoStatusPayloadSchema = z
         daemonDiagnostics: z.boolean().optional(),
         // COMPAT(daemonSelfUpdate): added in v0.1.93, remove gate after 2026-12-13.
         daemonSelfUpdate: z.boolean().optional(),
+        // COMPAT(terminalsSurviveRestart): added in v0.12.0, remove gate after 2027-04-21.
+        terminalsSurviveRestart: z.boolean().optional(),
         // COMPAT(agentForkContext): added in v0.1.102, remove gate after 2026-12-28.
         agentForkContext: z.boolean().optional(),
         // COMPAT(agentForkContextCursor): added in v0.1.108, remove gate after 2027-01-14.
@@ -3894,6 +4035,7 @@ export const ServerInfoStatusPayloadSchema = z
         providerSubagents: z.boolean().optional(),
         // COMPAT(projectedSubagentTimeline): added after v0.8.0, remove gates after 2027-03-14; retain wire field.
         projectedSubagentTimeline: z.boolean().optional(),
+        wholeTurnTimeline: z.boolean().optional(),
         // COMPAT(providerSubagentNesting): added in v0.7, remove gate after 2027-03-04.
         providerSubagentNesting: z.boolean().optional(),
         // COMPAT(workspacePinning): added in v0.1.107, remove gate after 2027-01-12.
@@ -3904,6 +4046,9 @@ export const ServerInfoStatusPayloadSchema = z
         workspaceMarkUnread: z.boolean().optional(),
         // COMPAT(hubRelationship): added in v0.1.X, drop the gate when floor >= v0.1.X.
         hubRelationship: z.boolean().optional(),
+        // COMPAT(relayProtectedSecurity): added in v0.13.0. A capable daemon always advertises
+        // it; relay clients that negotiated legacy security reject the connection on seeing it.
+        relayProtectedSecurity: z.boolean().optional(),
         // COMPAT(projectGithubClone): added in v0.1.108, remove gate after 2027-01-15.
         projectGithubClone: z.boolean().optional(),
         // COMPAT(workspaceGithubRepositorySearch): added in v0.1.108, remove gate after 2027-01-15.
@@ -3934,7 +4079,9 @@ export const ServerInfoStatusPayloadSchema = z
         explicitEventSubscriptions: z.boolean().optional(),
         ownedSubscriptions: z.boolean().optional(),
         idleAgentReload: z.boolean().optional(),
+        binaryChunkingV1: z.boolean().optional(),
         workspaceSetupObservation: z.boolean().optional(),
+        workspaceSortTimes: z.boolean().optional(),
         // COMPAT(canonicalSubmittedPrompts): added in v0.2.6, remove gate after 2027-01-30.
         canonicalSubmittedPrompts: z.boolean().optional(),
         agentMessageProvenance: z.boolean().optional(),
@@ -3998,6 +4145,7 @@ export const RpcErrorMessageSchema = z.object({
     error: z.string(),
     code: z.string().optional(),
     mainHost: MainHostStateSchema.optional(),
+    workspaceLayout: WorkspaceLayoutStatusSchema.optional(),
   }),
 });
 
@@ -4279,6 +4427,8 @@ export const WorkspaceGitHubRuntimePayloadSchema = z
 export const WorkspaceDescriptorPayloadSchema = z
   .object({
     id: z.string(),
+    // COMPAT(universalPins): added in v0.13.0-beta.1; remove optional after 2027-04-22.
+    pinPlacement: WorkspacePinPlacementSchema.optional(),
     parentWorkspaceId: z.string().nullable().optional(),
     siblingOrder: z.number().finite().optional(),
     projectId: z.string(),
@@ -4312,6 +4462,7 @@ export const WorkspaceDescriptorPayloadSchema = z
     // COMPAT(workspaceFields): added in v0.11.3; remove optional after 2027-04-14.
     fieldValues: z.record(z.string(), z.string()).optional(),
     pinnedAt: z.string().nullable().optional(),
+    effectiveSection: WorkspaceSidebarSectionSchema.nullable().optional(),
     // COMPAT(workspaceSuperpinning): old daemons omit this; remove optional after 2027-04-18.
     superpinnedAt: z.string().nullable().optional(),
     // COMPAT(workspaceLabels): added in v0.5.0, remove optional after 2027-08-14.
@@ -4330,6 +4481,8 @@ export const WorkspaceDescriptorPayloadSchema = z
       .nullish()
       .transform((value) => value ?? null),
     activityAt: z.string().nullable(),
+    createdAt: z.string().optional(),
+    lastUserMessageAt: z.string().nullable().optional(),
     diffStat: z
       .object({
         additions: z.number(),
@@ -5312,6 +5465,8 @@ export const DaemonGetStatusResponseSchema = z.object({
       requestId: z.string(),
       serverId: z.string(),
       version: z.string().nullable().optional(),
+      runtimeBuild: RuntimeBuildIdentitySchema.optional(),
+      runtimeWriteIntent: RuntimeWriteIntentSchema.optional(),
       pid: z.number(),
       nodePath: z.string(),
       startedAt: z.string().nullable().optional(),
@@ -5333,6 +5488,22 @@ export const DaemonGetStatusResponseSchema = z.object({
           error: z.string().nullable().optional(),
         }),
       ),
+      // Processes a terminal cleanup on this host (a kill restart or stop) could not confirm
+      // gone; empty when every cleanup finished. Daemons without terminalsSurviveRestart have
+      // no such cleanup and omit it.
+      terminalCleanupUnconfirmed: z
+        .array(
+          z.object({
+            pid: z.number(),
+            role: z.string(),
+            reason: z.string(),
+            detail: z.string(),
+          }),
+        )
+        .optional(),
+      // Set when this host's terminals are held by a terminal worker from a newer Paseo, which
+      // this daemon leaves running but cannot drive: why, and what the user can do.
+      terminalsUnavailable: z.string().optional(),
     })
     .passthrough(),
 });
@@ -5433,6 +5604,61 @@ export const DiagnosticsResponseSchema = z.object({
     .object({
       requestId: z.string(),
       diagnostic: z.string(),
+    })
+    .passthrough(),
+});
+
+export const DiagnosticsCpuProfileFrameKindSchema = z.enum([
+  "root",
+  "program",
+  "idle",
+  "gc",
+  "native",
+  "node",
+  "packet",
+  "unknown",
+]);
+
+/**
+ * One sanitized profile node. `file` is set only for packet-relative and
+ * `node:` builtin frames; function names and other URLs are never sent.
+ */
+export const DiagnosticsCpuProfileFrameSchema = z.object({
+  id: z.number().int(),
+  parent: z.number().int().nullable(),
+  kind: DiagnosticsCpuProfileFrameKindSchema,
+  file: z.string().nullable(),
+  line: z.number().int().nullable(),
+  column: z.number().int().nullable(),
+  selfSamples: z.number().int(),
+  totalSamples: z.number().int(),
+  selfMicros: z.number(),
+});
+
+export const DiagnosticsCpuProfileSummarySchema = z.object({
+  pid: z.number().int(),
+  samplingIntervalUs: z.number().int(),
+  requestedDurationMs: z.number().int(),
+  actualDurationMs: z.number(),
+  overrunMs: z.number(),
+  overrun: z.boolean(),
+  profileSpanMicros: z.number(),
+  sampleCount: z.number().int(),
+  totalNodeCount: z.number().int(),
+  frames: z.array(DiagnosticsCpuProfileFrameSchema),
+  truncated: z.object({
+    frames: z.boolean(),
+    samples: z.boolean(),
+    bytes: z.boolean(),
+  }),
+});
+
+export const DiagnosticsCpuProfileResponseSchema = z.object({
+  type: z.literal("diagnostics.cpu_profile.response"),
+  payload: z
+    .object({
+      requestId: z.string(),
+      profile: DiagnosticsCpuProfileSummarySchema,
     })
     .passthrough(),
 });
@@ -6999,7 +7225,10 @@ export const PluginCatalogGetResponseSchema = z.object({
     plugins: z.array(
       z.object({
         id: PluginIdSchema,
-        clientBundle: z.string(),
+        /** Left out only when the request listed this plugin with the same `clientBundleHash`. */
+        clientBundle: z.string().optional(),
+        /** SHA-256 of `clientBundle`, hex encoded. */
+        clientBundleHash: z.string().optional(),
         requirements: PluginRequirementsSchema.optional(),
       }),
     ),
@@ -7195,6 +7424,11 @@ export const AgentSkillsImportLegacySelectionResponseSchema = z.object({
 });
 
 export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
+  WorkspaceLayoutInspectResponseSchema,
+  WorkspaceLayoutInitializeResponseSchema,
+  WorkspaceLayoutCommitResponseSchema,
+  WorkspaceLayoutReceiptResponseSchema,
+  WorkspaceLayoutChangedSchema,
   MainHostGetResponseSchema,
   MainHostSetResponseSchema,
   MainHostApplyResponseSchema,
@@ -7318,6 +7552,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   HubManagementDaemonDisconnectResponseSchema,
   HubManagementDaemonPermissionsUpdateResponseSchema,
   DiagnosticsResponseSchema,
+  DiagnosticsCpuProfileResponseSchema,
   GetDaemonConfigResponseMessageSchema,
   SetDaemonConfigResponseMessageSchema,
   ReadProjectConfigResponseMessageSchema,
@@ -7339,6 +7574,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceTitleSetResponseSchema,
   WorkspaceFieldValueSetResponseSchema,
   WorkspaceMoveResponseSchema,
+  WorkspacePinPlacementSetResponseSchema,
   WorkspacePinSetResponseSchema,
   WorkspaceSuperpinSetResponseSchema,
   WorkspaceRecoveryInspectResponseSchema,
@@ -7427,6 +7663,9 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   ChatWaitResponseSchema,
   ScheduleCreateResponseSchema,
   ScheduleListResponseSchema,
+  SpeechLocalModelsListResponseSchema,
+  SpeechLocalModelsDownloadResponseSchema,
+  SpeechLocalModelsDeleteResponseSchema,
   ScheduleInspectResponseSchema,
   ScheduleLogsResponseSchema,
   SchedulePauseResponseSchema,
@@ -7577,6 +7816,9 @@ export type DaemonGetHostStatsResponse = z.infer<typeof DaemonGetHostStatsRespon
 export type DaemonGetPairingOfferResponse = z.infer<typeof DaemonGetPairingOfferResponseSchema>;
 export type DaemonConfigReloadResponse = z.infer<typeof DaemonConfigReloadResponseSchema>;
 export type DiagnosticsResponse = z.infer<typeof DiagnosticsResponseSchema>;
+export type DiagnosticsCpuProfileResponse = z.infer<typeof DiagnosticsCpuProfileResponseSchema>;
+export type DiagnosticsCpuProfileSummary = z.infer<typeof DiagnosticsCpuProfileSummarySchema>;
+export type DiagnosticsCpuProfileFrame = z.infer<typeof DiagnosticsCpuProfileFrameSchema>;
 export type GetProvidersSnapshotResponseMessage = z.infer<
   typeof GetProvidersSnapshotResponseMessageSchema
 >;

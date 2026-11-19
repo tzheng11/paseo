@@ -1,3 +1,5 @@
+import type { WorkspaceSidebarPlacement } from "./workspace-pin-placement.js";
+import type { PluginLifecycle } from "./plugins/lifecycle/index.js";
 import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
 
@@ -6,7 +8,8 @@ import { getRealpathAwareRelativePath } from "../utils/path.js";
 import type { PersistedWorkspaceRecord } from "./workspace-registry.js";
 import type { WorkspaceProvisioningService } from "./session/workspace-provisioning/workspace-provisioning-service.js";
 import {
-  createWorktreeCore,
+  createPreparedWorktree,
+  prepareWorktreeCreation,
   type CreateWorktreeCoreDeps,
   type CreateWorktreeCoreInput,
 } from "./worktree-core.js";
@@ -37,6 +40,7 @@ export interface CreatePaseoWorktreeInput extends CreateWorktreeCoreInput {
   siblingOrder?: number;
   background?: boolean;
   callerWorkspaceId?: string;
+  sidebarPlacement?: WorkspaceSidebarPlacement;
 }
 
 export interface CreatePaseoWorktreeResult {
@@ -61,14 +65,31 @@ export interface AttemptFirstAgentBranchAutoNameResult {
 }
 
 export interface CreatePaseoWorktreeDeps extends CreateWorktreeCoreDeps {
+  lifecycle?: Pick<PluginLifecycle, "wait" | "before">;
   workspaceGitService: WorkspaceGitService;
-  workspaceProvisioning: Pick<WorkspaceProvisioningService, "createWorkspaceForWorktree">;
+  workspaceProvisioning: Pick<WorkspaceProvisioningService, "createWorkspaceForWorktree"> &
+    Partial<Pick<WorkspaceProvisioningService, "assertCreationAllowed">>;
+  preparationTimeoutMs?: number;
+}
+
+export const WORKTREE_PREPARATION_TIMEOUT_MS = 2 * 60_000;
+
+/** Preparation has no Git command timeout of its own; a create must not wait on it forever. */
+export class WorktreePreparationTimeoutError extends Error {
+  readonly code = "worktree_preparation_timeout";
+  constructor(timeoutMs: number) {
+    super(
+      `Worktree creation timed out after ${Math.round(timeoutMs / 1000)}s before git worktree add started; nothing was created. Retry the create.`,
+    );
+    this.name = "WorktreePreparationTimeoutError";
+  }
 }
 
 export async function createPaseoWorktree(
   input: CreatePaseoWorktreeInput,
   deps: CreatePaseoWorktreeDeps,
 ): Promise<CreatePaseoWorktreeResult> {
+  await deps.workspaceProvisioning.assertCreationAllowed?.();
   return runWithGitCommandPriority("high", () => createPaseoWorktreeWithPriority(input, deps));
 }
 
@@ -76,10 +97,26 @@ async function createPaseoWorktreeWithPriority(
   input: CreatePaseoWorktreeInput,
   deps: CreatePaseoWorktreeDeps,
 ): Promise<CreatePaseoWorktreeResult> {
-  const workspaceCwdPlan = await planWorkspaceCwdForWorktree(input.cwd, deps.workspaceGitService);
-  const createdWorktree = await createWorktreeCore(input, deps);
+  const { workspaceCwdPlan, prepared } = await withPreparationDeadline(
+    (async () => ({
+      workspaceCwdPlan: await planWorkspaceCwdForWorktree(input.cwd, deps.workspaceGitService),
+      prepared: await prepareWorktreeCreation(input, deps),
+    }))(),
+    deps.preparationTimeoutMs ?? WORKTREE_PREPARATION_TIMEOUT_MS,
+  );
+  // Only reached before the deadline, so an abandoned preparation never adds a worktree late.
+  const createdWorktree = await createPreparedWorktree(prepared, input);
   try {
-    maybeMarkFirstAgentBranchAutoNameEligible({ createdWorktree });
+    if (createdWorktree.created) {
+      await deps.lifecycle?.wait("worktree.create.after", {
+        worktree: {
+          path: createdWorktree.worktree.worktreePath,
+          branch: createdWorktree.worktree.branchName,
+          sourceCheckout: workspaceCwdPlan.sourceCheckout,
+        },
+      });
+    }
+    await maybeMarkFirstAgentBranchAutoNameEligible({ createdWorktree });
     const workspaceCwd = mapWorkspaceRelativeCwdToWorktree({
       relativeWorkspaceCwd: workspaceCwdPlan.relativeWorkspaceCwd,
       targetWorktreePath: createdWorktree.worktree.worktreePath,
@@ -109,6 +146,7 @@ async function createPaseoWorktreeWithPriority(
       siblingOrder: input.siblingOrder,
       background: input.background,
       callerWorkspaceId: input.callerWorkspaceId,
+      sidebarPlacement: input.sidebarPlacement,
       ...(createdWorktree.intent.kind === "checkout-change-request" &&
       createdWorktree.intent.headRepository
         ? {
@@ -148,6 +186,18 @@ async function createPaseoWorktreeWithPriority(
   }
 }
 
+async function withPreparationDeadline<T>(preparation: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new WorktreePreparationTimeoutError(timeoutMs)), timeoutMs);
+  });
+  try {
+    return await Promise.race([preparation, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function isDirectory(targetPath: string): Promise<boolean> {
   try {
     return (await stat(targetPath)).isDirectory();
@@ -159,7 +209,7 @@ async function isDirectory(targetPath: string): Promise<boolean> {
 async function planWorkspaceCwdForWorktree(
   inputCwd: string,
   workspaceGitService: Pick<WorkspaceGitService, "getCheckout">,
-): Promise<{ inputCwd: string; relativeWorkspaceCwd: string }> {
+): Promise<{ inputCwd: string; relativeWorkspaceCwd: string; sourceCheckout: string }> {
   const normalizedInputCwd = resolve(inputCwd);
   const sourceCheckout = await workspaceGitService.getCheckout(normalizedInputCwd);
   const sourceWorktreePath = sourceCheckout.worktreeRoot ?? normalizedInputCwd;
@@ -167,7 +217,7 @@ async function planWorkspaceCwdForWorktree(
   if (relativeWorkspaceCwd === null) {
     throw new Error(`Workspace cwd is outside its source worktree: ${normalizedInputCwd}`);
   }
-  return { inputCwd: normalizedInputCwd, relativeWorkspaceCwd };
+  return { inputCwd: normalizedInputCwd, relativeWorkspaceCwd, sourceCheckout: sourceWorktreePath };
 }
 
 export async function attemptFirstAgentBranchAutoName(options: {
@@ -186,9 +236,9 @@ export async function attemptFirstAgentBranchAutoName(options: {
     return { attempted: false, renamed: false, branchName: null };
   }
 
-  let metadata: ReturnType<typeof readPaseoWorktreeMetadata>;
+  let metadata: Awaited<ReturnType<typeof readPaseoWorktreeMetadata>>;
   try {
-    metadata = readPaseoWorktreeMetadata(options.cwd);
+    metadata = await readPaseoWorktreeMetadata(options.cwd);
   } catch {
     return { attempted: false, renamed: false, branchName: null };
   }
@@ -203,11 +253,11 @@ export async function attemptFirstAgentBranchAutoName(options: {
   const getCurrentBranchImpl = options.getCurrentBranch ?? getCurrentBranch;
   const placeholderBranchName = metadata.firstAgentBranchAutoName.placeholderBranchName;
   if ((await getCurrentBranchImpl(options.cwd)) !== placeholderBranchName) {
-    markPaseoWorktreeFirstAgentBranchAutoNameAttempted(options.cwd);
+    await markPaseoWorktreeFirstAgentBranchAutoNameAttempted(options.cwd);
     return { attempted: true, renamed: false, branchName: null };
   }
 
-  markPaseoWorktreeFirstAgentBranchAutoNameAttempted(options.cwd);
+  await markPaseoWorktreeFirstAgentBranchAutoNameAttempted(options.cwd);
 
   const branchName = await options.generateBranchNameFromContext({
     cwd: options.cwd,
@@ -268,15 +318,15 @@ async function findAvailableBranchName(options: {
   return null;
 }
 
-function maybeMarkFirstAgentBranchAutoNameEligible(options: {
-  createdWorktree: Awaited<ReturnType<typeof createWorktreeCore>>;
-}): void {
+async function maybeMarkFirstAgentBranchAutoNameEligible(options: {
+  createdWorktree: Awaited<ReturnType<typeof createPreparedWorktree>>;
+}): Promise<void> {
   const { createdWorktree } = options;
   if (!createdWorktree.created || createdWorktree.intent.kind !== "branch-off") {
     return;
   }
 
-  writePaseoWorktreeFirstAgentBranchAutoNameMetadata(createdWorktree.worktree.worktreePath, {
+  await writePaseoWorktreeFirstAgentBranchAutoNameMetadata(createdWorktree.worktree.worktreePath, {
     placeholderBranchName: createdWorktree.worktree.branchName,
   });
 }

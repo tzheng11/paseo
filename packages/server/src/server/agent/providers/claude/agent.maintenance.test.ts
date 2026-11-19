@@ -1,5 +1,5 @@
 import { ChildProcess } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -11,6 +11,12 @@ import type { AgentStreamEvent } from "../../agent-sdk-types.js";
 import { ClaudeAgentClient } from "./agent.js";
 import type { ClaudeQuery, ClaudeQueryInput } from "./query.js";
 import { claudeProjectDirSync } from "./project-dir.js";
+import { AgentManager } from "../../agent-manager.js";
+import { AgentStorage } from "../../agent-storage.js";
+import { ReloadOperationStore } from "../../reload-operation-store.js";
+import { MessageReceipts } from "../../../message-receipts/index.js";
+import { buildProviderRegistry, getAgentProviderDefinition } from "../../provider-registry.js";
+import { startAgentRun, waitForAgentRunStartWithTimeout } from "../../agent-prompt.js";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -230,6 +236,41 @@ describe("Claude credential maintenance", () => {
     );
   }
 
+  test("history cleanup failure cannot bypass query and child shutdown", async () => {
+    const h = harness();
+    const session = await h.resume();
+    const internals = session as unknown as { historyLoad: Promise<void> };
+    internals.historyLoad = Promise.reject(new Error("disposable cache removal failed"));
+    await expect(session.close()).resolves.toBeUndefined();
+    expect(h.query.closeCalls).toBe(1);
+    expect(h.terminations).toContain(h.child);
+  });
+
+  test("retirement closes its owned child even when query close throws", async () => {
+    const h = harness();
+    const session = await h.resume();
+    const internals = session as unknown as { retireQuery(): Promise<void> };
+    vi.spyOn(h.query, "close").mockImplementation(() => {
+      throw new Error("query retirement failed");
+    });
+    await expect(internals.retireQuery()).rejects.toThrow("query retirement failed");
+    expect(h.terminations).toContain(h.child);
+    await session.close();
+  });
+
+  test("close retains and retries a retiring child with unconfirmed termination", async () => {
+    const h = harness();
+    const session = await h.resume();
+    h.cleanupResult = "kill-timeout";
+    const internals = session as unknown as { retireQuery(): Promise<void> };
+    await expect(internals.retireQuery()).rejects.toMatchObject({
+      code: "reload_cleanup_unconfirmed",
+    });
+    h.cleanupResult = "terminated";
+    await expect(session.close()).resolves.toBeUndefined();
+    expect(h.terminations).toEqual([h.child, h.child]);
+  });
+
   test("warms a fresh control-ready query without sending a model prompt", async () => {
     const h = harness();
     const session = await h.resume();
@@ -296,6 +337,331 @@ describe("Claude credential maintenance", () => {
     });
     expect(JSON.stringify(events)).not.toContain("BEFORE MAINTENANCE");
     await session.close();
+  });
+
+  test("quota-failed Claude reload reuses live adapter history and accepts a later prompt", async () => {
+    const h = harness();
+    const logger = createTestLogger();
+    const manager = new AgentManager({
+      clients: { claude: h.client },
+      logger,
+      registry: new AgentStorage(path.join(root, "agents"), logger),
+      reloadOperations: new ReloadOperationStore(path.join(root, "reloads"), logger),
+      recoveryMessages: new MessageReceipts(path.join(root, "receipts")),
+    });
+    const agent = await manager.createAgent({ provider: "claude", cwd }, undefined, {
+      workspaceId: undefined,
+    });
+    try {
+      const failed = expect(manager.runAgent(agent.id, "original task")).rejects.toThrow();
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+      await h.query.emit({
+        type: "assistant",
+        error: "rate_limit",
+        uuid: "quota-error",
+        session_id: sessionId,
+        message: { role: "assistant", content: [{ type: "text", text: "Quota exhausted" }] },
+      });
+      await h.query.emit({
+        type: "result",
+        subtype: "error_during_execution",
+        uuid: "quota-result",
+        session_id: sessionId,
+        errors: ["Quota exhausted"],
+      });
+      await failed;
+      await vi.waitFor(() =>
+        expect(manager.getAgent(agent.id)?.quotaTurnCheckpoint?.turnId).toEqual(expect.any(String)),
+      );
+      writeTranscript("transcript replay must remain deferred across a hot reload");
+      await manager.reloadAgentCredentials(agent.id, "quota-reload", {
+        credentialGeneration: "new-account",
+        credentialChangedAt: new Date().toISOString(),
+      });
+      await vi.waitFor(async () => {
+        const operation = await manager.getReloadOperation("quota-reload");
+        expect({ prompts: h.prompts.length, operation }).toMatchObject({ prompts: 2 });
+      });
+      const replacement = h.queries[1];
+      await replacement.emit({
+        type: "result",
+        subtype: "success",
+        uuid: "continued",
+        session_id: sessionId,
+        result: "done",
+        is_error: false,
+        usage: {},
+        modelUsage: {},
+      });
+      await vi.waitFor(async () =>
+        expect((await manager.getReloadOperation("quota-reload"))?.continuation?.status).toBe(
+          "submitted",
+        ),
+      );
+      await vi.waitFor(() => expect(manager.hasInFlightRun(agent.id)).toBe(false));
+      const reloaded = manager.getAgent(agent.id);
+      if (!reloaded || !("session" in reloaded)) throw new Error("Expected loaded Claude session");
+      // The manager retained the timeline; replaying it also rebuilds all sidechains before input.
+      expect(await reloaded.session.streamHistory().next()).toEqual({
+        done: true,
+        value: undefined,
+      });
+      const later = manager.runAgent(agent.id, "later prompt");
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(3));
+      await replacement.emit({
+        type: "result",
+        subtype: "success",
+        uuid: "later",
+        session_id: sessionId,
+        result: "done",
+        is_error: false,
+        usage: {},
+        modelUsage: {},
+      });
+      await later;
+      expect(h.spawnCalls).toBe(2);
+    } finally {
+      await manager.closeAgent(agent.id);
+    }
+  });
+
+  test.each([
+    {
+      reason: "a different native session id",
+      previousSessionId: "6f237dcc-f14d-48f1-b288-9067da29ad58",
+      closePrevious: true,
+    },
+    { reason: "a previous session still open", previousSessionId: sessionId, closePrevious: false },
+  ])(
+    "maintenance with $reason replays history and accepts a later plain prompt",
+    async (scenario) => {
+      const h = harness();
+      writeTranscript("previous transcript");
+      const previous = await h.client.resumeSession(
+        { provider: "claude", sessionId: scenario.previousSessionId },
+        { cwd },
+      );
+      if (scenario.closePrevious) await previous.close();
+      writeTranscript("requested session history after fallback");
+      try {
+        const replacement = await h.client.resumeSession(
+          { provider: "claude", sessionId },
+          { cwd },
+          undefined,
+          { purpose: "maintenance", previousSession: previous },
+        );
+        const events: AgentStreamEvent[] = [];
+        replacement.subscribe((event) => events.push(event));
+        try {
+          const { turnId } = await replacement.startTurn("plain prompt after maintenance fallback");
+          await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+          const history: AgentStreamEvent[] = [];
+          for await (const event of replacement.streamHistory()) history.push(event);
+          await h.query.emit({
+            type: "result",
+            subtype: "success",
+            uuid: "fallback-complete",
+            session_id: sessionId,
+            result: "done",
+            is_error: false,
+            usage: {},
+            modelUsage: {},
+          });
+          expect(history).toContainEqual({
+            type: "timeline",
+            provider: "claude",
+            timestamp: "2026-10-17T10:00:00.000Z",
+            item: {
+              type: "user_message",
+              text: "requested session history after fallback",
+              messageId: "history-user",
+            },
+          });
+          expect(events).toContainEqual({ type: "turn_started", provider: "claude", turnId });
+          expect(events).toContainEqual(
+            expect.objectContaining({ type: "turn_completed", provider: "claude", turnId }),
+          );
+        } finally {
+          await replacement.close();
+        }
+      } finally {
+        await previous.close();
+      }
+    },
+  );
+
+  test("registered provider wrappers retain task and rewind state across maintenance", async () => {
+    const h = harness();
+    const definition = getAgentProviderDefinition("claude");
+    if (!definition) throw new Error("Expected Claude definition");
+    const registry = buildProviderRegistry(createTestLogger(), {
+      pluginProviders: {
+        "test-claude": {
+          ...definition,
+          id: "test-claude",
+          supportsExactMcpPreapproval: true,
+          createClient: () => h.client,
+        },
+      },
+    });
+    const client = registry["test-claude"].createClient(createTestLogger());
+    const directory = claudeProjectDirSync(cwd, { configDir });
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(
+      path.join(directory, `${sessionId}.jsonl`),
+      [
+        { type: "user", uuid: "user-1", message: { role: "user", content: "first" } },
+        {
+          type: "assistant",
+          uuid: "assistant-1",
+          message: { role: "assistant", content: "answer" },
+        },
+        { type: "user", uuid: "user-2", message: { role: "user", content: "second" } },
+        {
+          type: "assistant",
+          message: {
+            content: [
+              {
+                type: "tool_use",
+                id: "create",
+                name: "TaskCreate",
+                input: { subject: "Retained task" },
+              },
+            ],
+          },
+        },
+        {
+          type: "user",
+          message: { content: [{ type: "tool_result", tool_use_id: "create", content: "ok" }] },
+          toolUseResult: { task: { id: "1", subject: "Retained task" } },
+        },
+      ]
+        .map((entry) => JSON.stringify(entry))
+        .join("\n"),
+    );
+    const previous = await client.resumeSession({ provider: "test-claude", sessionId }, { cwd });
+    for await (const _ of previous.streamHistory()) {
+      /* manager consumes initial history */
+    }
+    await previous.close();
+    writeTranscript("Full replay should not replace the retained adapter state");
+    const replacement = await client.resumeSession(
+      { provider: "test-claude", sessionId },
+      { cwd },
+      undefined,
+      {
+        purpose: "maintenance",
+        previousSession: previous,
+      },
+    );
+    const events: AgentStreamEvent[] = [];
+    replacement.subscribe((event) => events.push(event));
+    try {
+      await replacement.startTurn("continue");
+      expect(await replacement.streamHistory().next()).toEqual({ done: true, value: undefined });
+      await h.query.emit({
+        type: "assistant",
+        uuid: "update",
+        session_id: sessionId,
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "update",
+              name: "TaskUpdate",
+              input: { taskId: "1", status: "completed" },
+            },
+          ],
+        },
+      });
+      await h.query.emit({
+        type: "user",
+        uuid: "updated",
+        session_id: sessionId,
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "update", content: "ok" }],
+        },
+        tool_use_result: { success: true, taskId: "1" },
+      });
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "timeline",
+          item: {
+            type: "todo",
+            items: [{ id: "1", text: "Retained task", status: "completed", completed: true }],
+          },
+        }),
+      );
+      await h.query.emit({
+        type: "result",
+        subtype: "success",
+        uuid: "complete",
+        session_id: sessionId,
+        result: "done",
+        is_error: false,
+        usage: {},
+        modelUsage: {},
+      });
+      await replacement.revertConversation?.({ messageId: "user-2" });
+      expect(h.forks).toEqual(["assistant-1"]);
+    } finally {
+      await replacement.close();
+    }
+  });
+
+  test("a real Claude pre-input startup failure records failed delivery and permits the next send", async () => {
+    let available = false;
+    const h = harness({
+      resolveBinary: async () => {
+        if (!available) throw new Error("fixture binary unavailable");
+        return "/fake/claude";
+      },
+    });
+    const logger = createTestLogger();
+    const manager = new AgentManager({ clients: { claude: h.client }, logger });
+    const agent = await manager.createAgent({ provider: "claude", cwd }, undefined, {
+      workspaceId: undefined,
+    });
+    const receiptsDirectory = path.join(root, "failed-delivery");
+    const receipts = new MessageReceipts(receiptsDirectory);
+    try {
+      await expect(
+        receipts.send({
+          agentId: agent.id,
+          messageId: "cannot-start",
+          request: {},
+          send: async () => {
+            await startAgentRun(manager, agent.id, "cannot start", logger);
+            await vi.waitFor(() => expect(manager.hasInFlightRun(agent.id)).toBe(false));
+            await waitForAgentRunStartWithTimeout(manager, agent.id);
+          },
+        }),
+      ).rejects.toThrow("fixture binary unavailable");
+      const files = readdirSync(receiptsDirectory);
+      expect(files).toHaveLength(1);
+      expect(
+        JSON.parse(readFileSync(path.join(receiptsDirectory, files[0]), "utf8")),
+      ).toMatchObject({ state: "failed" });
+      expect(manager.hasInFlightRun(agent.id)).toBe(false);
+      available = true;
+      const later = manager.runAgent(agent.id, "later prompt");
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+      await h.query.emit({
+        type: "result",
+        subtype: "success",
+        uuid: "later",
+        session_id: sessionId,
+        result: "done",
+        is_error: false,
+        usage: {},
+        modelUsage: {},
+      });
+      await later;
+    } finally {
+      await manager.closeAgent(agent.id);
+    }
   });
 
   test("closing during deferred large-history replay cancels it without blocking callbacks", async () => {

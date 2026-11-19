@@ -20,7 +20,7 @@ export interface WorkspaceStructureProject {
   workspaceKeys: string[];
   workspaceHierarchy?: Record<
     string,
-    Pick<WorkspaceDescriptor, "parentWorkspaceId" | "siblingOrder">
+    Pick<WorkspaceDescriptor, "parentWorkspaceId" | "siblingOrder" | "pinPlacement">
   >;
 }
 
@@ -34,6 +34,14 @@ interface WorkspaceStructureSession {
   workspaces: Iterable<WorkspaceDescriptor>;
 }
 
+export type WorkspaceSort = "manual" | "created" | "lastPrompt";
+
+interface WorkspaceSortItem {
+  workspaceName: string;
+  workspaceKey: string;
+  sortTime: number;
+}
+
 interface ProjectDraft {
   viewKey: string;
   projectKey: string | null;
@@ -45,17 +53,19 @@ interface ProjectDraft {
   workspaces: WorkspaceStructureItem[];
 }
 
-interface WorkspaceStructureItem {
+interface WorkspaceStructureItem extends WorkspaceSortItem {
   workspaceId: string;
   workspaceName: string;
   workspaceKey: string;
   parentWorkspaceId?: string | null;
   siblingOrder?: number;
+  pinPlacement?: WorkspaceDescriptor["pinPlacement"];
 }
 
 /** The single app boundary that turns host-local projects into grouped display projects. */
 export function buildWorkspaceStructureProjects(input: {
   sessions: WorkspaceStructureSession[];
+  workspaceSort?: WorkspaceSort;
 }): WorkspaceStructureProject[] {
   const byProject = new Map<string, ProjectDraft>();
   const projectEntries: Array<{ serverId: string; project: ProjectDescriptor }> = [];
@@ -97,9 +107,11 @@ export function buildWorkspaceStructureProjects(input: {
       if (!viewKey) continue;
       byProject.get(viewKey)?.workspaces.push({
         workspaceId: workspace.id,
+        sortTime: workspaceSortTime(workspace, input.workspaceSort),
         workspaceName: workspace.name,
         workspaceKey: `${session.serverId}:${workspace.id}`,
         parentWorkspaceId: workspace.parentWorkspaceId,
+        pinPlacement: workspace.pinPlacement,
         siblingOrder: workspace.siblingOrder,
       });
     }
@@ -116,7 +128,11 @@ export function buildWorkspaceStructureProjects(input: {
           iconWorkingDir: draft.iconWorkingDir,
           hosts: Array.from(draft.hosts.values()),
           workspaceKeys: draft.workspaces
-            .sort(compareWorkspaceStructureItems)
+            .sort(
+              input.workspaceSort && input.workspaceSort !== "manual"
+                ? compareWorkspaceTimes
+                : compareWorkspaceStructureItems,
+            )
             .map((workspace) => workspace.workspaceKey),
         },
         workspaceHierarchy(draft.workspaces),
@@ -231,7 +247,7 @@ function compareWorkspaceStructureItems(
     left.workspaceName.localeCompare(right.workspaceName, undefined, {
       numeric: true,
       sensitivity: "base",
-    }) || left.workspaceId.localeCompare(right.workspaceId, undefined, { sensitivity: "base" })
+    }) || left.workspaceKey.localeCompare(right.workspaceKey)
   );
 }
 
@@ -240,7 +256,10 @@ function workspaceHierarchy(
 ): Pick<WorkspaceStructureProject, "workspaceHierarchy"> {
   const entries = workspaces
     .filter(
-      (workspace) => workspace.siblingOrder !== undefined || workspace.parentWorkspaceId != null,
+      (workspace) =>
+        workspace.siblingOrder !== undefined ||
+        workspace.parentWorkspaceId != null ||
+        workspace.pinPlacement !== undefined,
     )
     .map(
       (workspace) =>
@@ -248,9 +267,26 @@ function workspaceHierarchy(
           workspace.workspaceKey,
           {
             parentWorkspaceId: workspace.parentWorkspaceId ?? null,
+            ...(workspace.pinPlacement ? { pinPlacement: workspace.pinPlacement } : {}),
             siblingOrder: workspace.siblingOrder,
           },
         ] as const,
     );
   return entries.length > 0 ? { workspaceHierarchy: Object.fromEntries(entries) } : {};
+}
+
+function workspaceSortTime(
+  workspace: WorkspaceDescriptor,
+  sort: WorkspaceSort | undefined,
+): number {
+  if (!sort) return 0;
+  const time =
+    sort === "lastPrompt"
+      ? (workspace.lastUserMessageAt ?? workspace.createdAt)
+      : workspace.createdAt;
+  return time?.getTime() ?? 0;
+}
+
+function compareWorkspaceTimes(left: WorkspaceSortItem, right: WorkspaceSortItem): number {
+  return right.sortTime - left.sortTime || left.workspaceKey.localeCompare(right.workspaceKey);
 }

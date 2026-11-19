@@ -9,6 +9,7 @@ import {
 import { expect, type Page } from "@playwright/test";
 import { metroTest as test } from "../support/fixtures";
 import { gotoAppShell } from "../support/helpers/app";
+import { seedProjectSidebarGrouping } from "../support/helpers/sidebar";
 import {
   createMockIdleAgent,
   expectSessionRowArchived,
@@ -66,6 +67,7 @@ test.describe("Worktree restore after daemon restart", () => {
   });
 
   async function seedBrowser(page: Page) {
+    await seedProjectSidebarGrouping(page);
     const nowIso = new Date().toISOString();
     await page.addInitScript(
       ({ host, preferences }) => {

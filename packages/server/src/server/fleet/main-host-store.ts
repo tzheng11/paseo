@@ -6,8 +6,9 @@ import {
   sign,
   verify,
 } from "node:crypto";
-import { chmod, link, mkdir, open, readFile, rename, rm } from "node:fs/promises";
+import { chmod, link, mkdir, readFile, rm } from "node:fs/promises";
 import path from "node:path";
+import { writeFileDurably as replaceDurably } from "../atomic-file.js";
 import { z } from "zod";
 import {
   MAIN_HOST_MAX_GENERATION,
@@ -329,26 +330,4 @@ function isMissing(error: unknown): boolean {
 
 function isFileExists(error: unknown): boolean {
   return error instanceof Error && "code" in error && error.code === "EEXIST";
-}
-
-async function replaceDurably(filePath: string, contents: string): Promise<void> {
-  const temporary = `${filePath}.${randomUUID()}.tmp`;
-  const file = await open(temporary, "wx", 0o600);
-  try {
-    await file.writeFile(contents, "utf8");
-    await file.sync();
-    await file.close();
-    await rename(temporary, filePath);
-    // Windows cannot flush a directory opened for reading; file data is already synced.
-    if (process.platform === "win32") return;
-    const directory = await open(path.dirname(filePath), "r");
-    try {
-      await directory.sync();
-    } finally {
-      await directory.close();
-    }
-  } finally {
-    await file.close();
-    await rm(temporary, { force: true });
-  }
 }

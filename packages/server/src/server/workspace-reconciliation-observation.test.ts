@@ -20,6 +20,7 @@ import {
   type ReconciliationClock,
   type ReconciliationTimer,
   WorkspaceReconciliationService,
+  type WorkspaceReconciliationServiceOptions,
 } from "./workspace-reconciliation-service.js";
 
 const TIMESTAMP = "2026-07-15T00:00:00.000Z";
@@ -30,6 +31,11 @@ const cleanupPaths: string[] = [];
 afterEach(() => {
   for (const target of cleanupPaths.splice(0)) rmSync(target, { recursive: true, force: true });
 });
+
+/** Lets a pass that was wrongly started reach its file-backed registry reads. */
+function settleRegistryIo(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 50));
+}
 
 interface ProjectSpec {
   id: string;
@@ -102,11 +108,15 @@ interface TestTimer extends ReconciliationTimer {
 }
 
 class TestClock implements ReconciliationClock {
-  private now = 0;
+  private current = 0;
   private readonly timers = new Set<TestTimer>();
 
   get pendingCount(): number {
     return this.timers.size;
+  }
+
+  now(): number {
+    return this.current;
   }
 
   setTimeout(callback: () => void | Promise<void>, delayMs: number): TestTimer {
@@ -126,18 +136,19 @@ class TestClock implements ReconciliationClock {
   }
 
   async advanceBy(elapsedMs: number): Promise<void> {
-    const target = this.now + elapsedMs;
+    const target = this.current + elapsedMs;
     for (;;) {
       const next = [...this.timers]
         .filter((timer) => timer.dueAt <= target)
         .sort((left, right) => left.dueAt - right.dueAt)[0];
       if (!next) break;
-      this.now = next.dueAt;
+      this.current = next.dueAt;
       if (next.intervalMs === null) this.timers.delete(next);
       else next.dueAt += next.intervalMs;
       await next.callback();
     }
-    this.now = target;
+    // A nested advance may already have moved past this target; time never runs backwards.
+    this.current = Math.max(this.current, target);
   }
 
   private add(
@@ -145,7 +156,7 @@ class TestClock implements ReconciliationClock {
     delayMs: number,
     intervalMs: number | null,
   ): TestTimer {
-    const timer = { callback, dueAt: this.now + delayMs, intervalMs, unref: () => undefined };
+    const timer = { callback, dueAt: this.current + delayMs, intervalMs, unref: () => undefined };
     this.timers.add(timer);
     return timer;
   }
@@ -176,7 +187,12 @@ class ObservedPlacements {
   private started = false;
   private checkoutReadCount = 0;
 
-  constructor(private readonly specs: ProjectSpec[]) {
+  constructor(
+    private readonly specs: ProjectSpec[],
+    serviceOptions: Pick<WorkspaceReconciliationServiceOptions, "passCooldownMs"> = {
+      passCooldownMs: () => 0,
+    },
+  ) {
     cleanupPaths.push(this.home);
     const logger = createTestLogger();
     this.projects = new ObservedProjectRegistry(path.join(this.home, "projects.json"), logger);
@@ -200,6 +216,7 @@ class ObservedPlacements {
       clock: this.clock,
       debounceMs: DEBOUNCE_MS,
       rescanIntervalMs: RESCAN_INTERVAL_MS,
+      ...serviceOptions,
       onProjectUpdate: (update) => {
         this.projectEvents.push(update);
         this.lifecycleEvents.push(
@@ -495,6 +512,10 @@ describe("observed workspace placement", () => {
 
     expect((await observed.placement("workspace-one"))?.archivedAt).toEqual(expect.any(String));
     expect(observed.workspaceBatches).toEqual([["workspace-one"]]);
+    const archived = await observed.placement("workspace-one");
+    await observed.advanceBy(RESCAN_INTERVAL_MS);
+    expect(await observed.placement("workspace-one")).toEqual(archived);
+    expect(observed.workspaceBatches).toEqual([["workspace-one"]]);
     observed.dispose();
   });
 
@@ -521,6 +542,30 @@ describe("observed workspace placement", () => {
 
     expect((await observed.placement("workspace-one"))?.archivedAt).toEqual(expect.any(String));
     expect(observed.workspaceBatches).toEqual([["workspace-one"]]);
+    observed.dispose();
+  });
+
+  test("idles for as long as the last pass ran before a queued pass starts", async () => {
+    const observed = new ObservedPlacements([{ id: "project-one", root: "repo" }], {});
+    await observed.start();
+    const slowPass = observed.holdNextReconciliation();
+    observed.change("repo", ".git");
+    const firstPass = observed.advanceBy(DEBOUNCE_MS);
+    await slowPass.started;
+    // Watch events and periodic rescans that land during the pass coalesce into one pass.
+    observed.change("repo", ".git");
+    await observed.advanceBy(700);
+    slowPass.release();
+    await firstPass;
+    await settleRegistryIo();
+    expect(observed.gitReads).toBe(1);
+
+    observed.change("repo", ".git");
+    await observed.advanceBy(699);
+    await settleRegistryIo();
+    expect(observed.gitReads).toBe(1);
+    await observed.advanceBy(1);
+    expect(observed.gitReads).toBe(2);
     observed.dispose();
   });
 

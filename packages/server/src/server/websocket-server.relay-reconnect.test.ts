@@ -1,4 +1,5 @@
 import { AgentHistoryReplay } from "./agent/agent-history-replay.js";
+import { createWorkspaceRuntimeStore } from "./workspace-runtime-store/index.js";
 import { SessionDelivery } from "./session/owned-subscriptions/index.js";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { Server as HTTPServer } from "http";
@@ -286,6 +287,7 @@ function createServer(options?: {
     null,
     { allowedOrigins: new Set(), startPaused: options?.startPaused },
     createWorkspaceAutoNameStub(),
+    createWorkspaceRuntimeStore(),
     options?.auth,
     speechReadiness
       ? {
@@ -540,7 +542,7 @@ describe("relay external socket reconnect behavior", () => {
       await server.close();
     }
   });
-  test("admits a hello password and an old relay hello, but rejects a wrong password", async () => {
+  test("admits a relay hello password, but rejects a wrong or missing password", async () => {
     const server = createServer({
       auth: {
         password: "$2b$12$OLxyuuP9uLK30Uzc4wQX0O6liuU/Q1t5P2b0Ebf36mULvpVK3DRZW",
@@ -562,7 +564,8 @@ describe("relay external socket reconnect behavior", () => {
       const legacySocket = new MockSocket();
       await server.attachExternalSocket(legacySocket, { transport: "relay" });
       legacySocket.emit("message", JSON.stringify(createHelloMessage("relay-legacy")));
-      await vi.waitFor(() => expect(sentServerInfoEnvelopes(legacySocket)).toHaveLength(1));
+      await vi.waitFor(() => expect(legacySocket.readyState).toBe(3));
+      expect(sentServerInfoEnvelopes(legacySocket)).toHaveLength(0);
 
       const wrongSocket = new MockSocket();
       await server.attachExternalSocket(wrongSocket, { transport: "relay" });
@@ -745,6 +748,7 @@ describe("relay external socket reconnect behavior", () => {
 
     const pluginSocket = new MockSocket();
     const attachment = await server.attachPluginSocket("startup", pluginSocket);
+    expect(attachment.connectionId).toMatch(/^conn_[a-f0-9]{32}$/);
     pluginSocket.emit("message", JSON.stringify(createHelloMessage("plugin:startup")));
     await vi.waitFor(() => expect(sessionMock.instances).toHaveLength(1));
 
@@ -1199,6 +1203,7 @@ describe("relay external socket reconnect behavior", () => {
     expect(serverInfo.features?.workspaceSuperpinning).toBe(true);
     expect(serverInfo.features?.["terminal-input-mode-replay"]).toBe(true);
     expect(serverInfo.features?.["terminal-size-ownership"]).toBe(true);
+    expect(serverInfo.features?.["terminal-grapheme-widths"]).toBe(true);
     expect(serverInfo.features?.agentTurnIdentity).toBeUndefined();
     expect(serverInfo.permissions).toEqual(DAEMON_PERMISSIONS);
     await server.close();

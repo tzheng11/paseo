@@ -9,6 +9,7 @@ interface WorkspaceKeyboardDropInput {
   workspaceKey: string;
   targetKeys: readonly string[];
   currentDrop: WorkspaceTreeDrop | null;
+  canonicalOrder?: boolean;
 }
 interface KeyboardDropContext {
   input: WorkspaceKeyboardDropInput;

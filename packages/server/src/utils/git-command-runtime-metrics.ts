@@ -167,7 +167,7 @@ function topCounts(counts: ReadonlyMap<string, number>): Array<[string, number]>
     .slice(0, 12);
 }
 
-function summarizeDurations(samples: number[]): GitCommandDurationStats {
+export function summarizeDurations(samples: number[]): GitCommandDurationStats {
   if (samples.length === 0) {
     return { count: 0, p50Ms: 0, p95Ms: 0, maxMs: 0 };
   }

@@ -1,6 +1,7 @@
 import { useTranslation } from "react-i18next";
 import { useSidebarOrderStore } from "@/stores/sidebar-order-store";
 import { SidebarSectionHeader } from "./sidebar-section-header";
+import { ImportSavedPinLayout } from "./import-saved-pin-layout";
 import { WorkspaceSortMenu } from "./workspace-sort-menu";
 
 export function PinnedSectionHeader({
@@ -26,6 +27,7 @@ export function PinnedSectionHeader({
       onToggle={onToggle}
       testID={testID}
     >
+      {sortable ? <ImportSavedPinLayout /> : null}
       {sortable ? (
         <WorkspaceSortMenu
           mode={sortMode}

@@ -60,22 +60,25 @@ interface WorkflowReplayInput {
   convertEntry?: (entry: ClaudeReplayEntry) => AgentTimelineItem[];
 }
 
-export function observeReplayWorkflows(input: WorkflowReplayInput): SubagentObservation[] {
-  const observations: SubagentObservation[] = [];
-  for (const observation of replayWorkflows(input)) {
-    if (observation && observation.kind !== "read_entry") observations.push(observation);
-  }
-  return observations;
+export async function observeReplayWorkflows(
+  input: Omit<WorkflowReplayInput, "convertEntry"> & {
+    convertEntry?: (entry: ClaudeReplayEntry) => AgentTimelineItem[] | Promise<AgentTimelineItem[]>;
+  },
+): Promise<SubagentObservation[]> {
+  return observeReplayWorkflowsAsync(input, new AbortController().signal);
 }
 
 export async function observeReplayWorkflowsAsync(
-  input: WorkflowReplayInput & {
+  input: Omit<WorkflowReplayInput, "convertEntry"> & {
+    convertEntry?: (entry: ClaudeReplayEntry) => AgentTimelineItem[] | Promise<AgentTimelineItem[]>;
+  } & {
     readEntry?: (entry: ClaudeReplayEntry) => Promise<ClaudeReplayEntry>;
   },
   signal: AbortSignal,
 ): Promise<SubagentObservation[]> {
   const observations: SubagentObservation[] = [];
-  const replay = replayWorkflows(input);
+  let converted: AgentTimelineItem[] = [];
+  const replay = replayWorkflows({ ...input, convertEntry: () => converted });
   let step = replay.next();
   try {
     while (!step.done) {
@@ -87,6 +90,7 @@ export async function observeReplayWorkflowsAsync(
         const entry = input.readEntry
           ? await input.readEntry(observation.entry)
           : observation.entry;
+        converted = (await input.convertEntry?.(entry)) ?? [];
         step = replay.next(entry);
       } else {
         if (observation) observations.push(observation);

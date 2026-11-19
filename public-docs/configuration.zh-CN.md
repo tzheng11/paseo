@@ -84,7 +84,20 @@ Agent Provider，包括 Paseo 自带的一等 Provider 和你在 `agents.provide
 
 ## 空闲 Agent 运行时 {#idle-agent-runtimes}
 
-将 `agents.idleUnloadAfterMinutes` 设为 daemon 释放 Agent 的 Provider 进程前所需的空闲分钟数。默认值为 120；设为 0 可以禁用。此设置可以通过 `paseo reload` 应用，无需重启。Agent 仍会列为空闲，并在下次发送消息、读取时间线或附加时恢复会话。哪些检查会保留有后台工作或活动状态不确定的 Agent，见[运行时驻留](https://github.com/getpaseo/paseo/blob/main/docs/agent-lifecycle.md#runtime-residency)。
+当 daemon 和 Provider 的安全检查允许时，Paseo 会在 Agent 空闲一小时后释放可恢复的进程。
+Agent 仍显示为空闲；下次发送提示、读取历史或附加时恢复同一个会话。活动中的工作、后代 Agent、
+配额恢复、Hub 执行、语音清理和待发送的完成通知都会阻止清理。
+
+在 **设置 → 你的主机 → Agents** 中关闭 **释放空闲 Agent**，或设置：
+
+```json
+{ "agents": { "idleRuntimeCleanup": false } }
+```
+
+此设置默认为 `true`。自定义分支仍支持 `agents.idleUnloadAfterMinutes`：默认值为 60，
+保留已显式设置的时间，0 也会禁用清理。设置中的更改立即生效；配置文件更改在重新加载后生效。
+重新启用保留现有空闲计时。Provider 拒绝或活动状态不确定时，进程会保留。
+检查细节见[运行时驻留](https://github.com/getpaseo/paseo/blob/main/docs/agent-lifecycle.md#runtime-residency)。
 
 ## worktree {#worktrees}
 

@@ -3,6 +3,8 @@ import { runGitCommand, type RunGitCommand } from "../utils/run-git-command.js";
 export interface WorkspaceGitFetchResult {
   changes: WorkspaceGitRemoteRefChange[] | null;
   nonRemoteRefsChanged?: boolean;
+  /** Full names of local refs, tags and other non-remote refs that changed during the fetch. */
+  nonRemoteRefChanges?: string[];
   remoteRefs?: ReadonlySet<string>;
   error: unknown | null;
 }
@@ -33,7 +35,9 @@ export async function fetchWorkspaceGitRemote(
   try {
     await run(["fetch", "origin", "--prune"], {
       cwd,
-      envOverlay: { GIT_TERMINAL_PROMPT: "0" },
+      // Terminal prompting and graphical credential prompting have separate controls.
+      // Keep cached credentials available, but never start a login from a passive fetch.
+      envOverlay: { GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "", GCM_INTERACTIVE: "0" },
       timeout: 120_000,
     });
   } catch (caught) {
@@ -51,6 +55,7 @@ export async function fetchWorkspaceGitRemote(
   const result = {
     changes: diff.remoteChanges,
     nonRemoteRefsChanged: diff.nonRemoteRefsChanged,
+    nonRemoteRefChanges: diff.nonRemoteRefChanges,
     remoteRefs: collectWorkspaceGitRemoteRefs(after),
     error,
   } satisfies WorkspaceGitFetchResult;
@@ -88,6 +93,7 @@ export function parseWorkspaceGitRefs(stdout: string): Map<string, string> {
 export interface WorkspaceGitRefDiff {
   remoteChanges: WorkspaceGitRemoteRefChange[];
   nonRemoteRefsChanged: boolean;
+  nonRemoteRefChanges: string[];
 }
 
 export function diffWorkspaceGitRefs(
@@ -97,24 +103,25 @@ export function diffWorkspaceGitRefs(
   const remotePrefix = "refs/remotes/";
   const beforeRemote = new Map<string, string>();
   const afterRemote = new Map<string, string>();
-  let nonRemoteRefsChanged = false;
+  const nonRemoteRefChanges: string[] = [];
   for (const [ref, objectId] of before) {
     if (ref.startsWith(remotePrefix)) {
       beforeRemote.set(ref.slice(remotePrefix.length), objectId);
     } else if (after.get(ref) !== objectId) {
-      nonRemoteRefsChanged = true;
+      nonRemoteRefChanges.push(ref);
     }
   }
   for (const [ref, objectId] of after) {
     if (ref.startsWith(remotePrefix)) {
       afterRemote.set(ref.slice(remotePrefix.length), objectId);
     } else if (!before.has(ref)) {
-      nonRemoteRefsChanged = true;
+      nonRemoteRefChanges.push(ref);
     }
   }
   return {
     remoteChanges: diffWorkspaceGitRemoteRefs(beforeRemote, afterRemote),
-    nonRemoteRefsChanged,
+    nonRemoteRefsChanged: nonRemoteRefChanges.length > 0,
+    nonRemoteRefChanges,
   };
 }
 

@@ -2,6 +2,52 @@ import equal from "fast-deep-equal";
 import { create } from "zustand";
 import { subscribeWithSelector } from "zustand/middleware";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import {
+  resolveEffectiveWorkspaceLayout,
+  type WorkspaceLayoutSnapshot,
+  type WorkspaceLayoutEntry,
+  type EffectiveWorkspaceLayout,
+} from "@getpaseo/protocol/workspace-layout";
+
+let canonicalWorkspaceReadView: Map<
+  string,
+  { entry: WorkspaceLayoutEntry; view: EffectiveWorkspaceLayout }
+> | null = null;
+
+/** Directory caches remain native observations; only the shared read view is projected into UI state. */
+export function applyCanonicalWorkspaceLayout(snapshot: WorkspaceLayoutSnapshot | null): void {
+  if (snapshot?.semanticsVersion === 2 && snapshot.stamp.phase === "active") {
+    const effective = resolveEffectiveWorkspaceLayout(snapshot);
+    canonicalWorkspaceReadView = new Map(
+      snapshot.entries.map((entry) => {
+        const key = `${entry.ref.serverId}:${entry.ref.workspaceId}`;
+        return [key, { entry, view: effective.get(key)! }];
+      }),
+    );
+  } else canonicalWorkspaceReadView = null;
+  const state = useSessionStore.getState();
+  for (const [serverId, session] of Object.entries(state.sessions))
+    state.setWorkspaces(serverId, session.workspaces);
+}
+
+function projectCanonicalWorkspace(
+  serverId: string,
+  workspace: WorkspaceDescriptor,
+): WorkspaceDescriptor {
+  if (!canonicalWorkspaceReadView) return workspace;
+  const projected = canonicalWorkspaceReadView.get(`${serverId}:${workspace.id}`);
+  if (!projected) return { ...workspace, effectiveSection: null };
+  const { entry, view } = projected;
+  return {
+    ...workspace,
+    pinnedAt: view.section === null ? entry.pinnedAt : view.pinnedAt,
+    superpinnedAt: view.section === null ? entry.superpinnedAt : view.superpinnedAt,
+    effectiveSection: view.section,
+    pinPlacement: entry.pinPlacement ?? undefined,
+    parentWorkspaceId: entry.parent?.workspaceId ?? null,
+    siblingOrder: entry.siblingOrder ?? undefined,
+  };
+}
 import type { ViewedTimelineOwner } from "@/timeline/viewed-timeline-sync";
 import type { AgentDirectoryEntry } from "@/types/agent-directory";
 import {
@@ -103,9 +149,12 @@ export interface Agent {
 }
 
 export interface WorkspaceDescriptor {
+  createdAt: Date | null;
+  lastUserMessageAt: Date | null;
   id: string;
   parentWorkspaceId?: string | null;
   siblingOrder?: number;
+  pinPlacement?: WorkspaceDescriptorPayload["pinPlacement"];
   projectId: string;
   projectDisplayName: string;
   projectCustomName?: string | null;
@@ -121,6 +170,7 @@ export interface WorkspaceDescriptor {
   title?: string | null;
   pinnedAt?: string | null;
   superpinnedAt?: string | null;
+  effectiveSection?: "unpinned" | "pinned" | "superpinned" | null;
   labels?: string[];
   fieldValues?: WorkspaceDescriptorPayload["fieldValues"];
   status: WorkspaceDescriptorPayload["status"];
@@ -134,6 +184,11 @@ export interface WorkspaceDescriptor {
   project?: ProjectPlacementPayload;
 }
 
+function workspaceEffectiveSection(payload: WorkspaceDescriptorPayload) {
+  if (payload.effectiveSection === undefined) return {};
+  return { effectiveSection: payload.effectiveSection };
+}
+
 export function normalizeWorkspaceDescriptor(
   payload: WorkspaceDescriptorPayload,
 ): WorkspaceDescriptor {
@@ -143,9 +198,13 @@ export function normalizeWorkspaceDescriptor(
       ? new Date(statusEnteredAtRaw)
       : null;
   return {
+    // COMPAT(workspaceSortTimes): added in v0.13.0, remove after 2027-04-22.
+    createdAt: payload.createdAt ? new Date(payload.createdAt) : null,
+    lastUserMessageAt: payload.lastUserMessageAt ? new Date(payload.lastUserMessageAt) : null,
     id: normalizeWorkspaceOpaqueId(payload.id) ?? payload.id,
     // COMPAT(workspaceHierarchy): added in v0.11.2, remove after 2027-04-21 once daemon floor supports hierarchy.
     parentWorkspaceId: payload.parentWorkspaceId ?? null,
+    pinPlacement: payload.pinPlacement,
     siblingOrder: payload.siblingOrder,
     projectId: payload.projectId,
     projectDisplayName: payload.projectDisplayName,
@@ -165,6 +224,7 @@ export function normalizeWorkspaceDescriptor(
     name: payload.name,
     title: payload.title ?? null,
     pinnedAt: payload.pinnedAt ?? null,
+    ...workspaceEffectiveSection(payload),
     // COMPAT(workspaceSuperpinning): older daemons omit the field.
     superpinnedAt: payload.superpinnedAt ?? null,
     // COMPAT(workspaceLabels): old daemons omit assignments.
@@ -212,10 +272,17 @@ export function normalizeProjectDescriptor(
 function preserveWorkspaceDescriptorIdentity(
   incoming: WorkspaceDescriptor,
   existing?: WorkspaceDescriptor | null,
+  canonicalPlacement = false,
 ): WorkspaceDescriptor {
-  if (existing && equal(existing, incoming)) {
-    return existing;
+  // An RPC acknowledgement may arrive before an older directory snapshot.
+  if (
+    !canonicalPlacement &&
+    existing?.pinPlacement &&
+    existing.pinPlacement.revision > (incoming.pinPlacement?.revision ?? 0)
+  ) {
+    incoming = { ...incoming, pinPlacement: existing.pinPlacement };
   }
+  if (existing && equal(existing, incoming)) return existing;
   return incoming;
 }
 
@@ -280,6 +347,9 @@ export interface DaemonServerInfo {
   serverId: string;
   hostname: string | null;
   version: string | null;
+  runtimeBuild?: ServerInfoStatusPayload["runtimeBuild"];
+  runtimeWriteIntent?: ServerInfoStatusPayload["runtimeWriteIntent"];
+  workspaceLayout?: ServerInfoStatusPayload["workspaceLayout"];
   desktopManaged?: boolean;
   capabilities?: ServerCapabilities;
   features?: ServerInfoStatusPayload["features"];
@@ -292,6 +362,9 @@ export function toDaemonServerInfo(serverInfo: ServerInfoStatusPayload): DaemonS
     serverId: serverInfo.serverId,
     hostname: serverInfo.hostname ?? null,
     version: serverInfo.version ?? null,
+    ...(serverInfo.runtimeBuild ? { runtimeBuild: serverInfo.runtimeBuild } : {}),
+    ...(serverInfo.runtimeWriteIntent ? { runtimeWriteIntent: serverInfo.runtimeWriteIntent } : {}),
+    ...(serverInfo.workspaceLayout ? { workspaceLayout: serverInfo.workspaceLayout } : {}),
     ...(serverInfo.desktopManaged !== undefined
       ? { desktopManaged: serverInfo.desktopManaged }
       : {}),
@@ -340,6 +413,26 @@ export function selectAgentTimelineState(
     };
   }
   return items.length > 0 ? { status: "painted", items } : { status: "cold" };
+}
+
+/** Text of the loaded user messages, newest first, with back-to-back repeats collapsed. */
+export function selectAgentSentMessages(
+  session: SessionState | undefined,
+  agentId: string,
+): string[] {
+  if (!session) return [];
+  const items = [
+    ...(session.agentStreamTail.get(agentId) ?? []),
+    ...(session.agentStreamHead.get(agentId) ?? []),
+  ];
+  const messages: string[] = [];
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (item.kind !== "user_message" || item.text.trim().length === 0) continue;
+    if (messages[messages.length - 1] === item.text) continue;
+    messages.push(item.text);
+  }
+  return messages;
 }
 
 export function selectAgentTurnPresentation(
@@ -694,6 +787,9 @@ function isSessionServerInfoUnchanged(input: {
   nextDesktopManaged: boolean | undefined;
   nextCapabilities: ServerCapabilities | undefined;
   nextFeatures: ServerInfoStatusPayload["features"] | undefined;
+  nextWorkspaceLayout: ServerInfoStatusPayload["workspaceLayout"];
+  nextRuntimeBuild: ServerInfoStatusPayload["runtimeBuild"];
+  nextRuntimeWriteIntent: ServerInfoStatusPayload["runtimeWriteIntent"];
   nextServerId: string;
   nextPermissions: ServerInfoStatusPayload["permissions"];
   nextFieldCatalogVersion: number | undefined;
@@ -706,17 +802,21 @@ function isSessionServerInfoUnchanged(input: {
     nextCapabilities,
     nextFeatures,
   } = input;
-  const prevHostname = currentServerInfo?.hostname?.trim() || null;
-  const prevVersion = currentServerInfo?.version?.trim() || null;
+  if (!currentServerInfo) return false;
+  const prevHostname = currentServerInfo.hostname?.trim() || null;
+  const prevVersion = currentServerInfo.version?.trim() || null;
   return (
-    currentServerInfo?.serverId === input.nextServerId &&
-    JSON.stringify(currentServerInfo?.permissions) === JSON.stringify(input.nextPermissions) &&
-    currentServerInfo?.workspaceFieldCatalogVersion === input.nextFieldCatalogVersion &&
+    currentServerInfo.serverId === input.nextServerId &&
+    JSON.stringify(currentServerInfo.permissions) === JSON.stringify(input.nextPermissions) &&
+    currentServerInfo.workspaceFieldCatalogVersion === input.nextFieldCatalogVersion &&
     prevHostname === nextHostname &&
     prevVersion === nextVersion &&
-    currentServerInfo?.desktopManaged === nextDesktopManaged &&
-    areServerCapabilitiesEqual(currentServerInfo?.capabilities, nextCapabilities) &&
-    areServerInfoFeaturesEqual(currentServerInfo?.features, nextFeatures)
+    currentServerInfo.desktopManaged === nextDesktopManaged &&
+    areServerCapabilitiesEqual(currentServerInfo.capabilities, nextCapabilities) &&
+    areServerInfoFeaturesEqual(currentServerInfo.features, nextFeatures) &&
+    equal(currentServerInfo.workspaceLayout, input.nextWorkspaceLayout) &&
+    equal(currentServerInfo.runtimeBuild, input.nextRuntimeBuild) &&
+    equal(currentServerInfo.runtimeWriteIntent, input.nextRuntimeWriteIntent)
   );
 }
 
@@ -863,6 +963,9 @@ export const useSessionStore = create<SessionStore>()(
               nextDesktopManaged,
               nextCapabilities,
               nextFeatures,
+              nextWorkspaceLayout: info.workspaceLayout,
+              nextRuntimeBuild: info.runtimeBuild,
+              nextRuntimeWriteIntent: info.runtimeWriteIntent,
               nextServerId: info.serverId,
               nextPermissions: info.permissions,
               nextFieldCatalogVersion: info.workspaceFieldCatalogVersion,
@@ -886,6 +989,11 @@ export const useSessionStore = create<SessionStore>()(
                     : {}),
                   ...(nextCapabilities ? { capabilities: nextCapabilities } : {}),
                   ...(nextFeatures ? { features: nextFeatures } : {}),
+                  ...(info.workspaceLayout ? { workspaceLayout: info.workspaceLayout } : {}),
+                  ...(info.runtimeBuild ? { runtimeBuild: info.runtimeBuild } : {}),
+                  ...(info.runtimeWriteIntent
+                    ? { runtimeWriteIntent: info.runtimeWriteIntent }
+                    : {}),
                   permissions: info.permissions,
                   workspaceFieldCatalogVersion: info.workspaceFieldCatalogVersion,
                 },
@@ -1546,7 +1654,17 @@ export const useSessionStore = create<SessionStore>()(
           }
           const nextWorkspaces =
             typeof workspaces === "function" ? workspaces(session.workspaces) : workspaces;
-          const preservedWorkspaces = preserveMapIdentity(session.workspaces, nextWorkspaces);
+          const reconciledWorkspaces = new Map(
+            Array.from(nextWorkspaces, ([id, workspace]) => [
+              id,
+              preserveWorkspaceDescriptorIdentity(
+                projectCanonicalWorkspace(serverId, workspace),
+                session.workspaces.get(id),
+                canonicalWorkspaceReadView?.has(`${serverId}:${id}`) === true,
+              ),
+            ]),
+          );
+          const preservedWorkspaces = preserveMapIdentity(session.workspaces, reconciledWorkspaces);
           if (session.workspaces === preservedWorkspaces) {
             return prev;
           }
@@ -1671,7 +1789,11 @@ export const useSessionStore = create<SessionStore>()(
               changed = true;
             }
             const existing = next.get(workspace.id);
-            const nextWorkspace = preserveWorkspaceDescriptorIdentity(workspace, existing);
+            const nextWorkspace = preserveWorkspaceDescriptorIdentity(
+              projectCanonicalWorkspace(serverId, workspace),
+              existing,
+              canonicalWorkspaceReadView?.has(`${serverId}:${workspace.id}`) === true,
+            );
             if (existing === nextWorkspace) {
               continue;
             }

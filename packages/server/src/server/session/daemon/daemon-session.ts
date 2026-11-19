@@ -1,4 +1,5 @@
 import type pino from "pino";
+import type { RuntimeBuildIdentity, RuntimeWriteIntent } from "@getpaseo/protocol/runtime-build";
 import type { ProviderAvailability } from "../../agent/agent-manager.js";
 import type {
   AgentSnapshotPayload,
@@ -7,6 +8,7 @@ import type {
   WorkspaceDescriptorPayload,
 } from "../../messages.js";
 import { getPidLockInfo } from "../../pid-lock.js";
+import { readUnconfirmedTerminalCleanup } from "../../../terminal/terminal-worker-reaper.js";
 import { generateLocalPairingOffer } from "../../pairing-offer.js";
 import {
   collectDaemonDiagnostics,
@@ -14,12 +16,20 @@ import {
 } from "./diagnostics.js";
 import { DaemonSelfUpdateSessionController } from "./daemon-self-update-session-controller.js";
 import { collectHostStats } from "./host-stats.js";
+import {
+  CpuProfileError,
+  type CpuProfiler,
+  getProcessCpuProfiler,
+  getProcessCpuProfilerIfLoaded,
+} from "./cpu-profile.js";
 import type { ManagedAgent } from "../../agent/agent-manager.js";
 import type { PersistedProjectRecord, PersistedWorkspaceRecord } from "../../workspace-registry.js";
 import type { HubRelationshipManagement } from "../../hub/relationship-controller.js";
 import type { DaemonConfigReloadResult } from "../../daemon-config-store.js";
 
 export interface DaemonRuntimeConfig {
+  runtimeBuild?: RuntimeBuildIdentity;
+  runtimeWriteIntent?: RuntimeWriteIntent;
   listen: string | null;
   worktreesRoot?: string;
   appBaseUrl?: string;
@@ -30,6 +40,7 @@ export interface DaemonRuntimeConfig {
     publicEndpoint: string;
     useTls: boolean;
     publicUseTls: boolean;
+    requireProtectedSecurity?: boolean;
   } | null;
 }
 
@@ -40,6 +51,7 @@ export interface DaemonSessionHost {
     clientId: string;
     requestId: string;
     reason: string;
+    keepTerminals: boolean;
   }): void;
 }
 
@@ -58,11 +70,15 @@ export interface DaemonSessionOptions {
   listVisibleAgents: () => Promise<AgentSnapshotPayload[]>;
   /** The workspaces the sidebar lists: not archived or background. */
   listVisibleWorkspaces: () => Promise<WorkspaceDescriptorPayload[]>;
+  /** Why this host's terminals cannot be served (held by a newer Paseo's worker), if so. */
+  getTerminalsUnavailable?: () => string | null;
   getWebSocketRuntimeMetrics?: () => DaemonWebSocketRuntimeDiagnosticSnapshot | null;
   getObservationMetrics?: () => Record<string, number>;
   logger: pino.Logger;
   hubRelationships?: HubRelationshipManagement;
-  reloadConfig: () => DaemonConfigReloadResult;
+  reloadConfig: () => Promise<DaemonConfigReloadResult>;
+  /** Defaults to the process-wide profiler; tests inject their own. */
+  cpuProfiler?: CpuProfiler;
 }
 
 /**
@@ -85,12 +101,14 @@ export class DaemonSession {
   private readonly listProviderAvailability: () => Promise<ProviderAvailability[]>;
   private readonly listVisibleAgents: () => Promise<AgentSnapshotPayload[]>;
   private readonly listVisibleWorkspaces: () => Promise<WorkspaceDescriptorPayload[]>;
+  private readonly getTerminalsUnavailable: () => string | null;
   private readonly getWebSocketRuntimeMetrics: () => DaemonWebSocketRuntimeDiagnosticSnapshot | null;
   private readonly getObservationMetrics: DaemonSessionOptions["getObservationMetrics"];
   private readonly logger: pino.Logger;
   private readonly selfUpdate: DaemonSelfUpdateSessionController;
   private readonly hubRelationships: HubRelationshipManagement | null;
-  private readonly reloadConfig: () => DaemonConfigReloadResult;
+  private readonly reloadConfig: () => Promise<DaemonConfigReloadResult>;
+  private readonly injectedCpuProfiler: CpuProfiler | undefined;
 
   constructor(options: DaemonSessionOptions) {
     this.host = options.host;
@@ -105,11 +123,13 @@ export class DaemonSession {
     this.listProviderAvailability = options.listProviderAvailability;
     this.listVisibleAgents = options.listVisibleAgents;
     this.listVisibleWorkspaces = options.listVisibleWorkspaces;
+    this.getTerminalsUnavailable = options.getTerminalsUnavailable ?? (() => null);
     this.getWebSocketRuntimeMetrics = options.getWebSocketRuntimeMetrics ?? (() => null);
     this.getObservationMetrics = options.getObservationMetrics;
     this.logger = options.logger;
     this.hubRelationships = options.hubRelationships ?? null;
     this.reloadConfig = options.reloadConfig;
+    this.injectedCpuProfiler = options.cpuProfiler;
     this.selfUpdate = new DaemonSelfUpdateSessionController({
       clientId: this.clientId,
       daemonVersion: this.daemonVersion ?? null,
@@ -186,6 +206,12 @@ export class DaemonSession {
   async handleGetStatusRequest(
     msg: Extract<SessionInboundMessage, { type: "daemon.get_status.request" }>,
   ): Promise<void> {
+    // Read outside the degraded-status fallback below: a status that cannot say whether
+    // terminal cleanup finished must fail the request, not report that nothing is left.
+    const terminalCleanupUnconfirmed = (await readUnconfirmedTerminalCleanup(this.paseoHome)).map(
+      ({ pid, role, reason, detail }) => ({ pid, role, reason, detail }),
+    );
+    const terminalsUnavailable = this.getTerminalsUnavailable();
     try {
       const pidInfo = await getPidLockInfo(this.paseoHome);
       const providers = (await this.listProviderAvailability()).map((p) => ({
@@ -199,12 +225,16 @@ export class DaemonSession {
           requestId: msg.requestId,
           serverId: this.serverId ?? "",
           version: this.daemonVersion ?? null,
+          runtimeBuild: this.daemonRuntimeConfig?.runtimeBuild,
+          runtimeWriteIntent: this.daemonRuntimeConfig?.runtimeWriteIntent,
           pid: process.pid,
           nodePath: process.execPath,
           startedAt: pidInfo?.startedAt ?? null,
           listen: this.daemonRuntimeConfig?.listen ?? null,
           relay: this.daemonRuntimeConfig?.getRelayConfig() ?? null,
           providers,
+          terminalCleanupUnconfirmed,
+          ...(terminalsUnavailable ? { terminalsUnavailable } : {}),
         },
       });
     } catch (error) {
@@ -215,12 +245,16 @@ export class DaemonSession {
           requestId: msg.requestId,
           serverId: this.serverId ?? "",
           version: this.daemonVersion ?? null,
+          runtimeBuild: this.daemonRuntimeConfig?.runtimeBuild,
+          runtimeWriteIntent: this.daemonRuntimeConfig?.runtimeWriteIntent,
           pid: process.pid,
           nodePath: process.execPath,
           startedAt: null,
           listen: null,
           relay: null,
           providers: [],
+          terminalCleanupUnconfirmed,
+          ...(terminalsUnavailable ? { terminalsUnavailable } : {}),
         },
       });
     }
@@ -238,6 +272,7 @@ export class DaemonSession {
         relayPublicEndpoint: relay?.publicEndpoint,
         relayUseTls: relay?.useTls,
         relayPublicUseTls: relay?.publicUseTls,
+        relayRequireProtectedSecurity: relay?.requireProtectedSecurity ?? false,
         appBaseUrl: this.daemonRuntimeConfig?.appBaseUrl,
         includeQr: true,
         logger: this.logger,
@@ -264,13 +299,13 @@ export class DaemonSession {
     }
   }
 
-  handleConfigReloadRequest(
+  async handleConfigReloadRequest(
     msg: Extract<SessionInboundMessage, { type: "daemon.config.reload.request" }>,
-  ): void {
+  ): Promise<void> {
     try {
       this.host.emit({
         type: "daemon.config.reload.response",
-        payload: { requestId: msg.requestId, ...this.reloadConfig() },
+        payload: { requestId: msg.requestId, ...(await this.reloadConfig()) },
       });
     } catch (error) {
       this.logger.error({ err: error }, "Failed to reload daemon config");
@@ -284,6 +319,55 @@ export class DaemonSession {
         },
       });
     }
+  }
+
+  /**
+   * One bounded main-thread CPU profile. The session has already checked
+   * daemon.manage. `owner` is the physical socket the request arrived on.
+   */
+  async handleCpuProfileRequest(
+    msg: Extract<SessionInboundMessage, { type: "diagnostics.cpu_profile.request" }>,
+    owner: object,
+  ): Promise<void> {
+    try {
+      const profile = await this.cpuProfiler.capture({
+        durationMs: msg.durationMs,
+        owner,
+        scope: this,
+      });
+      this.host.emit({
+        type: "diagnostics.cpu_profile.response",
+        payload: { requestId: msg.requestId, profile },
+      });
+    } catch (error) {
+      // Never log or reply with an untyped error's message or stack.
+      const failure =
+        error instanceof CpuProfileError ? error : new CpuProfileError("profiler_failed");
+      this.logger.warn({ code: failure.code }, "CPU profile request failed");
+      this.host.emit({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: failure.message,
+          code: `cpu_profile_${failure.code}`,
+        },
+      });
+    }
+  }
+
+  cancelCpuProfileForSocket(owner: object): void {
+    this.injectedCpuProfiler?.cancelOwner(owner);
+    if (!this.injectedCpuProfiler) getProcessCpuProfilerIfLoaded()?.cancelOwner(owner);
+  }
+
+  cancelCpuProfiles(): void {
+    this.injectedCpuProfiler?.cancelScope(this);
+    if (!this.injectedCpuProfiler) getProcessCpuProfilerIfLoaded()?.cancelScope(this);
+  }
+
+  private get cpuProfiler(): CpuProfiler {
+    return this.injectedCpuProfiler ?? getProcessCpuProfiler();
   }
 
   async handleDiagnosticsRequest(

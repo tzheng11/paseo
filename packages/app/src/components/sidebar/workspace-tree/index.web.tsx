@@ -41,6 +41,7 @@ import {
 } from "./controller";
 import { workspaceDropPosition, type WorkspaceTreeDrop } from "./drop-target";
 import { resolveWorkspaceKeyboardDrop } from "./keyboard-drop";
+import { canonicalSidebar } from "@/stores/canonical-sidebar-runtime";
 import {
   WorkspaceTreeRowChrome,
   WorkspaceTreeDragPreview,
@@ -52,7 +53,7 @@ const ThemedGrip = withUnistyles(GripVertical);
 const treeAccessibility = {
   screenReaderInstructions: {
     draggable:
-      "Press Space to pick up. Use Up and Down to reorder. In Pinned and SuperPinned, use Right to nest and Left to lift out. Press Space to drop or Escape to cancel.",
+      "Press Space to pick up. Use Up and Down to reorder. In workspace trees, use Right to nest and Left to lift out. Press Space to drop or Escape to cancel.",
   },
 };
 const treeCollisionDetection: CollisionDetection = (args) => {
@@ -105,6 +106,7 @@ function WebTreeDragSurface({ children }: { children: React.ReactNode }) {
         })
         .sort((left, right) => left.rect.top - right.rect.top);
       const next = resolveWorkspaceKeyboardDrop({
+        canonicalOrder: canonicalSidebar.state().enabled,
         code: event.code,
         workspaces: drag.workspaces,
         allWorkspaces: drag.allWorkspaces,

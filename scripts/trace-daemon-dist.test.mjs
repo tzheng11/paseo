@@ -1,3 +1,4 @@
+import { DatabaseSync } from "node:sqlite";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { cp, mkdtemp, rm } from "node:fs/promises";
@@ -29,6 +30,24 @@ test("traced daemon closure ships the OpenCode bridge plugin for every OpenCode 
   const outRoot = await mkdtemp(path.join(os.tmpdir(), "trace-daemon-dist-"));
   try {
     await installTracedDaemon(outRoot);
+    const indexPath = "packages/server/dist/server/server/agent/providers/codex/history-index.js";
+    const { readCodexHistoryIndex } = await import(
+      pathToFileURL(path.join(outRoot, indexPath)).href
+    );
+    const databasePath = path.join(outRoot, "history-fixture.sqlite");
+    const database = new DatabaseSync(databasePath);
+    database.exec(`CREATE TABLE thread_items (
+      thread_id TEXT, turn_id TEXT, item_id TEXT, rollout_ordinal INTEGER,
+      updated_at_ordinal INTEGER, item_type TEXT, item_json TEXT
+    ); INSERT INTO thread_items VALUES ('owned', 'turn', 'prompt', 1, 1, 'userMessage', '{}');`);
+    database.close();
+    const history = await readCodexHistoryIndex({
+      databasePath,
+      threadId: "owned",
+      operation: "messages",
+    });
+    assert.equal(history.totalEvents, 1);
+    assert.equal(history.messages[0].itemId, "prompt");
     const installedBridgeUrl = pathToFileURL(path.join(outRoot, bridgeModule)).href;
     const { loadOpenCodeBridgePluginArtifact } = await import(installedBridgeUrl);
 

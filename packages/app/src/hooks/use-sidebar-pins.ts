@@ -29,6 +29,19 @@ export interface PinnedSidebarGroups {
   unpinnedProjects: SidebarProjectEntry[];
 }
 
+/** Host-owned placements are authoritative, including an explicitly root-level pin. */
+export function sharedPinnedWorkspaceTree(
+  projects: readonly SidebarProjectEntry[],
+): PinnedWorkspaceTree {
+  return Object.fromEntries(
+    projects.flatMap((project) =>
+      project.workspaces.flatMap((workspace) =>
+        workspace.pinPlacement ? [[workspace.workspaceKey, workspace.pinPlacement] as const] : [],
+      ),
+    ),
+  );
+}
+
 function projectWithoutPinnedWorkspaces(
   project: SidebarProjectEntry,
   pinnedWorkspaceKeys: ReadonlySet<string>,
@@ -155,10 +168,11 @@ export function splitPinnedSidebarGroups(input: {
       byTime || a.serverId.localeCompare(b.serverId) || a.workspaceId.localeCompare(b.workspaceId)
     );
   });
-  pinned.sort((a, b) =>
-    (keys.pinnedAtByKey[b.workspaceKey] ?? "").localeCompare(
-      keys.pinnedAtByKey[a.workspaceKey] ?? "",
-    ),
+  pinned.sort(
+    (a, b) =>
+      (keys.pinnedAtByKey[b.workspaceKey] ?? "").localeCompare(
+        keys.pinnedAtByKey[a.workspaceKey] ?? "",
+      ) || a.workspaceKey.localeCompare(b.workspaceKey),
   );
   const superRoots = applyStoredOrdering({
     items: superpinned,
@@ -172,12 +186,12 @@ export function splitPinnedSidebarGroups(input: {
   });
   const covered = new Set([...superpinned, ...pinned].map((workspace) => workspace.workspaceKey));
   return {
-    superpinnedChats: projectPinnedTree({
+    superpinnedChats: projectWorkspaceTree({
       workspaces: superRoots,
       section: "superpinned",
       tree: input.pinnedWorkspaceTree,
     }),
-    pinnedChats: projectPinnedTree({
+    pinnedChats: projectWorkspaceTree({
       workspaces: orderedRoots,
       section: "pinned",
       tree: input.pinnedWorkspaceTree,
@@ -190,7 +204,7 @@ interface PinnedTreeProjectionInput {
   section: PinnedWorkspaceSection;
   tree?: PinnedWorkspaceTree;
 }
-function projectPinnedTree({
+export function projectWorkspaceTree({
   workspaces,
   section,
   tree = {},

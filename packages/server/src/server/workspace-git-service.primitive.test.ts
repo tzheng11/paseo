@@ -1,3 +1,4 @@
+import { createWorkspaceRuntimeStore } from "./workspace-runtime-store/index.js";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -8,6 +9,7 @@ import type { CurrentPullRequestStatus, ForgeService } from "../services/forge-s
 import { defaultForgeRegistry } from "../services/forge-registry.js";
 import {
   getCheckoutDiff as getCheckoutDiffUncached,
+  getCheckoutIdentity as getCheckoutIdentityUncached,
   getCheckoutSnapshotFacts as getCheckoutSnapshotFactsUncached,
   getCheckoutStatus as getCheckoutStatusUncached,
   resolveAbsoluteGitDir as resolveAbsoluteGitDirReal,
@@ -18,6 +20,7 @@ import {
   type PullRequestStatusResult,
 } from "../utils/checkout-git.js";
 import {
+  getGitCommandPriority,
   runGitCommand as runGitCommandReal,
   snapshotGitCommandRuntimeMetrics,
 } from "../utils/run-git-command.js";
@@ -436,6 +439,56 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     service.dispose();
   });
 
+  test("getCheckout serves request-path reads ahead of a queued inventory pass", async () => {
+    const started: Array<{ cwd: string; priority: string }> = [];
+    const gates = new Map<string, ReturnType<typeof createDeferred<void>>>();
+    const getCheckoutIdentity = vi.fn(async (cwd: string) => {
+      started.push({ cwd, priority: getGitCommandPriority() });
+      const gate = createDeferred<void>();
+      gates.set(cwd, gate);
+      await gate.promise;
+      return createCheckoutFacts(cwd);
+    });
+    const service = createService({ getCheckoutIdentity });
+    const inventory = Array.from({ length: 6 }, (_, index) => `${REPO_CWD}-inventory-${index}`);
+    const inventoryReads = inventory.map((cwd) =>
+      service.getCheckout(cwd, { priority: "background" }),
+    );
+    const createCwd = `${REPO_CWD}-new-workspace`;
+    const createRead = service.getCheckout(createCwd);
+    // A request for a checkout whose inventory read is still queued does not wait for it.
+    const queuedCwdRead = service.getCheckout(inventory[5]!);
+    await flushPromises();
+
+    expect(started).toEqual([
+      { cwd: inventory[0], priority: "normal" },
+      { cwd: inventory[1], priority: "normal" },
+      { cwd: createCwd, priority: "high" },
+      { cwd: inventory[5], priority: "high" },
+    ]);
+    gates.get(createCwd)!.resolve();
+    gates.get(inventory[5]!)!.resolve();
+    await expect(createRead).resolves.toMatchObject({ cwd: createCwd });
+    await expect(queuedCwdRead).resolves.toMatchObject({ cwd: inventory[5] });
+
+    // An inventory read joins an in-flight request-path read instead of queueing a second one.
+    const joinedCwd = `${REPO_CWD}-joined`;
+    const requestRead = service.getCheckout(joinedCwd);
+    const joinedRead = service.getCheckout(joinedCwd, { priority: "background" });
+    await flushPromises();
+    gates.get(joinedCwd)!.resolve();
+    await expect(joinedRead).resolves.toMatchObject({ cwd: joinedCwd });
+    await expect(requestRead).resolves.toMatchObject({ cwd: joinedCwd });
+    expect(started.filter((entry) => entry.cwd === joinedCwd)).toHaveLength(1);
+
+    for (const cwd of inventory) {
+      await flushPromises();
+      gates.get(cwd)?.resolve();
+    }
+    await Promise.all(inventoryReads);
+    service.dispose();
+  });
+
   test("getSnapshot returns the current snapshot without shelling out", async () => {
     let nowMs = Date.parse("2026-04-12T00:00:00.000Z");
     const getCheckoutStatus = vi.fn(async (cwd: string) => createCheckoutStatus(cwd));
@@ -568,14 +621,14 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     expect(subscription).toEqual({ ready: expect.any(Promise), unsubscribe: expect.any(Function) });
     expect(getCheckoutStatus).not.toHaveBeenCalled();
     expect(listener).not.toHaveBeenCalled();
-    expect(service.peekSnapshot(REPO_CWD)).toBeNull();
+    expect(listener.mock.lastCall?.[0] ?? null).toBeNull();
 
     await vi.waitFor(() => {
       expect(getCheckoutStatus).toHaveBeenCalledTimes(1);
     });
     await flushPromises();
     expect(getCheckoutStatus).toHaveBeenCalledTimes(1);
-    expect(service.peekSnapshot(REPO_CWD)).toBeNull();
+    expect(listener.mock.lastCall?.[0] ?? null).toBeNull();
 
     checkoutStatusDeferred.resolve(createCheckoutStatus(REPO_CWD));
 
@@ -709,7 +762,7 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
 
     refreshStatus.resolve(createCheckoutStatus(REPO_CWD, { currentBranch: "feature" }));
     await refresh;
-    expect(service.peekSnapshot(REPO_CWD)).toEqual(
+    expect(await service.getSnapshot(REPO_CWD)).toEqual(
       createSnapshot(REPO_CWD, {
         git: {
           currentBranch: "feature",
@@ -1003,7 +1056,7 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     await vi.advanceTimersByTimeAsync(60_000);
     await flushPromises();
 
-    expect(subscribe).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(subscribe).toHaveBeenCalledTimes(2));
     expect(getCheckoutStatus).toHaveBeenCalledTimes(1);
 
     subscription.unsubscribe();
@@ -1431,23 +1484,25 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
       getPullRequestStatus: vi.fn(async () => createPullRequestStatusResult("Visible PR")),
     });
 
+    const workspaceRuntimeStore = createWorkspaceRuntimeStore();
+    service.onSnapshotUpdated((snapshot) => workspaceRuntimeStore.set(snapshot));
     try {
-      await service.getSnapshot(REPO_CWD);
+      workspaceRuntimeStore.set(await service.getSnapshot(REPO_CWD));
       const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
-      expect(service.peekSnapshot(REPO_CWD)?.forge.pullRequest?.title).toBe("Visible PR");
+      expect(workspaceRuntimeStore.get(REPO_CWD)?.forge.pullRequest?.title).toBe("Visible PR");
 
       headSha = "2222222222222222222222222222222222222222";
       nowMs = 3_000;
       await service.refresh(REPO_CWD);
 
-      expect(service.peekSnapshot(REPO_CWD)?.forge.pullRequest).toBeNull();
+      expect(workspaceRuntimeStore.get(REPO_CWD)?.forge.pullRequest).toBeNull();
       expect(forge.getCurrentPullRequestStatus).not.toHaveBeenCalled();
 
       await vi.advanceTimersByTimeAsync(0);
       await flushPromises();
 
       expect(forge.getCurrentPullRequestStatus).toHaveBeenCalledTimes(1);
-      expect(service.peekSnapshot(REPO_CWD)?.forge.pullRequest?.title).toBe("MR self-healed");
+      expect(workspaceRuntimeStore.get(REPO_CWD)?.forge.pullRequest?.title).toBe("MR self-healed");
       subscription.unsubscribe();
     } finally {
       service.dispose();
@@ -1921,6 +1976,7 @@ describe("WorkspaceGitServiceImpl D2 read methods", () => {
     ];
     const listPaseoWorktrees = vi.fn(async () => worktrees);
     const service = createService({
+      getCheckoutIdentity: getCheckoutIdentityUncached as never,
       getCheckoutSnapshotFacts: getCheckoutSnapshotFactsUncached as never,
       getCheckoutStatus: getCheckoutStatusUncached as never,
       listPaseoWorktrees,
@@ -1973,35 +2029,45 @@ describe("WorkspaceGitServiceImpl D2 read methods", () => {
     service.dispose();
   });
 
-  test("resolveRepoRoot cold-loads, warms, forces, and coalesces through snapshots", async () => {
-    let nowMs = 0;
-    const checkoutDeferred = createDeferred<CheckoutStatusGit>();
-    const getCheckoutStatus = vi
-      .fn()
-      .mockImplementationOnce(async () => checkoutDeferred.promise)
-      .mockResolvedValue(createCheckoutStatus(REPO_CWD));
-    const service = createService({
-      getCheckoutStatus,
-      now: () => new Date(nowMs),
-    });
+  test("resolveRepoRoot reads checkout identity and never waits on an in-flight snapshot refresh", async () => {
+    const refreshDeferred = createDeferred<CheckoutStatusGit>();
+    const getCheckoutStatus = vi.fn(async () => refreshDeferred.promise);
+    const service = createService({ getCheckoutStatus });
 
-    const first = service.resolveRepoRoot(REPO_CWD);
-    const second = service.resolveRepoRoot(join(REPO_CWD, "."));
+    void service.getSnapshot(REPO_CWD).catch(() => undefined);
     await vi.waitFor(() => {
       expect(getCheckoutStatus).toHaveBeenCalledTimes(1);
     });
-    await flushPromises();
+
+    await expect(
+      Promise.all([
+        service.resolveRepoRoot(REPO_CWD),
+        service.resolveRepoRoot(join(REPO_CWD, ".")),
+      ]),
+    ).resolves.toEqual([REPO_CWD, REPO_CWD]);
     expect(getCheckoutStatus).toHaveBeenCalledTimes(1);
-    checkoutDeferred.resolve(createCheckoutStatus(REPO_CWD));
-    await expect(Promise.all([first, second])).resolves.toEqual([REPO_CWD, REPO_CWD]);
 
-    nowMs = 1_000;
-    await service.resolveRepoRoot(REPO_CWD);
-    expect(getCheckoutStatus).toHaveBeenCalledTimes(1);
+    refreshDeferred.resolve(createCheckoutStatus(REPO_CWD));
+    service.dispose();
+  });
 
-    await service.resolveRepoRoot(REPO_CWD, { force: true, reason: "test" });
-    expect(getCheckoutStatus).toHaveBeenCalledTimes(2);
+  test("resolveRepoRoot resolves a Paseo worktree to its main repository and refuses a non-Git directory", async () => {
+    const worktree = join(REPO_CWD, "..", "worktrees", "feature");
+    const service = createService({
+      getCheckoutIdentity: vi.fn(async (cwd: string) =>
+        cwd === REPO_CWD
+          ? { isGit: false }
+          : createCheckoutFacts(cwd, {
+              paseoWorktree: { isPaseoOwnedWorktree: true, worktreeRoot: cwd },
+              mainRepoRoot: "/tmp/main-repo",
+            }),
+      ),
+    });
 
+    await expect(service.resolveRepoRoot(worktree)).resolves.toBe("/tmp/main-repo");
+    await expect(service.resolveRepoRoot(REPO_CWD)).rejects.toThrow(
+      "Create worktree requires a git repository",
+    );
     service.dispose();
   });
 
@@ -2267,7 +2333,7 @@ describe("WorkspaceGitServiceImpl D2 read methods", () => {
     expect(getCheckoutStatus).toHaveBeenCalledTimes(2);
     expect(getPullRequestStatus).toHaveBeenCalledTimes(2);
 
-    service.dispose();
+    await service.dispose();
   });
 
   test("onWorkspaceStateMayHaveChanged preserves includeForge when a file watcher fires within the debounce window", async () => {

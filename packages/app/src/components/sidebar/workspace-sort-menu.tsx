@@ -11,7 +11,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useSidebarOrderStore } from "@/stores/sidebar-order-store";
 import type { Theme } from "@/styles/theme";
-import type { SidebarWorkspaceSortMode } from "./workspace-sort";
+import { UNGROUPED_WORKSPACE_SORT_KEY, type SidebarWorkspaceSortMode } from "./workspace-sort";
 
 const ThemedChevronDown = withUnistyles(ChevronDown);
 const foregroundMutedColorMapping = (theme: Theme) => ({
@@ -87,6 +87,26 @@ export function ProjectWorkspaceSortMenu({
       onSelect={onSelect}
       testID={`sidebar-project-sort-${projectViewKey}`}
       label={`${t("sidebar.workspaceSort.label")}: ${projectName}`}
+    />
+  );
+}
+
+export function UngroupedWorkspaceSortMenu() {
+  const { t } = useTranslation();
+  const mode = useSidebarOrderStore(
+    (state) => state.workspaceSortModeByProject[UNGROUPED_WORKSPACE_SORT_KEY] ?? "manual",
+  );
+  const setMode = useSidebarOrderStore((state) => state.setWorkspaceSortMode);
+  const onSelect = useCallback(
+    (nextMode: SidebarWorkspaceSortMode) => setMode(UNGROUPED_WORKSPACE_SORT_KEY, nextMode),
+    [setMode],
+  );
+  return (
+    <WorkspaceSortMenu
+      mode={mode}
+      onSelect={onSelect}
+      testID="sidebar-ungrouped-sort"
+      label={t("sidebar.workspaceSort.label")}
     />
   );
 }

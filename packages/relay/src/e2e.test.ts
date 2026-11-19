@@ -56,6 +56,10 @@ function spawnRelayDevServer(port: number): ChildProcess {
       wranglerCliPath,
       "dev",
       "--local",
+      // This fixture must exercise the local Durable Object, not the production
+      // cutover proxy configured in wrangler.toml or an external DNS service.
+      "--var",
+      "PASEO_RELAY_UPSTREAM:",
       "--ip",
       "127.0.0.1",
       "--port",
@@ -212,6 +216,9 @@ async function stopRelayProcess(relayProcess: ChildProcess): Promise<void> {
     try {
       await waitForServer(relayPort, relayProcess, 30000);
       await waitForRelayWebSocketReady(relayPort, relayProcess, 60000);
+      const health = await fetch(`http://127.0.0.1:${relayPort}/health`);
+      expect(health.status).toBe(200);
+      expect(await health.json()).toEqual({ status: "ok" });
     } catch (error) {
       await stopRelayProcess(relayProcess);
       relayProcess = null;

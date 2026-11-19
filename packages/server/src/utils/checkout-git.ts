@@ -1,13 +1,21 @@
 import { MAX_RELAY_WEBSOCKET_MESSAGE_BYTES } from "@getpaseo/protocol/websocket-message-limit";
 import { resolve, dirname, basename } from "path";
-import { existsSync, realpathSync } from "fs";
-import { open as openFile, readFile, stat as statFile, mkdtemp, copyFile, rm } from "fs/promises";
+import {
+  open as openFile,
+  readFile,
+  stat as statFile,
+  mkdtemp,
+  copyFile,
+  realpath,
+  access,
+  rm,
+} from "fs/promises";
 import { tmpdir } from "node:os";
 import { setImmediate } from "node:timers/promises";
 import { TTLCache } from "@isaacs/ttlcache";
 import type { CheckoutCommit, CheckoutCommitFile } from "@getpaseo/protocol/messages";
 import { parseGitHubRemoteIdentity, parseGitRemoteLocation } from "@getpaseo/protocol/git-remote";
-import { maxBase64EncryptedPlaintextByteLength } from "@getpaseo/relay";
+import { maxSecuredPlaintextByteLength } from "@getpaseo/relay";
 import type { Logger } from "pino";
 import type { ParsedDiffFile } from "../server/utils/diff-highlighter.js";
 import {
@@ -37,6 +45,8 @@ import { unquoteGitPath } from "./git-quoted-path.js";
 import { isPaseoOwnedWorktreeCwd, resolvePaseoWorktreesBaseRoot } from "./worktree.js";
 import {
   branchNameFromRef,
+  findPaseoWorktreeRootForCwd,
+  hasPaseoWorktreeMetadata,
   getPaseoWorktreeChangeRequestHintForBranch,
   type PaseoWorktreeMetadata,
   readPaseoWorktreeMetadata,
@@ -83,6 +93,8 @@ const lastSuccessfulPullRequestStatus = new Map<string, PullRequestStatusResult>
 let shortstatCacheTtlMs = DEFAULT_SHORTSTAT_CACHE_TTL_MS;
 let shortstatCache = createShortstatCache(shortstatCacheTtlMs);
 const shortstatInFlight = new Map<string, Promise<CheckoutShortstat | null>>();
+// The merge base each checkout's last computed shortstat was measured against.
+const shortstatMergeBases = new Map<string, string>();
 
 interface CheckoutReadCacheOptions {
   force?: boolean;
@@ -160,6 +172,21 @@ function getShortstatCacheKey(cwd: string): string {
   return resolve(cwd);
 }
 
+function rememberShortstatMergeBase(cacheKey: string, mergeBase: string | null): void {
+  shortstatMergeBases.delete(cacheKey);
+  if (mergeBase === null) {
+    return;
+  }
+  shortstatMergeBases.set(cacheKey, mergeBase);
+  if (shortstatMergeBases.size <= SHORTSTAT_CACHE_MAX) {
+    return;
+  }
+  const oldest = shortstatMergeBases.keys().next();
+  if (!oldest.done) {
+    shortstatMergeBases.delete(oldest.value);
+  }
+}
+
 export function __resetPullRequestStatusCacheForTests(): void {
   pullRequestStatusCache.clear();
   pullRequestStatusCache.cancelTimer();
@@ -184,6 +211,7 @@ export function __resetCheckoutShortstatCacheForTests(): void {
   shortstatCacheTtlMs = DEFAULT_SHORTSTAT_CACHE_TTL_MS;
   shortstatCache = createShortstatCache(shortstatCacheTtlMs);
   shortstatInFlight.clear();
+  shortstatMergeBases.clear();
 }
 
 export function __setCheckoutShortstatCacheTtlForTests(ttlMs: number): void {
@@ -192,6 +220,7 @@ export function __setCheckoutShortstatCacheTtlForTests(ttlMs: number): void {
   shortstatCacheTtlMs = ttlMs;
   shortstatCache = createShortstatCache(ttlMs);
   shortstatInFlight.clear();
+  shortstatMergeBases.clear();
 }
 
 interface CheckoutFileChange {
@@ -1117,7 +1146,7 @@ async function getMainRepoRootFromCommonDir(
   if (!commonDir) {
     throw new Error("Not in a git repository");
   }
-  const normalized = realpathSync(commonDir);
+  const normalized = await realpath(commonDir);
 
   if (basename(normalized) === ".git") {
     return dirname(normalized);
@@ -1131,9 +1160,17 @@ async function getMainRepoRootFromCommonDir(
     },
   );
   const worktrees = parseWorktreeList(worktreeOut);
+  const paseoPaths = new Set(
+    (
+      await Promise.all(
+        worktrees.map(async (wt) => ((await hasPaseoWorktreeMetadata(wt.path)) ? wt.path : null)),
+      )
+    ).filter((p) => p !== null),
+  );
   const nonBareNonPaseo = worktrees.filter(
     (wt) =>
       !wt.isBare &&
+      !paseoPaths.has(wt.path) &&
       !isPaseoWorktreePath(wt.path, {
         paseoHome: context?.paseoHome,
         worktreesRoot: context?.worktreesRoot,
@@ -1242,7 +1279,7 @@ export async function renameCurrentBranch(
 
   const currentBranch = await getCurrentBranch(cwd);
   if (currentBranch) {
-    rebindPaseoWorktreeChangeRequestHint(worktreeRoot, previousBranch, currentBranch);
+    await rebindPaseoWorktreeChangeRequestHint(worktreeRoot, previousBranch, currentBranch);
   }
   return { previousBranch, currentBranch };
 }
@@ -1262,7 +1299,7 @@ async function getPaseoWorktreeForCwd(
   options: PaseoWorktreeLookupOptions = {},
 ): Promise<PaseoWorktreeForCwd> {
   // Fast-path reject: non-worktree paths do not need expensive ownership checks.
-  if (!/[\\/]worktrees[\\/]/.test(cwd)) {
+  if (!/[\\/]worktrees[\\/]/.test(cwd) && (await findPaseoWorktreeRootForCwd(cwd)) === null) {
     return { isPaseoOwnedWorktree: false };
   }
 
@@ -1287,8 +1324,8 @@ function storedBaseRefFromMetadata(metadata: PaseoWorktreeMetadata | null): stri
   return metadata?.baseRef ?? metadata?.baseRefName ?? null;
 }
 
-function readPaseoWorktreeBaseRef(worktreeRoot: string): string | null {
-  return storedBaseRefFromMetadata(readPaseoWorktreeMetadata(worktreeRoot));
+async function readPaseoWorktreeBaseRef(worktreeRoot: string): Promise<string | null> {
+  return storedBaseRefFromMetadata(await readPaseoWorktreeMetadata(worktreeRoot));
 }
 
 async function getStoredBaseRefForCwd(
@@ -1562,7 +1599,12 @@ async function abortGitPullConflictState(cwd: string): Promise<void> {
   const rebaseMergePath = resolve(gitDir, "rebase-merge");
   const rebaseApplyPath = resolve(gitDir, "rebase-apply");
 
-  if (existsSync(mergeHeadPath)) {
+  if (
+    await access(mergeHeadPath).then(
+      () => true,
+      () => false,
+    )
+  ) {
     try {
       await runGitCommand(["merge", "--abort"], { cwd, timeout: 120_000 });
     } catch {
@@ -1570,7 +1612,16 @@ async function abortGitPullConflictState(cwd: string): Promise<void> {
     }
   }
 
-  if (existsSync(rebaseMergePath) || existsSync(rebaseApplyPath)) {
+  if (
+    (await access(rebaseMergePath).then(
+      () => true,
+      () => false,
+    )) ||
+    (await access(rebaseApplyPath).then(
+      () => true,
+      () => false,
+    ))
+  ) {
     try {
       await runGitCommand(["rebase", "--abort"], { cwd, timeout: 120_000 });
     } catch {
@@ -1876,7 +1927,7 @@ export async function getCheckoutIdentity(
   // Only Paseo ownership depends on a valid recorded/default base. Ordinary
   // checkout membership does not need base, upstream or PR discovery.
   const resolvedBaseRef = inspected.paseoWorktree.isPaseoOwnedWorktree
-    ? (readPaseoWorktreeBaseRef(inspected.paseoWorktree.worktreeRoot) ??
+    ? ((await readPaseoWorktreeBaseRef(inspected.paseoWorktree.worktreeRoot)) ??
       (await resolveBaseRef(cwd, context)))
     : null;
   const mainRepoRoot = await getMainRepoRootFromCommonDir(
@@ -2121,7 +2172,7 @@ export async function getCheckoutSnapshotFacts(
   }
 
   const paseoWorktreeMetadata = inspected.paseoWorktree.isPaseoOwnedWorktree
-    ? readPaseoWorktreeMetadata(inspected.paseoWorktree.worktreeRoot)
+    ? await readPaseoWorktreeMetadata(inspected.paseoWorktree.worktreeRoot)
     : null;
   const storedBaseRef = storedBaseRefFromMetadata(paseoWorktreeMetadata);
   const resolvedBaseRef = storedBaseRef ?? (await resolveBaseRef(cwd, context));
@@ -2205,7 +2256,7 @@ const CHECKOUT_DIFF_FRAME_HEADROOM_BYTES = 1024 * 1024;
 // binding: string frames are encrypted and base64-encoded. Reserve 1 MiB plaintext for
 // the surrounding WebSocket JSON envelope after inverting that exact wire expansion.
 export const CHECKOUT_DIFF_MAX_STRUCTURED_BYTES =
-  maxBase64EncryptedPlaintextByteLength(MAX_RELAY_WEBSOCKET_MESSAGE_BYTES) -
+  maxSecuredPlaintextByteLength(MAX_RELAY_WEBSOCKET_MESSAGE_BYTES) -
   CHECKOUT_DIFF_FRAME_HEADROOM_BYTES;
 
 interface StructuredDiffAccumulator {
@@ -2765,10 +2816,12 @@ export async function getCommitFileDiff({
   cwd,
   sha,
   path,
+  signal,
 }: {
   cwd: string;
   sha: string;
   path: string;
+  signal?: AbortSignal;
 }): Promise<ParsedDiffFile | null> {
   const worktreeRoot = await requireGitWorktreeRoot(cwd);
   const renames = await getCommitRenames(worktreeRoot, sha);
@@ -2796,6 +2849,7 @@ export async function getCommitFileDiff({
   }
 
   const parsedFiles = await parseAndHighlightDiff(stdout, worktreeRoot, {
+    signal,
     getOldFileContent: (file) => readGitFileContentAtRef(worktreeRoot, `${sha}^`, file.path),
     getNewFileContent: (file) => readGitFileContentAtRef(worktreeRoot, sha, file.path),
   });
@@ -2894,11 +2948,10 @@ function handleShortstatGitError(error: unknown, throwOnGitError = false): null 
   return null;
 }
 
-async function getCheckoutShortstatUncached(
+async function resolveCheckoutShortstatMergeBase(
   cwd: string,
   context?: CheckoutContext,
-  options?: { throwOnGitError?: boolean },
-): Promise<CheckoutShortstat | null> {
+): Promise<string | null> {
   if (context?.facts?.isGit === false) {
     return null;
   }
@@ -2926,37 +2979,101 @@ async function getCheckoutShortstatUncached(
     return null;
   }
 
+  const { stdout: mergeBaseOut } = await getRunGitCommand(context)(
+    ["merge-base", "HEAD", comparisonRef],
+    {
+      cwd,
+      envOverlay: READ_ONLY_GIT_ENV,
+    },
+  );
+  return mergeBaseOut.trim() || null;
+}
+
+async function getCheckoutShortstatFromMergeBase(
+  cwd: string,
+  mergeBase: string,
+  context?: CheckoutContext,
+  options?: { throwOnGitError?: boolean },
+): Promise<CheckoutShortstat | null> {
+  const [{ stdout }, untrackedAdditions] = await Promise.all([
+    getRunGitCommand(context)(["diff", "--shortstat", mergeBase], {
+      cwd,
+      envOverlay: READ_ONLY_GIT_ENV,
+    }),
+    countUntrackedAdditions(cwd, context, options?.throwOnGitError),
+  ]);
+
+  const tracked = parseCheckoutShortstat(stdout);
+
+  if (tracked) {
+    return { additions: tracked.additions + untrackedAdditions, deletions: tracked.deletions };
+  }
+  if (untrackedAdditions > 0) {
+    return { additions: untrackedAdditions, deletions: 0 };
+  }
+  return null;
+}
+
+async function getCheckoutShortstatUncached(
+  cwd: string,
+  context?: CheckoutContext,
+  options?: { throwOnGitError?: boolean },
+): Promise<CheckoutShortstat | null> {
+  const cacheKey = getShortstatCacheKey(cwd);
   try {
-    const { stdout: mergeBaseOut } = await getRunGitCommand(context)(
-      ["merge-base", "HEAD", comparisonRef],
-      {
-        cwd,
-        envOverlay: READ_ONLY_GIT_ENV,
-      },
-    );
-    const mergeBase = mergeBaseOut.trim();
+    const mergeBase = await resolveCheckoutShortstatMergeBase(cwd, context);
     if (!mergeBase) {
+      rememberShortstatMergeBase(cacheKey, null);
       return null;
     }
-
-    const [{ stdout }, untrackedAdditions] = await Promise.all([
-      getRunGitCommand(context)(["diff", "--shortstat", mergeBase], {
-        cwd,
-        envOverlay: READ_ONLY_GIT_ENV,
-      }),
-      countUntrackedAdditions(cwd, context, options?.throwOnGitError),
-    ]);
-
-    const tracked = parseCheckoutShortstat(stdout);
-
-    if (tracked) {
-      return { additions: tracked.additions + untrackedAdditions, deletions: tracked.deletions };
-    }
-    if (untrackedAdditions > 0) {
-      return { additions: untrackedAdditions, deletions: 0 };
-    }
-    return null;
+    const shortstat = await getCheckoutShortstatFromMergeBase(cwd, mergeBase, context, options);
+    rememberShortstatMergeBase(cacheKey, mergeBase);
+    return shortstat;
   } catch (error) {
+    rememberShortstatMergeBase(cacheKey, null);
+    return handleShortstatGitError(error, options?.throwOnGitError);
+  }
+}
+
+/**
+ * A moved base or upstream ref changes the diff stat only when it moves the merge base:
+ * `diff --shortstat <merge-base>` and the untracked count read the working tree, which
+ * working-tree observation refreshes on its own. Resolving the merge base reads commits
+ * only, so ref fan-out no longer rescans every dependent checkout's files.
+ *
+ * With no merge base on record, `keepCurrentWhenUnrecorded` records today's for `current`
+ * instead of rescanning, for callers that previously kept `current` unconditionally.
+ */
+export async function getCheckoutShortstatIfMergeBaseMoved(
+  cwd: string,
+  current: CheckoutShortstat | null,
+  context?: CheckoutContext,
+  options?: { throwOnGitError?: boolean; keepCurrentWhenUnrecorded?: boolean },
+): Promise<CheckoutShortstat | null> {
+  const cacheKey = getShortstatCacheKey(cwd);
+  const previousMergeBase = shortstatMergeBases.get(cacheKey);
+  if (previousMergeBase === undefined && !options?.keepCurrentWhenUnrecorded) {
+    return getCheckoutShortstatUncached(cwd, context, options);
+  }
+  try {
+    const mergeBase = await resolveCheckoutShortstatMergeBase(cwd, context);
+    if (previousMergeBase === undefined) {
+      rememberShortstatMergeBase(cacheKey, mergeBase);
+      return current;
+    }
+    if (mergeBase === previousMergeBase) {
+      return current;
+    }
+    if (!mergeBase) {
+      rememberShortstatMergeBase(cacheKey, null);
+      return null;
+    }
+    const shortstat = await getCheckoutShortstatFromMergeBase(cwd, mergeBase, context, options);
+    rememberShortstatMergeBase(cacheKey, mergeBase);
+    shortstatCache.set(cacheKey, shortstat);
+    return shortstat;
+  } catch (error) {
+    rememberShortstatMergeBase(cacheKey, null);
     return handleShortstatGitError(error, options?.throwOnGitError);
   }
 }
@@ -3111,8 +3228,9 @@ export async function getCheckoutRefDerivedState(
     });
   }
   if (baseMoved || (upstreamMoved && currentBranch === normalizedResolvedBase)) {
-    diffStat = await getCheckoutShortstatUncached(
+    diffStat = await getCheckoutShortstatIfMergeBaseMoved(
       cwd,
+      current.diffStat,
       { ...context, facts },
       { throwOnGitError: true },
     );
@@ -3178,6 +3296,7 @@ export function warmCheckoutShortstatInBackground(
 }
 
 interface AppendStructuredTrackedDiffsInput {
+  signal?: AbortSignal;
   cwd: string;
   trackedChanges: CheckoutFileChange[];
   trackedNumstatByPath: Map<string, FileStat>;
@@ -3193,6 +3312,7 @@ interface AppendStructuredTrackedDiffsInput {
 }
 
 async function buildHighlightedTrackedDiffFile(input: {
+  signal?: AbortSignal;
   cwd: string;
   change: CheckoutFileChange;
   parsedFile: ParsedDiffFile;
@@ -3215,6 +3335,7 @@ async function buildHighlightedTrackedDiffFile(input: {
           : null,
       ]);
   const highlightedFile = await highlightDiffWithFileContent(parsedFile, cwd, {
+    signal: input.signal,
     oldFileContent,
     newFileContent,
   });
@@ -3300,6 +3421,7 @@ async function appendStructuredTrackedDiffs(
       const parsedFile = parsedTrackedByPath.get(change.path);
       if (parsedFile) {
         const file = await buildHighlightedTrackedDiffFile({
+          signal: input.signal,
           cwd,
           change,
           parsedFile,
@@ -3341,6 +3463,7 @@ async function appendStructuredTrackedDiffs(
 }
 
 interface ProcessUntrackedChangeInput {
+  signal?: AbortSignal;
   cwd: string;
   change: CheckoutFileChange;
   ignoreWhitespace: boolean;
@@ -3391,7 +3514,7 @@ async function processUntrackedChange(input: ProcessUntrackedChangeInput): Promi
   }
 
   appendDiff(text);
-  const parsed = await parseAndHighlightDiff(text, cwd);
+  const parsed = await parseAndHighlightDiff(text, cwd, { signal: input.signal });
   const parsedFile =
     parsed[0] ??
     ({
@@ -3587,6 +3710,7 @@ export async function getCheckoutDiff(
   cwd: string,
   compare: CheckoutDiffCompare,
   context?: CheckoutContext,
+  signal?: AbortSignal,
 ): Promise<CheckoutDiffResult> {
   cwd = await requireGitWorktreeRoot(cwd);
 
@@ -3598,10 +3722,15 @@ export async function getCheckoutDiff(
   const index =
     compare.mode === "all" ? await prepareAllChangesIndex(cwd, refsForDiff.baseRef) : null;
   try {
-    return await readCheckoutDiff(cwd, compare, {
-      ...refsForDiff,
-      indexEnv: index ? { GIT_INDEX_FILE: index.indexFile } : undefined,
-    });
+    return await readCheckoutDiff(
+      cwd,
+      compare,
+      {
+        ...refsForDiff,
+        indexEnv: index ? { GIT_INDEX_FILE: index.indexFile } : undefined,
+      },
+      signal,
+    );
   } finally {
     await index?.cleanup();
   }
@@ -3611,6 +3740,7 @@ async function readCheckoutDiff(
   cwd: string,
   compare: CheckoutDiffCompare,
   refsForDiff: CheckoutDiffRefs,
+  signal?: AbortSignal,
 ): Promise<CheckoutDiffResult> {
   const ignoreWhitespace = compare.ignoreWhitespace === true;
   let effectiveRefsForDiff = refsForDiff;
@@ -3671,6 +3801,7 @@ async function readCheckoutDiff(
 
   if (compare.includeStructured) {
     const didAppendTrackedDiffs = await appendStructuredTrackedDiffs({
+      signal,
       cwd,
       trackedChanges,
       trackedNumstatByPath: trackedDiff.trackedNumstatByPath,
@@ -3698,6 +3829,7 @@ async function readCheckoutDiff(
       break;
     }
     const didAppendUntrackedDiff = await processUntrackedChange({
+      signal,
       cwd,
       change,
       ignoreWhitespace,

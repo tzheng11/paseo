@@ -11,6 +11,7 @@ import {
 } from "./helpers/project-picker-fixture";
 import { connectSeedClient, type SeedDaemonClient } from "./helpers/seed-client";
 import { createWithWorkspace, type WithWorkspace } from "./helpers/with-workspace";
+import { seedProjectSidebarGrouping } from "./helpers/sidebar";
 
 const EXTRA_HOSTS_KEY = "@paseo:e2e-extra-hosts";
 
@@ -132,6 +133,7 @@ const test = daemonTest.extend<{
       });
 
       await hideDeveloperToasts(page);
+      await seedProjectSidebarGrouping(page);
 
       const entries: string[] = [];
 
@@ -180,6 +182,11 @@ const test = daemonTest.extend<{
           localStorage.setItem("@paseo:daemon-registry", JSON.stringify([daemon, ...extraHosts]));
           localStorage.removeItem("@paseo:settings");
           localStorage.setItem("@paseo:create-agent-preferences", JSON.stringify(preferences));
+          // New installs collapse finished turns; specs assert on the rows inside them, so they
+          // start from the full chat unless they seed their own settings.
+          if (!localStorage.getItem("@paseo:app-settings")) {
+            localStorage.setItem("@paseo:app-settings", JSON.stringify({ chatDisplay: "full" }));
+          }
         },
         {
           daemon: testDaemon,

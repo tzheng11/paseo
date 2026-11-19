@@ -7,6 +7,7 @@ import {
   buildPinnedSidebarKeys,
   arePinnedSidebarKeysEqual,
   splitPinnedSidebarGroups,
+  sharedPinnedWorkspaceTree,
   type PinnedSidebarKeys,
 } from "@/hooks/use-sidebar-pins";
 
@@ -390,4 +391,43 @@ it("keeps superpin daemon order until a separate subtree reorder is saved", () =
   ]);
   expect(reordered.pinnedChats).toEqual([]);
   expect(reordered.unpinnedProjects[0]?.workspaces).toEqual([]);
+});
+
+describe("shared pin projection", () => {
+  it("reads cross-host parenting and manual order entirely from shared descriptors", () => {
+    const parent = {
+      ...placement("host-b:parent"),
+      serverId: "host-b",
+      pinPlacement: { parentWorkspaceKey: null, siblingOrder: 20, revision: 1 },
+    };
+    const child = {
+      ...placement("s1:child"),
+      pinPlacement: { parentWorkspaceKey: parent.workspaceKey, siblingOrder: 1, revision: 2 },
+    };
+    const root = {
+      ...placement("s1:root"),
+      pinPlacement: { parentWorkspaceKey: null, siblingOrder: 10, revision: 1 },
+    };
+    const projects = [project("p1", [child, root]), project("p2", [parent])];
+    const tree = sharedPinnedWorkspaceTree(projects);
+    const projectClient = () =>
+      splitPinnedSidebarGroups({
+        projects,
+        keys: pinKeys([parent, child, root]),
+        pinnedWorkspaceOrder: [],
+        superpinnedWorkspaceOrder: [],
+        pinnedWorkspaceTree: tree,
+      }).pinnedChats;
+    const first = projectClient();
+    const independent = projectClient();
+    expect(first.map((w) => w.workspaceKey)).toEqual([
+      root.workspaceKey,
+      parent.workspaceKey,
+      child.workspaceKey,
+    ]);
+    expect(independent).toEqual(first);
+    expect(
+      first.find((w) => w.workspaceKey === child.workspaceKey)?.sidebarParentWorkspaceKey,
+    ).toBe(parent.workspaceKey);
+  });
 });

@@ -4,10 +4,14 @@ import { getE2EDaemonPort } from "../support/helpers/daemon-port";
 import {
   expectNewWorkspaceProjectSelected,
   openGlobalNewWorkspaceComposer,
+  submitNewWorkspaceEmpty,
 } from "../support/helpers/new-workspace";
 import { seedWorkspace, type SeededWorkspace } from "../support/helpers/seed-client";
 import { getServerId } from "../support/helpers/server-id";
 import { seedSavedSettingsHosts } from "../support/helpers/settings";
+import { openSidebarDisplayPage, openWorkspaceContextMenu } from "../support/helpers/sidebar";
+import { startIsolatedHostDaemon } from "../support/helpers/isolated-host-daemon";
+import { reloadPreservingHostRegistry } from "../support/helpers/hosts";
 import { LAST_WORKSPACE_SELECTION_STORAGE_KEY } from "@/stores/last-workspace-selection";
 import { buildHostWorkspaceRoute, buildNewWorkspaceRoute } from "@/utils/host-routes";
 import {
@@ -20,6 +24,158 @@ const OFFLINE_SERVER_IDS = [
   "srv_e2e_preselect_offline_2",
   "srv_e2e_preselect_offline_3",
 ];
+
+async function findNewWorkspace(client: SeededWorkspace["client"], before: ReadonlySet<string>) {
+  return (await client.fetchWorkspaces()).entries.find((workspace) => !before.has(workspace.id));
+}
+
+test.describe("Universal child workspace creation", () => {
+  test.setTimeout(240_000);
+
+  test("Add child inherits Superpinned and appends without moving existing siblings", async ({
+    page,
+  }, testInfo) => {
+    const parent = await seedWorkspace({
+      repoPrefix: "child-menu-parent-",
+      title: "Manager workspace",
+    });
+    const other = await seedWorkspace({ repoPrefix: "child-menu-other-", title: "Existing IC" });
+    const parentKey = `${getServerId()}:${parent.workspaceId}`;
+    const siblingKey = `${getServerId()}:${other.workspaceId}`;
+    try {
+      await parent.client.setWorkspaceSuperpinned(parent.workspaceId, true);
+      await other.client.setWorkspaceSuperpinned(other.workspaceId, true);
+      await other.client.setWorkspacePinPlacement({
+        workspaceId: other.workspaceId,
+        placement: { parentWorkspaceKey: parentKey, siblingOrder: 8192 },
+        expectedRevision: 0,
+      });
+      await gotoAppShell(page);
+      await waitForSidebarHydration(page);
+      await openWorkspaceContextMenu(page, parent.workspaceId);
+      await page.getByTestId(`sidebar-workspace-menu-add-child-${parentKey}`).click();
+      await expect(page).toHaveURL(/\/new\?/);
+      await expectNewWorkspaceProjectSelected(page, parent.projectDisplayName);
+      await expect(page.getByTestId("new-workspace-parent-picker-trigger")).toContainText(
+        "Manager workspace",
+      );
+      const before = new Set(
+        (await parent.client.fetchWorkspaces()).entries.map((workspace) => workspace.id),
+      );
+      await submitNewWorkspaceEmpty(page);
+      await expect(page).toHaveURL(/\/workspace\//, { timeout: 60_000 });
+      let child:
+        | Awaited<ReturnType<typeof parent.client.fetchWorkspaces>>["entries"][number]
+        | undefined;
+      await expect
+        .poll(async () => {
+          child = await findNewWorkspace(parent.client, before);
+          return child?.pinPlacement?.parentWorkspaceKey;
+        })
+        .toBe(parentKey);
+      expect(child?.superpinnedAt).toBeTruthy();
+      expect(child?.pinPlacement?.siblingOrder).toBeGreaterThan(8192);
+      const sibling = (await other.client.fetchWorkspaces()).entries.find(
+        (workspace) => workspace.id === other.workspaceId,
+      );
+      expect(sibling?.pinPlacement).toEqual({
+        parentWorkspaceKey: parentKey,
+        siblingOrder: 8192,
+        revision: 1,
+      });
+      const childRow = page.getByTestId(`sidebar-workspace-row-${getServerId()}:${child!.id}`);
+      await expect(childRow).toBeVisible();
+      const siblingRow = page.getByTestId(`sidebar-workspace-row-${siblingKey}`);
+      expect((await childRow.boundingBox())!.y).toBeGreaterThan(
+        (await siblingRow.boundingBox())!.y,
+      );
+      await page.screenshot({ path: testInfo.outputPath("superpinned-child-created.png") });
+    } finally {
+      await parent.cleanup();
+      await other.cleanup();
+    }
+  });
+
+  test("parent picker creates an unpinned child on another host and None renders the shared tree", async ({
+    page,
+  }, testInfo) => {
+    const remote = await startIsolatedHostDaemon("child-picker-remote");
+    const local = await seedWorkspace({
+      repoPrefix: "child-picker-local-",
+      title: "Local project",
+    });
+    const parent = await seedWorkspace({
+      repoPrefix: "child-picker-parent-",
+      title: "Remote manager",
+      port: remote.port,
+    });
+    const parentKey = `${remote.serverId}:${parent.workspaceId}`;
+    try {
+      await seedSavedSettingsHosts(page, [
+        {
+          serverId: getServerId(),
+          label: "Local host",
+          endpoint: `127.0.0.1:${getE2EDaemonPort()}`,
+        },
+        { serverId: remote.serverId, label: "Remote host", endpoint: `127.0.0.1:${remote.port}` },
+      ]);
+      await gotoAppShell(page);
+      await waitForSidebarHydration(page);
+      await openSidebarDisplayPage(page, "sidebar-display-grouping");
+      await page.getByTestId("sidebar-grouping-none").click();
+      await expect(page.getByTestId("sidebar-ungrouped-list")).toBeVisible();
+      await expect(page.locator('[data-testid^="sidebar-project-row-"]')).toHaveCount(0);
+      await switchWorkspaceViaSidebar({
+        page,
+        serverId: getServerId(),
+        workspaceId: local.workspaceId,
+      });
+      await openGlobalNewWorkspaceComposer(page);
+      await expectNewWorkspaceProjectSelected(page, local.projectDisplayName);
+      await page.getByTestId("new-workspace-parent-picker-trigger").click();
+      await page.getByTestId(`new-workspace-parent-option-${parentKey}`).click();
+      await expect(page.getByTestId("new-workspace-parent-picker-trigger")).toContainText(
+        "Remote manager",
+      );
+      const before = new Set(
+        (await local.client.fetchWorkspaces()).entries.map((workspace) => workspace.id),
+      );
+      await submitNewWorkspaceEmpty(page);
+      await expect(page).toHaveURL(new RegExp(`/h/${getServerId()}/workspace/`), {
+        timeout: 60_000,
+      });
+      let child:
+        | Awaited<ReturnType<typeof local.client.fetchWorkspaces>>["entries"][number]
+        | undefined;
+      await expect
+        .poll(async () => {
+          child = await findNewWorkspace(local.client, before);
+          return child?.pinPlacement?.parentWorkspaceKey;
+        })
+        .toBe(parentKey);
+      expect(child?.pinnedAt).toBeFalsy();
+      expect(child?.superpinnedAt).toBeFalsy();
+      const childRow = page.getByTestId(`sidebar-workspace-row-${getServerId()}:${child!.id}`);
+      const parentRow = page.getByTestId(`sidebar-workspace-row-${parentKey}`);
+      await expect(childRow).toBeVisible();
+      await expect(parentRow).toBeVisible();
+      await expect
+        .poll(async () => (await childRow.boundingBox())!.x - (await parentRow.boundingBox())!.x)
+        .toBe(16);
+      await reloadPreservingHostRegistry(page);
+      await expect(childRow).toBeVisible({ timeout: 30_000 });
+      await expect(page.getByTestId("sidebar-ungrouped-list")).toBeVisible();
+      await expect
+        .poll(async () => (await childRow.boundingBox())!.x - (await parentRow.boundingBox())!.x)
+        .toBe(16);
+      await page.screenshot({ path: testInfo.outputPath("ungrouped-cross-host-child.png") });
+    } finally {
+      await local.cleanup();
+      await parent.cleanup();
+      await remote.close();
+    }
+  });
+});
 
 // New Workspace preselection is a form-context decision, not startup routing.
 // Entry points from a workspace should carry the current project context, and a

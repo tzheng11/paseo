@@ -323,6 +323,7 @@ export function CommandCenterRootActions() {
           section: t("shell.commandCenter.actions"),
           groupByProject: t("shell.commandCenter.groupByProject"),
           groupByStatus: t("shell.commandCenter.groupByStatus"),
+          groupByNone: t("shell.commandCenter.groupByNone"),
         },
         icons: { project: FolderIcon, status: CircleDashedIcon },
         setGroupMode,

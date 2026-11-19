@@ -351,8 +351,9 @@ test("loads an archived agent's history after its working directory is removed",
     // history afterwards, and the turn is finalized only once that append lands.
     // Archive after the turn is finalized so the transcript this test reads back is
     // already on disk when the worktree goes away.
-    const finished = await manager.waitForAgentEvent(agent.id);
+    const finished = await manager.waitForAgentEvent(agent.id, { waitForActive: true });
     expect(finished.status).toBe("idle");
+    expect(finished.lastMessage).toBeTruthy();
     await manager.archiveAgent(agent.id);
     await manager.closeAgent(agent.id);
     await manager.flush();

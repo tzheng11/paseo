@@ -7,6 +7,8 @@ import { resolveSidebarWorkspacePrimaryLabel } from "./sidebar-workspace-title";
 
 export type SidebarWorkspaceSortMode = "manual" | "alphabetical" | "activity";
 
+export { UNGROUPED_WORKSPACE_SORT_KEY } from "@getpaseo/protocol/sidebar-order";
+
 interface SidebarWorkspaceSortInput<T extends SidebarWorkspacePlacement> {
   workspaces: readonly T[];
   mode: SidebarWorkspaceSortMode;

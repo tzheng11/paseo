@@ -1,6 +1,8 @@
 export const CLIENT_CAPS = {
   // COMPAT(mainHost): added in v0.11.3; remove gate after 2027-04-18.
   mainHost: "main_host",
+  terminalChunkedReplay: "terminal_chunked_replay",
+  binaryChunkingV1: "binary_chunking_v1",
   helloRejection: "hello_rejection",
   // COMPAT(ownedSubscriptions): added in v0.8.0, remove legacy ownership after 2027-03-09.
   ownedSubscriptions: "owned_subscriptions",

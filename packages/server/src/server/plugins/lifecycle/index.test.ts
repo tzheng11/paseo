@@ -25,7 +25,7 @@ describe("plugin stream timeline loading", () => {
     ];
     for (const event of events) publishAgentStream(lifecycle, agent, event, getTimeline);
     expect(getTimeline).not.toHaveBeenCalled();
-    expect(emit).toHaveBeenCalledExactlyOnceWith("agent.turn_started", { agent, turnId: "t" });
+    expect(emit).toHaveBeenCalledExactlyOnceWith("agent.turn.before", { agent, turnId: "t" });
   });
 
   it.each(["turn_completed", "turn_failed", "turn_canceled"] as const)(
@@ -45,7 +45,7 @@ describe("plugin stream timeline loading", () => {
       publishAgentStream(lifecycle, agent, event, getTimeline);
       expect(getTimeline).toHaveBeenCalledOnce();
       expect(emit).toHaveBeenCalledWith(
-        "agent.turn_ended",
+        "agent.turn.after",
         expect.objectContaining({ agent, timeline }),
       );
     },
@@ -64,7 +64,7 @@ it("marks the bounded hook timeline and provider middle explicitly", () => {
     () => ({ timelineGap, providerHistoryGap }),
   );
   expect(emit).toHaveBeenCalledWith(
-    "agent.turn_ended",
+    "agent.turn.after",
     expect.objectContaining({ timelineGap, providerHistoryGap }),
   );
 });

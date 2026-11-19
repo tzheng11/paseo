@@ -23,6 +23,7 @@ function source(groupMode: SidebarGroupMode): {
         section: "Actions",
         groupByProject: "Group by project",
         groupByStatus: "Group by status",
+        groupByNone: "Show workspace hierarchy",
       },
       icons: { project: ProjectIcon, status: StatusIcon },
       setGroupMode: (mode) => applied.push(mode),
@@ -45,15 +46,25 @@ describe("grouping command center contribution", () => {
     expect(fixture.applied).toEqual(["status"]);
   });
 
-  it("offers project while grouped by status", () => {
+  it("offers the workspace hierarchy while grouped by status", () => {
     const fixture = source("status");
     const contribution = buildGroupingContribution(fixture.value);
 
     expect(contribution.presentation).toMatchObject({
+      title: "Show workspace hierarchy",
+    });
+
+    contribution.run();
+    expect(fixture.applied).toEqual(["none"]);
+  });
+
+  it("offers project grouping from the workspace hierarchy", () => {
+    const fixture = source("none");
+    const contribution = buildGroupingContribution(fixture.value);
+    expect(contribution.presentation).toMatchObject({
       title: "Group by project",
       icon: ProjectIcon,
     });
-
     contribution.run();
     expect(fixture.applied).toEqual(["project"]);
   });
@@ -65,7 +76,7 @@ describe("grouping command center contribution", () => {
   });
 
   it("stays out of the default empty-query list", () => {
-    for (const mode of ["project", "status"] as const) {
+    for (const mode of ["none", "project", "status"] as const) {
       const contribution = buildGroupingContribution(source(mode).value);
       expect(contribution.visibility).toBe("query");
       expect(contribution.group).toBe("actions");

@@ -18,6 +18,7 @@ import type { AgentProfile } from "@getpaseo/protocol/messages";
 interface TestPaseoDaemonOptions {
   daemonVersion?: string;
   desktopManaged?: boolean;
+  workspaceLayout?: PaseoDaemonConfig["workspaceLayout"];
   downloadTokenTtlMs?: number;
   corsAllowedOrigins?: string[];
   listen?: string;
@@ -30,6 +31,7 @@ interface TestPaseoDaemonOptions {
   relayEndpoint?: string;
   relayUseTls?: boolean;
   relayPublicUseTls?: boolean;
+  relayRequireProtectedSecurity?: boolean;
   daemonStatusRpcCapability?: boolean;
   relayConfigCapability?: boolean;
   agentClients?: Partial<Record<AgentProvider, AgentClient>>;
@@ -38,7 +40,8 @@ interface TestPaseoDaemonOptions {
   staticDir?: string;
   cleanup?: boolean;
   openai?: PaseoOpenAIConfig;
-  speech?: PaseoSpeechConfig;
+  // localModelsDir defaults to the local provider's modelsDir, then to a dir under paseoHome.
+  speech?: Omit<PaseoSpeechConfig, "localModelsDir"> & { localModelsDir?: string };
   voiceLlmProvider?: PaseoDaemonConfig["voiceLlmProvider"];
   voiceLlmProviderExplicit?: boolean;
   voiceLlmModel?: string | null;
@@ -50,6 +53,8 @@ interface TestPaseoDaemonOptions {
   trustedProxies?: PaseoDaemonConfig["trustedProxies"];
   agentProfiles?: AgentProfile[];
   autoArchiveAfterMerge?: boolean;
+  resumeOnStartup?: boolean;
+  resumePrompt?: string;
   pluginsEnabled?: PaseoDaemonConfig["pluginsEnabled"];
   builtinPlugins?: BuiltinPluginLoader;
   plugins?: PaseoDaemonConfig["plugins"];
@@ -187,6 +192,7 @@ async function prepareTestDaemonConfig(
     paseoHome,
     daemonVersion: options.daemonVersion,
     desktopManaged: options.desktopManaged,
+    workspaceLayout: options.workspaceLayout,
     corsAllowedOrigins: options.corsAllowedOrigins ?? [],
     hostnames: true,
     mcpEnabled: options.mcpEnabled ?? true,
@@ -200,6 +206,7 @@ async function prepareTestDaemonConfig(
     relayEndpoint: options.relayEndpoint ?? "relay.paseo.sh:443",
     relayUseTls: options.relayUseTls,
     relayPublicUseTls: options.relayPublicUseTls,
+    relayRequireProtectedSecurity: options.relayRequireProtectedSecurity,
     appBaseUrl: "https://app.paseo.sh",
     auth: options.auth,
     pushNotificationSender: options.pushNotificationSender,
@@ -207,7 +214,15 @@ async function prepareTestDaemonConfig(
     webUi: options.webUi,
     trustedProxies: options.trustedProxies,
     openai: options.openai,
-    speech: options.speech,
+    speech: options.speech
+      ? {
+          ...options.speech,
+          localModelsDir:
+            options.speech.localModelsDir ??
+            options.speech.local?.modelsDir ??
+            path.join(paseoHome, "models", "local-speech"),
+        }
+      : undefined,
     voiceLlmProvider: options.voiceLlmProvider ?? null,
     voiceLlmProviderExplicit: options.voiceLlmProviderExplicit ?? false,
     voiceLlmModel: options.voiceLlmModel ?? null,
@@ -215,6 +230,8 @@ async function prepareTestDaemonConfig(
     downloadTokenTtlMs: options.downloadTokenTtlMs,
     agentProfiles: options.agentProfiles,
     autoArchiveAfterMerge: options.autoArchiveAfterMerge,
+    resumeOnStartup: options.resumeOnStartup,
+    resumePrompt: options.resumePrompt,
     pluginsEnabled: options.pluginsEnabled,
     plugins: options.plugins,
   };

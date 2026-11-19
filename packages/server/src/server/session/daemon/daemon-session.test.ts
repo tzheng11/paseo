@@ -1,7 +1,7 @@
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import pino from "pino";
 import {
   DaemonSession,
@@ -9,6 +9,7 @@ import {
   type DaemonSessionHost,
 } from "./daemon-session.js";
 import type { DaemonWebSocketRuntimeDiagnosticSnapshot } from "./diagnostics.js";
+import { CpuProfiler, type CpuProfilerRuntime } from "./cpu-profile.js";
 import type { ProviderAvailability } from "../../agent/agent-manager.js";
 import type { HubRelationshipManagement } from "../../hub/relationship-controller.js";
 import type {
@@ -50,6 +51,9 @@ function makeSubsystem(overrides: {
   reloadConfig?: () => DaemonConfigReloadResult;
   listVisibleAgents?: () => Promise<AgentSnapshotPayload[]>;
   listVisibleWorkspaces?: () => Promise<WorkspaceDescriptorPayload[]>;
+  reloadConfig?: () => Promise<DaemonConfigReloadResult>;
+  cpuProfiler?: CpuProfiler;
+  logger?: pino.Logger;
 }) {
   const emitted: SessionOutboundMessage[] = [];
   const restartIntents: Parameters<DaemonSessionHost["emitLifecycleIntent"]>[0][] = [];
@@ -75,27 +79,179 @@ function makeSubsystem(overrides: {
     hubRelationships: overrides.hubRelationships,
     reloadConfig:
       overrides.reloadConfig ??
-      (() => ({
+      (async () => ({
         appliedPaths: [],
         restartRequiredPaths: [],
         overrideControlledPaths: [],
       })),
-    logger: pino({ level: "silent" }),
+    logger: overrides.logger ?? pino({ level: "silent" }),
+    cpuProfiler: overrides.cpuProfiler,
   });
   return { subsystem, emitted, paseoHome, restartIntents };
 }
 
+function fakeProfilerRuntime(calls: string[]): CpuProfilerRuntime {
+  return {
+    pid: 99,
+    isMainThread: true,
+    inspectorUrl: () => undefined,
+    now: () => performance.now(),
+    createSession: () => ({
+      connect: () => calls.push("connect"),
+      disconnect: () => calls.push("disconnect"),
+      post: async (method: string) => {
+        calls.push(method);
+        if (method !== "Profiler.stop") return {};
+        return {
+          profile: {
+            nodes: [
+              {
+                id: 1,
+                callFrame: {
+                  functionName: "(root)",
+                  scriptId: "0",
+                  url: "",
+                  lineNumber: -1,
+                  columnNumber: -1,
+                },
+              },
+            ],
+            startTime: 0,
+            endTime: 10,
+            samples: [1],
+            timeDeltas: [10],
+          },
+        };
+      },
+    }),
+  };
+}
+
+function countStarts(calls: string[]): number {
+  return calls.filter((call) => call === "Profiler.start").length;
+}
+
+describe("DaemonSession CPU profile", () => {
+  test("emits only the sanitized summary for a completed capture", async () => {
+    const calls: string[] = [];
+    const cpuProfiler = new CpuProfiler({
+      packetRoot: "/packet",
+      loadRuntime: async () => fakeProfilerRuntime(calls),
+    });
+    const { subsystem, emitted } = makeSubsystem({ cpuProfiler });
+
+    await subsystem.handleCpuProfileRequest(
+      { type: "diagnostics.cpu_profile.request", requestId: "cpu-1", durationMs: 5 },
+      {},
+    );
+
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toMatchObject({
+      type: "diagnostics.cpu_profile.response",
+      payload: { requestId: "cpu-1", profile: { pid: 99, sampleCount: 1 } },
+    });
+    expect(JSON.stringify(emitted)).not.toContain("functionName");
+    expect(calls.at(-1)).toBe("disconnect");
+  });
+
+  test("an untyped profiler failure replies and logs only the fixed code and text", async () => {
+    const secret = "sk-SECRET-token-in-error";
+    const logLines: string[] = [];
+    const logger = pino({ level: "trace" }, { write: (line: string) => logLines.push(line) });
+    const cpuProfiler = new CpuProfiler({
+      packetRoot: "/packet",
+      loadRuntime: async () => fakeProfilerRuntime([]),
+    });
+    vi.spyOn(cpuProfiler, "capture").mockRejectedValue(new Error(secret));
+    const { subsystem, emitted } = makeSubsystem({ cpuProfiler, logger });
+
+    await subsystem.handleCpuProfileRequest(
+      { type: "diagnostics.cpu_profile.request", requestId: "cpu-untyped", durationMs: 5 },
+      {},
+    );
+
+    expect(emitted).toEqual([
+      {
+        type: "rpc_error",
+        payload: {
+          requestId: "cpu-untyped",
+          requestType: "diagnostics.cpu_profile.request",
+          error: "The CPU profiler failed",
+          code: "cpu_profile_profiler_failed",
+        },
+      },
+    ]);
+    expect(logLines.join("")).not.toContain(secret);
+    expect(logLines.join("")).toContain("profiler_failed");
+  });
+
+  test("socket close cancels only its own capture and session cleanup cancels the rest", async () => {
+    const calls: string[] = [];
+    const cpuProfiler = new CpuProfiler({
+      packetRoot: "/packet",
+      loadRuntime: async () => fakeProfilerRuntime(calls),
+    });
+    const { subsystem, emitted } = makeSubsystem({ cpuProfiler });
+    const socket = {};
+
+    const first = subsystem.handleCpuProfileRequest(
+      { type: "diagnostics.cpu_profile.request", requestId: "cpu-2", durationMs: 4000 },
+      socket,
+    );
+    await vi.waitFor(() => expect(calls).toContain("Profiler.start"));
+    subsystem.cancelCpuProfileForSocket({});
+    expect(cpuProfiler.busy).toBe(true);
+    subsystem.cancelCpuProfileForSocket(socket);
+    await first;
+
+    const second = subsystem.handleCpuProfileRequest(
+      { type: "diagnostics.cpu_profile.request", requestId: "cpu-3", durationMs: 4000 },
+      {},
+    );
+    await vi.waitFor(() => expect(countStarts(calls)).toBe(2));
+    const busy = subsystem.handleCpuProfileRequest(
+      { type: "diagnostics.cpu_profile.request", requestId: "cpu-4", durationMs: 10 },
+      {},
+    );
+    await busy;
+    subsystem.cancelCpuProfiles();
+    await second;
+
+    expect(emitted.map((message) => message.type === "rpc_error" && message.payload)).toEqual([
+      {
+        requestId: "cpu-2",
+        requestType: "diagnostics.cpu_profile.request",
+        error: "The CPU profile was cancelled",
+        code: "cpu_profile_cancelled",
+      },
+      {
+        requestId: "cpu-4",
+        requestType: "diagnostics.cpu_profile.request",
+        error: "A CPU profile is already running in this daemon",
+        code: "cpu_profile_busy",
+      },
+      {
+        requestId: "cpu-3",
+        requestType: "diagnostics.cpu_profile.request",
+        error: "The CPU profile was cancelled",
+        code: "cpu_profile_cancelled",
+      },
+    ]);
+    expect(cpuProfiler.busy).toBe(false);
+  });
+});
+
 describe("DaemonSession", () => {
-  test("config reload returns the daemon-owned classification", () => {
+  test("config reload returns the daemon-owned classification", async () => {
     const { subsystem, emitted } = makeSubsystem({
-      reloadConfig: () => ({
+      reloadConfig: async () => ({
         appliedPaths: ["daemon.browserTools.enabled"],
         restartRequiredPaths: ["daemon.listen"],
         overrideControlledPaths: ["app.baseUrl"],
       }),
     });
 
-    subsystem.handleConfigReloadRequest({
+    await subsystem.handleConfigReloadRequest({
       type: "daemon.config.reload.request",
       requestId: "reload-1",
     });
@@ -113,14 +269,14 @@ describe("DaemonSession", () => {
     ]);
   });
 
-  test("config reload failures return a correlated RPC error", () => {
+  test("config reload failures return a correlated RPC error", async () => {
     const { subsystem, emitted } = makeSubsystem({
-      reloadConfig: () => {
+      reloadConfig: async () => {
         throw new Error("Invalid config");
       },
     });
 
-    subsystem.handleConfigReloadRequest({
+    await subsystem.handleConfigReloadRequest({
       type: "daemon.config.reload.request",
       requestId: "reload-2",
     });
@@ -220,6 +376,7 @@ describe("DaemonSession", () => {
             { provider: "claude", available: true, error: null },
             { provider: "codex", available: false, error: "boom" },
           ],
+          terminalCleanupUnconfirmed: [],
         },
       },
     ]);
@@ -250,6 +407,7 @@ describe("DaemonSession", () => {
           listen: null,
           relay: null,
           providers: [],
+          terminalCleanupUnconfirmed: [],
         },
       },
     ]);

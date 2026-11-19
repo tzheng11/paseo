@@ -1,6 +1,6 @@
 import type { Logger } from "pino";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import {
@@ -45,6 +45,12 @@ const RecordSchema = z.object({
   inFlight: z.enum(["workspace", "agent", "prompt"]).nullable(),
 });
 type Record = z.infer<typeof RecordSchema>;
+/** Codes thrown before provisioning creates anything, so the same key can retry. */
+const REJECTED_BEFORE_PROVISION = new Set([
+  "directory_not_found",
+  "source_required",
+  "worktree_preparation_timeout",
+]);
 
 /** Owns creation across socket lifetimes. Resource owners perform work; this module commits its milestones. */
 export class CreationService {
@@ -120,6 +126,50 @@ export class CreationService {
     } finally {
       unsubscribe();
     }
+  }
+
+  /** Fails creates a previous daemon left in flight. Their runners died with it; none resumes. */
+  async failInterrupted(): Promise<number> {
+    const run = this.admission.then(async () => {
+      let interrupted = 0;
+      for (const file of await readdirOptional(this.directory)) {
+        if (!file.endsWith(".json")) continue;
+        const identity = file.slice(0, -".json".length);
+        try {
+          if (await this.failIfInterrupted(identity)) interrupted += 1;
+        } catch (err) {
+          // One unreadable record must not keep the daemon from starting; its own create still fails on it.
+          this.logger.error(
+            { err, file: join(this.directory, file) },
+            "Skipped unreadable creation record at startup",
+          );
+        }
+      }
+      return interrupted;
+    });
+    this.admission = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private async failIfInterrupted(identity: string): Promise<boolean> {
+    const record = await this.read(identity);
+    if (!record?.inFlight || this.active.has(identity)) return false;
+    const { phase, kind } = record.snapshot;
+    if (phase === "failed" || phase === "completed") return false;
+    const stage = record.inFlight;
+    // Cleared so a later subscribe keeps this reason instead of a generic outcome_unknown.
+    record.inFlight = null;
+    await this.publish(identity, record, {
+      phase: "failed",
+      error: `The daemon restarted before this ${kind} create finished. It was interrupted and will not resume; check whether its ${stage} exists before retrying with a new key.`,
+      errorCode: `${kind}_request_interrupted`,
+      failedStage: stage,
+      outcomeUnknown: true,
+    });
+    return true;
   }
 
   async subscribe(
@@ -198,10 +248,9 @@ export class CreationService {
         error instanceof Error && "code" in error && typeof error.code === "string"
           ? error.code
           : undefined;
-      const rejectedBeforeProvision = code === "directory_not_found" || code === "source_required";
       const unknown =
         stage === "prompt" ||
-        (stage === "workspace" && !rejectedBeforeProvision) ||
+        (stage === "workspace" && !REJECTED_BEFORE_PROVISION.has(code ?? "")) ||
         (resourceId !== null && (await input.exists(stage, resourceId)));
       // A failed provider startup with no registered resource can retry under the same ID.
       // A partially provisioned resource or an attempted prompt needs reconciliation.
@@ -366,6 +415,14 @@ function digest(input: unknown): string {
       }),
     )
     .digest("hex");
+}
+async function readdirOptional(directory: string): Promise<string[]> {
+  try {
+    return await readdir(directory);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return [];
+    throw error;
+  }
 }
 async function readOptional(file: string): Promise<string | null> {
   try {

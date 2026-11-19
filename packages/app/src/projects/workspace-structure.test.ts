@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import type { ProjectDescriptor, WorkspaceDescriptor } from "@/stores/session-store";
 import { buildWorkspaceStructureProjects, createProjectViewKey } from "./workspace-structure";
+import { decodeLegacyWorkspaceLayout } from "../../../server/src/server/workspace-layout-import.js";
 
 function project(input: {
   id: string;
@@ -20,6 +21,8 @@ function project(input: {
 
 function workspace(id: string, projectId: string, root: string): WorkspaceDescriptor {
   return {
+    createdAt: null,
+    lastUserMessageAt: null,
     id,
     projectId,
     projectDisplayName: "acme/app",
@@ -38,6 +41,60 @@ function workspace(id: string, projectId: string, root: string): WorkspaceDescri
 }
 
 describe("buildWorkspaceStructureProjects", () => {
+  test("the explicit disk import decoder preserves mixed-host numeric and legacy-name root ordering", () => {
+    const key = "remote:github.com/acme/app";
+    const original = [
+      { ...workspace("z-id", "old-project", "/old/app"), name: "Alpha" },
+      { ...workspace("a-id", "old-project", "/old/app"), name: "Zulu" },
+    ];
+    const decoded = decodeLegacyWorkspaceLayout({
+      serverId: "old",
+      profile: "upstream-014",
+      bytes: new TextEncoder().encode(
+        JSON.stringify(
+          original.map((record) => ({
+            workspaceId: record.id,
+            projectId: record.projectId,
+            pinnedAt: null,
+            archivedAt: null,
+          })),
+        ),
+      ),
+    });
+    const oldSession = {
+      serverId: "old",
+      projects: [project({ id: "old-project", key, root: "/old/app" })],
+      workspaces: original,
+    };
+    const rankedSession = {
+      serverId: "ranked",
+      projects: [project({ id: "ranked-project", key, root: "/new/app" })],
+      workspaces: [
+        {
+          ...workspace("first", "ranked-project", "/new/app"),
+          name: "Last alphabetically",
+          siblingOrder: 40,
+        },
+      ],
+    };
+    const before = buildWorkspaceStructureProjects({ sessions: [oldSession, rankedSession] });
+    const after = buildWorkspaceStructureProjects({
+      sessions: [
+        rankedSession,
+        {
+          ...oldSession,
+          workspaces: original.map((record, index) =>
+            Object.assign({}, record, {
+              siblingOrder: decoded.entries[index].siblingOrder ?? undefined,
+            }),
+          ),
+        },
+      ],
+    });
+    expect(after[0].workspaceKeys).toEqual(before[0].workspaceKeys);
+    expect(after[0].workspaceKeys).toEqual(["ranked:first", "old:z-id", "old:a-id"]);
+  });
+
   test("carries persisted parenting and sibling order into the structural sidebar model", () => {
     const first = {
       ...workspace("first", "prj_a", "/repo"),
@@ -48,6 +105,7 @@ describe("buildWorkspaceStructureProjects", () => {
       ...workspace("second", "prj_a", "/repo"),
       parentWorkspaceId: "first",
       siblingOrder: 10,
+      pinPlacement: { parentWorkspaceKey: "other-host:parent", siblingOrder: 512, revision: 2 },
     };
     const result = buildWorkspaceStructureProjects({
       sessions: [
@@ -61,7 +119,11 @@ describe("buildWorkspaceStructureProjects", () => {
     expect(result[0]?.workspaceKeys).toEqual(["host-a:second", "host-a:first"]);
     expect(result[0]?.workspaceHierarchy).toEqual({
       "host-a:first": { parentWorkspaceId: null, siblingOrder: 20 },
-      "host-a:second": { parentWorkspaceId: "first", siblingOrder: 10 },
+      "host-a:second": {
+        parentWorkspaceId: "first",
+        siblingOrder: 10,
+        pinPlacement: second.pinPlacement,
+      },
     });
   });
 
@@ -246,4 +308,52 @@ describe("buildWorkspaceStructureProjects", () => {
       placementShapedKey,
     );
   });
+});
+
+test("sorts by creation or human prompt without changing picker name order", () => {
+  const old = {
+    ...workspace("old", "p", "/p"),
+    name: "A",
+    createdAt: new Date("2026-01-01"),
+    lastUserMessageAt: new Date("2026-03-01"),
+  };
+  const fresh = {
+    ...workspace("fresh", "p", "/p"),
+    name: "B",
+    createdAt: new Date("2026-02-01"),
+    lastUserMessageAt: null,
+  };
+  const sessions = [
+    {
+      serverId: "host",
+      projects: [project({ id: "p", key: "p", root: "/p" })],
+      workspaces: [old, fresh],
+    },
+  ];
+  expect(
+    buildWorkspaceStructureProjects({ sessions, workspaceSort: "created" })[0].workspaceKeys,
+  ).toEqual(["host:fresh", "host:old"]);
+  expect(
+    buildWorkspaceStructureProjects({ sessions, workspaceSort: "lastPrompt" })[0].workspaceKeys,
+  ).toEqual(["host:old", "host:fresh"]);
+  expect(buildWorkspaceStructureProjects({ sessions })[0].workspaceKeys).toEqual([
+    "host:old",
+    "host:fresh",
+  ]);
+});
+
+test("time ties use workspace identity so renaming cannot move Created rows", () => {
+  const a = { ...workspace("a", "p", "/p"), name: "Z", createdAt: new Date("2026-01-01") };
+  const b = { ...workspace("b", "p", "/p"), name: "A", createdAt: a.createdAt };
+  const sessions = [
+    { serverId: "h", projects: [project({ id: "p", key: "p", root: "/p" })], workspaces: [b, a] },
+  ];
+  expect(
+    buildWorkspaceStructureProjects({ sessions, workspaceSort: "created" })[0].workspaceKeys,
+  ).toEqual(["h:a", "h:b"]);
+  a.name = "A";
+  b.name = "Z";
+  expect(
+    buildWorkspaceStructureProjects({ sessions, workspaceSort: "created" })[0].workspaceKeys,
+  ).toEqual(["h:a", "h:b"]);
 });
