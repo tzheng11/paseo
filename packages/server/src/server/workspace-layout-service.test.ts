@@ -68,6 +68,79 @@ function attach(value: WorkspaceLayoutService, read: () => Promise<WorkspaceLayo
   return client;
 }
 
+function expectCloneFreeStatus(value: WorkspaceLayoutService, synchronized: boolean) {
+  const cached = vi.spyOn(value, "cached");
+  const clone = vi.spyOn(globalThis, "structuredClone");
+  try {
+    const status = value.status();
+    expect(status.synchronized).toBe(synchronized);
+    if (!status.stamp) throw new Error("fixture status stamp missing");
+    const stamp = { ...status.stamp };
+    status.stamp.revision++;
+    expect(value.status().stamp).toEqual(stamp);
+    expect(cached).not.toHaveBeenCalled();
+    expect(clone).not.toHaveBeenCalled();
+  } finally {
+    clone.mockRestore();
+    cached.mockRestore();
+  }
+}
+
+it.each(["importing", "active"] as const)(
+  "reports current %s freshness without cloning a 3308-entry cache",
+  async (phase) => {
+    const prior: WorkspaceLayoutSnapshot = {
+      ...snapshot(8),
+      stamp: { ...snapshot(8).stamp, phase },
+      entries: Array.from({ length: 3308 }, (_, index) => ({
+        ref: { serverId: "srv_replica", workspaceId: `large-${index}` },
+        projectId: "project",
+        pinnedAt: null,
+        superpinnedAt: null,
+        parent: null,
+        siblingOrder: index,
+        pinPlacement: null,
+        archivedAt: null,
+        revision: 1,
+      })),
+    };
+    await writeFile(path.join(home, "workspace-layout-replica.json"), JSON.stringify(prior));
+    const value = service();
+    await value.load();
+    expectCloneFreeStatus(value, false);
+    const client = createStub<DaemonClient>({
+      observeWorkspaceLayout: () => ({
+        subscriptionId: null,
+        ready: Promise.resolve(prior),
+        subscribe: () => () => {},
+        release: async () => {},
+      }),
+      subscribeConnectionStatus: () => () => {},
+    });
+    value.attachTransport({ use: async (action) => action(client), changed: () => () => {} });
+    await expect.poll(() => value.status().synchronized).toBe(true);
+    expectCloneFreeStatus(value, true);
+    const copy = value.cached();
+    if (!copy.snapshot) throw new Error("large fixture cache missing");
+    copy.snapshot.entries[0].pinnedAt = "2026-11-04T12:00:00.000Z";
+    expect(value.cached().snapshot?.entries[0].pinnedAt).toBeNull();
+    await value.close();
+    expectCloneFreeStatus(value, false);
+  },
+);
+
+it("reports healthy authority freshness without cloning its cache", async () => {
+  const value = new WorkspaceLayoutService({
+    home: path.join(home, "authority"),
+    serverId: "srv_hub",
+    config: { ...config, role: "authority" },
+    failed: () => {},
+  });
+  services.push(value);
+  await value.initialize(config);
+  expectCloneFreeStatus(value, true);
+});
+
 it("loads an offline replica as stale/read-only and never promotes it to an authority", async () => {
   const prior = snapshot(8);
   await writeFile(path.join(home, "workspace-layout-replica.json"), JSON.stringify(prior));

@@ -9,6 +9,7 @@ import type {
   WorkspaceLayoutSnapshot,
 } from "@getpaseo/protocol/workspace-layout";
 import { emptyWorkspaceNavigationPreferences } from "@getpaseo/protocol/workspace-layout";
+import * as layoutProtocol from "@getpaseo/protocol/workspace-layout";
 import {
   FileBackedWorkspaceRegistry,
   type PersistedWorkspaceRecord,
@@ -119,6 +120,158 @@ async function registry(records: PersistedWorkspaceRecord[], name = "a", serverI
   await value.initialize();
   return { value, file };
 }
+
+async function largeReadFixture(phase: "importing" | "active") {
+  await service.close();
+  const derivedConfig = { ...config, semanticsVersion: 2 as const };
+  service = new WorkspaceLayoutService({
+    home,
+    serverId: "srv_hub",
+    config: derivedConfig,
+    failed: () => {},
+  });
+  const childPin = "2026-11-04T09:00:00.000Z";
+  const records = Array.from({ length: 440 }, (_, index) => ({
+    ...row(`large-${index}`),
+    siblingOrder: index,
+  }));
+  records[0] = {
+    ...records[0],
+    pinnedAt: childPin,
+    pinPlacement: { parentWorkspaceKey: "srv_b:large-440", siblingOrder: 0, revision: 1 },
+  };
+  records[1] = {
+    ...records[1],
+    pinnedAt: childPin,
+    pinPlacement: { parentWorkspaceKey: "srv_unknown:missing", siblingOrder: 1, revision: 1 },
+  };
+  records[2] = { ...records[0], workspaceId: "large-2", archivedAt: at };
+  const remote = Array.from({ length: 2869 }, (_, index) => ({
+    ...row(`large-${index + 440}`),
+    pinnedAt: index === 0 ? at : null,
+  }));
+  const initial = await service.initialize(derivedConfig);
+  await service.commit({
+    writerVersion: 2,
+    requestId: "large-import",
+    expected: initial.stamp,
+    mutations: [
+      ...[
+        { serverId: "srv_a", records: records.slice(0, 439) },
+        { serverId: "srv_b", records: remote },
+      ].map(({ serverId, records: owned }) => ({
+        kind: "import-host" as const,
+        source: { serverId, sourceSha256: "a".repeat(64), resolutionSha256: "b".repeat(64) },
+        previousSourceSha256: null,
+        entries: layoutProtocol.qualifyLegacyWorkspaceLayoutEntries(
+          owned.map((record) => canonical(record, serverId)),
+        ),
+      })),
+      { kind: "declare-unknown-owner", serverId: "srv_unknown" },
+      {
+        kind: "put-navigation",
+        expectedRevision: 0,
+        preferences: emptyWorkspaceNavigationPreferences(),
+        importResolution: { clientSources: [], resolutionSha256: "0".repeat(64) },
+      },
+    ],
+  });
+  const imported = await service.inspect();
+  expect(imported.entries).toHaveLength(3308);
+  if (phase === "active")
+    await service.commit({
+      writerVersion: 2,
+      requestId: "large-activate",
+      expected: imported.stamp,
+      mutations: [
+        {
+          kind: "activate",
+          requiredImports: imported.imports,
+          requiredClientImports: [],
+          requiredOwnerDomains: imported.ownerDomains,
+        },
+      ],
+    });
+  const file = path.join(home, "large", "workspaces.json");
+  await mkdir(path.dirname(file));
+  await writeFile(file, JSON.stringify(records));
+  const value = new CanonicalWorkspaceRegistry(file, createTestLogger(), service, "srv_a");
+  registries.push(value);
+  await value.initialize();
+  return { value, file, records, childPin };
+}
+
+it.each([
+  { phase: "importing" as const, count: 440, derives: 0, pin: "2026-11-04T09:00:00.000Z" },
+  { phase: "active" as const, count: 439, derives: 1, pin: at },
+])(
+  "bounds 3308-entry $phase reads with 440 local rows while preserving publication",
+  async ({ phase, count, derives, pin }) => {
+    const { value, file, records, childPin } = await largeReadFixture(phase);
+    const before = await readFile(file, "utf8");
+    const cached = vi.spyOn(service, "cached");
+    const clone = vi.spyOn(globalThis, "structuredClone");
+    const derive = vi.spyOn(layoutProtocol, "resolveEffectiveWorkspaceLayout");
+    try {
+      const listed = await value.list();
+      expect(cached).toHaveBeenCalledTimes(1);
+      expect(clone).toHaveBeenCalledTimes(1);
+      expect(derive).toHaveBeenCalledTimes(derives);
+      expect(listed.map((record) => record.workspaceId)).toEqual(
+        records.slice(0, count).map((record) => record.workspaceId),
+      );
+      expect(listed[0].pinnedAt).toBe(pin);
+      expect(listed[1].pinnedAt).toBe(childPin);
+      expect(listed[2]).toMatchObject({ archivedAt: at, pinnedAt: childPin });
+      expect(await readFile(file, "utf8")).toBe(before);
+    } finally {
+      derive.mockRestore();
+      clone.mockRestore();
+      cached.mockRestore();
+    }
+  },
+);
+
+it("isolates large active read snapshots and sees a new authority revision on the next list", async () => {
+  const { value, file, childPin } = await largeReadFixture("active");
+  const first = await value.list();
+  expect(first[1]).toMatchObject({ pinnedAt: childPin, effectiveSection: null });
+  expect(first[0].pinPlacement).toEqual({
+    parentWorkspaceKey: "srv_b:large-440",
+    siblingOrder: 0,
+    revision: 1,
+  });
+  const placement = first[0].pinPlacement;
+  if (!placement) throw new Error("large fixture placement missing");
+  placement.siblingOrder = 9000;
+  const before = await service.inspect();
+  expect(
+    before.entries.find((entry) => entry.ref.workspaceId === "large-0")?.pinPlacement?.siblingOrder,
+  ).toBe(0);
+  const parent = before.entries.find((entry) => entry.ref.workspaceId === "large-440");
+  if (!parent?.sectionIntent) throw new Error("large fixture parent missing");
+  const nextPin = "2026-11-04T11:00:00.000Z";
+  await service.commit({
+    writerVersion: 2,
+    requestId: "large-new-revision",
+    expected: before.stamp,
+    mutations: [
+      {
+        kind: "put",
+        entry: {
+          ...parent,
+          pinnedAt: nextPin,
+          sectionIntent: { ...parent.sectionIntent, mode: "explicit" },
+        },
+      },
+    ],
+  });
+  const next = await value.list();
+  expect(next[0]).toMatchObject({ pinnedAt: nextPin, pinPlacement: { siblingOrder: 0 } });
+  expect(next[1]).toMatchObject({ pinnedAt: childPin, effectiveSection: null });
+  expect(next[2]).toMatchObject({ archivedAt: at, pinnedAt: childPin });
+  expect(JSON.parse(await readFile(file, "utf8"))[0].pinnedAt).toBe(childPin);
+});
 
 it("routes ordinary pin and superpin writes through one durable authority across independent clients", async () => {
   const original = row("one");

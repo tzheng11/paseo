@@ -105,15 +105,19 @@ export class WorkspaceLayoutService {
   cached(): { snapshot: WorkspaceLayoutSnapshot | null; fresh: boolean } {
     return {
       snapshot: structuredClone(this.cache),
-      fresh: this.healthy && (this.store !== null || this.connected),
+      fresh: this.isFresh(),
     };
+  }
+
+  private isFresh(): boolean {
+    return this.healthy && (this.store !== null || this.connected);
   }
 
   status() {
     return {
       ...this.options.config,
-      stamp: this.cache?.stamp ?? null,
-      synchronized: this.cached().fresh,
+      stamp: this.cache ? { ...this.cache.stamp } : null,
+      synchronized: this.isFresh(),
     };
   }
 
