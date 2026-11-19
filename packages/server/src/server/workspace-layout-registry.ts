@@ -5,6 +5,7 @@ import {
   workspaceReferenceKey,
   type WorkspaceLayoutEntry,
   type WorkspaceLayoutSnapshot,
+  type EffectiveWorkspaceLayout,
   resolveEffectiveWorkspaceLayout,
   workspaceLayoutParentKey,
   workspaceLayoutSection,
@@ -34,6 +35,10 @@ interface SectionEntryIntent {
   previous: WorkspaceLayoutEntry | undefined;
   snapshot: WorkspaceLayoutSnapshot;
   sectionMode: "inherit" | "explicit" | undefined;
+}
+interface WorkspaceLayoutReadView {
+  snapshot: WorkspaceLayoutSnapshot | null;
+  effective: Map<string, EffectiveWorkspaceLayout> | null;
 }
 function isExplicitSectionIntent(
   mode: WorkspaceMutationContext["sectionIntent"],
@@ -75,8 +80,10 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
   }
 
   override async list(): Promise<PersistedWorkspaceRecord[]> {
-    return (await super.list()).flatMap((record) => {
-      const projected = this.projectOrQuarantine(record);
+    const records = await super.list();
+    const view = this.readView();
+    return records.flatMap((record) => {
+      const projected = this.projectOrQuarantine(record, view);
       return projected ? [projected] : [];
     });
   }
@@ -101,7 +108,7 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
       const raw = await super.get(id);
       if (!raw) return null;
       const snapshot = layoutWrite ? await this.freshActive() : undefined;
-      const current = this.publish(raw, snapshot);
+      const current = this.publish(raw, this.readView(snapshot));
       let next = updater(structuredClone(current));
       let changed = changedFields(current, next);
       let layoutChanged = LAYOUT_FIELDS.filter((field) => Object.hasOwn(changed, field));
@@ -109,7 +116,7 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
       let projected = this.project(raw, snapshot);
       if (layoutChanged.length) {
         const active = snapshot ?? (await this.freshActive());
-        const fresh = this.publish(raw, active);
+        const fresh = this.publish(raw, this.readView(active));
         // Re-run pure updater guards (notably expected placement revision) on
         // the authority value, rather than accepting a stale replica's check.
         next = snapshot ? next : updater(structuredClone(fresh));
@@ -408,22 +415,31 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
     return entry;
   }
 
+  private readView(snapshot = this.layout.cached().snapshot): WorkspaceLayoutReadView {
+    return {
+      snapshot,
+      effective:
+        snapshot?.semanticsVersion === 2 && snapshot.stamp.phase === "active"
+          ? resolveEffectiveWorkspaceLayout(snapshot)
+          : null,
+    };
+  }
+
   private publish(
     record: PersistedWorkspaceRecord,
-    snapshot = this.layout.cached().snapshot,
+    view = this.readView(),
   ): PersistedWorkspaceRecord {
+    const { snapshot, effective } = view;
     const raw = this.project(record, snapshot);
-    if (snapshot?.semanticsVersion !== 2 || snapshot.stamp.phase !== "active") return raw;
-    const view = resolveEffectiveWorkspaceLayout(snapshot).get(
-      `${this.serverId}:${record.workspaceId}`,
-    );
-    if (!view) throw new WorkspaceLayoutRefusal("workspace_not_imported");
-    if (view.section === null) return { ...raw, effectiveSection: null };
+    if (!effective) return raw;
+    const membership = effective.get(`${this.serverId}:${record.workspaceId}`);
+    if (!membership) throw new WorkspaceLayoutRefusal("workspace_not_imported");
+    if (membership.section === null) return { ...raw, effectiveSection: null };
     return {
       ...raw,
-      pinnedAt: view.pinnedAt,
-      superpinnedAt: view.superpinnedAt,
-      effectiveSection: view.section,
+      pinnedAt: membership.pinnedAt,
+      superpinnedAt: membership.superpinnedAt,
+      effectiveSection: membership.section,
     };
   }
 
@@ -460,12 +476,9 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
     };
   }
 
-  private projectOrQuarantine(
-    record: PersistedWorkspaceRecord,
-    snapshot = this.layout.cached().snapshot,
-  ) {
+  private projectOrQuarantine(record: PersistedWorkspaceRecord, view = this.readView()) {
     try {
-      return this.publish(record, snapshot);
+      return this.publish(record, view);
     } catch (error) {
       if (!(error instanceof WorkspaceLayoutRefusal) || error.code !== "workspace_not_imported")
         throw error;
@@ -478,10 +491,11 @@ export class CanonicalWorkspaceRegistry extends FileBackedWorkspaceRegistry {
   }
 
   private async syncProtectionProjection(): Promise<void> {
-    const snapshot = this.layout.cached().snapshot;
+    const view = this.readView();
+    const { snapshot } = view;
     if (!snapshot || snapshot.stamp.phase !== "active") return;
     for (const raw of await super.list()) {
-      const visible = this.projectOrQuarantine(raw, snapshot);
+      const visible = this.projectOrQuarantine(raw, view);
       const next = visible ? this.project(raw, snapshot) : null;
       if (!next) continue;
       if (!isDeepStrictEqual(this.protectionFields(raw), this.protectionFields(next)))
