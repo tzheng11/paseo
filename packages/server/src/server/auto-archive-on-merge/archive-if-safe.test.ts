@@ -350,6 +350,22 @@ describe("archiveIfSafe", () => {
     vi.clearAllMocks();
   });
 
+  test("a CWD-only canonical merge observation cannot retire a replacement generation", async () => {
+    const harness = createHarness();
+    harness.options.retirementAuthority = {} as NonNullable<
+      AutoArchiveArchiveOptions["retirementAuthority"]
+    >;
+
+    await runArchiveIfSafe(harness);
+
+    expect(harness.deps.archiveByScope).not.toHaveBeenCalled();
+    expect(harness.deps.isPaseoOwnedWorktreeCwd).not.toHaveBeenCalled();
+    expect(harness.log.warn).toHaveBeenCalledWith(
+      { code: "canonical_auto_archive_generation_unqualified" },
+      "Canonical auto-archive requires a native-generation-bound trigger",
+    );
+  });
+
   test("does nothing when the pull request is not merged", async () => {
     const harness = createHarness();
 

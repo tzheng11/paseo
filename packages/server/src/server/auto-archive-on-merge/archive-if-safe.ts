@@ -1,3 +1,5 @@
+import type { RetirementAuthority } from "../workspace-retirement.js";
+import type { PersistedWorkspaceRecord } from "../workspace-registry.js";
 import type { Logger } from "pino";
 
 import type { AgentManager } from "../agent/agent-manager.js";
@@ -18,6 +20,9 @@ import { isPaseoOwnedWorktreeCwd } from "../../utils/worktree.js";
 import type { WorkspaceArchiveContext } from "../workspace-registry.js";
 
 export interface AutoArchiveArchiveOptions {
+  retirementAuthority?: RetirementAuthority;
+  getWorkspace?: (id: string) => Promise<PersistedWorkspaceRecord | null>;
+  listRetirementRecords?: () => Promise<PersistedWorkspaceRecord[]>;
   paseoHome: string;
   paseoWorktreesBaseRoot?: string;
   daemonConfigStore: DaemonConfigStore;
@@ -55,6 +60,15 @@ export async function archiveIfSafe(input: {
   deps?: ArchiveIfSafeDependencies;
 }): Promise<void> {
   const { workspaceId, snapshot, options, log } = input;
+  // This observer's intent is keyed only by CWD/PR, not the native backing lifetime.
+  // It cannot authorize retirement of a replacement that reuses that path.
+  if (options.retirementAuthority) {
+    log.warn(
+      { code: "canonical_auto_archive_generation_unqualified" },
+      "Canonical auto-archive requires a native-generation-bound trigger",
+    );
+    return;
+  }
   const deps = input.deps ?? defaultDependencies;
   const cwd = snapshot.cwd;
   const pullRequest = snapshot.forge.pullRequest;
@@ -86,6 +100,9 @@ export async function archiveIfSafe(input: {
     await deps.archiveByScope(
       {
         paseoHome: options.paseoHome,
+        retirementAuthority: options.retirementAuthority,
+        getWorkspace: options.getWorkspace,
+        listRetirementRecords: options.listRetirementRecords,
         paseoWorktreesBaseRoot: options.paseoWorktreesBaseRoot,
         github: options.github,
         workspaceGitService: options.workspaceGitService,

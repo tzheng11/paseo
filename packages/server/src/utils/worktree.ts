@@ -1133,6 +1133,7 @@ export interface DeletePaseoWorktreeOptions {
   // gone, where the marker proof can no longer be verified. Only pass
   // this when the record was matched against the path by the caller.
   registryProven?: boolean;
+  requireCleanRemoval?: true;
 }
 
 // Project scoping for delete: a proof for some other repo's worktree must
@@ -1162,6 +1163,7 @@ export async function deletePaseoWorktree({
   paseoHome,
   worktreesBaseRoot,
   registryProven,
+  requireCleanRemoval,
 }: DeletePaseoWorktreeOptions): Promise<void> {
   if (!worktreePath && !worktreeSlug) {
     throw new Error("worktreePath or worktreeSlug is required");
@@ -1210,6 +1212,12 @@ export async function deletePaseoWorktree({
     }
   }
 
+  if (requireCleanRemoval) {
+    if (!cwd) throw new Error("A repository is required for clean worktree removal");
+    // Git owns the final dirty/untracked check. Never fall through to forced recursive removal.
+    await runGitCommand(["worktree", "remove", resolvedWorktree], { cwd, timeout: 120_000 });
+    return;
+  }
   if (cwd) {
     try {
       await runGitCommand(["worktree", "remove", resolvedWorktree, "--force"], {

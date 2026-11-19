@@ -32,10 +32,10 @@ export const WorkspaceLayoutConfigSchema = WorkspaceLayoutIdentitySchema.extend(
 });
 export const WORKSPACE_LAYOUT_MODE_FILENAME = "workspace-layout-mode.json";
 export const WorkspaceLayoutHomeMarkerSchema = WorkspaceLayoutConfigSchema.extend({
-  schemaVersion: z.union([z.literal(1), z.literal(2)]),
+  schemaVersion: z.union([z.literal(1), z.literal(2), z.literal(3)]),
   destructiveRetirement: z.literal("refuse"),
 }).refine(
-  (marker) => (marker.schemaVersion === 2) === (marker.semanticsVersion === 2),
+  (marker) => marker.schemaVersion >= 2 === (marker.semanticsVersion === 2),
   "layout_semantics_marker_mismatch",
 );
 export const WorkspaceLayoutStampSchema = WorkspaceLayoutIdentitySchema.extend({
@@ -109,7 +109,25 @@ export const WorkspaceNavigationSchema = z.object({
   clientSources: z.array(WorkspaceLayoutClientSourceSchema),
   resolutionSha256: DigestSchema,
 });
+export const WorkspaceRetirementTargetSchema = z.object({
+  ref: WorkspaceReferenceSchema,
+  revision: RevisionSchema,
+});
+export const WorkspaceRetirementSchema = z.object({
+  operationId: z.string().uuid(),
+  ownerServerId: IdSchema,
+  backingGeneration: DigestSchema,
+  targets: z.array(WorkspaceRetirementTargetSchema).min(1).max(10000),
+  // Authority-derived dependency read set. Callers cannot choose which ancestors to fence.
+  dependencies: z.array(WorkspaceRetirementTargetSchema),
+  state: z.enum(["reserved", "archived", "complete"]),
+  reservedRevision: RevisionSchema,
+  archivedAt: TimestampSchema.nullable(),
+});
+export type WorkspaceRetirement = z.infer<typeof WorkspaceRetirementSchema>;
 export const WorkspaceLayoutSnapshotSchema = z.object({
+  retirementVersion: z.literal(1).optional(),
+  retirements: z.array(WorkspaceRetirementSchema).optional(),
   semanticsVersion: z.literal(2).optional(),
   ownerDomains: z.array(WorkspaceOwnerDomainSchema).optional(),
   stamp: WorkspaceLayoutStampSchema,
@@ -120,6 +138,19 @@ export const WorkspaceLayoutSnapshotSchema = z.object({
 });
 
 export const WorkspaceLayoutMutationSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("reserve-retirement"),
+    operationId: z.string().uuid(),
+    ownerServerId: IdSchema,
+    backingGeneration: DigestSchema,
+    targets: z.array(WorkspaceRetirementTargetSchema).min(1).max(10000),
+  }),
+  z.object({
+    kind: z.literal("archive-retirement"),
+    operationId: z.string().uuid(),
+    archivedAt: TimestampSchema,
+  }),
+  z.object({ kind: z.literal("complete-retirement"), operationId: z.string().uuid() }),
   z.object({ kind: z.literal("put"), entry: WorkspaceLayoutEntrySchema }),
   z.object({
     kind: z.literal("activate"),
@@ -157,7 +188,7 @@ export const WorkspaceLayoutMutationSchema = z.discriminatedUnion("kind", [
   }),
 ]);
 export const WorkspaceLayoutCommitSchema = z.object({
-  writerVersion: z.literal(2).optional(),
+  writerVersion: z.union([z.literal(2), z.literal(3)]).optional(),
   requestId: z.string().min(1).max(256),
   expected: WorkspaceLayoutStampSchema,
   mutations: z.array(WorkspaceLayoutMutationSchema).min(1).max(10000),
@@ -167,10 +198,25 @@ export const WorkspaceLayoutReceiptSchema = z.object({
   requestSha256: z.string().regex(/^[a-f0-9]{64}$/),
   stamp: WorkspaceLayoutStampSchema,
 });
+export const WorkspaceRetirementOutcomeSchema = z.object({
+  operationId: z.string().uuid(),
+  state: z.enum(["complete", "partial"]),
+  code: z.string().optional(),
+  receipt: WorkspaceLayoutReceiptSchema.optional(),
+});
+export const WorkspaceArchiveOutcomeSchema = z.object({
+  archivedAgentIds: z.array(z.string()).optional(),
+  archivedWorkspaceIds: z.array(z.string()).optional(),
+  removedDirectory: z.boolean().optional(),
+  slotKept: z.boolean().optional(),
+  directoryLeftBehind: z.object({ path: z.string(), reason: z.string() }).optional(),
+  retirement: WorkspaceRetirementOutcomeSchema.optional(),
+});
 export const WorkspaceLayoutInspectRequestSchema = z.object({
   type: z.literal("workspace.layout.inspect.request"),
   requestId: z.string(),
   observe: z.boolean().optional(),
+  retirementVersion: z.literal(1).optional(),
 });
 export const WorkspaceLayoutReceiptRequestSchema = z.object({
   type: z.literal("workspace.layout.receipt.request"),

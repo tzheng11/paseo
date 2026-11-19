@@ -1279,6 +1279,9 @@ export async function createPaseoDaemon(
 
   setupAutoArchiveOnMerge({
     paseoHome: config.paseoHome,
+    retirementAuthority: workspaceLayoutService,
+    getWorkspace: (id) => workspaceRegistry.get(id),
+    listRetirementRecords: () => workspaceRegistry.listRetirementRecords(),
     paseoWorktreesBaseRoot: config.worktreesRoot,
     daemonConfigStore,
     workspaceGitService,
@@ -1367,6 +1370,8 @@ export async function createPaseoDaemon(
     archiveByScope(
       {
         paseoHome: config.paseoHome,
+        retirementAuthority: workspaceLayoutService,
+        listRetirementRecords: () => workspaceRegistry.listRetirementRecords(),
         paseoWorktreesBaseRoot: config.worktreesRoot,
         github,
         workspaceGitService,
@@ -1390,6 +1395,12 @@ export async function createPaseoDaemon(
     );
   const hubAgentLifecycle = new CreateAgentLifecycleDispatch({
     paseoHome: config.paseoHome,
+    retirementAuthority: workspaceLayoutService,
+    getWorkspace: (id) => workspaceRegistry.get(id),
+    listRetirementRecords: () => workspaceRegistry.listRetirementRecords(),
+    stopWorkspaceSetup: (id) => workspaceSetupRuntime.stop(id),
+    assertWorkspaceAutomationAllowed: (id) =>
+      assertWorkspaceAutomationAllowedForWorkspace(workspaceRegistry, id),
     worktreesRoot: config.worktreesRoot,
     agentManager,
     agentStorage,
@@ -1490,6 +1501,8 @@ export async function createPaseoDaemon(
     await archiveByScope(
       {
         paseoHome: config.paseoHome,
+        retirementAuthority: workspaceLayoutService,
+        listRetirementRecords: () => workspaceRegistry.listRetirementRecords(),
         paseoWorktreesBaseRoot: config.worktreesRoot,
         github,
         workspaceGitService,

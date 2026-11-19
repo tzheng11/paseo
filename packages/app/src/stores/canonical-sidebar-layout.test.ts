@@ -48,8 +48,8 @@ function fixture(initialBytes: string | null = null) {
   });
   return { controller, changes, write, bytes: () => bytes };
 }
-function peer() {
-  let snapshot = baseline();
+function peer(initial = baseline()) {
+  let snapshot = initial;
   const receipts = new Map<
     string,
     Awaited<ReturnType<DaemonClient["getWorkspaceLayoutReceipt"]>>
@@ -522,4 +522,20 @@ test("a retired subscription's late release failure cannot disable its replaceme
   failRelease(new Error("old release failed"));
   await released.catch(() => {});
   expect(f.controller.state().writable).toBe(true);
+});
+
+test("navigation uses retirement-capable writer 3 without changing its receipt hash after authority adoption", async () => {
+  const f = fixture();
+  const p = peer({
+    ...baseline(),
+    semanticsVersion: 2,
+    ownerDomains: [],
+    retirementVersion: 1,
+    retirements: [],
+  });
+  await f.controller.attach("replica", p.client, { ...config, semanticsVersion: 2 });
+  await vi.waitFor(() => expect(f.controller.state().writable).toBe(true));
+  await f.controller.update((current) => ({ ...current, projectOrder: ["same-project"] }));
+  expect(p.commit).toHaveBeenCalledWith(expect.objectContaining({ writerVersion: 3 }));
+  expect(JSON.parse(f.bytes()!).pending).toBeNull();
 });

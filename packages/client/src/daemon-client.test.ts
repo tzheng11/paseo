@@ -9702,3 +9702,27 @@ test("a layout RPC refusal retains the authority code and request identity", asy
   await rejection;
   expect(mock.sent).toHaveLength(1);
 });
+
+test("retirement writers are refused before dispatch when the authority lacks the feature", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "retirement-writer",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connection = client.connect();
+  mock.triggerOpen({
+    features: {
+      workspaceLayout: true,
+      workspaceLayoutDerivedSections: true,
+      ownedSubscriptions: true,
+    },
+  });
+  await connection;
+  await expect(
+    client.commitWorkspaceLayout({ ...layoutCommitFixture(), writerVersion: 3 }),
+  ).rejects.toMatchObject({ code: "DAEMON_REQUEST_NOT_SENT", outcome: "not-sent" });
+  expect(mock.sent).toHaveLength(0);
+});

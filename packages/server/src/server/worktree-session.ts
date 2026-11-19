@@ -1,3 +1,5 @@
+import { nativeGeneration } from "./workspace-retirement.js";
+import { createRealpathAwarePathMatcher } from "../utils/path.js";
 import type { Logger } from "pino";
 import { basename } from "node:path";
 import {
@@ -142,6 +144,7 @@ export async function handlePaseoWorktreeListRequest(
   dependencies: {
     emit: EmitSessionMessage;
     paseoHome?: string;
+    listRetirementRecords?: () => Promise<PersistedWorkspaceRecord[]>;
     workspaceGitService: WorkspaceGitService;
   },
   msg: Extract<SessionInboundMessage, { type: "paseo_worktree_list_request" }>,
@@ -165,15 +168,28 @@ export async function handlePaseoWorktreeListRequest(
       { workspaceGitService: dependencies.workspaceGitService },
       { cwd },
     );
+    const records = await dependencies.listRetirementRecords?.();
     dependencies.emit({
       type: "paseo_worktree_list_response",
       payload: {
-        worktrees: worktrees.map((entry) => ({
-          worktreePath: entry.path,
-          createdAt: entry.createdAt,
-          branchName: entry.branchName ?? null,
-          head: entry.head ?? null,
-        })),
+        worktrees: worktrees.map((entry) => {
+          const output = {
+            worktreePath: entry.path,
+            createdAt: entry.createdAt,
+            branchName: entry.branchName ?? null,
+            head: entry.head ?? null,
+          };
+          if (!records) return output;
+          return Object.assign(output, {
+            backingGeneration: nativeGeneration(
+              records.filter(
+                (record) =>
+                  !record.archivedAt &&
+                  createRealpathAwarePathMatcher(entry.path)(record.worktreeRoot ?? record.cwd),
+              ),
+            ),
+          });
+        }),
         error: null,
         requestId,
       },
@@ -213,6 +229,7 @@ export async function handlePaseoWorktreeArchiveRequest(
       repoRoot: msg.repoRoot,
       branchName: msg.branchName,
       workspaceId: msg.workspaceId,
+      expectedBackingGeneration: msg.expectedBackingGeneration,
       scope: msg.scope,
     });
     if (!result.ok) {
@@ -220,6 +237,7 @@ export async function handlePaseoWorktreeArchiveRequest(
         type: "paseo_worktree_archive_response",
         payload: {
           success: false,
+          ...result.archive,
           removedAgents: result.removedAgents,
           error: {
             code: result.code,
@@ -235,6 +253,7 @@ export async function handlePaseoWorktreeArchiveRequest(
       type: "paseo_worktree_archive_response",
       payload: {
         success: true,
+        ...result.archive,
         removedAgents: result.removedAgents,
         error: null,
         requestId,

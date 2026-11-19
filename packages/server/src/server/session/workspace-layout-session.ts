@@ -60,15 +60,19 @@ export class WorkspaceLayoutSession {
           type: "workspace.layout.commit.response",
           payload: { requestId: message.requestId, receipt },
         });
-      } else if (message.observe) await this.observe(message);
-      else
+      } else if (message.observe) {
+        await this.observe(message);
+      } else {
+        const snapshot = await this.service.inspect();
+        this.requireRetirementReader(message.retirementVersion, snapshot.retirementVersion);
         this.emit({
           type: "workspace.layout.inspect.response",
           payload: {
             requestId: message.requestId,
-            snapshot: await this.service.inspect(),
+            snapshot,
           },
         });
+      }
     } catch (error) {
       let code: string | undefined;
       if (error instanceof WorkspaceLayoutRefusal) code = error.code;
@@ -91,6 +95,11 @@ export class WorkspaceLayoutSession {
     }
   }
 
+  private requireRetirementReader(version: 1 | undefined, required: 1 | undefined): void {
+    if (required === 1 && version !== 1)
+      throw new WorkspaceLayoutRefusal("retirement_reader_required");
+  }
+
   private async observe(message: LayoutRequest): Promise<void> {
     const service = this.service!;
     let stop: (() => void) | undefined;
@@ -106,6 +115,10 @@ export class WorkspaceLayoutSession {
     try {
       stop = service.subscribe(publish);
       const snapshot = await service.inspect();
+      this.requireRetirementReader(
+        message.type === "workspace.layout.inspect.request" ? message.retirementVersion : undefined,
+        snapshot.retirementVersion,
+      );
       this.emit({
         type: "workspace.layout.inspect.response",
         payload: {

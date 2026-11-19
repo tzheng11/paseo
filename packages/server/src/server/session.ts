@@ -1,3 +1,5 @@
+import { serializeWorkspaceBacking } from "./workspace-retirement-context.js";
+import { assertWorkspaceRetirementAllowed } from "./workspace-layout-mode.js";
 import { NATIVE_WORKSPACE_LAYOUT_WRITER_REQUESTS } from "@getpaseo/protocol/workspace-layout";
 import type { WorkspaceLayoutService } from "./workspace-layout-service.js";
 import { WorkspaceLayoutSession } from "./session/workspace-layout-session.js";
@@ -214,10 +216,7 @@ import { HubExecutionController } from "./hub/execution-controller.js";
 import type { HubExecutionAgents } from "./hub/daemon-executions.js";
 import { DownloadTokenStore } from "./file-download/token-store.js";
 import type { PushNotifications } from "./push/index.js";
-import {
-  archivePersistedWorkspaceRecord,
-  archiveWorkspaceContents,
-} from "./workspace-archive-service.js";
+import { archivePersistedWorkspaceRecord } from "./workspace-archive-service.js";
 import type { ServiceProxySubsystem } from "./service-proxy.js";
 import { renameCurrentBranch as renameCurrentBranchDefault } from "../utils/checkout-git.js";
 import {
@@ -278,7 +277,11 @@ import {
   handleWorkspaceSetupStatusRequest as handleWorkspaceSetupStatusRequestMessage,
   handleWorkspaceSetupRunRequest as handleWorkspaceSetupRunRequestMessage,
 } from "./worktree-session.js";
-import { archiveByScope, type ActiveWorkspaceRef } from "./workspace-archive-service.js";
+import {
+  archiveByScope,
+  type ActiveWorkspaceRef,
+  type ArchiveDependencies,
+} from "./workspace-archive-service.js";
 import { WorkspaceSetupRuntime } from "./workspace-setup-runtime.js";
 import { SessionAuthorization, type DaemonPermission } from "./authorization/index.js";
 
@@ -288,7 +291,6 @@ function resolveWorkspaceSetupRuntime(
   return runtime ?? new WorkspaceSetupRuntime();
 }
 import { WorktreeRequestError, toWorktreeWireError } from "./worktree-errors.js";
-import { assertWorkspaceRetirementAllowed } from "./workspace-layout-mode.js";
 import { parseGitRemoteLocation } from "@getpaseo/protocol/git-remote";
 import {
   createProjectDirectory,
@@ -1231,6 +1233,12 @@ export class Session {
     });
     this.createAgentLifecycleDispatch = new CreateAgentLifecycleDispatch({
       paseoHome: this.paseoHome,
+      retirementAuthority: this.workspaceLayoutService,
+      getWorkspace: (id) => this.workspaceRegistry.get(id),
+      listRetirementRecords: () => this.readRetirementRecords(),
+      stopWorkspaceSetup: (id) => this.workspaceSetupRuntime.stop(id),
+      assertWorkspaceAutomationAllowed: (id) =>
+        assertWorkspaceAutomationAllowedForWorkspace(this.workspaceRegistry, id),
       worktreesRoot: this.worktreesRoot,
       agentManager: this.agentManager,
       agentStorage: this.agentStorage,
@@ -3911,98 +3919,110 @@ export class Session {
     const { projectId, requestId } = request;
     this.sessionLogger.info({ projectId, requestId }, "session: project.remove.request");
 
-    try {
-      await assertWorkspaceRetirementAllowed(this.paseoHome);
-      const project = await this.projectRegistry.get(projectId);
-      const resolvedProjectId = project?.projectId ?? projectId;
-      const projectWorkspaces = (await this.workspaceRegistry.list()).filter(
-        (workspace) => workspace.projectId === resolvedProjectId,
-      );
-      const activeWorkspaceIds = projectWorkspaces
-        .filter((workspace) => !workspace.archivedAt)
-        .map((workspace) => workspace.workspaceId);
-
-      if (activeWorkspaceIds.length > 0) {
-        this.markWorkspaceArchiving(activeWorkspaceIds, new Date().toISOString());
-        await this.emitWorkspaceUpdatesForWorkspaceIds(activeWorkspaceIds);
-      }
-
-      const removedWorkspaceIds: string[] = [];
+    await serializeWorkspaceBacking(this.paseoHome, async () => {
       try {
-        for (const workspaceId of activeWorkspaceIds) {
-          await archiveWorkspaceContents(
-            {
-              agentManager: this.agentManager,
-              agentStorage: this.agentStorage,
-              killTerminalsForWorkspace: (id) =>
-                this.terminalController.killTerminalsForWorkspace(id),
-              sessionLogger: this.sessionLogger,
-            },
-            workspaceId,
-          );
-          await this.archiveWorkspaceRecord(workspaceId);
-          removedWorkspaceIds.push(workspaceId);
+        if (!this.workspaceLayoutService) await assertWorkspaceRetirementAllowed(this.paseoHome);
+        const project = await this.projectRegistry.get(projectId);
+        const resolvedProjectId = project?.projectId ?? projectId;
+        const projectWorkspaces = (await this.readRetirementRecords()).filter(
+          (workspace) => workspace.projectId === resolvedProjectId,
+        );
+        const activeWorkspaceIds = projectWorkspaces
+          .filter((workspace) => !workspace.archivedAt)
+          .map((workspace) => workspace.workspaceId);
+
+        if (this.workspaceLayoutService) {
+          const snapshot = await this.workspaceLayoutService.inspect();
+          const ids = new Set(projectWorkspaces.map((workspace) => workspace.workspaceId));
+          if (
+            snapshot.retirements?.some(
+              (operation) =>
+                operation.state !== "complete" &&
+                operation.targets.some(
+                  (target) =>
+                    target.ref.serverId === this.workspaceLayoutService!.options.serverId &&
+                    ids.has(target.ref.workspaceId),
+                ),
+            )
+          )
+            throw new Error("Project retirement remains fenced pending reconciliation");
         }
 
-        await this.projectRegistry.remove(resolvedProjectId);
-        await removeProjectCustomIcon({
-          paseoHome: this.paseoHome,
-          projectId: resolvedProjectId,
-        }).catch((error) => {
-          this.sessionLogger.warn(
-            { err: error, projectId: resolvedProjectId },
-            "Failed to clean up removed project icon",
-          );
+        const removedWorkspaceIds: string[] = [];
+        try {
+          if (activeWorkspaceIds.length) {
+            const archive = await archiveByScope(this.workspaceArchiveDependencies(), {
+              scope: { kind: "project", projectId: resolvedProjectId },
+              requestId,
+            });
+            if (
+              archive.retirement?.state === "partial" ||
+              archive.archivedWorkspaceIds.length !== activeWorkspaceIds.length
+            )
+              throw new Error("Project retirement remains fenced pending reconciliation");
+            removedWorkspaceIds.push(...archive.archivedWorkspaceIds);
+          }
+
+          await this.projectRegistry.remove(resolvedProjectId);
+          await removeProjectCustomIcon({
+            paseoHome: this.paseoHome,
+            projectId: resolvedProjectId,
+          }).catch((error) => {
+            this.sessionLogger.warn(
+              { err: error, projectId: resolvedProjectId },
+              "Failed to clean up removed project icon",
+            );
+          });
+        } finally {
+          if (activeWorkspaceIds.length > 0) {
+            this.clearWorkspaceArchiving(activeWorkspaceIds);
+          }
+        }
+
+        const updateIds =
+          removedWorkspaceIds.length > 0
+            ? removedWorkspaceIds
+            : [projectWorkspaces[0]?.workspaceId ?? projectId];
+        await this.emitWorkspaceUpdatesForWorkspaceIds(updateIds, {
+          removedProjectId: projectId,
         });
-      } finally {
-        if (activeWorkspaceIds.length > 0) {
-          this.clearWorkspaceArchiving(activeWorkspaceIds);
-        }
+
+        this.emit({
+          type: "project.remove.response",
+          payload: {
+            requestId,
+            projectId,
+            accepted: true,
+            removedWorkspaceIds,
+            error: null,
+          },
+        });
+      } catch (error) {
+        this.sessionLogger.error(
+          { err: error, projectId, requestId },
+          "session: project.remove.request error",
+        );
+        this.emit({
+          type: "activity_log",
+          payload: {
+            id: uuidv4(),
+            timestamp: new Date(),
+            type: "error",
+            content: `Failed to remove project: ${getErrorMessage(error)}`,
+          },
+        });
+        this.emit({
+          type: "project.remove.response",
+          payload: {
+            requestId,
+            projectId,
+            accepted: false,
+            removedWorkspaceIds: [],
+            error: getErrorMessageOr(error, "Failed to remove project"),
+          },
+        });
       }
-
-      const updateIds =
-        removedWorkspaceIds.length > 0
-          ? removedWorkspaceIds
-          : [projectWorkspaces[0]?.workspaceId ?? projectId];
-      await this.emitWorkspaceUpdatesForWorkspaceIds(updateIds, {
-        removedProjectId: projectId,
-      });
-
-      this.emit({
-        type: "project.remove.response",
-        payload: {
-          requestId,
-          projectId,
-          accepted: true,
-          removedWorkspaceIds,
-          error: null,
-        },
-      });
-    } catch (error) {
-      this.sessionLogger.error(
-        { err: error, projectId, requestId },
-        "session: project.remove.request error",
-      );
-      this.emit({
-        type: "activity_log",
-        payload: {
-          id: uuidv4(),
-          timestamp: new Date(),
-          type: "error",
-          content: `Failed to remove project: ${getErrorMessage(error)}`,
-        },
-      });
-      this.emit({
-        type: "project.remove.response",
-        payload: {
-          requestId,
-          projectId,
-          accepted: false,
-          removedWorkspaceIds: [],
-          error: getErrorMessageOr(error, "Failed to remove project"),
-        },
-      });
-    }
+    });
   }
 
   private async handleWorkspacePinPlacementSetRequest(
@@ -5711,6 +5731,9 @@ export class Session {
       {
         emit: (message) => this.emit(message),
         paseoHome: this.paseoHome,
+        listRetirementRecords: this.workspaceLayoutService
+          ? () => this.readRetirementRecords()
+          : undefined,
         workspaceGitService: this.workspaceGitService,
       },
       msg,
@@ -5722,24 +5745,9 @@ export class Session {
   ): Promise<void> {
     return handleWorktreeArchiveRequest(
       {
-        paseoHome: this.paseoHome,
-        paseoWorktreesBaseRoot: this.worktreesRoot,
-        github: this.github,
+        ...this.workspaceArchiveDependencies(),
         workspaceGitService: this.workspaceGitService,
-        agentManager: this.agentManager,
-        agentStorage: this.agentStorage,
-        findWorkspaceIdForCwd: (cwd) => this.findWorkspaceIdForCwd(cwd),
-        listActiveWorkspaces: () => this.listActiveWorkspaceRefs(),
-        archiveWorkspaceRecord: (workspaceId) => this.archiveWorkspaceRecord(workspaceId),
         emit: (message) => this.emit(message),
-        emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>
-          this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds),
-        markWorkspaceArchiving: (workspaceIds, archivingAt) =>
-          this.markWorkspaceArchiving(workspaceIds, archivingAt),
-        clearWorkspaceArchiving: (workspaceIds) => this.clearWorkspaceArchiving(workspaceIds),
-        killTerminalsForWorkspace: (workspaceId) =>
-          this.terminalController.killTerminalsForWorkspace(workspaceId),
-        sessionLogger: this.sessionLogger,
       },
       msg,
     );
@@ -8040,6 +8048,41 @@ export class Session {
     );
   }
 
+  private async readRetirementRecords(): Promise<PersistedWorkspaceRecord[]> {
+    if (this.workspaceRegistry.listRetirementRecords)
+      return this.workspaceRegistry.listRetirementRecords();
+    if (this.workspaceLayoutService) throw new Error("canonical_native_inventory_required");
+    return this.workspaceRegistry.list();
+  }
+
+  private workspaceArchiveDependencies(): ArchiveDependencies {
+    return {
+      paseoHome: this.paseoHome,
+      retirementAuthority: this.workspaceLayoutService,
+      listRetirementRecords: () => this.readRetirementRecords(),
+      paseoWorktreesBaseRoot: this.worktreesRoot,
+      github: this.github,
+      workspaceGitService: this.workspaceGitService,
+      agentManager: this.agentManager,
+      agentStorage: this.agentStorage,
+      findWorkspaceIdForCwd: (cwd) => this.findWorkspaceIdForCwd(cwd),
+      getWorkspace: (workspaceId) => this.workspaceRegistry.get(workspaceId),
+      listActiveWorkspaces: () => this.listActiveWorkspaceRefs(),
+      archiveWorkspaceRecord: (workspaceId) => this.archiveWorkspaceRecord(workspaceId),
+      emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>
+        this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds),
+      markWorkspaceArchiving: (workspaceIds, archivingAt) =>
+        this.markWorkspaceArchiving(workspaceIds, archivingAt),
+      clearWorkspaceArchiving: (workspaceIds) => this.clearWorkspaceArchiving(workspaceIds),
+      assertWorkspaceAutomationAllowed: (workspaceId) =>
+        assertWorkspaceAutomationAllowedForWorkspace(this.workspaceRegistry, workspaceId),
+      killTerminalsForWorkspace: (workspaceId) =>
+        this.terminalController.killTerminalsForWorkspace(workspaceId),
+      stopWorkspaceSetup: (workspaceId) => this.workspaceSetupRuntime.stop(workspaceId),
+      sessionLogger: this.sessionLogger,
+    };
+  }
+
   private async handleArchiveWorkspaceRequest(
     request: Extract<SessionInboundMessage, { type: "archive_workspace_request" }>,
   ): Promise<void> {
@@ -8049,45 +8092,27 @@ export class Session {
         throw new Error(`Workspace not found: ${request.workspaceId}`);
       }
 
-      await archiveByScope(
-        {
-          paseoHome: this.paseoHome,
-          paseoWorktreesBaseRoot: this.worktreesRoot,
-          github: this.github,
-          workspaceGitService: this.workspaceGitService,
-          agentManager: this.agentManager,
-          agentStorage: this.agentStorage,
-          findWorkspaceIdForCwd: (cwd) => this.findWorkspaceIdForCwd(cwd),
-          getWorkspace: (workspaceId) => this.workspaceRegistry.get(workspaceId),
-          listActiveWorkspaces: () => this.listActiveWorkspaceRefs(),
-          archiveWorkspaceRecord: (workspaceId) => this.archiveWorkspaceRecord(workspaceId),
-          emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>
-            this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds),
-          markWorkspaceArchiving: (workspaceIds, archivingAt) =>
-            this.markWorkspaceArchiving(workspaceIds, archivingAt),
-          clearWorkspaceArchiving: (workspaceIds) => this.clearWorkspaceArchiving(workspaceIds),
-          assertWorkspaceAutomationAllowed: (workspaceId) =>
-            assertWorkspaceAutomationAllowedForWorkspace(this.workspaceRegistry, workspaceId),
-          killTerminalsForWorkspace: (workspaceId) =>
-            this.terminalController.killTerminalsForWorkspace(workspaceId),
-          stopWorkspaceSetup: (workspaceId) => this.workspaceSetupRuntime.stop(workspaceId),
-          sessionLogger: this.sessionLogger,
-        },
-        {
-          scope: { kind: "workspace", workspaceId: existing.workspaceId },
-          requestId: request.requestId,
-        },
-      );
+      const result = await archiveByScope(this.workspaceArchiveDependencies(), {
+        scope: { kind: "workspace", workspaceId: existing.workspaceId },
+        requestId: request.requestId,
+      });
 
       const archivedWorkspace = await this.workspaceRegistry.get(request.workspaceId);
-      const archivedAt = archivedWorkspace?.archivedAt ?? new Date().toISOString();
+      const archivedAt =
+        result.retirement?.state === "partial"
+          ? (archivedWorkspace?.archivedAt ?? null)
+          : (archivedWorkspace?.archivedAt ?? new Date().toISOString());
       this.emit({
         type: "archive_workspace_response",
         payload: {
           requestId: request.requestId,
           workspaceId: request.workspaceId,
           archivedAt,
-          error: null,
+          ...(result.retirement ? result : {}),
+          error:
+            result.retirement?.state === "partial"
+              ? `Retirement ${result.retirement.operationId} remains fenced: ${result.retirement.code}`
+              : null,
         },
       });
     } catch (error) {

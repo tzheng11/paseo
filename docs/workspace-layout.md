@@ -161,7 +161,9 @@ failed; it leaves replication stale. Older read responses overtaken during the
 request cannot replace a newer snapshot. An actual regression below the revision
 known when the read started, or a same-revision fork, still refuses.
 
-No delete/retirement mutation is exposed in this initial contract.
+Active scoped-inheritance homes support reserve-then-retire through normal archive;
+see [Canonical retirement](#canonical-retirement). Complete-layout format-3 homes
+retain their original retirement refusal.
 
 ## Shared navigation and client sources
 
@@ -410,19 +412,95 @@ Canonical boot writes the sticky `workspace-layout-mode.json` marker:
 }
 ```
 
-Removing the config key does not remove this protection. Core workspace archive
-refuses before any teardown when the config declares `workspaceLayout` or the
-marker exists. A malformed/unreadable declaration or marker is a refusal, not
-evidence of a legacy home. Project removal follows the same refusal before it
-stops agents or terminals. Background reconciliation retains missing canonical
-workspaces and continues unrelated metadata inspection. External retirement tools
-must apply the same rule.
+Removing the config key does not remove this protection. A malformed/unreadable
+declaration or marker is a refusal, not evidence of a legacy home. Direct native
+archive/remove and unqualified teardown still refuse. Normal archive on an active
+scoped-inheritance home uses the reservation path below. Background reconciliation
+retains missing canonical workspaces and continues unrelated metadata inspection.
+External retirement tools must use the same operation rather than infer permission
+from a recent file, explicit null pin, CWD, request ID or a local lock.
 
-This deliberately blocks destructive retirement until an authority reservation
-and its consuming filesystem operation are implemented. A recent file, explicit
-null pin or property-presence check cannot substitute for that reservation: another
-client can pin the workspace after a read. Archive never gets to decide that a
-stale protection copy is authoritative.
+## Canonical retirement
+
+The normal workspace archive, whole-worktree archive, MCP archive, callbacks
+bound to an exact native workspace ID, and project removal share the owner-side
+archive service. The CWD/PR-only auto-merge observer remains unqualified on canonical
+homes and refuses; it cannot reinterpret an old observation as a replacement ID.
+Caller permissions, caller-directory scope and untrusted-source gates still apply.
+Project removal reserves its complete local footprint before stopping resources;
+it retains project directories, as before. Quarantined native records participate
+in destructive admission even though they are absent from published workspace lists.
+
+The authority accepts three additive mutations with `writerVersion: 3`:
+
+- `reserve-retirement`: an operation UUID, owner server, exact owner-qualified
+  target refs and entry revisions, and the owner's opaque backing-generation digest.
+  The authority derives and fences the ancestry read set. It refuses importing,
+  protected targets, unresolved/foreign ancestry, live descendants outside the
+  footprint, stale revisions and overlapping retirements.
+- `archive-retirement`: archives the reserved targets in place. The tombstones,
+  original refs, layout provenance, imports, navigation and historical receipts remain.
+- `complete-retirement`: releases the reservation's temporary dependency fences
+  after the owner's teardown obligations finish. Retired IDs cannot be resurrected.
+
+A reservation promotes the authority to format 5, preserving its identity, epoch,
+revision history and prior receipt map. The retiring owner promotes its existing
+sticky marker to schema 3 without changing the binding. Format-4 writers remain
+accepted before the first reservation; afterwards writer 3 is required. Inspect
+and observation requests advertise `retirementVersion: 1`; older authority readers
+are refused once reservation state exists. `workspaceLayoutRetirement` advertises
+the implementation. Upgrade the authority first, then all adopted writers before
+using retirement. Do not roll back an owner with a schema-3 marker or a format-5
+authority. Older binaries cannot enforce this state and must fail closed.
+
+An unrelated unknown owner is retained and does not veto a proven eligible leaf.
+An affected missing owner or ancestry refuses. A later owner import that introduces
+an edge to a reserved or retired target also refuses; unknown data is not treated
+as an empty domain or silently reparented after retirement.
+
+`workspace-retirements/` under the owning home contains durable effect journals.
+Each binds authority identity, operation, checked CAS inputs, native IDs/creation
+times, backing paths and the backing/shared-reference generation. Authority receipts
+are reconciled by the original request and hash after a lost acknowledgement.
+Reservation is durable before setup, agent or terminal teardown. Native archival
+and the canonical tombstones use the same journaled timestamp. Canonical archive
+is committed and receipt-checked after native archival and before path hooks or
+irreversible directory deletion. Each effect records intent before execution and
+completion afterwards, and rechecks fresh authority ownership, native identity,
+holds and backing/shared references. Only the private, currently executing owner
+context can consume that reservation. A context inherited by a delayed async
+callback expires when the operation returns.
+
+Normal native backing transitions share serialization with retirement. Completed
+operations return their recorded result on replay. A retained directory can later
+be registered as a new native ID; old-ID callbacks cannot select that replacement.
+Whole-worktree list responses additionally carry an opaque `backingGeneration`;
+the CLI returns it automatically as `expectedBackingGeneration`. A stale or missing
+generation on a canonical path archive refuses before effects.
+
+An interrupted or uncertain effect remains journaled and fenced, without a TTL.
+A retry queries the same operation and reports partial/reconciliation-required;
+it does not repeat a completed or uncertain destructive command. A definite,
+receipt-checked reservation refusal with no effects is terminal and retained in
+journal history before a later fresh admission. Unrelated canonical branches
+remain writable while a reservation is outstanding.
+
+Directory removal requires owned backing, no remaining native references and a
+clean source checkout whose HEAD is proven landed in the main checkout. These
+checks run before hooks and again before removal. The final Git removal is
+non-forcing: it cannot fall through to recursive deletion or broad prune. A source
+change, unknown proof or shared reference retains the directory. Results separate
+record archival, `removedDirectory`, `slotKept`, `directoryLeftBehind` and the
+retirement operation's complete/partial state; they do not claim reclaimed bytes.
+
+External routines must not detach dependencies or stop shared resources before
+native reservation, nor repeat path cleanup after a completed operation. Their
+independent resource journal must be adapted to the owner operation and backing
+lifetime, or delegate that cleanup to the synchronous daemon teardown path.
+An environment flag, standalone shell invocation or cached receipt is not a
+reservation consumer. The Impower retirement routine's external dependency/resource
+adapter is a separate integration change; deploying this fork alone does not
+qualify that routine.
 
 ## Recovery limits
 

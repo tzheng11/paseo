@@ -2103,6 +2103,7 @@ export class VoiceAssistantWebSocketServer {
         workspaceLayout: this.workspaceLayoutService !== undefined,
         workspaceLayoutDerivedSections:
           this.workspaceLayoutService?.status().semanticsVersion === 2,
+        workspaceLayoutRetirement: this.workspaceLayoutService?.status().semanticsVersion === 2,
         connectedHosts: true,
         hostMultiplexing: true,
         // COMPAT(relayProtectedSecurity): added in v0.13.0, remove gate after 2027-04-21.

@@ -1,8 +1,13 @@
+import type { ArchiveWorkspaceResponseMessage } from "@getpaseo/protocol/messages";
 import type { Command } from "commander";
 import { connectToDaemon, getDaemonHost } from "../../utils/client.js";
 import type { CommandError, OutputSchema, SingleResult } from "../../output/index.js";
 
 interface WorkspaceArchiveResult {
+  retirement?: ArchiveWorkspaceResponseMessage["payload"]["retirement"];
+  removedDirectory?: boolean;
+  slotKept?: boolean;
+  directoryLeftBehind?: { path: string; reason: string };
   workspaceId: string;
   status: "archived";
   archivedAt: string;
@@ -33,14 +38,33 @@ export async function runArchiveCommand(
   try {
     const payload = await client.archiveWorkspace(workspaceId);
     if (payload.error) {
-      throw new Error(payload.error);
+      throw {
+        code:
+          payload.retirement?.state === "partial"
+            ? "WORKSPACE_RETIREMENT_PARTIAL"
+            : "WORKSPACE_ARCHIVE_FAILED",
+        message: payload.error,
+        details: payload,
+      } satisfies CommandError;
     }
     if (!payload.archivedAt) {
       throw new Error("Workspace archive did not return an archive timestamp");
     }
     return {
       type: "single",
-      data: { workspaceId, status: "archived", archivedAt: payload.archivedAt },
+      data: {
+        workspaceId,
+        status: "archived",
+        archivedAt: payload.archivedAt,
+        ...(payload.retirement
+          ? {
+              retirement: payload.retirement,
+              removedDirectory: payload.removedDirectory,
+              slotKept: payload.slotKept,
+              directoryLeftBehind: payload.directoryLeftBehind,
+            }
+          : {}),
+      },
       schema: workspaceArchiveSchema,
     };
   } catch (error) {

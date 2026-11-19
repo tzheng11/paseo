@@ -1,3 +1,4 @@
+import { requireWorkspaceRetirement } from "./workspace-retirement.js";
 import { createHash } from "node:crypto";
 import { open, readFile, mkdir } from "node:fs/promises";
 import path from "node:path";
@@ -30,7 +31,7 @@ export function requiresWorkspaceLayoutProtectedRelay(
 
 export async function assertWorkspaceRetirementAllowed(home: string): Promise<void> {
   if (await readMarker(path.join(home, WORKSPACE_LAYOUT_MODE_FILENAME)))
-    throw new WorkspaceLayoutRefusal("canonical_retirement_reservation_required");
+    return requireWorkspaceRetirement(home);
   // The config declaration protects the interval before first canonical boot.
   // Parse failures are failures, never proof that this is an unconfigured home.
   try {
@@ -52,7 +53,7 @@ export async function resolveWorkspaceLayoutMode(
   const file = path.join(home, WORKSPACE_LAYOUT_MODE_FILENAME);
   const previous = await readMarker(file);
   if (previous) {
-    if ((previous.schemaVersion === 2) !== (previous.semanticsVersion === 2))
+    if (previous.schemaVersion >= 2 !== (previous.semanticsVersion === 2))
       throw new WorkspaceLayoutRefusal("layout_semantics_marker_mismatch");
     const { schemaVersion: _version, destructiveRetirement: _retirement, ...mode } = previous;
     if (configured && canonicalLayoutJson(mode) !== canonicalLayoutJson(configured))

@@ -15,6 +15,10 @@ export interface WorktreeArchiveResult {
   name: string;
   status: "archived";
   removedAgents: string[];
+  retirement?: Awaited<ReturnType<DaemonClient["archivePaseoWorktree"]>>["retirement"];
+  removedDirectory?: boolean;
+  slotKept?: boolean;
+  directoryLeftBehind?: { path: string; reason: string };
 }
 
 /** Schema for archive command output */
@@ -109,6 +113,9 @@ export async function runArchiveCommandWithDeps(
     const response = await client.archivePaseoWorktree({
       worktreePath: worktree.worktreePath,
       scope: "worktree",
+      ...(worktree.backingGeneration
+        ? { expectedBackingGeneration: worktree.backingGeneration }
+        : {}),
     });
 
     await client.close();
@@ -117,6 +124,7 @@ export async function runArchiveCommandWithDeps(
       const error: CommandError = {
         code: "WORKTREE_ARCHIVE_FAILED",
         message: `Failed to archive worktree: ${response.error.message}`,
+        details: response,
       };
       throw error;
     }
@@ -129,6 +137,14 @@ export async function runArchiveCommandWithDeps(
         name: worktreeName,
         status: "archived",
         removedAgents: response.removedAgents ?? [],
+        ...(response.retirement
+          ? {
+              retirement: response.retirement,
+              removedDirectory: response.removedDirectory,
+              slotKept: response.slotKept,
+              directoryLeftBehind: response.directoryLeftBehind,
+            }
+          : {}),
       },
       schema: archiveSchema,
     };

@@ -1,3 +1,4 @@
+import { serializeWorkspaceBacking } from "../../workspace-retirement-context.js";
 import {
   initialWorkspaceSidebarFields,
   type WorkspaceSidebarPlacement,
@@ -65,7 +66,7 @@ export interface CreateWorktreeWorkspaceInput {
 }
 
 export interface WorkspaceProvisioningService {
-  assertCreationAllowed(): Promise<void>;
+  assertCreationAllowed(cwd?: string, parentWorkspaceId?: string | null): Promise<void>;
   runInImportWorkspace<T>(
     input: ImportWorkspaceInput,
     operation: (workspace: PersistedWorkspaceRecord) => Promise<T>,
@@ -122,8 +123,18 @@ export function createWorkspaceProvisioningService(deps: {
 }): WorkspaceProvisioningService {
   const { serverId, workspaceRegistry, projectRegistry, workspaceGitService, logger } = deps;
 
-  async function assertCreationAllowed(): Promise<void> {
+  async function assertCreationAllowed(
+    cwd?: string,
+    parentWorkspaceId?: string | null,
+  ): Promise<void> {
     await workspaceRegistry.assertLayoutWriteAllowed?.();
+    if (cwd) await workspaceRegistry.assertBackingWriteAllowed?.(cwd);
+    if (parentWorkspaceId) {
+      await workspaceRegistry.assertWorkspaceRestoreAllowed?.(parentWorkspaceId);
+      const parent = await workspaceRegistry.get(parentWorkspaceId);
+      if (!parent || parent.archivedAt || parent.effectiveSection === null)
+        throw new Error("Parent workspace is unavailable");
+    }
   }
 
   /**
@@ -215,6 +226,14 @@ export function createWorkspaceProvisioningService(deps: {
   }
 
   async function findOrCreateProjectForDirectory(cwd: string): Promise<PersistedProjectRecord> {
+    return serializeWorkspaceBacking(cwd, async () => {
+      await workspaceRegistry.assertBackingWriteAllowed?.(cwd);
+      return findOrCreateProjectForDirectoryUnlocked(cwd);
+    });
+  }
+  async function findOrCreateProjectForDirectoryUnlocked(
+    cwd: string,
+  ): Promise<PersistedProjectRecord> {
     await assertCreationAllowed();
     const rootPath = resolve(cwd);
     const checkout = await workspaceGitService.getCheckout(rootPath);
@@ -254,6 +273,16 @@ export function createWorkspaceProvisioningService(deps: {
   }
 
   async function createWorkspaceForDirectory(
+    ...args: Parameters<typeof createWorkspaceForDirectoryUnlocked>
+  ): Promise<PersistedWorkspaceRecord> {
+    return serializeWorkspaceBacking(args[0], async () => {
+      await workspaceRegistry.assertBackingWriteAllowed?.(args[0]);
+
+      return createWorkspaceForDirectoryUnlocked(...args);
+    });
+  }
+
+  async function createWorkspaceForDirectoryUnlocked(
     cwd: string,
     title?: string | null,
     projectId?: string,
@@ -267,7 +296,7 @@ export function createWorkspaceProvisioningService(deps: {
       sidebarPlacement?: WorkspaceSidebarPlacement;
     },
   ): Promise<PersistedWorkspaceRecord> {
-    await assertCreationAllowed();
+    await assertCreationAllowed(cwd, context?.parentWorkspaceId);
     const normalizedCwd = resolve(cwd);
     const checkout = await workspaceGitService.getCheckout(normalizedCwd);
     projectId =
@@ -301,9 +330,19 @@ export function createWorkspaceProvisioningService(deps: {
   }
 
   async function createWorkspaceForWorktree(
+    ...args: Parameters<typeof createWorkspaceForWorktreeUnlocked>
+  ): Promise<PersistedWorkspaceRecord> {
+    return serializeWorkspaceBacking(args[0].worktreeRoot, async () => {
+      await workspaceRegistry.assertBackingWriteAllowed?.(args[0].worktreeRoot);
+
+      return createWorkspaceForWorktreeUnlocked(...args);
+    });
+  }
+
+  async function createWorkspaceForWorktreeUnlocked(
     input: CreateWorktreeWorkspaceInput,
   ): Promise<PersistedWorkspaceRecord> {
-    await assertCreationAllowed();
+    await assertCreationAllowed(input.worktreeRoot, input.parentWorkspaceId);
     const sourceCwd = resolve(input.sourceCwd);
     const repoRoot = resolve(input.repoRoot);
     const cwd = resolve(input.cwd);
@@ -393,7 +432,19 @@ export function createWorkspaceProvisioningService(deps: {
     return refreshProjectKind(project);
   }
 
-  async function findOrCreateWorkspaceForDirectory(cwd: string): Promise<PersistedWorkspaceRecord> {
+  async function findOrCreateWorkspaceForDirectory(
+    ...args: Parameters<typeof findOrCreateWorkspaceForDirectoryUnlocked>
+  ): Promise<PersistedWorkspaceRecord> {
+    return serializeWorkspaceBacking(args[0], async () => {
+      await workspaceRegistry.assertBackingWriteAllowed?.(args[0]);
+
+      return findOrCreateWorkspaceForDirectoryUnlocked(...args);
+    });
+  }
+
+  async function findOrCreateWorkspaceForDirectoryUnlocked(
+    cwd: string,
+  ): Promise<PersistedWorkspaceRecord> {
     const normalizedCwd = resolve(cwd);
     // Path-based discovery selects public work; explicit-ID recovery bypasses this selector.
     const workspaces = (await workspaceRegistry.list())
@@ -446,6 +497,16 @@ export function createWorkspaceProvisioningService(deps: {
   }
 
   async function ensureWorkspaceRecordUnarchived(
+    ...args: Parameters<typeof ensureWorkspaceRecordUnarchivedUnlocked>
+  ): Promise<PersistedWorkspaceRecord> {
+    return serializeWorkspaceBacking(args[0].worktreeRoot ?? args[0].cwd, async () => {
+      await workspaceRegistry.assertBackingWriteAllowed?.(args[0].worktreeRoot ?? args[0].cwd);
+      await workspaceRegistry.assertWorkspaceRestoreAllowed?.(args[0].workspaceId);
+      return ensureWorkspaceRecordUnarchivedUnlocked(...args);
+    });
+  }
+
+  async function ensureWorkspaceRecordUnarchivedUnlocked(
     workspace: PersistedWorkspaceRecord,
   ): Promise<PersistedWorkspaceRecord> {
     const project = await projectRegistry.get(workspace.projectId);

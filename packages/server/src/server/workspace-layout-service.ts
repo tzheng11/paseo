@@ -62,6 +62,7 @@ export interface WorkspaceLayoutReadProjection {
 }
 
 interface IndexedWorkspaceLayout {
+  retirementTargets: Set<string>;
   entries: Map<string, WorkspaceLayoutEntry>;
   effective: Map<string, EffectiveWorkspaceLayout> | null;
 }
@@ -148,6 +149,11 @@ export class WorkspaceLayoutService {
     const existing = this.indexedCache.get(snapshot);
     if (existing) return existing;
     const index = {
+      retirementTargets: new Set(
+        (snapshot.retirements ?? []).flatMap((operation) =>
+          operation.targets.map((target) => workspaceReferenceKey(target.ref)),
+        ),
+      ),
       entries: new Map(snapshot.entries.map((entry) => [workspaceReferenceKey(entry.ref), entry])),
       effective:
         snapshot.semanticsVersion === 2 && snapshot.stamp.phase === "active"
@@ -156,6 +162,12 @@ export class WorkspaceLayoutService {
     };
     this.indexedCache.set(snapshot, index);
     return index;
+  }
+
+  cachedRetirementTarget(ref: WorkspaceLayoutEntry["ref"]): boolean {
+    return this.cache
+      ? this.index(this.cache).retirementTargets.has(workspaceReferenceKey(ref))
+      : false;
   }
 
   cachedReadView(): WorkspaceLayoutReadView {

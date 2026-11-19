@@ -234,6 +234,9 @@ export interface WorkspaceRegistry extends WorkspaceReadBatch {
   readonly destructiveRetirement?: "refuse";
   /** Refuse creation before hooks, project writes or filesystem provisioning. */
   assertLayoutWriteAllowed?(): Promise<void>;
+  assertBackingWriteAllowed?(cwd: string): Promise<void>;
+  listRetirementRecords?(): Promise<PersistedWorkspaceRecord[]>;
+  assertWorkspaceRestoreAllowed?(id: string): Promise<void>;
   initialize(): Promise<void>;
   existsOnDisk(): Promise<boolean>;
   list(): Promise<PersistedWorkspaceRecord[]>;
@@ -614,6 +617,11 @@ export class FileBackedWorkspaceRegistry
       component: "workspaces",
       writeRecords: options?.writeRecords,
     });
+  }
+
+  async listRetirementRecords(): Promise<PersistedWorkspaceRecord[]> {
+    // Destructive admission includes quarantined native rows, not just published layout projections.
+    return structuredClone(await super.list());
   }
 
   subscribeToMutations(
