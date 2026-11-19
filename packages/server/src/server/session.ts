@@ -177,6 +177,8 @@ import {
   type ProjectRegistry,
   type WorkspaceMutation,
   type WorkspaceRegistry,
+  type WorkspaceReadBatch,
+  withWorkspaceReadBatch,
 } from "./workspace-registry.js";
 import { wrapSpokenInput } from "./voice-config.js";
 import { isVoicePermissionAllowed } from "./voice-permission-policy.js";
@@ -2258,8 +2260,9 @@ export class Session {
 
   private async buildProjectPlacementForWorkspaceId(
     workspaceId: string,
+    reader: WorkspaceReadBatch = this.workspaceRegistry,
   ): Promise<ProjectPlacementPayload | null> {
-    const workspace = await this.workspaceRegistry.get(workspaceId);
+    const workspace = await reader.get(workspaceId);
     if (!workspace) return null;
 
     const project = await this.projectRegistry.get(workspace.projectId);
@@ -5756,8 +5759,9 @@ export class Session {
    */
   private listAgentPayloads(
     filter?: Parameters<AgentDirectory["list"]>[0],
+    workspaces?: readonly PersistedWorkspaceRecord[],
   ): Promise<AgentSnapshotPayload[]> {
-    return this.agentDirectory.list(filter);
+    return this.agentDirectory.list(filter, workspaces);
   }
 
   private async resolveAgentIdentifier(
@@ -5883,22 +5887,21 @@ export class Session {
     }
   }
 
-  private async buildActiveProjectPlacementsByWorkspaceId(): Promise<
-    Map<string, ProjectPlacementPayload>
-  > {
-    const [persistedWorkspaces, persistedProjects] = await Promise.all([
-      this.workspaceRegistry.list(),
-      this.projectRegistry.list(),
-    ]);
+  private async buildProjectPlacementsByWorkspaceId(input: {
+    workspaces: readonly PersistedWorkspaceRecord[];
+    activeOnly: boolean;
+  }): Promise<Map<string, ProjectPlacementPayload>> {
+    const persistedWorkspaces = input.workspaces;
+    const persistedProjects = await this.projectRegistry.list();
     const activeProjects = new Map(
       persistedProjects
-        .filter((project) => !project.archivedAt)
+        .filter((project) => !input.activeOnly || !project.archivedAt)
         .map((project) => [project.projectId, project] as const),
     );
     const placementsByWorkspaceId = new Map<string, ProjectPlacementPayload>();
 
     const pairs = persistedWorkspaces.flatMap((workspace) => {
-      if (workspace.archivedAt) return [];
+      if (input.activeOnly && workspace.archivedAt) return [];
       const project = activeProjects.get(workspace.projectId);
       if (!project) return [];
       return [{ workspace, project }];
@@ -5965,6 +5968,30 @@ export class Session {
     pageInfo: FetchAgentsResponsePageInfo;
     searchTruncated?: boolean;
   }> {
+    return withWorkspaceReadBatch(this.workspaceRegistry, (reader) =>
+      this.listFetchAgentsEntriesInBatch(request, reader),
+    );
+  }
+
+  private async readAgentPlacementWorkspaces(
+    reader: WorkspaceReadBatch,
+    activeOnly: boolean,
+    includeBackground: boolean | undefined,
+  ): Promise<PersistedWorkspaceRecord[] | undefined> {
+    // Background-inclusive history/listing used point reads on the base. Avoid
+    // enumerating unrelated quarantined rows solely to resolve visible agents.
+    if (activeOnly || !includeBackground) return reader.list();
+    return undefined;
+  }
+
+  private async listFetchAgentsEntriesInBatch(
+    request: AgentDirectoryRequestMessage,
+    reader: WorkspaceReadBatch,
+  ): Promise<{
+    entries: FetchAgentsResponseEntry[];
+    pageInfo: FetchAgentsResponsePageInfo;
+    searchTruncated?: boolean;
+  }> {
     const filter =
       request.type === "fetch_agent_history_request" &&
       request.filter?.includeArchived === undefined
@@ -5973,42 +6000,54 @@ export class Session {
     const scope = request.type === "fetch_agents_request" ? request.scope : undefined;
     const sort = this.agentsPager.normalizeSort(request.sort);
 
-    let agents = await this.listAgentPayloads({
-      labels: filter?.labels,
-      includeArchived: filter?.includeArchived,
-      includeBackground:
-        filter?.includeBackground ||
-        (request.type === "fetch_agents_request" && request.includeBackground),
-      includeUnavailablePersisted: request.type === "fetch_agent_history_request",
-    });
-    const activePlacementsByWorkspaceId =
-      scope === "active" ? await this.buildActiveProjectPlacementsByWorkspaceId() : null;
-    if (activePlacementsByWorkspaceId) {
+    const includeBackground =
+      filter?.includeBackground ||
+      (request.type === "fetch_agents_request" && request.includeBackground);
+    const workspaces = await this.readAgentPlacementWorkspaces(
+      reader,
+      scope === "active",
+      includeBackground,
+    );
+    let agents = await this.listAgentPayloads(
+      {
+        labels: filter?.labels,
+        includeArchived: filter?.includeArchived,
+        includeBackground,
+        includeUnavailablePersisted: request.type === "fetch_agent_history_request",
+      },
+      workspaces,
+    );
+    const placementsByWorkspaceId = workspaces
+      ? await this.buildProjectPlacementsByWorkspaceId({
+          workspaces,
+          activeOnly: scope === "active",
+        })
+      : new Map<string, ProjectPlacementPayload>();
+    if (scope === "active") {
       agents = agents.filter(
         (agent) =>
           !agent.archivedAt &&
           agent.workspaceId != null &&
-          activePlacementsByWorkspaceId.has(agent.workspaceId),
+          placementsByWorkspaceId.has(agent.workspaceId),
       );
     }
 
-    const placementByWorkspaceId = new Map<string, Promise<ProjectPlacementPayload | null>>();
+    const missingPlacements = new Map<string, Promise<ProjectPlacementPayload | null>>();
     const getPlacement = (
       workspaceId: string | undefined,
     ): Promise<ProjectPlacementPayload | null> => {
       if (!workspaceId) {
         return Promise.resolve(null);
       }
-      if (activePlacementsByWorkspaceId) {
-        return Promise.resolve(activePlacementsByWorkspaceId.get(workspaceId) ?? null);
-      }
-      const existing = placementByWorkspaceId.get(workspaceId);
-      if (existing) {
-        return existing;
-      }
-      const placementPromise = this.buildProjectPlacementForWorkspaceId(workspaceId);
-      placementByWorkspaceId.set(workspaceId, placementPromise);
-      return placementPromise;
+      const placement = placementsByWorkspaceId.get(workspaceId);
+      if (placement) return Promise.resolve(placement);
+      if (scope === "active") return Promise.resolve(null);
+      // A missing published row can be quarantined. Preserve its point-read refusal.
+      const existing = missingPlacements.get(workspaceId);
+      if (existing) return existing;
+      const pending = this.buildProjectPlacementForWorkspaceId(workspaceId, reader);
+      missingPlacements.set(workspaceId, pending);
+      return pending;
     };
 
     const search = agentDirectorySearchQuery(request);

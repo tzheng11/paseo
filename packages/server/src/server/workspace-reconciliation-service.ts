@@ -6,9 +6,11 @@ import type pino from "pino";
 import type {
   ProjectRegistry,
   WorkspaceRegistry,
+  WorkspaceReadBatch,
   PersistedProjectRecord,
   PersistedWorkspaceRecord,
 } from "./workspace-registry.js";
+import { withWorkspaceReadBatch } from "./workspace-registry.js";
 import type { WorkspaceGitService } from "./workspace-git-service.js";
 import { areEquivalentPaths } from "../utils/path.js";
 import {
@@ -232,13 +234,14 @@ export class WorkspaceReconciliationService {
   }
 
   /** Reconciles mutable Git facts only; never archives missing records. */
-  async reconcileGitMetadata(): Promise<ReconciliationResult> {
+  async reconcileGitMetadata(reader?: WorkspaceReadBatch): Promise<ReconciliationResult> {
+    if (!reader)
+      return withWorkspaceReadBatch(this.workspaceRegistry, (batch) =>
+        this.reconcileGitMetadata(batch),
+      );
     const start = Date.now();
     const changes: ReconciliationChange[] = [];
-    const [projects, workspaces] = await Promise.all([
-      this.projectRegistry.list(),
-      this.workspaceRegistry.list(),
-    ]);
+    const [projects, workspaces] = await Promise.all([this.projectRegistry.list(), reader.list()]);
     const workspacesByProject = new Map<string, PersistedWorkspaceRecord[]>();
     const workspaceStates = await mapBounded(
       workspaces.filter((w) => !w.archivedAt),
@@ -246,7 +249,7 @@ export class WorkspaceReconciliationService {
     );
     for (const { workspace, state } of workspaceStates) {
       if (state !== "directory") continue;
-      if ((await this.workspaceRegistry.get(workspace.workspaceId))?.archivedAt !== null) continue;
+      if ((await reader.get(workspace.workspaceId))?.archivedAt !== null) continue;
       const siblings = workspacesByProject.get(workspace.projectId) ?? [];
       siblings.push(workspace);
       workspacesByProject.set(workspace.projectId, siblings);
@@ -259,17 +262,20 @@ export class WorkspaceReconciliationService {
       projectStates.filter(({ state }) => state === "directory").map(({ project }) => project),
       workspacesByProject,
       changes,
+      reader,
     );
     if (changes.length > 0) this.onChanges?.(changes);
     return { changesApplied: changes, durationMs: Date.now() - start };
   }
 
-  async runOnce(): Promise<ReconciliationResult> {
+  async runOnce(reader?: WorkspaceReadBatch): Promise<ReconciliationResult> {
+    if (!reader)
+      return withWorkspaceReadBatch(this.workspaceRegistry, (batch) => this.runOnce(batch));
     const start = Date.now();
     const changes: ReconciliationChange[] = [];
 
     const allProjects = await this.projectRegistry.list();
-    const allWorkspaces = await this.workspaceRegistry.list();
+    const allWorkspaces = await reader.list();
 
     const activeProjects = allProjects.filter((p) => !p.archivedAt);
     const activeProjectsById = new Map(
@@ -295,7 +301,7 @@ export class WorkspaceReconciliationService {
     const workspacesByProject = new Map<string, PersistedWorkspaceRecord[]>();
     for (const { workspace, state } of workspaceDirectoryStates) {
       if (state !== "directory") continue;
-      if ((await this.workspaceRegistry.get(workspace.workspaceId))?.archivedAt !== null) continue;
+      if ((await reader.get(workspace.workspaceId))?.archivedAt !== null) continue;
       const list = workspacesByProject.get(workspace.projectId) ?? [];
       list.push(workspace);
       workspacesByProject.set(workspace.projectId, list);
@@ -316,7 +322,7 @@ export class WorkspaceReconciliationService {
       // A missing directory cannot acquire a canonical retirement reservation.
       // Continue metadata reconciliation instead of failing daemon bootstrap.
       if (this.workspaceRegistry.destructiveRetirement === "refuse") return;
-      const current = await this.workspaceRegistry.get(workspace.workspaceId);
+      const current = await reader.get(workspace.workspaceId);
       const project = await this.projectRegistry.get(workspace.projectId);
       if (
         !current ||
@@ -346,6 +352,7 @@ export class WorkspaceReconciliationService {
       activeProjects.filter((project) => reachableProjectIds.has(project.projectId)),
       workspacesByProject,
       changes,
+      reader,
     );
 
     if (changes.length > 0 && this.onChanges) {
@@ -371,6 +378,7 @@ export class WorkspaceReconciliationService {
     projectsToReconcile: PersistedProjectRecord[],
     workspacesByProject: Map<string, PersistedWorkspaceRecord[]>,
     changes: ReconciliationChange[],
+    reader: WorkspaceReadBatch,
   ): Promise<void> {
     const checkoutReads: CachedCheckoutRead[] = [];
     const readCheckout = (cwd: string): Promise<ProjectCheckoutLitePayload> => {
@@ -394,13 +402,16 @@ export class WorkspaceReconciliationService {
           const rootGit = await readCheckout(rootPath);
           await Promise.all(
             projects.map((project) =>
-              this.reconcileProject({
-                project,
-                siblings: workspacesByProject.get(project.projectId) ?? [],
-                currentGit: rootGit,
-                readCheckout,
-                changes,
-              }),
+              this.reconcileProject(
+                {
+                  project,
+                  siblings: workspacesByProject.get(project.projectId) ?? [],
+                  currentGit: rootGit,
+                  readCheckout,
+                  changes,
+                },
+                reader,
+              ),
             ),
           );
         } catch (error) {
@@ -413,11 +424,14 @@ export class WorkspaceReconciliationService {
     );
   }
 
-  private async reconcileProject(input: ProjectReconciliationInput): Promise<void> {
+  private async reconcileProject(
+    input: ProjectReconciliationInput,
+    reader: WorkspaceReadBatch,
+  ): Promise<void> {
     const { siblings, currentGit, readCheckout, changes } = input;
     const workspaceCheckouts = await Promise.all(
       siblings.map(async (workspace) => {
-        const current = await this.workspaceRegistry.get(workspace.workspaceId);
+        const current = await reader.get(workspace.workspaceId);
         if (!current || current.cwd !== workspace.cwd || current.projectId !== workspace.projectId)
           return null;
         return { workspace: current, checkout: await readCheckout(current.cwd) };
@@ -580,25 +594,28 @@ export class WorkspaceReconciliationService {
     this.reconciling = true;
     const startedAt = this.now();
     try {
-      await this.syncProjectRootWatches();
-      const result = mode === "full" ? await this.runOnce() : await this.reconcileGitMetadata();
-      const workspaceIds = new Set<string>();
-      const projectIds = new Set<string>();
-      for (const change of result.changesApplied) {
-        if (change.kind === "workspace_updated" || change.kind === "workspace_archived") {
-          workspaceIds.add(change.workspaceId);
+      await withWorkspaceReadBatch(this.workspaceRegistry, async (reader) => {
+        await this.syncProjectRootWatches();
+        const result =
+          mode === "full" ? await this.runOnce(reader) : await this.reconcileGitMetadata(reader);
+        const workspaceIds = new Set<string>();
+        const projectIds = new Set<string>();
+        for (const change of result.changesApplied) {
+          if (change.kind === "workspace_updated" || change.kind === "workspace_archived") {
+            workspaceIds.add(change.workspaceId);
+          }
+          if (change.kind === "project_updated") projectIds.add(change.projectId);
         }
-        if (change.kind === "project_updated") projectIds.add(change.projectId);
-      }
-      if (projectIds.size > 0) {
-        const workspaces = await this.workspaceRegistry.list();
-        for (const workspaceId of workspaceIdsForProjects(workspaces, projectIds)) {
-          workspaceIds.add(workspaceId);
+        if (projectIds.size > 0) {
+          const workspaces = await reader.list();
+          for (const workspaceId of workspaceIdsForProjects(workspaces, projectIds)) {
+            workspaceIds.add(workspaceId);
+          }
         }
-      }
-      if (!this.disposed && workspaceIds.size > 0) {
-        await this.onWorkspacesChanged?.(Array.from(workspaceIds));
-      }
+        if (!this.disposed && workspaceIds.size > 0) {
+          await this.onWorkspacesChanged?.(Array.from(workspaceIds));
+        }
+      });
     } catch (error) {
       if (!this.disposed) {
         this.logger.warn({ err: error }, "Workspace reconciliation failed");

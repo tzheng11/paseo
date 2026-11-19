@@ -217,7 +217,20 @@ export type WorkspaceMoveInput = Pick<
   "parentWorkspaceId" | "beforeWorkspaceId"
 >;
 
-export interface WorkspaceRegistry {
+export interface WorkspaceReadBatch {
+  list(): Promise<PersistedWorkspaceRecord[]>;
+  get(workspaceId: string): Promise<PersistedWorkspaceRecord | null>;
+}
+
+export function withWorkspaceReadBatch<T>(
+  registry: WorkspaceRegistry,
+  run: (reader: WorkspaceReadBatch) => Promise<T>,
+): Promise<T> {
+  return registry.withReadBatch ? registry.withReadBatch(run) : run(registry);
+}
+
+export interface WorkspaceRegistry extends WorkspaceReadBatch {
+  withReadBatch?<T>(run: (reader: WorkspaceReadBatch) => Promise<T>): Promise<T>;
   readonly destructiveRetirement?: "refuse";
   /** Refuse creation before hooks, project writes or filesystem provisioning. */
   assertLayoutWriteAllowed?(): Promise<void>;

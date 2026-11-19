@@ -13,6 +13,10 @@ import {
   type WorkspaceLayoutSnapshot,
   type WorkspaceLayoutCommit,
   type WorkspaceLayoutReceipt,
+  type WorkspaceLayoutEntry,
+  type EffectiveWorkspaceLayout,
+  workspaceReferenceKey,
+  resolveEffectiveWorkspaceLayout,
 } from "@getpaseo/protocol/workspace-layout";
 import { writeJsonFileAtomic } from "./atomic-file.js";
 import {
@@ -36,10 +40,21 @@ interface LayoutServiceOptions {
   failed(error: unknown): void;
 }
 
+export interface WorkspaceLayoutReadView {
+  snapshot: WorkspaceLayoutSnapshot | null;
+  entries: Map<string, WorkspaceLayoutEntry>;
+  effective: Map<string, EffectiveWorkspaceLayout> | null;
+}
+interface IndexedWorkspaceLayout {
+  entries: Map<string, WorkspaceLayoutEntry>;
+  effective: Map<string, EffectiveWorkspaceLayout> | null;
+}
+
 /** Canonical writes or identity-bound forwarding; the cache never accepts a write. */
 export class WorkspaceLayoutService {
   private readonly store: WorkspaceLayoutStore | null;
   private cache: WorkspaceLayoutSnapshot | null = null;
+  private readonly indexedCache = new WeakMap<WorkspaceLayoutSnapshot, IndexedWorkspaceLayout>();
   private readonly listeners = new Set<() => void>();
   private transport: WorkspaceLayoutTransport | null = null;
   private readonly lifetime = new AbortController();
@@ -109,6 +124,44 @@ export class WorkspaceLayoutService {
     };
   }
 
+  private index(snapshot: WorkspaceLayoutSnapshot): IndexedWorkspaceLayout {
+    const existing = this.indexedCache.get(snapshot);
+    if (existing) return existing;
+    const index = {
+      entries: new Map(snapshot.entries.map((entry) => [workspaceReferenceKey(entry.ref), entry])),
+      effective:
+        snapshot.semanticsVersion === 2 && snapshot.stamp.phase === "active"
+          ? resolveEffectiveWorkspaceLayout(snapshot)
+          : null,
+    };
+    this.indexedCache.set(snapshot, index);
+    return index;
+  }
+
+  cachedReadView(): WorkspaceLayoutReadView {
+    const snapshot = this.cache;
+    const index = snapshot === null ? null : this.index(snapshot);
+    return structuredClone({
+      snapshot,
+      entries: index?.entries ?? new Map<string, WorkspaceLayoutEntry>(),
+      effective: index?.effective ?? null,
+    });
+  }
+
+  cachedWorkspace(ref: WorkspaceLayoutEntry["ref"]) {
+    const snapshot = this.cache;
+    const index = snapshot === null ? null : this.index(snapshot);
+    const key = workspaceReferenceKey(ref);
+    return structuredClone({
+      stamp: snapshot?.stamp ?? null,
+      semanticsVersion: snapshot?.semanticsVersion ?? null,
+      entry: index?.entries.get(key) ?? null,
+      effective: index?.effective?.get(`${ref.serverId}:${ref.workspaceId}`) ?? null,
+      derived: index !== null && index.effective !== null,
+      fresh: this.isFresh(),
+    });
+  }
+
   private isFresh(): boolean {
     return this.healthy && (this.store !== null || this.connected);
   }
@@ -126,19 +179,29 @@ export class WorkspaceLayoutService {
     return () => this.listeners.delete(listener);
   }
 
-  async inspect(): Promise<WorkspaceLayoutSnapshot> {
+  private async refresh(): Promise<WorkspaceLayoutSnapshot> {
     const knownRevision = this.cache?.stamp.revision ?? 0;
     try {
       const snapshot = this.store
         ? await this.store.inspect()
         : await this.remote((client) => client.getWorkspaceLayout());
       await this.accept(snapshot, knownRevision);
-      return structuredClone(this.cache ?? snapshot);
+      return this.cache ?? snapshot;
     } catch (error) {
       this.healthy = false;
       this.changed();
       throw error;
     }
+  }
+
+  async inspect(): Promise<WorkspaceLayoutSnapshot> {
+    return structuredClone(await this.refresh());
+  }
+
+  async inspectReadView(): Promise<WorkspaceLayoutReadView> {
+    const snapshot = await this.refresh();
+    const index = this.index(snapshot);
+    return structuredClone({ snapshot, entries: index.entries, effective: index.effective });
   }
 
   async initialize(identity: WorkspaceLayoutIdentity): Promise<WorkspaceLayoutSnapshot> {

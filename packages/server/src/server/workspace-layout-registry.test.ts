@@ -1,3 +1,8 @@
+import { measureLayoutReads } from "./test-utils/layout-read-counts.js";
+import {
+  createLargeLayoutFixture,
+  coldLayoutGeneration,
+} from "./test-fixtures/canonical-layout-scale.js";
 import { randomUUID } from "node:crypto";
 import { mkdtemp, readFile, rm, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -12,6 +17,8 @@ import { emptyWorkspaceNavigationPreferences } from "@getpaseo/protocol/workspac
 import * as layoutProtocol from "@getpaseo/protocol/workspace-layout";
 import {
   FileBackedWorkspaceRegistry,
+  FileBackedProjectRegistry,
+  createPersistedProjectRecord,
   type PersistedWorkspaceRecord,
 } from "./workspace-registry.js";
 import { CanonicalWorkspaceRegistry } from "./workspace-layout-registry.js";
@@ -121,84 +128,16 @@ async function registry(records: PersistedWorkspaceRecord[], name = "a", serverI
   return { value, file };
 }
 
-async function largeReadFixture(phase: "importing" | "active") {
+async function largeReadFixture(
+  phase: "importing" | "active",
+  options: { directories?: boolean } = {},
+) {
   await service.close();
-  const derivedConfig = { ...config, semanticsVersion: 2 as const };
-  service = new WorkspaceLayoutService({
-    home,
-    serverId: "srv_hub",
-    config: derivedConfig,
-    failed: () => {},
-  });
-  const childPin = "2026-11-04T09:00:00.000Z";
-  const records = Array.from({ length: 440 }, (_, index) => ({
-    ...row(`large-${index}`),
-    siblingOrder: index,
-  }));
-  records[0] = {
-    ...records[0],
-    pinnedAt: childPin,
-    pinPlacement: { parentWorkspaceKey: "srv_b:large-440", siblingOrder: 0, revision: 1 },
-  };
-  records[1] = {
-    ...records[1],
-    pinnedAt: childPin,
-    pinPlacement: { parentWorkspaceKey: "srv_unknown:missing", siblingOrder: 1, revision: 1 },
-  };
-  records[2] = { ...records[0], workspaceId: "large-2", archivedAt: at };
-  const remote = Array.from({ length: 2869 }, (_, index) => ({
-    ...row(`large-${index + 440}`),
-    pinnedAt: index === 0 ? at : null,
-  }));
-  const initial = await service.initialize(derivedConfig);
-  await service.commit({
-    writerVersion: 2,
-    requestId: "large-import",
-    expected: initial.stamp,
-    mutations: [
-      ...[
-        { serverId: "srv_a", records: records.slice(0, 439) },
-        { serverId: "srv_b", records: remote },
-      ].map(({ serverId, records: owned }) => ({
-        kind: "import-host" as const,
-        source: { serverId, sourceSha256: "a".repeat(64), resolutionSha256: "b".repeat(64) },
-        previousSourceSha256: null,
-        entries: layoutProtocol.qualifyLegacyWorkspaceLayoutEntries(
-          owned.map((record) => canonical(record, serverId)),
-        ),
-      })),
-      { kind: "declare-unknown-owner", serverId: "srv_unknown" },
-      {
-        kind: "put-navigation",
-        expectedRevision: 0,
-        preferences: emptyWorkspaceNavigationPreferences(),
-        importResolution: { clientSources: [], resolutionSha256: "0".repeat(64) },
-      },
-    ],
-  });
-  const imported = await service.inspect();
-  expect(imported.entries).toHaveLength(3308);
-  if (phase === "active")
-    await service.commit({
-      writerVersion: 2,
-      requestId: "large-activate",
-      expected: imported.stamp,
-      mutations: [
-        {
-          kind: "activate",
-          requiredImports: imported.imports,
-          requiredClientImports: [],
-          requiredOwnerDomains: imported.ownerDomains,
-        },
-      ],
-    });
-  const file = path.join(home, "large", "workspaces.json");
-  await mkdir(path.dirname(file));
-  await writeFile(file, JSON.stringify(records));
-  const value = new CanonicalWorkspaceRegistry(file, createTestLogger(), service, "srv_a");
-  registries.push(value);
-  await value.initialize();
-  return { value, file, records, childPin };
+  const fixture = await createLargeLayoutFixture({ home, phase, ...options });
+  service = fixture.service;
+  await coldLayoutGeneration(fixture);
+  registries.push(fixture.value);
+  return fixture;
 }
 
 it.each([
@@ -209,14 +148,15 @@ it.each([
   async ({ phase, count, derives, pin }) => {
     const { value, file, records, childPin } = await largeReadFixture(phase);
     const before = await readFile(file, "utf8");
-    const cached = vi.spyOn(service, "cached");
+    const cached = vi.spyOn(service, "cachedReadView");
+    const measured = measureLayoutReads();
     const clone = vi.spyOn(globalThis, "structuredClone");
-    const derive = vi.spyOn(layoutProtocol, "resolveEffectiveWorkspaceLayout");
     try {
       const listed = await value.list();
       expect(cached).toHaveBeenCalledTimes(1);
-      expect(clone).toHaveBeenCalledTimes(1);
-      expect(derive).toHaveBeenCalledTimes(derives);
+      expect(clone.mock.calls.filter(([input]) => isGraphClone(input))).toHaveLength(1);
+      expect(measured.counts.derivations).toBe(derives);
+      expect(measured.counts.jsonCopies + measured.counts.mapCopies).toBe(0);
       expect(listed.map((record) => record.workspaceId)).toEqual(
         records.slice(0, count).map((record) => record.workspaceId),
       );
@@ -225,10 +165,291 @@ it.each([
       expect(listed[2]).toMatchObject({ archivedAt: at, pinnedAt: childPin });
       expect(await readFile(file, "utf8")).toBe(before);
     } finally {
-      derive.mockRestore();
       clone.mockRestore();
+      measured.restore();
       cached.mockRestore();
     }
+  },
+);
+
+function isGraphClone(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  if ("entries" in value && Array.isArray(value.entries)) return true;
+  return "snapshot" in value && isGraphClone(value.snapshot);
+}
+
+it("detects native, JSON and Map whole-graph copies in the read counters", async () => {
+  await largeReadFixture("active");
+  const view = service.cachedReadView();
+  if (!view.snapshot) throw new Error("fixture snapshot missing");
+  const measured = measureLayoutReads();
+  try {
+    const nativeCopy = structuredClone(view.snapshot);
+    const jsonCopy = JSON.parse(JSON.stringify(view.snapshot));
+    structuredClone(view.snapshot.entries);
+    JSON.parse(JSON.stringify(view.snapshot.entries));
+    const mapCopy = new Map(view.entries);
+    expect(nativeCopy.entries).toHaveLength(3308);
+    expect(jsonCopy.entries).toHaveLength(3308);
+    expect(mapCopy.size).toBe(3308);
+    expect(measured.counts).toMatchObject({ graphClones: 2, jsonCopies: 2, mapCopies: 1 });
+  } finally {
+    measured.restore();
+  }
+});
+
+it.each(["importing", "active"] as const)(
+  "bounds entry reads over 3308 entries and 440 local rows in %s",
+  async (phase) => {
+    const { value, records, childPin } = await largeReadFixture(phase);
+    const measured = measureLayoutReads();
+    const clone = vi.spyOn(globalThis, "structuredClone");
+    try {
+      const results = await Promise.all(
+        records.slice(0, 439).map((record) => value.get(record.workspaceId)),
+      );
+      expect(results[0]).toMatchObject({
+        workspaceId: "large-0",
+        pinnedAt: phase === "active" ? at : childPin,
+      });
+      expect(results[1]).toMatchObject({ pinnedAt: childPin });
+      expect(results[2]).toMatchObject({ archivedAt: at });
+      expect(measured.counts.graphClones).toBe(0);
+      expect(measured.counts.entryClones).toBeGreaterThan(0);
+      expect(measured.counts.jsonCopies + measured.counts.mapCopies).toBe(0);
+      expect(clone.mock.calls.filter(([input]) => isGraphClone(input))).toHaveLength(0);
+      expect(measured.counts.derivations).toBe(phase === "active" ? 1 : 0);
+    } finally {
+      clone.mockRestore();
+      measured.restore();
+    }
+  },
+);
+
+it.each(["importing", "active"] as const)(
+  "updates local metadata without copying the 3308-entry graph in %s",
+  async (phase) => {
+    const { value, childPin } = await largeReadFixture(phase);
+    const measured = measureLayoutReads();
+    const clone = vi.spyOn(globalThis, "structuredClone");
+    try {
+      const result = await value.update("large-0", (record) => ({
+        ...record,
+        title: "updated metadata",
+      }));
+      expect(result).toMatchObject({
+        title: "updated metadata",
+        pinnedAt: phase === "active" ? at : childPin,
+      });
+      expect(measured.counts.graphClones).toBe(0);
+      expect(measured.counts.entryClones).toBeGreaterThan(0);
+      expect(measured.counts.jsonCopies + measured.counts.mapCopies).toBe(0);
+      expect(clone.mock.calls.filter(([input]) => isGraphClone(input))).toHaveLength(0);
+      expect(measured.counts.derivations).toBe(phase === "active" ? 1 : 0);
+    } finally {
+      clone.mockRestore();
+      measured.restore();
+    }
+  },
+);
+
+it.each(["importing", "active"] as const)(
+  "upserts existing metadata without graph copies in %s",
+  async (phase) => {
+    const { value, records, file, childPin } = await largeReadFixture(phase);
+    const measured = measureLayoutReads();
+    const clone = vi.spyOn(globalThis, "structuredClone");
+    try {
+      await value.upsert({ ...records[0], title: "upserted metadata", pinnedAt: null });
+      expect(measured.counts.graphClones).toBe(0);
+      expect(measured.counts.jsonCopies + measured.counts.mapCopies).toBe(0);
+      expect(clone.mock.calls.filter(([input]) => isGraphClone(input))).toHaveLength(0);
+      expect(measured.counts.derivations).toBe(phase === "active" ? 1 : 0);
+    } finally {
+      clone.mockRestore();
+      measured.restore();
+    }
+    expect(await value.get("large-0")).toMatchObject({
+      title: "upserted metadata",
+      pinnedAt: phase === "active" ? at : childPin,
+    });
+    expect(JSON.parse(await readFile(file, "utf8"))[0].pinnedAt).toBe(childPin);
+  },
+);
+
+it.each([
+  { phase: "importing" as const, method: "runOnce" as const },
+  { phase: "active" as const, method: "runOnce" as const },
+  { phase: "importing" as const, method: "reconcileGitMetadata" as const },
+  { phase: "active" as const, method: "reconcileGitMetadata" as const },
+  { phase: "importing" as const, method: "reconcileNow" as const },
+  { phase: "active" as const, method: "reconcileNow" as const },
+])("bounds the entire $method pass at 3308/440 scale in $phase", async ({ phase, method }) => {
+  const { value, file, records, childPin } = await largeReadFixture(phase, { directories: true });
+  const projects = new FileBackedProjectRegistry(
+    path.join(home, "projects.json"),
+    createTestLogger(),
+  );
+  await projects.initialize();
+  await projects.upsert(
+    createPersistedProjectRecord({
+      projectId: "project",
+      rootPath: home,
+      kind: "non_git",
+      displayName: "scale",
+      createdAt: at,
+      updatedAt: at,
+    }),
+  );
+  const changes = vi.fn();
+  const workspacesChanged = vi.fn(async () => {});
+  const git = createNoopWorkspaceGitService();
+  const reconciliation = new WorkspaceReconciliationService({
+    projectRegistry: projects,
+    workspaceRegistry: value,
+    logger: createTestLogger(),
+    serverId: "srv_a",
+    workspaceGitService: createNoopWorkspaceGitService({
+      getCheckout: async (cwd) => ({
+        ...(await git.getCheckout(cwd)),
+        ...(cwd === records[0].cwd || cwd === records[1].cwd
+          ? { isGit: true, currentBranch: "observed-branch", worktreeRoot: cwd }
+          : {}),
+      }),
+    }),
+    onChanges: changes,
+    onWorkspacesChanged: workspacesChanged,
+  });
+  const measured = measureLayoutReads();
+  const clone = vi.spyOn(globalThis, "structuredClone");
+  try {
+    await reconciliation[method]();
+    expect(measured.counts.graphClones).toBe(1);
+    expect(measured.counts.jsonCopies + measured.counts.mapCopies).toBe(0);
+    expect(clone.mock.calls.filter(([input]) => isGraphClone(input)).length).toBeLessThanOrEqual(1);
+    expect(measured.counts.derivations).toBe(phase === "active" ? 1 : 0);
+    expect(changes).toHaveBeenCalledTimes(1);
+    expect(changes.mock.calls[0][0]).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "workspace_updated", workspaceId: "large-0" }),
+        expect.objectContaining({ kind: "workspace_updated", workspaceId: "large-1" }),
+      ]),
+    );
+    if (method === "reconcileNow")
+      expect(workspacesChanged).toHaveBeenCalledWith(
+        expect.arrayContaining(["large-0", "large-1"]),
+      );
+    const retained: PersistedWorkspaceRecord[] = JSON.parse(await readFile(file, "utf8"));
+    expect(retained).toHaveLength(440);
+    expect(retained.filter((record) => record.archivedAt)).toHaveLength(1);
+    expect(retained[0]).toMatchObject({
+      branch: "observed-branch",
+      kind: "local_checkout",
+      pinnedAt: childPin,
+      pinPlacement: { parentWorkspaceKey: "srv_b:large-440", siblingOrder: 0 },
+    });
+    expect(retained[1]).toMatchObject({
+      branch: "observed-branch",
+      pinnedAt: childPin,
+      pinPlacement: { parentWorkspaceKey: "srv_unknown:missing" },
+    });
+    expect(retained[439]).toMatchObject({ branch: null, archivedAt: null });
+  } finally {
+    clone.mockRestore();
+    measured.restore();
+    reconciliation.dispose();
+  }
+});
+
+it.each(["importing", "active"] as const)(
+  "bounds protection initialization at 3308/440 scale in %s",
+  async (phase) => {
+    const { value, file } = await largeReadFixture(phase);
+    const before = await readFile(file, "utf8");
+    const measured = measureLayoutReads();
+    const clone = vi.spyOn(globalThis, "structuredClone");
+    try {
+      await value.initialize();
+      expect(measured.counts.graphClones).toBe(1);
+      expect(measured.counts.jsonCopies + measured.counts.mapCopies).toBe(0);
+      expect(clone.mock.calls.filter(([input]) => isGraphClone(input))).toHaveLength(1);
+      expect(measured.counts.derivations).toBe(phase === "active" ? 1 : 0);
+      expect(await readFile(file, "utf8")).toBe(before);
+    } finally {
+      clone.mockRestore();
+      measured.restore();
+    }
+  },
+);
+
+it("isolates indexed entry reads and sees new revisions without rebuilding on every get", async () => {
+  const { value, records, childPin } = await largeReadFixture("active");
+  const copiedView = service.cachedReadView();
+  copiedView.entries.clear();
+  if (!copiedView.snapshot?.entries[0].pinPlacement)
+    throw new Error("fixture copied placement missing");
+  copiedView.snapshot.entries[0].pinPlacement.siblingOrder = 8888;
+  const first = await value.get("large-0");
+  if (!first?.pinPlacement) throw new Error("fixture placement missing");
+  first.pinPlacement.siblingOrder = 9999;
+  expect(await value.get("large-0")).toMatchObject({
+    pinPlacement: { siblingOrder: 0 },
+    pinnedAt: at,
+  });
+  expect(await value.get("large-1")).toMatchObject({ pinnedAt: childPin, effectiveSection: null });
+  await expect(value.get("large-439")).rejects.toThrow("workspace_not_imported");
+  const before = await service.inspect();
+  const parent = before.entries.find(
+    (entry) => entry.ref.serverId === "srv_b" && entry.ref.workspaceId === "large-440",
+  );
+  if (!parent?.sectionIntent) throw new Error("fixture parent missing");
+  const changedPin = "2026-11-04T13:00:00.000Z";
+  await service.commit({
+    writerVersion: 2,
+    requestId: "entry-index-new-revision",
+    expected: before.stamp,
+    mutations: [
+      {
+        kind: "put",
+        entry: {
+          ...parent,
+          pinnedAt: changedPin,
+          sectionIntent: { ...parent.sectionIntent, mode: "explicit" },
+        },
+      },
+    ],
+  });
+  expect(await value.get("large-0")).toMatchObject({
+    pinnedAt: changedPin,
+    pinPlacement: { siblingOrder: 0 },
+  });
+  const derive = vi.spyOn(layoutProtocol, "resolveEffectiveWorkspaceLayout");
+  const clone = vi.spyOn(globalThis, "structuredClone");
+  try {
+    await Promise.all(records.slice(0, 439).map((record) => value.get(record.workspaceId)));
+    expect(derive).not.toHaveBeenCalled();
+    expect(clone.mock.calls.filter(([input]) => isGraphClone(input))).toHaveLength(0);
+  } finally {
+    derive.mockRestore();
+    clone.mockRestore();
+  }
+});
+
+it.each(["importing", "active"] as const)(
+  "retains fresh local metadata within a shared %s canonical read batch",
+  async (phase) => {
+    const { value } = await largeReadFixture(phase);
+    await value.withReadBatch(async (reader) => {
+      const first = await reader.get("large-0");
+      if (!first?.pinPlacement) throw new Error("fixture placement missing");
+      first.pinPlacement.siblingOrder = 1234;
+      await value.update("large-0", (record) => ({ ...record, cwd: home, title: "new metadata" }));
+      expect(await reader.get("large-0")).toMatchObject({
+        cwd: home,
+        title: "new metadata",
+        pinPlacement: { siblingOrder: 0 },
+      });
+    });
   },
 );
 
@@ -271,6 +492,107 @@ it("isolates large active read snapshots and sees a new authority revision on th
   expect(next[1]).toMatchObject({ pinnedAt: childPin, effectiveSection: null });
   expect(next[2]).toMatchObject({ archivedAt: at, pinnedAt: childPin });
   expect(JSON.parse(await readFile(file, "utf8"))[0].pinnedAt).toBe(childPin);
+});
+
+it("refreshes missing batch entries after a generation advances without copying another graph", async () => {
+  const { value, records } = await largeReadFixture("active");
+  await value.withReadBatch(async (reader) => {
+    const late = { ...records[3], workspaceId: "late-workspace", cwd: "/fixture/late-workspace" };
+    await value.upsert(late);
+    const points = vi.spyOn(service, "cachedWorkspace");
+    const views = vi.spyOn(service, "cachedReadView");
+    const measured = measureLayoutReads();
+    try {
+      expect(await reader.get(records[0].workspaceId)).toMatchObject({
+        workspaceId: records[0].workspaceId,
+      });
+      expect(points).not.toHaveBeenCalled();
+      expect(await reader.get(late.workspaceId)).toMatchObject({ workspaceId: late.workspaceId });
+      expect(points).toHaveBeenCalledTimes(1);
+      expect(views).not.toHaveBeenCalled();
+      await expect(reader.get("large-439")).rejects.toThrow("workspace_not_imported");
+      expect((await reader.list()).map((record) => record.workspaceId)).toContain(late.workspaceId);
+      expect(views).not.toHaveBeenCalled();
+      expect(points).toHaveBeenCalledTimes(4);
+      expect(
+        measured.counts.graphClones + measured.counts.jsonCopies + measured.counts.mapCopies,
+      ).toBe(0);
+      points.mockImplementation(() => {
+        throw new Error("entry_read_failed");
+      });
+      await expect(reader.get(late.workspaceId)).rejects.toThrow("entry_read_failed");
+      await expect(reader.list()).rejects.toThrow("entry_read_failed");
+    } finally {
+      points.mockRestore();
+      views.mockRestore();
+      measured.restore();
+    }
+  });
+});
+
+it("does not fall back for a genuinely missing entry in an unchanged generation", async () => {
+  const { value } = await largeReadFixture("active");
+  await value.withReadBatch(async (reader) => {
+    const points = vi.spyOn(service, "cachedWorkspace");
+    try {
+      await expect(reader.get("large-439")).rejects.toThrow("workspace_not_imported");
+      expect(points).not.toHaveBeenCalled();
+    } finally {
+      points.mockRestore();
+    }
+  });
+});
+
+it("reconciliation fans out a workspace created during the pass without false quarantine", async () => {
+  const { value, records, logger } = await largeReadFixture("active", { directories: true });
+  const projects = new FileBackedProjectRegistry(
+    path.join(home, "late-projects.json"),
+    createTestLogger(),
+  );
+  await projects.initialize();
+  await projects.upsert(
+    createPersistedProjectRecord({
+      projectId: "project",
+      rootPath: home,
+      kind: "non_git",
+      displayName: "scale",
+      createdAt: at,
+      updatedAt: at,
+    }),
+  );
+  const original = projects.update.bind(projects);
+  const update = vi.spyOn(projects, "update").mockImplementation(async (id, updater) => {
+    const result = await original(id, updater);
+    await value.upsert({
+      ...records[3],
+      workspaceId: "late-workspace",
+      cwd: path.join(home, "late"),
+    });
+    return result;
+  });
+  const changed = vi.fn(async () => {});
+  const errors = vi.spyOn(logger, "error");
+  const reconciliation = new WorkspaceReconciliationService({
+    projectRegistry: projects,
+    workspaceRegistry: value,
+    logger: createTestLogger(),
+    serverId: "srv_a",
+    workspaceGitService: createNoopWorkspaceGitService(),
+    onWorkspacesChanged: changed,
+  });
+  try {
+    await reconciliation.reconcileNow();
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(changed).toHaveBeenCalledWith(expect.arrayContaining(["late-workspace"]));
+    expect(errors).not.toHaveBeenCalledWith(
+      expect.objectContaining({ workspaceId: "late-workspace" }),
+      expect.any(String),
+    );
+  } finally {
+    update.mockRestore();
+    errors.mockRestore();
+    reconciliation.dispose();
+  }
 });
 
 it("routes ordinary pin and superpin writes through one durable authority across independent clients", async () => {
@@ -618,7 +940,16 @@ it("checks explicit pin intent against fresh authority state even when the stale
     expected: stale.stamp,
     mutations: [{ kind: "put", entry: { ...stale.entries[0], pinnedAt: null } }],
   });
-  const cached = vi.spyOn(service, "cached").mockReturnValue({ snapshot: stale, fresh: true });
+  const cached = vi.spyOn(service, "cachedWorkspace").mockImplementation(() =>
+    structuredClone({
+      stamp: stale.stamp,
+      semanticsVersion: stale.semanticsVersion,
+      entry: stale.entries[0],
+      effective: null,
+      derived: false,
+      fresh: true,
+    }),
+  );
   try {
     await value.update("one", (record) => ({ ...record, pinnedAt: at }), {
       requestId: "repin",
@@ -645,7 +976,16 @@ it("refuses stale placement revision before it can overwrite a newer authority m
     "srv_a",
   );
   const before = await service.inspect();
-  const cached = vi.spyOn(service, "cached").mockReturnValue({ snapshot: stale, fresh: true });
+  const cached = vi.spyOn(service, "cachedWorkspace").mockImplementation(() =>
+    structuredClone({
+      stamp: stale.stamp,
+      semanticsVersion: stale.semanticsVersion,
+      entry: stale.entries[0],
+      effective: null,
+      derived: false,
+      fresh: true,
+    }),
+  );
   try {
     await expect(
       setWorkspacePinPlacement(

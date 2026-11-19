@@ -84,6 +84,9 @@ function expectCloneFreeStatus(value: WorkspaceLayoutService, synchronized: bool
     clone.mockRestore();
     cached.mockRestore();
   }
+  expect(
+    value.cachedWorkspace({ serverId: value.options.serverId, workspaceId: "missing" }).fresh,
+  ).toBe(synchronized);
 }
 
 it.each(["importing", "active"] as const)(
