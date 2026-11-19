@@ -381,9 +381,11 @@ describe("sanitizeCpuProfile", () => {
     );
     expect(summary.frames.find((frame) => frame.kind === "gc")?.selfSamples).toBe(1);
     expect(summary.frames.find((frame) => frame.kind === "native")?.file).toBeNull();
-    expect(summary.frames.find((frame) => frame.kind === "node")?.file).toBe(
-      "node:internal/streams/readable",
-    );
+    expect(summary.frames.find((frame) => frame.kind === "node")).toMatchObject({
+      file: "node:internal",
+      line: null,
+      column: null,
+    });
     expect(summary.sampleCount).toBe(11);
     expect(summary.truncated).toEqual({ frames: false, samples: false, bytes: false });
   });
@@ -395,6 +397,8 @@ describe("sanitizeCpuProfile", () => {
       "node:internal/streams/readable",
       "node:sk_secret_token_abc",
       `node:internal/${"a".repeat(200)}`,
+      "node:internal/sk_secret_token_abc",
+      `node:internal/${"payloadvalue".repeat(7)}`,
       "node:fs?token=abc",
       "node:Internal/Streams",
       "node:internal/../fs",
@@ -420,10 +424,34 @@ describe("sanitizeCpuProfile", () => {
 
     expect(
       summary.frames.filter((frame) => frame.kind === "node").map((frame) => frame.file),
-    ).toEqual(["node:fs", "node:fs/promises", "node:internal/streams/readable"]);
-    expect(summary.frames.filter((frame) => frame.kind === "unknown")).toHaveLength(6);
+    ).toEqual([
+      "node:fs",
+      "node:fs/promises",
+      "node:internal",
+      "node:internal",
+      "node:internal",
+      "node:internal",
+      "node:internal",
+    ]);
+    // Internals collapse to one fixed id: no subpath, line or column.
+    expect(
+      summary.frames
+        .filter((frame) => frame.file === "node:internal")
+        .every((frame) => frame.line === null && frame.column === null),
+    ).toBe(true);
+    expect(summary.frames.find((frame) => frame.file === "node:fs")?.line).toBe(1);
+    expect(summary.frames.filter((frame) => frame.kind === "unknown")).toHaveLength(4);
     const json = JSON.stringify(summary);
-    for (const leaked of ["sk_secret", "token", "aaaa", "Internal", ".."]) {
+    expect(json).not.toContain("node:internal/");
+    for (const leaked of [
+      "sk_secret",
+      "token",
+      "aaaa",
+      "payloadvalue",
+      "streams",
+      "Internal",
+      "..",
+    ]) {
       expect(json).not.toContain(leaked);
     }
   });

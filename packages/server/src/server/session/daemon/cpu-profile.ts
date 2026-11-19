@@ -260,20 +260,25 @@ const PSEUDO_FRAME_KINDS = new Map<string, DiagnosticsCpuProfileFrame["kind"]>([
   ["(idle)", "idle"],
   ["(garbage collector)", "gc"],
 ]);
-// `node:` frames are emitted only for public builtins or bounded internals:
-// any script can name itself `node:<anything>` with a sourceURL.
+// Any script can name itself `node:<anything>` with a sourceURL. Only an exact
+// public builtin id is emitted; every `node:internal/...` collapses to one fixed
+// id with no subpath or position; anything else is unknown.
 const NODE_BUILTIN_IDS: ReadonlySet<string> = new Set(
   builtinModules.map((id) => id.replace(/^node:/, "")),
 );
-const NODE_INTERNAL_URL = /^node:internal\/[a-z0-9_]+(\/[a-z0-9_]+)*$/;
-const MAX_NODE_URL_LENGTH = 100;
+const NODE_INTERNAL_PREFIX = "node:internal/";
+const NODE_INTERNAL_ID = "node:internal";
 const SAFE_PACKET_PATH = /^[A-Za-z0-9_@.+-]+(\/[A-Za-z0-9_@.+-]+)*$/;
 const MAX_PACKET_PATH_LENGTH = 240;
 
 interface FrameIdentity {
   kind: DiagnosticsCpuProfileFrame["kind"];
   file: string | null;
+  /** Whether line and column may be emitted with `file`. */
+  positioned: boolean;
 }
+
+const UNKNOWN_FRAME: FrameIdentity = { kind: "unknown", file: null, positioned: false };
 
 function classifyFrame(
   callFrame: RawCpuProfile["nodes"][number]["callFrame"],
@@ -281,19 +286,20 @@ function classifyFrame(
 ): FrameIdentity {
   const url = callFrame.url ?? "";
   if (url === "") {
-    if (callFrame.scriptId !== "0") return { kind: "unknown", file: null };
-    return { kind: PSEUDO_FRAME_KINDS.get(callFrame.functionName) ?? "native", file: null };
+    if (callFrame.scriptId !== "0") return UNKNOWN_FRAME;
+    const kind = PSEUDO_FRAME_KINDS.get(callFrame.functionName) ?? "native";
+    return { kind, file: null, positioned: false };
+  }
+  if (url.startsWith(NODE_INTERNAL_PREFIX)) {
+    return { kind: "node", file: NODE_INTERNAL_ID, positioned: false };
   }
   if (url.startsWith("node:")) {
-    return isNodeBuiltinUrl(url) ? { kind: "node", file: url } : { kind: "unknown", file: null };
+    return NODE_BUILTIN_IDS.has(url.slice("node:".length))
+      ? { kind: "node", file: url, positioned: true }
+      : UNKNOWN_FRAME;
   }
   const file = packetRelativePath(url, packetRoot);
-  return file ? { kind: "packet", file } : { kind: "unknown", file: null };
-}
-
-function isNodeBuiltinUrl(url: string): boolean {
-  if (url.length > MAX_NODE_URL_LENGTH) return false;
-  return NODE_BUILTIN_IDS.has(url.slice("node:".length)) || NODE_INTERNAL_URL.test(url);
+  return file ? { kind: "packet", file, positioned: true } : UNKNOWN_FRAME;
 }
 
 function packetRelativePath(url: string, packetRoot: string): string | null {
@@ -404,7 +410,7 @@ function toFrame(
   totals: Map<number, number>,
 ): DiagnosticsCpuProfileFrame {
   const identity = classifyFrame(node.callFrame, packetRoot);
-  const positioned = identity.file !== null;
+  const { positioned } = identity;
   return {
     id: index,
     parent,
