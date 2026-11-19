@@ -471,12 +471,26 @@ holds and backing/shared references. Only the private, currently executing owner
 context can consume that reservation. A context inherited by a delayed async
 callback expires when the operation returns.
 
-Normal native backing transitions share serialization with retirement. Completed
+Normal native backing transitions acquire canonicalized overlapping-path and
+native identity read-set leases. Disjoint updates and creation continue during a
+paused retirement. Nested acquisitions must be covered or acquire a vacant scope
+extension; a conflicting expansion refuses rather than waiting with a partial
+lease. Provider imports preflight the backing fence and hold their lease through
+the complete import callback, with fresh admission after acquisition. Completed
 operations return their recorded result on replay. A retained directory can later
 be registered as a new native ID; old-ID callbacks cannot select that replacement.
 Whole-worktree list responses additionally carry an opaque `backingGeneration`;
 the CLI returns it automatically as `expectedBackingGeneration`. A stale or missing
 generation on a canonical path archive refuses before effects.
+
+Project removal also persists an owner-side `project-retirements/` request journal
+before native teardown. It binds the authority/epoch, owner, original project
+incarnation, exact native IDs and backing generation. Retries reconcile that saved
+footprint and its authority receipt; they never select a replacement workspace.
+New active members or a different project incarnation refuse metadata removal.
+If removal persisted but its notification failed, original-project absence resolves
+the operation without repeating removal or icon cleanup. A completed request returns
+its original outcome without touching a later project or slot generation.
 
 An interrupted or uncertain effect remains journaled and fenced, without a TTL.
 A retry queries the same operation and reports partial/reconciliation-required;

@@ -1038,6 +1038,7 @@ export async function createPaseoDaemon(
     }
   });
   const workspaceProvisioning = createWorkspaceProvisioningService({
+    paseoHome: config.paseoHome,
     lifecycle: pluginRuntime,
     serverId,
     projectRegistry,
@@ -1634,6 +1635,7 @@ export async function createPaseoDaemon(
     findWorkspaceIdForCwd: findWorkspaceIdForCwdExternal,
     listActiveWorkspaces: listActiveWorkspacesExternal,
     archiveWorkspaceRecord: archiveWorkspaceRecordExternal,
+    stopWorkspaceSetup: (id) => workspaceSetupRuntime.stop(id),
     emitWorkspaceUpdatesForWorkspaceIds: emitWorkspaceUpdatesExternal,
     workspaceLayoutService,
     workspaceRegistry,

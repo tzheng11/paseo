@@ -1,4 +1,4 @@
-import { serializeWorkspaceBacking } from "./workspace-retirement-context.js";
+import { serializeWorkspaceBacking, nativeTransitionKey } from "./workspace-retirement-context.js";
 import type { WorkspaceSidebarPlacement } from "./workspace-pin-placement.js";
 import type { PluginLifecycle } from "./plugins/lifecycle/index.js";
 import { stat } from "node:fs/promises";
@@ -91,8 +91,21 @@ export async function createPaseoWorktree(
   deps: CreatePaseoWorktreeDeps,
 ): Promise<CreatePaseoWorktreeResult> {
   await deps.workspaceProvisioning.assertCreationAllowed?.(input.cwd, input.parentWorkspaceId);
-  return serializeWorkspaceBacking(input.cwd, () =>
-    runWithGitCommandPriority("high", () => createPaseoWorktreeWithPriority(input, deps)),
+  return serializeWorkspaceBacking(
+    {
+      paths: [input.cwd],
+      keys: input.paseoHome
+        ? [
+            ...(input.projectId
+              ? [nativeTransitionKey(input.paseoHome, "project", input.projectId)]
+              : []),
+            ...(input.parentWorkspaceId
+              ? [nativeTransitionKey(input.paseoHome, "workspace", input.parentWorkspaceId)]
+              : []),
+          ]
+        : [],
+    },
+    () => runWithGitCommandPriority("high", () => createPaseoWorktreeWithPriority(input, deps)),
   );
 }
 

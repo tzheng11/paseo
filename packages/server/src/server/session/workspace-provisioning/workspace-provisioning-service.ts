@@ -1,4 +1,7 @@
-import { serializeWorkspaceBacking } from "../../workspace-retirement-context.js";
+import {
+  serializeWorkspaceBacking,
+  nativeTransitionKey,
+} from "../../workspace-retirement-context.js";
 import {
   initialWorkspaceSidebarFields,
   type WorkspaceSidebarPlacement,
@@ -113,6 +116,7 @@ export class WorkspaceProvisioningError extends Error {
 }
 
 export function createWorkspaceProvisioningService(deps: {
+  paseoHome?: string;
   serverId?: string;
   workspaceRegistry: WorkspaceRegistry;
   projectRegistry: ProjectRegistry;
@@ -137,6 +141,17 @@ export function createWorkspaceProvisioningService(deps: {
     }
   }
 
+  async function admitProjectBinding(project: PersistedProjectRecord): Promise<void> {
+    if (!deps.paseoHome || !workspaceRegistry.assertBackingWriteAllowed) return;
+    await serializeWorkspaceBacking(
+      { paths: [], keys: [nativeTransitionKey(deps.paseoHome, "project", project.projectId)] },
+      async () => {},
+    );
+    const fresh = await requireActiveProject(project.projectId);
+    if (fresh.createdAt !== project.createdAt || fresh.rootPath !== project.rootPath)
+      throw new Error("Project changed before workspace admission");
+  }
+
   /**
    * Placement facts at a workspace directory, or null when there is nothing
    * there to read. A git read answers "not a checkout" for a plain directory
@@ -153,6 +168,36 @@ export function createWorkspaceProvisioningService(deps: {
   }
 
   async function runInImportWorkspace<T>(
+    input: ImportWorkspaceInput,
+    operation: (workspace: PersistedWorkspaceRecord) => Promise<T>,
+  ): Promise<ImportWorkspaceResult<T>> {
+    await assertCreationAllowed(input.cwd);
+    if (input.requestedWorkspaceId)
+      await workspaceRegistry.assertWorkspaceRestoreAllowed?.(input.requestedWorkspaceId);
+    const selected = input.requestedWorkspaceId
+      ? await workspaceRegistry.get(input.requestedWorkspaceId)
+      : null;
+    return serializeWorkspaceBacking(
+      {
+        paths: [input.cwd, ...(selected ? [selected.worktreeRoot ?? selected.cwd] : [])],
+        keys:
+          deps.paseoHome && selected
+            ? [
+                nativeTransitionKey(deps.paseoHome, "project", selected.projectId),
+                nativeTransitionKey(deps.paseoHome, "workspace", selected.workspaceId),
+              ]
+            : [],
+      },
+      async () => {
+        await assertCreationAllowed(input.cwd);
+        if (input.requestedWorkspaceId)
+          await workspaceRegistry.assertWorkspaceRestoreAllowed?.(input.requestedWorkspaceId);
+        return runInImportWorkspaceUnlocked(input, operation);
+      },
+    );
+  }
+
+  async function runInImportWorkspaceUnlocked<T>(
     input: ImportWorkspaceInput,
     operation: (workspace: PersistedWorkspaceRecord) => Promise<T>,
   ): Promise<ImportWorkspaceResult<T>> {
@@ -275,11 +320,24 @@ export function createWorkspaceProvisioningService(deps: {
   async function createWorkspaceForDirectory(
     ...args: Parameters<typeof createWorkspaceForDirectoryUnlocked>
   ): Promise<PersistedWorkspaceRecord> {
-    return serializeWorkspaceBacking(args[0], async () => {
-      await workspaceRegistry.assertBackingWriteAllowed?.(args[0]);
+    return serializeWorkspaceBacking(
+      {
+        paths: [args[0]],
+        keys: deps.paseoHome
+          ? [
+              ...(args[2] ? [nativeTransitionKey(deps.paseoHome, "project", args[2])] : []),
+              ...(args[3]?.parentWorkspaceId
+                ? [nativeTransitionKey(deps.paseoHome, "workspace", args[3].parentWorkspaceId)]
+                : []),
+            ]
+          : [],
+      },
+      async () => {
+        await workspaceRegistry.assertBackingWriteAllowed?.(args[0]);
 
-      return createWorkspaceForDirectoryUnlocked(...args);
-    });
+        return createWorkspaceForDirectoryUnlocked(...args);
+      },
+    );
   }
 
   async function createWorkspaceForDirectoryUnlocked(
@@ -308,6 +366,7 @@ export function createWorkspaceProvisioningService(deps: {
       ? await refreshProjectKind(await requireActiveProject(projectId), normalizedCwd, checkout)
       : // COMPAT(workspaceCreateMissingProjectId): added in v0.1.107, remove after 2027-01-15.
         await findOrCreateProjectForDirectory(normalizedCwd);
+    await admitProjectBinding(project);
     const timestamp = new Date().toISOString();
     const workspace = createPersistedWorkspaceRecord({
       workspaceId: context?.workspaceId ?? generateWorkspaceId(),
@@ -332,11 +391,26 @@ export function createWorkspaceProvisioningService(deps: {
   async function createWorkspaceForWorktree(
     ...args: Parameters<typeof createWorkspaceForWorktreeUnlocked>
   ): Promise<PersistedWorkspaceRecord> {
-    return serializeWorkspaceBacking(args[0].worktreeRoot, async () => {
-      await workspaceRegistry.assertBackingWriteAllowed?.(args[0].worktreeRoot);
+    return serializeWorkspaceBacking(
+      {
+        paths: [args[0].worktreeRoot],
+        keys: deps.paseoHome
+          ? [
+              ...(args[0].projectId
+                ? [nativeTransitionKey(deps.paseoHome, "project", args[0].projectId)]
+                : []),
+              ...(args[0].parentWorkspaceId
+                ? [nativeTransitionKey(deps.paseoHome, "workspace", args[0].parentWorkspaceId)]
+                : []),
+            ]
+          : [],
+      },
+      async () => {
+        await workspaceRegistry.assertBackingWriteAllowed?.(args[0].worktreeRoot);
 
-      return createWorkspaceForWorktreeUnlocked(...args);
-    });
+        return createWorkspaceForWorktreeUnlocked(...args);
+      },
+    );
   }
 
   async function createWorkspaceForWorktreeUnlocked(
@@ -356,6 +430,7 @@ export function createWorkspaceProvisioningService(deps: {
           : undefined),
       repoRoot,
     });
+    await admitProjectBinding(project);
     const timestamp = new Date().toISOString();
     const workspace = createPersistedWorkspaceRecord({
       workspaceId: input.workspaceId ?? generateWorkspaceId(),

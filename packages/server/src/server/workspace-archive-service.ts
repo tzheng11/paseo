@@ -9,7 +9,7 @@ import {
   hasWorkspaceRetirement,
   workspaceRetirementStep,
 } from "./workspace-retirement.js";
-import { serializeWorkspaceBacking } from "./workspace-retirement-context.js";
+import { serializeWorkspaceBacking, nativeTransitionKey } from "./workspace-retirement-context.js";
 import { resolve } from "node:path";
 
 import type { Logger } from "pino";
@@ -82,7 +82,12 @@ export interface KillTerminalsForWorkspaceDependencies {
 export type ArchiveScope =
   | { kind: "workspace"; workspaceId: string }
   | { kind: "worktree"; targetPath: string; expectedBackingGeneration?: string }
-  | { kind: "project"; projectId: string };
+  | {
+      kind: "project";
+      projectId: string;
+      workspaceIds?: string[];
+      expectedBackingGeneration?: string;
+    };
 
 export interface ArchiveResult {
   slotKept?: boolean;
@@ -163,45 +168,73 @@ export async function archiveByScope(
     if (!nativeInventory || !dependencies.getWorkspace)
       throw new Error("canonical_native_inventory_required");
     const initial = await resolveArchiveTarget(dependencies, request.scope);
-    const queuePath = initial.backing?.path ?? dependencies.paseoHome ?? ".";
-    return serializeWorkspaceBacking(queuePath, async () => {
-      const target = await resolveArchiveTarget(dependencies, request.scope);
-      if (request.scope.kind === "worktree" && !target.workspaceIds.length)
-        throw new Error("Canonical retirement requires an exact native workspace footprint");
-      const ids =
-        request.scope.kind === "workspace" ? [request.scope.workspaceId] : target.workspaceIds;
-      const inventory = await nativeInventory();
-      const records = await Promise.all(
-        ids.map(async (id) => {
-          const record =
-            inventory.find((candidate) => candidate.workspaceId === id) ??
-            (await dependencies.getWorkspace?.(id));
-          if (!record)
-            throw new Error("Canonical retirement requires native identity and creation time");
-          return record;
-        }),
-      );
-      if (
-        request.scope.kind === "worktree" &&
-        request.scope.expectedBackingGeneration !== nativeGeneration(records)
-      )
-        throw new Error("canonical_backing_generation_required_or_changed");
-      const backing = target.backing?.path ?? records[0].cwd;
-      return retireCanonicalWorkspace({
-        authority: dependencies.retirementAuthority!,
-        records,
-        backing,
-        nativeInventory,
-        getRecord: async (id) => (await dependencies.getWorkspace?.(id)) ?? null,
-        assertHolds: async (id) => {
-          await dependencies.assertWorkspaceAutomationAllowed?.(id);
-        },
-        run: () =>
-          runWithGitCommandPriority("high", () =>
-            archiveResolvedTarget(dependencies, request, target),
+    const initialInventory = await nativeInventory();
+    const initialIds =
+      request.scope.kind === "workspace" ? [request.scope.workspaceId] : initial.workspaceIds;
+    const initialRecords = initialInventory.filter((record) =>
+      initialIds.includes(record.workspaceId),
+    );
+    return serializeWorkspaceBacking(
+      {
+        paths: initialRecords.flatMap((record) => [record.cwd, record.worktreeRoot ?? record.cwd]),
+        keys: [
+          ...initialIds.map((id) =>
+            nativeTransitionKey(dependencies.retirementAuthority!.options.home, "workspace", id),
           ),
-      });
-    });
+          ...(request.scope.kind === "project"
+            ? [
+                nativeTransitionKey(
+                  dependencies.retirementAuthority!.options.home,
+                  "project",
+                  request.scope.projectId,
+                ),
+              ]
+            : []),
+        ],
+      },
+      async () => {
+        const target = await resolveArchiveTarget(dependencies, request.scope);
+        if (request.scope.kind === "worktree" && !target.workspaceIds.length)
+          throw new Error("Canonical retirement requires an exact native workspace footprint");
+        const ids =
+          request.scope.kind === "workspace" ? [request.scope.workspaceId] : target.workspaceIds;
+        const inventory = await nativeInventory();
+        const records = await Promise.all(
+          ids.map(async (id) => {
+            const record =
+              inventory.find((candidate) => candidate.workspaceId === id) ??
+              (await dependencies.getWorkspace?.(id));
+            if (!record)
+              throw new Error("Canonical retirement requires native identity and creation time");
+            return record;
+          }),
+        );
+        if (nativeGeneration(records) !== nativeGeneration(initialRecords))
+          throw new Error("retirement_native_footprint_changed");
+        if (
+          (request.scope.kind === "worktree" ||
+            (request.scope.kind === "project" && request.scope.workspaceIds)) &&
+          request.scope.expectedBackingGeneration !== nativeGeneration(records)
+        )
+          throw new Error("canonical_backing_generation_required_or_changed");
+        const backing = target.backing?.path ?? records[0].cwd;
+        return retireCanonicalWorkspace({
+          expectedProjectId: request.scope.kind === "project" ? request.scope.projectId : undefined,
+          authority: dependencies.retirementAuthority!,
+          records,
+          backing,
+          nativeInventory,
+          getRecord: async (id) => (await dependencies.getWorkspace?.(id)) ?? null,
+          assertHolds: async (id) => {
+            await dependencies.assertWorkspaceAutomationAllowed?.(id);
+          },
+          run: () =>
+            runWithGitCommandPriority("high", () =>
+              archiveResolvedTarget(dependencies, request, target),
+            ),
+        });
+      },
+    );
   }
   if (dependencies.paseoHome) await assertWorkspaceRetirementAllowed(dependencies.paseoHome);
   return runWithGitCommandPriority("high", () => archiveByScopeWithPriority(dependencies, request));
@@ -320,15 +353,8 @@ async function resolveArchiveTarget(
   scope: ArchiveScope,
 ): Promise<ArchiveTarget> {
   const activeWorkspaces = await activeNativeReferences(dependencies);
-  if (scope.kind === "project") {
-    const records = await Promise.all(
-      activeWorkspaces.map((workspace) => dependencies.getWorkspace?.(workspace.workspaceId)),
-    );
-    const ids = records.flatMap((record) =>
-      record?.projectId === scope.projectId ? [record.workspaceId] : [],
-    );
-    return { backing: null, teardownTargets: [], setupWorkspaceIds: ids, workspaceIds: ids };
-  }
+  if (scope.kind === "project")
+    return resolveProjectArchiveTarget(dependencies, scope, activeWorkspaces);
 
   if (scope.kind === "workspace") {
     const workspaceId = scope.workspaceId;
@@ -381,6 +407,37 @@ async function resolveArchiveTarget(
     setupWorkspaceIds: targetWorkspaces.map((workspace) => workspace.workspaceId),
     workspaceIds: targetWorkspaces.map((workspace) => workspace.workspaceId),
   };
+}
+
+async function resolveProjectArchiveTarget(
+  dependencies: ArchiveDependencies,
+  scope: Extract<ArchiveScope, { kind: "project" }>,
+  activeWorkspaces: ActiveWorkspaceRef[],
+): Promise<ArchiveTarget> {
+  if (scope.workspaceIds) {
+    const inventory = await dependencies.listRetirementRecords?.();
+    if (!inventory) throw new Error("canonical_native_inventory_required");
+    for (const id of scope.workspaceIds)
+      if (
+        !inventory.some(
+          (record) => record.workspaceId === id && record.projectId === scope.projectId,
+        )
+      )
+        throw new Error("project_retirement_footprint_changed");
+    return {
+      backing: null,
+      teardownTargets: [],
+      setupWorkspaceIds: scope.workspaceIds,
+      workspaceIds: scope.workspaceIds,
+    };
+  }
+  const records = await Promise.all(
+    activeWorkspaces.map((workspace) => dependencies.getWorkspace?.(workspace.workspaceId)),
+  );
+  const ids = records.flatMap((record) =>
+    record?.projectId === scope.projectId ? [record.workspaceId] : [],
+  );
+  return { backing: null, teardownTargets: [], setupWorkspaceIds: ids, workspaceIds: ids };
 }
 
 async function stopWorkspaceSetups(

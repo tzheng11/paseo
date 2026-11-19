@@ -1,3 +1,6 @@
+import { createWorkspaceProvisioningService } from "./session/workspace-provisioning/workspace-provisioning-service.js";
+import { Session } from "./session.js";
+import { retireCanonicalProject } from "./project-retirement.js";
 import { createPaseoToolCatalog } from "./agent/tools/paseo-tools.js";
 import { AgentManager } from "./agent/agent-manager.js";
 import { AgentStorage } from "./agent/agent-storage.js";
@@ -9,6 +12,8 @@ import { WorkspaceLayoutService } from "./workspace-layout-service.js";
 import { CanonicalWorkspaceRegistry } from "./workspace-layout-registry.js";
 import {
   FileBackedWorkspaceRegistry,
+  FileBackedProjectRegistry,
+  createPersistedProjectRecord,
   createPersistedWorkspaceRecord,
 } from "./workspace-registry.js";
 import {
@@ -1288,7 +1293,7 @@ describe("resolveWorkspaceIdAtPath", () => {
   });
 });
 
-async function canonicalArchiveFixture(teardown?: string) {
+async function canonicalArchiveFixture(teardown?: string, activate = true) {
   const { tempDir, repoDir } = createGitRepo();
   if (teardown) {
     writeFileSync(
@@ -1376,18 +1381,19 @@ async function canonicalArchiveFixture(teardown?: string) {
     ],
   });
   state = await layout.inspect();
-  await layout.commit({
-    writerVersion: 2,
-    requestId: randomUUID(),
-    expected: state.stamp,
-    mutations: [
-      {
-        kind: "activate",
-        requiredImports: state.imports,
-        requiredOwnerDomains: state.ownerDomains,
-      },
-    ],
-  });
+  if (activate)
+    await layout.commit({
+      writerVersion: 2,
+      requestId: randomUUID(),
+      expected: state.stamp,
+      mutations: [
+        {
+          kind: "activate",
+          requiredImports: state.imports,
+          requiredOwnerDomains: state.ownerDomains,
+        },
+      ],
+    });
   const registry = new CanonicalWorkspaceRegistry(file, createLogger(), layout, "owner");
   await registry.initialize();
   const deps = createArchiveDeps({ paseoHome: home, activeWorkspaces: [record] });
@@ -2102,6 +2108,7 @@ test("canonical project retirement archives its whole multi-backing footprint an
 test("canonical MCP archive uses the same reservation and returns its durable outcome", async () => {
   const f = await canonicalArchiveFixture();
   const logger = createLogger();
+  const order: string[] = [];
   const storage = new AgentStorage(path.join(f.home, "agents"), logger);
   const manager = new AgentManager({ clients: {}, registry: storage, logger });
   try {
@@ -2118,13 +2125,22 @@ test("canonical MCP archive uses the same reservation and returns its durable ou
       findWorkspaceIdForCwd: f.deps.findWorkspaceIdForCwd,
       listActiveWorkspaces: f.deps.listActiveWorkspaces,
       archiveWorkspaceRecord: f.deps.archiveWorkspaceRecord,
+      stopWorkspaceSetup: async () => {
+        order.push("stop-setup");
+      },
       emitWorkspaceUpdatesForWorkspaceIds: f.deps.emitWorkspaceUpdatesForWorkspaceIds,
       markWorkspaceArchiving: f.deps.markWorkspaceArchiving,
       clearWorkspaceArchiving: f.deps.clearWorkspaceArchiving,
       logger,
     });
+    vi.spyOn(manager, "listAgents").mockImplementation(() => {
+      order.push("agents");
+      return [];
+    });
     const result = await catalog.executeTool("archive_workspace", { workspaceId: "old-a" });
     expect(result.isError).not.toBe(true);
+    expect(order[0]).toBe("stop-setup");
+    expect(order).toContain("agents");
     expect(result.structuredContent).toMatchObject({
       workspaceId: "old-a",
       removedDirectory: true,
@@ -2184,6 +2200,671 @@ test("canonical pending backing also fences a symlink alias and its not-yet-crea
       f.registry.assertBackingWriteAllowed(path.join(alias, "future-child")),
     ).rejects.toThrow("retirement_backing_reserved");
     expect(existsSync(path.join(f.worktree.worktreePath, "future-child"))).toBe(false);
+  } finally {
+    await f.close();
+  }
+});
+
+test("REVIEW MCP refuses untrusted source before reservation and hooks", async () => {
+  const f = await canonicalArchiveFixture(
+    "node -e \"require('fs').writeFileSync(process.env.PASEO_SOURCE_CHECKOUT_PATH+'/review-untrusted-hook','ran')\"",
+  );
+  const logger = createLogger();
+  const storage = new AgentStorage(path.join(f.home, "agents"), logger);
+  const manager = new AgentManager({ clients: {}, registry: storage, logger });
+  try {
+    await f.registry.update("old-a", (r) => ({
+      ...r,
+      untrustedSource: {
+        kind: "change_request",
+        forge: "github",
+        number: 42,
+        headRepository: "untrusted/fork",
+      },
+    }));
+    const catalog = await createPaseoToolCatalog({
+      agentManager: manager,
+      agentStorage: storage,
+      providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+      workspaceRegistry: f.registry,
+      workspaceLayoutService: f.layout,
+      serverId: "owner",
+      paseoHome: f.home,
+      github: f.deps.github,
+      workspaceGitService: createNoopWorkspaceGitService(),
+      findWorkspaceIdForCwd: f.deps.findWorkspaceIdForCwd,
+      listActiveWorkspaces: f.deps.listActiveWorkspaces,
+      archiveWorkspaceRecord: f.deps.archiveWorkspaceRecord,
+      emitWorkspaceUpdatesForWorkspaceIds: f.deps.emitWorkspaceUpdatesForWorkspaceIds,
+      markWorkspaceArchiving: f.deps.markWorkspaceArchiving,
+      clearWorkspaceArchiving: f.deps.clearWorkspaceArchiving,
+      logger,
+    });
+    let result: Awaited<ReturnType<typeof catalog.executeTool>> | undefined;
+    let rejection: unknown;
+    try {
+      result = await catalog.executeTool("archive_workspace", { workspaceId: "old-a" });
+    } catch (error) {
+      rejection = error;
+    }
+    const hookRan = existsSync(path.join(f.repoDir, "review-untrusted-hook"));
+    expect(rejection instanceof Error || result?.isError === true).toBe(true);
+    expect(hookRan).toBe(false);
+    expect((await f.layout.inspect()).retirements).toBeUndefined();
+  } finally {
+    await f.close();
+  }
+});
+
+test("REVIEW unrelated native metadata write proceeds during paused retirement", async () => {
+  const f = await canonicalArchiveFixture();
+  let release = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let entered = () => {};
+  const ready = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  f.deps.stopWorkspaceSetup = async () => {
+    entered();
+    await gate;
+  };
+  let archive: ReturnType<typeof archiveByScope> | undefined;
+  let update: Promise<unknown> | undefined;
+  let completed = false;
+  try {
+    await f.registry.upsert({
+      ...f.record,
+      workspaceId: "unrelated",
+      cwd: f.repoDir,
+      worktreeRoot: f.repoDir,
+      kind: "local_checkout",
+      isPaseoOwnedWorktree: false,
+    });
+    archive = archiveByScope(f.deps, {
+      scope: { kind: "workspace", workspaceId: "old-a" },
+      requestId: "review-pause",
+    });
+    await ready;
+    update = f.registry
+      .update("unrelated", (r) => ({ ...r, title: "unrelated metadata change" }))
+      .then((r) => {
+        completed = true;
+        return r;
+      });
+    await Promise.race([update, new Promise<void>((resolve) => setTimeout(resolve, 3000))]);
+    expect(completed).toBe(true);
+  } finally {
+    release();
+    await archive;
+    await update;
+    await f.close();
+  }
+});
+
+test("REVIEW multi-alias slot reuse rejects A whole-path generation and old-ID replay preserves B", async () => {
+  const f = await canonicalArchiveFixture();
+  const { nativeGeneration } = await import("./workspace-retirement.js");
+  try {
+    const alias = { ...f.record, workspaceId: "shared-alias" };
+    await f.registry.upsert(alias);
+    const staleGeneration = nativeGeneration([f.record, alias]);
+    const first = await archiveByScope(f.deps, {
+      scope: { kind: "workspace", workspaceId: "old-a" },
+      requestId: "review-old-a",
+    });
+    expect(first.retirement?.state).toBe("complete");
+    expect(first.directoryLeftBehind?.reason).toBe("shared_backing_retained");
+    await f.registry.upsert({
+      ...f.record,
+      workspaceId: "new-b",
+      createdAt: "2026-11-19T21:00:00.000Z",
+    });
+    mkdirSync(path.join(f.worktree.worktreePath, "node_modules"));
+    writeFileSync(path.join(f.worktree.worktreePath, "node_modules", "b-service-dependency"), "B");
+    const killCount = vi.mocked(f.deps.killTerminalsForWorkspace).mock.calls.length;
+    await expect(
+      archiveByScope(f.deps, {
+        scope: {
+          kind: "worktree",
+          targetPath: f.worktree.worktreePath,
+          expectedBackingGeneration: staleGeneration,
+        },
+        requestId: "review-stale-path",
+      }),
+    ).rejects.toThrow("canonical_backing_generation_required_or_changed");
+    expect(
+      await archiveByScope(f.deps, {
+        scope: { kind: "workspace", workspaceId: "old-a" },
+        requestId: "review-stale-id",
+      }),
+    ).toEqual(first);
+    expect(
+      readFileSync(
+        path.join(f.worktree.worktreePath, "node_modules", "b-service-dependency"),
+        "utf8",
+      ),
+    ).toBe("B");
+    expect((await f.registry.get("new-b"))?.archivedAt).toBe(null);
+    expect((await f.registry.get("shared-alias"))?.archivedAt).toBe(null);
+    expect(vi.mocked(f.deps.killTerminalsForWorkspace).mock.calls.length).toBe(killCount);
+  } finally {
+    await f.close();
+  }
+});
+
+test("REVIEW failed project removal retry never archives replacement B after native completion", async () => {
+  const f = await canonicalArchiveFixture();
+  const messages: Array<{ type: string; payload?: unknown }> = [];
+  let failRemoval = true;
+  const session = Object.assign(Object.create(Session.prototype), {
+    paseoHome: f.home,
+    workspaceLayoutService: f.layout,
+    workspaceRegistry: f.registry,
+    projectRegistry: {
+      get: async () => ({ projectId: "project" }),
+      remove: async () => {
+        if (failRemoval) {
+          failRemoval = false;
+          throw new Error("fixture project persistence failure");
+        }
+      },
+    },
+    readRetirementRecords: () => f.registry.listRetirementRecords(),
+    workspaceArchiveDependencies: () => f.deps,
+    clearWorkspaceArchiving: () => {},
+    emitWorkspaceUpdatesForWorkspaceIds: async () => {},
+    sessionLogger: createLogger(),
+    emit: (message: { type: string; payload?: unknown }) => messages.push(message),
+  }) as {
+    handleProjectRemoveRequest: (request: {
+      type: "project.remove.request";
+      projectId: string;
+      requestId: string;
+    }) => Promise<void>;
+  };
+  try {
+    const request = {
+      type: "project.remove.request" as const,
+      projectId: "project",
+      requestId: "same-project-removal-request",
+    };
+    await session.handleProjectRemoveRequest(request);
+    expect(messages.at(-1)?.payload).toMatchObject({
+      accepted: false,
+      error: "fixture project persistence failure",
+    });
+    expect((await f.layout.inspect()).retirements?.[0].state).toBe("complete");
+    await f.registry.upsert({
+      ...f.record,
+      workspaceId: "new-b",
+      createdAt: "2026-11-19T21:00:00.000Z",
+    });
+    mkdirSync(path.join(f.worktree.worktreePath, "node_modules"));
+    writeFileSync(path.join(f.worktree.worktreePath, "node_modules", "b-dependency"), "B");
+    const kills = vi.mocked(f.deps.killTerminalsForWorkspace).mock.calls.length;
+    await session.handleProjectRemoveRequest(request);
+    const b = await f.registry.get("new-b");
+    expect(b?.archivedAt).toBe(null);
+    expect(vi.mocked(f.deps.killTerminalsForWorkspace).mock.calls.length).toBe(kills);
+  } finally {
+    await f.close();
+  }
+});
+
+test("REVIEW explicit-ID provider import is fenced after archive captures its agent footprint", async () => {
+  const f = await canonicalArchiveFixture();
+  const projects = new FileBackedProjectRegistry(
+    path.join(f.home, "projects", "review-projects.json"),
+    createLogger(),
+  );
+  await projects.initialize();
+  await projects.upsert(
+    createPersistedProjectRecord({
+      projectId: "project",
+      rootPath: f.repoDir,
+      kind: "git",
+      displayName: "project",
+      createdAt: f.record.createdAt,
+      updatedAt: f.record.updatedAt,
+    }),
+  );
+  const provisioning = createWorkspaceProvisioningService({
+    serverId: "owner",
+    workspaceRegistry: f.registry,
+    projectRegistry: projects,
+    workspaceGitService: createNoopWorkspaceGitService(),
+    isDirectory: async () => true,
+    logger: createLogger(),
+  });
+  let release = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let entered = () => {};
+  const ready = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  let imported = false;
+  f.deps.agentManager.listAgents = () =>
+    imported ? ([{ id: "late-imported-agent", workspaceId: "old-a" }] as ManagedAgent[]) : [];
+  f.deps.killTerminalsForWorkspace = async () => {
+    entered();
+    await gate;
+  };
+  const archive = archiveByScope(f.deps, {
+    scope: { kind: "workspace", workspaceId: "old-a" },
+    requestId: "review-import-race",
+  });
+  try {
+    await ready;
+    expect((await f.layout.inspect()).retirements?.[0].state).toBe("reserved");
+    let rejected: unknown;
+    try {
+      await provisioning.runInImportWorkspace(
+        { requestedWorkspaceId: "old-a", cwd: f.record.cwd },
+        async () => {
+          imported = true;
+          return "imported";
+        },
+      );
+    } catch (error) {
+      rejected = error;
+    }
+    expect(rejected).toBeInstanceOf(Error);
+    expect(imported).toBe(false);
+  } finally {
+    release();
+    const outcome = await archive;
+    expect(outcome.retirement?.state).toBe("complete");
+    await f.close();
+  }
+});
+
+test("REVIEW importing-phase refusal permits a fresh archive after activation", async () => {
+  const f = await canonicalArchiveFixture(undefined, false);
+  try {
+    const first = await archiveByScope(f.deps, {
+      scope: { kind: "workspace", workspaceId: "old-a" },
+      requestId: "before-activation",
+    });
+    expect(first.retirement).toMatchObject({ state: "partial", code: "layout_importing" });
+    expect(f.deps.killTerminalsForWorkspace).not.toHaveBeenCalled();
+    const snapshot = await f.layout.inspect();
+    expect(snapshot.retirements).toBeUndefined();
+    await f.layout.commit({
+      writerVersion: 2,
+      requestId: randomUUID(),
+      expected: snapshot.stamp,
+      mutations: [
+        {
+          kind: "activate",
+          requiredImports: snapshot.imports,
+          requiredOwnerDomains: snapshot.ownerDomains,
+        },
+      ],
+    });
+    const second = await archiveByScope(f.deps, {
+      scope: { kind: "workspace", workspaceId: "old-a" },
+      requestId: "after-activation",
+    });
+    let backingError: unknown;
+    try {
+      await f.registry.assertBackingWriteAllowed(f.record.cwd);
+    } catch (error) {
+      backingError = error;
+    }
+    expect(backingError).toBeUndefined();
+    expect(second.retirement?.state).toBe("complete");
+  } finally {
+    await f.close();
+  }
+});
+
+async function projectCompletionFixture() {
+  const f = await canonicalArchiveFixture();
+  const file = path.join(f.home, "projects", "project-completion.json");
+  const projects = new FileBackedProjectRegistry(file, createLogger());
+  await projects.initialize();
+  const project = createPersistedProjectRecord({
+    projectId: "project",
+    rootPath: f.repoDir,
+    kind: "git",
+    displayName: "project",
+    createdAt: f.record.createdAt,
+    updatedAt: f.record.updatedAt,
+  });
+  await projects.upsert(project);
+  const input = {
+    authority: f.layout,
+    projectId: "project",
+    requestId: "original-project-removal",
+    getProject: () => projects.get("project"),
+    readRecords: () => f.registry.listRetirementRecords(),
+    archive: vi.fn((workspaceIds: string[], generation: string) =>
+      archiveByScope(f.deps, {
+        scope: {
+          kind: "project",
+          projectId: "project",
+          workspaceIds,
+          expectedBackingGeneration: generation,
+        },
+        requestId: "original-project-removal",
+      }),
+    ),
+    removeProject: vi.fn(() => projects.remove("project")),
+    cleanupIcon: vi.fn(async () => {}),
+  };
+  return { ...f, file, projects, project, input };
+}
+
+test("project completion reopens its durable intent after a pre-write failure without repeating native teardown", async () => {
+  const f = await projectCompletionFixture();
+  try {
+    f.input.removeProject.mockRejectedValueOnce(new Error("fixture project write failed"));
+    await expect(retireCanonicalProject(f.input)).rejects.toThrow("fixture project write failed");
+    const kills = vi.mocked(f.deps.killTerminalsForWorkspace).mock.calls.length;
+    const projects = new FileBackedProjectRegistry(f.file, createLogger());
+    await projects.initialize();
+    const authority = new WorkspaceLayoutService(f.layout.options);
+    await authority.load();
+    try {
+      expect(
+        await retireCanonicalProject({
+          ...f.input,
+          authority,
+          getProject: () => projects.get("project"),
+          removeProject: () => projects.remove("project"),
+        }),
+      ).toEqual(["old-a"]);
+      expect(await projects.get("project")).toBeNull();
+      expect(vi.mocked(f.deps.killTerminalsForWorkspace).mock.calls.length).toBe(kills);
+      expect(f.input.archive).toHaveBeenCalledTimes(1);
+      expect(f.input.cleanupIcon).toHaveBeenCalledTimes(1);
+    } finally {
+      await authority.close();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+test("project removal persisted before a notification failure is reconciled by absence, then old completed replay preserves B", async () => {
+  const f = await projectCompletionFixture();
+  const detach = f.projects.subscribeToMutations((mutation) => {
+    if (mutation.kind === "remove") throw new Error("fixture project notification failed");
+  });
+  try {
+    await expect(retireCanonicalProject(f.input)).rejects.toThrow(
+      "fixture project notification failed",
+    );
+    expect(await f.projects.get("project")).toBeNull();
+    expect(await retireCanonicalProject(f.input)).toEqual(["old-a"]);
+    expect(f.input.removeProject).toHaveBeenCalledTimes(1);
+    expect(f.input.cleanupIcon).not.toHaveBeenCalled();
+    detach();
+    await f.projects.upsert({ ...f.project, createdAt: "2026-11-20T00:00:00.000Z" });
+    await f.registry.upsert({
+      ...f.record,
+      workspaceId: "new-b",
+      createdAt: "2026-11-20T00:00:00.000Z",
+    });
+    const kills = vi.mocked(f.deps.killTerminalsForWorkspace).mock.calls.length;
+    expect(await retireCanonicalProject(f.input)).toEqual(["old-a"]);
+    expect((await f.registry.get("new-b"))?.archivedAt).toBeNull();
+    expect(await f.projects.get("project")).not.toBeNull();
+    expect(f.input.removeProject).toHaveBeenCalledTimes(1);
+    expect(f.input.cleanupIcon).not.toHaveBeenCalled();
+    expect(vi.mocked(f.deps.killTerminalsForWorkspace).mock.calls.length).toBe(kills);
+  } finally {
+    detach();
+    await f.close();
+  }
+});
+
+test.each(["archive-known", "native-complete"])(
+  "project journal failure at %s resolves only its saved native operation",
+  async (stage) => {
+    const f = await projectCompletionFixture();
+    const original = atomicFile.writeFileDurably;
+    const writer = vi
+      .spyOn(atomicFile, "writeFileDurably")
+      .mockImplementation(async (file, bytes) => {
+        if (file.startsWith(path.join(f.home, "project-retirements"))) {
+          const journal = JSON.parse(bytes) as { phase: string; archive: unknown };
+          if (
+            (stage === "archive-known" && journal.archive !== null) ||
+            (stage === "native-complete" && journal.phase === "native-complete")
+          )
+            throw new Error("fixture project journal interrupted");
+        }
+        return original(file, bytes);
+      });
+    try {
+      await expect(retireCanonicalProject(f.input)).rejects.toThrow(
+        "fixture project journal interrupted",
+      );
+      expect((await f.layout.inspect()).retirements![0].state).toBe("complete");
+      const kills = vi.mocked(f.deps.killTerminalsForWorkspace).mock.calls.length;
+      writer.mockRestore();
+      expect(await retireCanonicalProject(f.input)).toEqual(["old-a"]);
+      expect(vi.mocked(f.deps.killTerminalsForWorkspace).mock.calls.length).toBe(kills);
+      expect((await f.layout.inspect()).retirements).toHaveLength(1);
+    } finally {
+      writer.mockRestore();
+      await f.close();
+    }
+  },
+);
+
+test("initial project intent persistence failure has zero native retirement effects", async () => {
+  const f = await projectCompletionFixture();
+  const original = atomicFile.writeFileDurably;
+  const writer = vi
+    .spyOn(atomicFile, "writeFileDurably")
+    .mockImplementation(async (file, bytes) => {
+      if (file.startsWith(path.join(f.home, "project-retirements")))
+        throw new Error("fixture no project journal space");
+      return original(file, bytes);
+    });
+  try {
+    await expect(retireCanonicalProject(f.input)).rejects.toThrow(
+      "fixture no project journal space",
+    );
+    expect(f.input.archive).not.toHaveBeenCalled();
+    expect(f.deps.killTerminalsForWorkspace).not.toHaveBeenCalled();
+    expect((await f.layout.inspect()).retirements).toBeUndefined();
+  } finally {
+    writer.mockRestore();
+    await f.close();
+  }
+});
+
+test("an incomplete project request cannot consume a new project incarnation", async () => {
+  const f = await projectCompletionFixture();
+  try {
+    f.input.removeProject.mockRejectedValueOnce(
+      new Error("fixture failed before metadata removal"),
+    );
+    await expect(retireCanonicalProject(f.input)).rejects.toThrow(
+      "fixture failed before metadata removal",
+    );
+    await f.projects.upsert({ ...f.project, createdAt: "2026-11-20T00:00:00.000Z" });
+    await expect(retireCanonicalProject(f.input)).rejects.toThrow("project_incarnation_changed");
+    expect(f.input.removeProject).toHaveBeenCalledTimes(1);
+    expect(f.input.cleanupIcon).not.toHaveBeenCalled();
+  } finally {
+    await f.close();
+  }
+});
+
+test("unrelated directory creation completes while a retirement is paused", async () => {
+  const f = await projectCompletionFixture();
+  let release = () => {},
+    entered = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const ready = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  f.deps.stopWorkspaceSetup = async () => {
+    entered();
+    await gate;
+  };
+  const provisioning = createWorkspaceProvisioningService({
+    paseoHome: f.home,
+    serverId: "owner",
+    workspaceRegistry: f.registry,
+    projectRegistry: f.projects,
+    workspaceGitService: createNoopWorkspaceGitService(),
+    isDirectory: async () => true,
+    logger: createLogger(),
+  });
+  const retiring = archiveByScope(f.deps, {
+    scope: { kind: "workspace", workspaceId: "old-a" },
+    requestId: "paused-for-independent-create",
+  });
+  await ready;
+  let completed = false;
+  const created = provisioning
+    .createWorkspaceForDirectory(f.repoDir, "independent", "project")
+    .then((workspace) => {
+      completed = true;
+      return workspace;
+    });
+  try {
+    await vi.waitFor(() => expect(completed).toBe(true));
+    const workspace = await created;
+    expect(workspace.workspaceId).not.toBe("old-a");
+    expect(workspace.archivedAt).toBeNull();
+  } finally {
+    release();
+    await Promise.all([retiring, created]);
+    await f.close();
+  }
+});
+
+test("an import admitted before retirement remains in its captured agent footprint", async () => {
+  const f = await projectCompletionFixture();
+  let release = () => {},
+    entered = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const ready = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  let imported = false;
+  const agent = { id: "imported-before-retirement", workspaceId: "old-a" } as ManagedAgent;
+  f.deps.agentManager.listAgents = () => (imported ? [agent] : []);
+  f.deps.agentManager.getAgent = () => (imported ? agent : null);
+  f.deps.agentManager.archiveAgent = vi.fn(async () => {
+    imported = false;
+    return { archivedAt: new Date().toISOString() };
+  });
+  const provisioning = createWorkspaceProvisioningService({
+    paseoHome: f.home,
+    serverId: "owner",
+    workspaceRegistry: f.registry,
+    projectRegistry: f.projects,
+    workspaceGitService: createNoopWorkspaceGitService(),
+    isDirectory: async () => true,
+    logger: createLogger(),
+  });
+  const importing = provisioning.runInImportWorkspace(
+    { requestedWorkspaceId: "old-a", cwd: f.record.cwd },
+    async () => {
+      entered();
+      await gate;
+      imported = true;
+      return "imported";
+    },
+  );
+  await ready;
+  const retiring = archiveByScope(f.deps, {
+    scope: { kind: "workspace", workspaceId: "old-a" },
+    requestId: "after-import-admission",
+  });
+  try {
+    expect(f.deps.killTerminalsForWorkspace).not.toHaveBeenCalled();
+    release();
+    await importing;
+    const result = await retiring;
+    expect(result.retirement?.state).toBe("complete");
+    expect(result.removedDirectory).toBe(true);
+    expect(imported).toBe(false);
+    expect(f.deps.agentManager.archiveAgent).toHaveBeenCalledTimes(1);
+  } finally {
+    release();
+    await Promise.all([importing, retiring]);
+    await f.close();
+  }
+});
+
+test("a verified importing refusal also releases backing admission after activation", async () => {
+  const f = await canonicalArchiveFixture(undefined, false);
+  try {
+    const first = await archiveByScope(f.deps, {
+      scope: { kind: "workspace", workspaceId: "old-a" },
+      requestId: "importing-refusal",
+    });
+    expect(first.retirement).toMatchObject({ state: "partial", code: "layout_importing" });
+    const snapshot = await f.layout.inspect();
+    await f.layout.commit({
+      writerVersion: 2,
+      requestId: randomUUID(),
+      expected: snapshot.stamp,
+      mutations: [
+        {
+          kind: "activate",
+          requiredImports: snapshot.imports,
+          requiredOwnerDomains: snapshot.ownerDomains,
+        },
+      ],
+    });
+    await f.registry.upsert({
+      ...f.record,
+      workspaceId: "new-alias-after-refusal",
+      createdAt: "2026-11-20T00:00:00.000Z",
+    });
+    const second = await archiveByScope(f.deps, {
+      scope: { kind: "workspace", workspaceId: "old-a" },
+      requestId: "archive-after-activation",
+    });
+    expect(second.retirement?.state).toBe("complete");
+    expect(second.retirement?.operationId).not.toBe(first.retirement?.operationId);
+    expect(second.directoryLeftBehind?.reason).toBe("shared_backing_retained");
+    expect((await f.registry.get("new-alias-after-refusal"))?.archivedAt).toBeNull();
+  } finally {
+    await f.close();
+  }
+});
+
+test("a project movement before reservation refuses the saved project footprint before effects", async () => {
+  const f = await projectCompletionFixture();
+  const original = f.input.archive;
+  f.input.archive = vi.fn(async (ids: string[], generation: string) => {
+    const snapshot = await f.layout.inspect();
+    await f.layout.commit({
+      writerVersion: 2,
+      requestId: randomUUID(),
+      expected: snapshot.stamp,
+      mutations: [
+        { kind: "put", entry: { ...snapshot.entries[0], projectId: "different-project" } },
+      ],
+    });
+    return original(ids, generation);
+  });
+  try {
+    await expect(retireCanonicalProject(f.input)).rejects.toThrow(
+      "Project retirement remains fenced pending reconciliation",
+    );
+    expect(f.deps.killTerminalsForWorkspace).not.toHaveBeenCalled();
+    expect((await f.layout.inspect()).retirements).toBeUndefined();
+    expect(f.input.removeProject).not.toHaveBeenCalled();
+    expect(existsSync(f.worktree.worktreePath)).toBe(true);
   } finally {
     await f.close();
   }

@@ -1,4 +1,4 @@
-import { serializeWorkspaceBacking } from "./workspace-retirement-context.js";
+import { retireCanonicalProject } from "./project-retirement.js";
 import { assertWorkspaceRetirementAllowed } from "./workspace-layout-mode.js";
 import { NATIVE_WORKSPACE_LAYOUT_WRITER_REQUESTS } from "@getpaseo/protocol/workspace-layout";
 import type { WorkspaceLayoutService } from "./workspace-layout-service.js";
@@ -1005,6 +1005,7 @@ export class Session {
     });
     this.workspaceAutoName = workspaceAutoName;
     this.workspaceProvisioning = createWorkspaceProvisioningService({
+      paseoHome: this.paseoHome,
       lifecycle: this.pluginRuntime,
       serverId,
       workspaceRegistry: this.workspaceRegistry,
@@ -3919,110 +3920,127 @@ export class Session {
     const { projectId, requestId } = request;
     this.sessionLogger.info({ projectId, requestId }, "session: project.remove.request");
 
-    await serializeWorkspaceBacking(this.paseoHome, async () => {
-      try {
-        if (!this.workspaceLayoutService) await assertWorkspaceRetirementAllowed(this.paseoHome);
-        const project = await this.projectRegistry.get(projectId);
-        const resolvedProjectId = project?.projectId ?? projectId;
-        const projectWorkspaces = (await this.readRetirementRecords()).filter(
-          (workspace) => workspace.projectId === resolvedProjectId,
+    try {
+      if (this.workspaceLayoutService) {
+        const removedWorkspaceIds = await retireCanonicalProject({
+          authority: this.workspaceLayoutService,
+          projectId,
+          requestId,
+          getProject: () => this.projectRegistry.get(projectId),
+          readRecords: () => this.readRetirementRecords(),
+          archive: (workspaceIds, generation) =>
+            archiveByScope(this.workspaceArchiveDependencies(), {
+              scope: {
+                kind: "project",
+                projectId,
+                workspaceIds,
+                expectedBackingGeneration: generation,
+              },
+              requestId,
+            }),
+          removeProject: () => this.projectRegistry.remove(projectId),
+          cleanupIcon: () =>
+            removeProjectCustomIcon({ paseoHome: this.paseoHome, projectId }).catch((error) => {
+              this.sessionLogger.warn(
+                { err: error, projectId },
+                "Failed to clean up removed project icon",
+              );
+            }),
+        });
+        await this.emitWorkspaceUpdatesForWorkspaceIds(
+          removedWorkspaceIds.length ? removedWorkspaceIds : [projectId],
+          { removedProjectId: projectId },
         );
-        const activeWorkspaceIds = projectWorkspaces
-          .filter((workspace) => !workspace.archivedAt)
-          .map((workspace) => workspace.workspaceId);
+        this.emit({
+          type: "project.remove.response",
+          payload: { requestId, projectId, accepted: true, removedWorkspaceIds, error: null },
+        });
+        return;
+      }
+      if (!this.workspaceLayoutService) await assertWorkspaceRetirementAllowed(this.paseoHome);
+      const project = await this.projectRegistry.get(projectId);
+      const resolvedProjectId = project?.projectId ?? projectId;
+      const projectWorkspaces = (await this.readRetirementRecords()).filter(
+        (workspace) => workspace.projectId === resolvedProjectId,
+      );
+      const activeWorkspaceIds = projectWorkspaces
+        .filter((workspace) => !workspace.archivedAt)
+        .map((workspace) => workspace.workspaceId);
 
-        if (this.workspaceLayoutService) {
-          const snapshot = await this.workspaceLayoutService.inspect();
-          const ids = new Set(projectWorkspaces.map((workspace) => workspace.workspaceId));
+      const removedWorkspaceIds: string[] = [];
+      try {
+        if (activeWorkspaceIds.length) {
+          const archive = await archiveByScope(this.workspaceArchiveDependencies(), {
+            scope: { kind: "project", projectId: resolvedProjectId },
+            requestId,
+          });
           if (
-            snapshot.retirements?.some(
-              (operation) =>
-                operation.state !== "complete" &&
-                operation.targets.some(
-                  (target) =>
-                    target.ref.serverId === this.workspaceLayoutService!.options.serverId &&
-                    ids.has(target.ref.workspaceId),
-                ),
-            )
+            archive.retirement?.state === "partial" ||
+            archive.archivedWorkspaceIds.length !== activeWorkspaceIds.length
           )
             throw new Error("Project retirement remains fenced pending reconciliation");
+          removedWorkspaceIds.push(...archive.archivedWorkspaceIds);
         }
 
-        const removedWorkspaceIds: string[] = [];
-        try {
-          if (activeWorkspaceIds.length) {
-            const archive = await archiveByScope(this.workspaceArchiveDependencies(), {
-              scope: { kind: "project", projectId: resolvedProjectId },
-              requestId,
-            });
-            if (
-              archive.retirement?.state === "partial" ||
-              archive.archivedWorkspaceIds.length !== activeWorkspaceIds.length
-            )
-              throw new Error("Project retirement remains fenced pending reconciliation");
-            removedWorkspaceIds.push(...archive.archivedWorkspaceIds);
-          }
-
-          await this.projectRegistry.remove(resolvedProjectId);
-          await removeProjectCustomIcon({
-            paseoHome: this.paseoHome,
-            projectId: resolvedProjectId,
-          }).catch((error) => {
-            this.sessionLogger.warn(
-              { err: error, projectId: resolvedProjectId },
-              "Failed to clean up removed project icon",
-            );
-          });
-        } finally {
-          if (activeWorkspaceIds.length > 0) {
-            this.clearWorkspaceArchiving(activeWorkspaceIds);
-          }
+        await this.projectRegistry.remove(resolvedProjectId);
+        await removeProjectCustomIcon({
+          paseoHome: this.paseoHome,
+          projectId: resolvedProjectId,
+        }).catch((error) => {
+          this.sessionLogger.warn(
+            { err: error, projectId: resolvedProjectId },
+            "Failed to clean up removed project icon",
+          );
+        });
+      } finally {
+        if (activeWorkspaceIds.length > 0) {
+          this.clearWorkspaceArchiving(activeWorkspaceIds);
         }
-
-        const updateIds =
-          removedWorkspaceIds.length > 0
-            ? removedWorkspaceIds
-            : [projectWorkspaces[0]?.workspaceId ?? projectId];
-        await this.emitWorkspaceUpdatesForWorkspaceIds(updateIds, {
-          removedProjectId: projectId,
-        });
-
-        this.emit({
-          type: "project.remove.response",
-          payload: {
-            requestId,
-            projectId,
-            accepted: true,
-            removedWorkspaceIds,
-            error: null,
-          },
-        });
-      } catch (error) {
-        this.sessionLogger.error(
-          { err: error, projectId, requestId },
-          "session: project.remove.request error",
-        );
-        this.emit({
-          type: "activity_log",
-          payload: {
-            id: uuidv4(),
-            timestamp: new Date(),
-            type: "error",
-            content: `Failed to remove project: ${getErrorMessage(error)}`,
-          },
-        });
-        this.emit({
-          type: "project.remove.response",
-          payload: {
-            requestId,
-            projectId,
-            accepted: false,
-            removedWorkspaceIds: [],
-            error: getErrorMessageOr(error, "Failed to remove project"),
-          },
-        });
       }
-    });
+
+      const updateIds =
+        removedWorkspaceIds.length > 0
+          ? removedWorkspaceIds
+          : [projectWorkspaces[0]?.workspaceId ?? projectId];
+      await this.emitWorkspaceUpdatesForWorkspaceIds(updateIds, {
+        removedProjectId: projectId,
+      });
+
+      this.emit({
+        type: "project.remove.response",
+        payload: {
+          requestId,
+          projectId,
+          accepted: true,
+          removedWorkspaceIds,
+          error: null,
+        },
+      });
+    } catch (error) {
+      this.sessionLogger.error(
+        { err: error, projectId, requestId },
+        "session: project.remove.request error",
+      );
+      this.emit({
+        type: "activity_log",
+        payload: {
+          id: uuidv4(),
+          timestamp: new Date(),
+          type: "error",
+          content: `Failed to remove project: ${getErrorMessage(error)}`,
+        },
+      });
+      this.emit({
+        type: "project.remove.response",
+        payload: {
+          requestId,
+          projectId,
+          accepted: false,
+          removedWorkspaceIds: [],
+          error: getErrorMessageOr(error, "Failed to remove project"),
+        },
+      });
+    }
   }
 
   private async handleWorkspacePinPlacementSetRequest(

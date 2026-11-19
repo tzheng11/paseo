@@ -19,6 +19,7 @@ import type { PersistedWorkspaceRecord } from "./workspace-registry.js";
 import { hashLayoutValue, WorkspaceLayoutRefusal } from "./workspace-layout-store.js";
 import { writeFileDurably } from "./atomic-file.js";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { assertWorkspaceAutomationAllowed } from "./workspace-automation-gate.js";
 
 interface RetirementContext {
   active: boolean;
@@ -112,6 +113,7 @@ const JournalSchema = z.strictObject({
 });
 type RetirementJournal = z.infer<typeof JournalSchema>;
 interface RetirementInput {
+  expectedProjectId?: string;
   authority: RetirementAuthority;
   records: PersistedWorkspaceRecord[];
   backing: string;
@@ -121,7 +123,17 @@ interface RetirementInput {
   nativeInventory: () => Promise<PersistedWorkspaceRecord[]>;
 }
 
-export function nativeGeneration(records: PersistedWorkspaceRecord[]): string {
+export type NativeWorkspaceIdentity = Pick<
+  PersistedWorkspaceRecord,
+  | "workspaceId"
+  | "createdAt"
+  | "cwd"
+  | "worktreeRoot"
+  | "mainRepoRoot"
+  | "kind"
+  | "isPaseoOwnedWorktree"
+>;
+export function nativeGeneration(records: readonly NativeWorkspaceIdentity[]): string {
   return hashLayoutValue(
     records
       .map((record) => ({
@@ -331,6 +343,7 @@ export async function retireCanonicalWorkspace(input: RetirementInput): Promise<
         /do not archive/i.test(`${record.title ?? ""} ${record.displayName}`)
       )
         throw new WorkspaceLayoutRefusal("retirement_native_hold");
+      assertWorkspaceAutomationAllowed(record.untrustedSource);
       await input.assertHolds(record.workspaceId);
     }
     const operation = snapshot.retirements?.find((op) => op.operationId === operationId);
@@ -358,6 +371,8 @@ export async function retireCanonicalWorkspace(input: RetirementInput): Promise<
           (row) => workspaceReferenceKey(row.ref) === workspaceReferenceKey(ref),
         );
         if (!entry) throw new WorkspaceLayoutRefusal("workspace_not_imported");
+        if (input.expectedProjectId && entry.projectId !== input.expectedProjectId)
+          throw new WorkspaceLayoutRefusal("retirement_project_changed");
         return { ref, revision: entry.revision };
       }),
     });
@@ -534,6 +549,7 @@ function nativeHold(record: PersistedWorkspaceRecord): boolean {
 }
 async function requireLiveNativeTargets(input: RetirementInput): Promise<void> {
   for (const record of input.records) {
+    assertWorkspaceAutomationAllowed(record.untrustedSource);
     await input.assertHolds(record.workspaceId);
     if (record.archivedAt)
       throw new WorkspaceLayoutRefusal("retirement_native_generation_archived");
@@ -557,6 +573,8 @@ async function recordRetirementFailure({
     (error instanceof DaemonRpcError && error.requestType === "workspace.layout.commit.request");
   const code = refused ? (error.code ?? "retirement_effect_failed") : "retirement_effect_failed";
   const definiteRefusals = new Set([
+    "layout_importing",
+    "retirement_project_changed",
     "entry_revision_conflict",
     "stale_revision",
     "retirement_protected",

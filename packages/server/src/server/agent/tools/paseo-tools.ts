@@ -1,3 +1,4 @@
+import { assertWorkspaceAutomationAllowedForWorkspace } from "../../workspace-automation-gate.js";
 import { WorkspaceArchiveOutcomeSchema } from "@getpaseo/protocol/workspace-layout";
 import {
   resolveSidebarAutomationPlacement,
@@ -162,6 +163,7 @@ type CallerSnapshot = Pick<
 const callerSnapshots = new AsyncLocalStorage<CallerSnapshot | null>();
 
 export interface PaseoToolHostDependencies {
+  stopWorkspaceSetup?: (workspaceId: string) => Promise<void>;
   agentMessages?: () => AgentMessageDelivery;
   finishSubscriptions?: () => FinishSubscriptions;
   serverId?: string;
@@ -4174,6 +4176,12 @@ function archiveWorktreeDependencies(
     findWorkspaceIdForCwd: options.findWorkspaceIdForCwd,
     listActiveWorkspaces: options.listActiveWorkspaces,
     archiveWorkspaceRecord: options.archiveWorkspaceRecord,
+    stopWorkspaceSetup: options.stopWorkspaceSetup,
+    assertWorkspaceAutomationAllowed:
+      options.workspaceLayoutService && options.workspaceRegistry
+        ? (workspaceId) =>
+            assertWorkspaceAutomationAllowedForWorkspace(options.workspaceRegistry!, workspaceId)
+        : undefined,
     emitWorkspaceUpdatesForWorkspaceIds: options.emitWorkspaceUpdatesForWorkspaceIds,
     markWorkspaceArchiving: options.markWorkspaceArchiving,
     clearWorkspaceArchiving: options.clearWorkspaceArchiving,
