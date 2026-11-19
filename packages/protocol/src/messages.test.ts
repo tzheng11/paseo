@@ -286,6 +286,71 @@ describe("diagnostics message contract", () => {
     }
     expect(parsed.payload.diagnostic).toContain("Status: ok");
   });
+
+  test("bounds the CPU profile request duration to whole milliseconds up to 4000", () => {
+    expect(
+      SessionInboundMessageSchema.parse({
+        type: "diagnostics.cpu_profile.request",
+        requestId: "cpu-1",
+        durationMs: 4000,
+      }),
+    ).toEqual({ type: "diagnostics.cpu_profile.request", requestId: "cpu-1", durationMs: 4000 });
+    for (const durationMs of [0, 4001, 1.5, undefined]) {
+      expect(
+        SessionInboundMessageSchema.safeParse({
+          type: "diagnostics.cpu_profile.request",
+          requestId: "cpu-2",
+          durationMs,
+        }).success,
+      ).toBe(false);
+    }
+  });
+
+  test("accepts a sanitized CPU profile response", () => {
+    const parsed = SessionOutboundMessageSchema.parse({
+      type: "diagnostics.cpu_profile.response",
+      payload: {
+        requestId: "cpu-3",
+        profile: {
+          pid: 1,
+          samplingIntervalUs: 2000,
+          requestedDurationMs: 100,
+          actualDurationMs: 101.5,
+          overrunMs: 1.5,
+          overrun: false,
+          profileSpanMicros: 100000,
+          sampleCount: 1,
+          totalNodeCount: 2,
+          frames: [
+            {
+              id: 0,
+              parent: null,
+              kind: "root",
+              file: null,
+              line: null,
+              column: null,
+              selfSamples: 0,
+              totalSamples: 1,
+              selfMicros: 0,
+            },
+            {
+              id: 1,
+              parent: 0,
+              kind: "packet",
+              file: "packages/server/dist/a.js",
+              line: 2,
+              column: 3,
+              selfSamples: 1,
+              totalSamples: 1,
+              selfMicros: 2000,
+            },
+          ],
+          truncated: { frames: false, samples: false, bytes: false },
+        },
+      },
+    });
+    expect(parsed.type).toBe("diagnostics.cpu_profile.response");
+  });
 });
 
 describe("agent detach RPC", () => {

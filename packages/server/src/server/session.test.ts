@@ -2,6 +2,7 @@ import {
   createWorkspaceRuntimeStore,
   type WorkspaceRuntimeStore,
 } from "./workspace-runtime-store/index.js";
+import { CpuProfiler } from "./session/daemon/cpu-profile.js";
 import { createAgentMessageDeliveryStub } from "./test-utils/session-stubs.js";
 import {
   createMessageReceiptsStub,
@@ -1022,6 +1023,37 @@ describe("session authorization permissions", () => {
         },
       },
     ]);
+  });
+
+  test("refuses a CPU profile without daemon.manage before touching the profiler", async () => {
+    const capture = vi.spyOn(CpuProfiler.prototype, "capture");
+    try {
+      for (const permissions of [["daemon.read"], ["hub.execute"]] as const) {
+        const messages: SessionOutboundMessage[] = [];
+        const session = createSessionForTest({ permissions, messages });
+
+        await session.handleMessage({
+          type: "diagnostics.cpu_profile.request",
+          requestId: "cpu-profile-denied",
+          durationMs: 100,
+        });
+
+        expect(messages).toEqual([
+          {
+            type: "rpc_error",
+            payload: {
+              requestId: "cpu-profile-denied",
+              requestType: "diagnostics.cpu_profile.request",
+              error: "Session is not authorized for diagnostics.cpu_profile.request",
+              code: "access_denied",
+            },
+          },
+        ]);
+      }
+      expect(capture).not.toHaveBeenCalled();
+    } finally {
+      capture.mockRestore();
+    }
   });
 
   test("replaces a session's permissions without reconstructing the session", async () => {

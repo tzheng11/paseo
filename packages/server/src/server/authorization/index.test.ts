@@ -46,6 +46,31 @@ describe("SessionAuthorization", () => {
     ).toBe(true);
   });
 
+  test("CPU profiling requires daemon.manage, not the diagnostics read grant", () => {
+    for (const permissions of [
+      [],
+      ["daemon.read"],
+      ["hub.execute"],
+      ["workspace.manage"],
+    ] as const) {
+      const authorization = new SessionAuthorization(permissions);
+      expect(authorization.allowsInbound(inboundMessage("diagnostics.cpu_profile.request"))).toBe(
+        false,
+      );
+      expect(
+        authorization.allowsOutbound(outboundMessage("diagnostics.cpu_profile.response")),
+      ).toBe(false);
+    }
+    const manager = new SessionAuthorization(["daemon.manage"]);
+    expect(manager.allowsInbound(inboundMessage("diagnostics.cpu_profile.request"))).toBe(true);
+    expect(manager.allowsOutbound(outboundMessage("diagnostics.cpu_profile.response"))).toBe(true);
+    expect(
+      new SessionAuthorization(["daemon.read"]).allowsInbound(
+        inboundMessage("diagnostics.request"),
+      ),
+    ).toBe(true);
+  });
+
   test("semantic permissions authorize operations instead of RPC namespaces", () => {
     const authorization = new SessionAuthorization(["hub.execute"]);
 

@@ -90,6 +90,8 @@ const INBOUND_PERMISSION = {
   "daemon.update.request": "daemon.manage",
   delete_agent_request: "workspace.write",
   "diagnostics.request": "daemon.read",
+  // Profiling is daemon-wide operator authority, beyond the diagnostics read grant.
+  "diagnostics.cpu_profile.request": "daemon.manage",
   dictation_stream_cancel: "workspace.write",
   dictation_stream_chunk: "workspace.write",
   dictation_stream_finish: "workspace.write",
@@ -343,6 +345,7 @@ const OUTBOUND_PERMISSION = {
   "daemon.update.progress": "daemon.manage",
   "daemon.update.response": "daemon.manage",
   "diagnostics.response": "daemon.read",
+  "diagnostics.cpu_profile.response": "daemon.manage",
   dictation_stream_ack: "workspace.write",
   dictation_stream_error: "workspace.write",
   dictation_stream_final: "workspace.write",

@@ -127,6 +127,7 @@ import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import type { SecurityMode } from "@getpaseo/relay/e2ee";
 import type { BrowserToolsBroker } from "./browser-tools/broker.js";
 import type { DaemonRuntimeConfig } from "./session/daemon/daemon-session.js";
+import { cancelProcessCpuProfile } from "./session/daemon/cpu-profile.js";
 import { DirectorySyncService } from "./directory-sync/index.js";
 import { OWNER_PERMISSIONS, type DaemonPermission } from "./authorization/index.js";
 import type { WorkspaceLabelService } from "./workspace-labels/index.js";
@@ -1216,6 +1217,7 @@ export class VoiceAssistantWebSocketServer {
   }
 
   public async close(): Promise<void> {
+    cancelProcessCpuProfile();
     this.releaseMainHost?.();
     this.releaseWorkspaceLayout?.();
     this.prepareForShutdown();
@@ -2159,6 +2161,8 @@ export class VoiceAssistantWebSocketServer {
         hostStats: true,
         // COMPAT(daemonConfigReload): added in v0.4.0, remove gate after 2027-02-14.
         daemonConfigReload: true,
+        // COMPAT(diagnosticsCpuProfile): added in v0.15.0-impower, remove gate after 2027-05-19.
+        diagnosticsCpuProfile: true,
         // COMPAT(speechSettings): added in v0.12.0, remove gate after 2027-04-18.
         speechSettings: true,
         // COMPAT(relayConfig): added in v0.2.6, remove gate after 2027-01-31.
@@ -2423,6 +2427,7 @@ export class VoiceAssistantWebSocketServer {
     this.sessions.delete(ws);
     connection.sockets.delete(ws);
     connection.session.clearAgentTimelineSubscription(ws);
+    connection.session.cancelCpuProfileForSocket(ws);
     this.socketIdentities.delete(ws);
 
     if (connection.sockets.size === 0) {

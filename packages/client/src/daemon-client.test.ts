@@ -2021,6 +2021,96 @@ test("gates config reload on the daemon capability", async () => {
   expect(mock.sent).toEqual([]);
 });
 
+function connectCpuProfileClient(features?: Record<string, boolean>) {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger: createMockLogger(),
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+  const connectPromise = client.connect();
+  mock.triggerOpen(features ? { features } : undefined);
+  return { mock, client, connected: connectPromise };
+}
+
+test("refuses a CPU profile on a host without the capability, without sending", async () => {
+  const { mock, client, connected } = connectCpuProfileClient();
+  await connected;
+
+  await expect(client.captureCpuProfile(100, { requestId: "cpu-old" })).rejects.toThrow(
+    "Update the host to capture a CPU profile.",
+  );
+  expect(mock.sent).toEqual([]);
+});
+
+test("sends a bounded CPU profile request and returns the sanitized summary", async () => {
+  const { mock, client, connected } = connectCpuProfileClient({ diagnosticsCpuProfile: true });
+  await connected;
+
+  const response = client.captureCpuProfile(250, { requestId: "cpu-new" });
+  expect(parseSentFrame(mock.sent[0])).toEqual({
+    type: "diagnostics.cpu_profile.request",
+    requestId: "cpu-new",
+    durationMs: 250,
+  });
+  const profile = {
+    pid: 7,
+    samplingIntervalUs: 2000,
+    requestedDurationMs: 250,
+    actualDurationMs: 251,
+    overrunMs: 1,
+    overrun: false,
+    profileSpanMicros: 250000,
+    sampleCount: 1,
+    totalNodeCount: 1,
+    frames: [
+      {
+        id: 0,
+        parent: null,
+        kind: "root",
+        file: null,
+        line: null,
+        column: null,
+        selfSamples: 1,
+        totalSamples: 1,
+        selfMicros: 2000,
+      },
+    ],
+    truncated: { frames: false, samples: false, bytes: false },
+  };
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "diagnostics.cpu_profile.response",
+      payload: { requestId: "cpu-new", profile },
+    }),
+  );
+
+  await expect(response).resolves.toEqual({ requestId: "cpu-new", profile });
+});
+
+test("surfaces a typed busy refusal for a CPU profile", async () => {
+  const { mock, client, connected } = connectCpuProfileClient({ diagnosticsCpuProfile: true });
+  await connected;
+
+  const response = client.captureCpuProfile(100, { requestId: "cpu-busy" });
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "rpc_error",
+      payload: {
+        requestId: "cpu-busy",
+        requestType: "diagnostics.cpu_profile.request",
+        error: "A CPU profile is already running in this daemon",
+        code: "cpu_profile_busy",
+      },
+    }),
+  );
+
+  await expect(response).rejects.toMatchObject({ code: "cpu_profile_busy" });
+});
+
 test("sends and parses daemon config reload", async () => {
   const mock = createMockTransport();
   const client = new DaemonClient({

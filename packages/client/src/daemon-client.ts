@@ -124,6 +124,7 @@ import type {
   DaemonGetPairingOfferResponse,
   DaemonConfigReloadResponse,
   DiagnosticsResponse,
+  DiagnosticsCpuProfileResponse,
   AgentRewindResponseMessage,
   ListTerminalsResponse,
   CreateTerminalResponse,
@@ -632,6 +633,7 @@ type DaemonStatusPayload = DaemonGetStatusResponse["payload"];
 type HostStatsPayload = DaemonGetHostStatsResponse["payload"];
 type DaemonPairingOfferPayload = DaemonGetPairingOfferResponse["payload"];
 type DiagnosticsPayload = DiagnosticsResponse["payload"];
+type DiagnosticsCpuProfilePayload = DiagnosticsCpuProfileResponse["payload"];
 type ReadProjectConfigPayload = Extract<
   SessionOutboundMessage,
   { type: "read_project_config_response" }
@@ -6048,6 +6050,25 @@ export class DaemonClient {
       message: {
         type: "diagnostics.request",
       },
+    });
+  }
+
+  /**
+   * Take one bounded main-thread CPU profile of the daemon (1-4000 ms, daemon.manage).
+   * Returns sanitized frame positions and counts, never a raw profile.
+   */
+  async captureCpuProfile(
+    durationMs: number,
+    options?: { requestId?: string; timeout?: number },
+  ): Promise<DiagnosticsCpuProfilePayload> {
+    // COMPAT(diagnosticsCpuProfile): added in v0.15.0-impower, remove gate after 2027-05-19.
+    if (this.lastServerInfoMessage?.features?.diagnosticsCpuProfile !== true) {
+      throw new Error("Update the host to capture a CPU profile.");
+    }
+    return this.sendNamespacedCorrelatedSessionRequest({
+      requestId: options?.requestId,
+      message: { type: "diagnostics.cpu_profile.request", durationMs },
+      timeout: options?.timeout ?? durationMs + 15_000,
     });
   }
 
