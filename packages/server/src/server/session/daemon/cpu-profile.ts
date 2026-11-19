@@ -1,3 +1,4 @@
+import { builtinModules } from "node:module";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -142,6 +143,11 @@ export class CpuProfiler {
     this.active = active;
     try {
       return await this.run(durationMs, active);
+    } catch (error) {
+      // Only typed, fixed-text failures leave this module: an untyped error
+      // could carry inspector, runtime or profile values.
+      if (error instanceof CpuProfileError) throw error;
+      throw new CpuProfileError("profiler_failed");
     } finally {
       this.active = null;
     }
@@ -171,7 +177,14 @@ export class CpuProfiler {
     active: ActiveCapture,
   ): Promise<DiagnosticsCpuProfileSummary> {
     this.runtime ??= this.loadRuntime();
-    const runtime = await this.runtime;
+    let runtime: CpuProfilerRuntime;
+    try {
+      runtime = await this.runtime;
+    } catch {
+      // Let the next capture retry the load.
+      this.runtime = null;
+      throw new CpuProfileError("profiler_failed");
+    }
     throwIfCancelled(active);
     if (!runtime.isMainThread) throw new CpuProfileError("not_main_thread");
     if (runtime.inspectorUrl()) throw new CpuProfileError("inspector_in_use");
@@ -247,7 +260,13 @@ const PSEUDO_FRAME_KINDS = new Map<string, DiagnosticsCpuProfileFrame["kind"]>([
   ["(idle)", "idle"],
   ["(garbage collector)", "gc"],
 ]);
-const NODE_BUILTIN_URL = /^node:[a-z0-9_]+(\/[a-z0-9_]+)*$/;
+// `node:` frames are emitted only for public builtins or bounded internals:
+// any script can name itself `node:<anything>` with a sourceURL.
+const NODE_BUILTIN_IDS: ReadonlySet<string> = new Set(
+  builtinModules.map((id) => id.replace(/^node:/, "")),
+);
+const NODE_INTERNAL_URL = /^node:internal\/[a-z0-9_]+(\/[a-z0-9_]+)*$/;
+const MAX_NODE_URL_LENGTH = 100;
 const SAFE_PACKET_PATH = /^[A-Za-z0-9_@.+-]+(\/[A-Za-z0-9_@.+-]+)*$/;
 const MAX_PACKET_PATH_LENGTH = 240;
 
@@ -266,12 +285,15 @@ function classifyFrame(
     return { kind: PSEUDO_FRAME_KINDS.get(callFrame.functionName) ?? "native", file: null };
   }
   if (url.startsWith("node:")) {
-    return NODE_BUILTIN_URL.test(url)
-      ? { kind: "node", file: url }
-      : { kind: "unknown", file: null };
+    return isNodeBuiltinUrl(url) ? { kind: "node", file: url } : { kind: "unknown", file: null };
   }
   const file = packetRelativePath(url, packetRoot);
   return file ? { kind: "packet", file } : { kind: "unknown", file: null };
+}
+
+function isNodeBuiltinUrl(url: string): boolean {
+  if (url.length > MAX_NODE_URL_LENGTH) return false;
+  return NODE_BUILTIN_IDS.has(url.slice("node:".length)) || NODE_INTERNAL_URL.test(url);
 }
 
 function packetRelativePath(url: string, packetRoot: string): string | null {

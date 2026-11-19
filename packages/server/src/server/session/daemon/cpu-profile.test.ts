@@ -253,6 +253,72 @@ describe("CpuProfiler bounds and ownership", () => {
   });
 });
 
+describe("CpuProfiler typed failures", () => {
+  const SECRET = "sk-SECRET-token-in-error";
+
+  test("a failed runtime load is a fixed profiler_failed and the next capture retries the load", async () => {
+    const { runtime } = fakeRuntime();
+    let loads = 0;
+    const profiler = new CpuProfiler({
+      packetRoot: PACKET_ROOT,
+      loadRuntime: async () => {
+        loads += 1;
+        if (loads === 1) throw new Error(SECRET);
+        return runtime;
+      },
+    });
+
+    const error = await expectCode(
+      profiler.capture({ durationMs: 5, owner: {}, scope: {} }),
+      "profiler_failed",
+    );
+    expect(error.message).not.toContain(SECRET);
+    expect(profiler.busy).toBe(false);
+
+    await profiler.capture({ durationMs: 5, owner: {}, scope: {} });
+    expect(loads).toBe(2);
+  });
+
+  test("a throwing inspector connect is a fixed profiler_failed", async () => {
+    const { runtime } = fakeRuntime();
+    const profiler = profilerWith({
+      ...runtime,
+      createSession: () => ({
+        connect: () => {
+          throw new Error(SECRET);
+        },
+        disconnect: () => {},
+        post: async () => ({}),
+      }),
+    });
+
+    const error = await expectCode(
+      profiler.capture({ durationMs: 5, owner: {}, scope: {} }),
+      "profiler_failed",
+    );
+    expect(error.message).not.toContain(SECRET);
+    expect(profiler.busy).toBe(false);
+  });
+
+  test("a sanitizer throw is a fixed profiler_failed", async () => {
+    const poisoned = {
+      id: 1,
+      children: [],
+      get callFrame(): never {
+        throw new Error(SECRET);
+      },
+    } as unknown as RawCpuProfile["nodes"][number];
+    const { runtime } = fakeRuntime({ profile: rawProfile([poisoned], [1]) });
+    const profiler = profilerWith(runtime);
+
+    const error = await expectCode(
+      profiler.capture({ durationMs: 5, owner: {}, scope: {} }),
+      "profiler_failed",
+    );
+    expect(error.message).not.toContain(SECRET);
+  });
+});
+
 describe("sanitizeCpuProfile", () => {
   const secrets = [
     "sk-SECRET-123",
@@ -320,6 +386,46 @@ describe("sanitizeCpuProfile", () => {
     );
     expect(summary.sampleCount).toBe(11);
     expect(summary.truncated).toEqual({ frames: false, samples: false, bytes: false });
+  });
+
+  test("emits node: frames only for real builtins and bounded internals", () => {
+    const urls = [
+      "node:fs",
+      "node:fs/promises",
+      "node:internal/streams/readable",
+      "node:sk_secret_token_abc",
+      `node:internal/${"a".repeat(200)}`,
+      "node:fs?token=abc",
+      "node:Internal/Streams",
+      "node:internal/../fs",
+      "node:",
+    ];
+    const profile = rawProfile(
+      [
+        node(
+          1,
+          urls.map((_, index) => index + 2),
+          { functionName: "(root)", scriptId: "0" },
+        ),
+        ...urls.map((url, index) => node(index + 2, [], { url, lineNumber: index })),
+      ],
+      urls.map((_, index) => index + 2),
+    );
+    const summary = sanitizeCpuProfile(profile, {
+      packetRoot: PACKET_ROOT,
+      pid: 1,
+      requestedDurationMs: 10,
+      actualDurationMs: 10,
+    });
+
+    expect(
+      summary.frames.filter((frame) => frame.kind === "node").map((frame) => frame.file),
+    ).toEqual(["node:fs", "node:fs/promises", "node:internal/streams/readable"]);
+    expect(summary.frames.filter((frame) => frame.kind === "unknown")).toHaveLength(6);
+    const json = JSON.stringify(summary);
+    for (const leaked of ["sk_secret", "token", "aaaa", "Internal", ".."]) {
+      expect(json).not.toContain(leaked);
+    }
   });
 
   test("caps frames to an ancestor-closed subset and marks truncation", () => {

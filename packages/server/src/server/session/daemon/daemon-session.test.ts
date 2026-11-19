@@ -53,6 +53,7 @@ function makeSubsystem(overrides: {
   listVisibleWorkspaces?: () => Promise<WorkspaceDescriptorPayload[]>;
   reloadConfig?: () => Promise<DaemonConfigReloadResult>;
   cpuProfiler?: CpuProfiler;
+  logger?: pino.Logger;
 }) {
   const emitted: SessionOutboundMessage[] = [];
   const restartIntents: Parameters<DaemonSessionHost["emitLifecycleIntent"]>[0][] = [];
@@ -83,7 +84,7 @@ function makeSubsystem(overrides: {
         restartRequiredPaths: [],
         overrideControlledPaths: [],
       })),
-    logger: pino({ level: "silent" }),
+    logger: overrides.logger ?? pino({ level: "silent" }),
     cpuProfiler: overrides.cpuProfiler,
   });
   return { subsystem, emitted, paseoHome, restartIntents };
@@ -151,6 +152,37 @@ describe("DaemonSession CPU profile", () => {
     });
     expect(JSON.stringify(emitted)).not.toContain("functionName");
     expect(calls.at(-1)).toBe("disconnect");
+  });
+
+  test("an untyped profiler failure replies and logs only the fixed code and text", async () => {
+    const secret = "sk-SECRET-token-in-error";
+    const logLines: string[] = [];
+    const logger = pino({ level: "trace" }, { write: (line: string) => logLines.push(line) });
+    const cpuProfiler = new CpuProfiler({
+      packetRoot: "/packet",
+      loadRuntime: async () => fakeProfilerRuntime([]),
+    });
+    vi.spyOn(cpuProfiler, "capture").mockRejectedValue(new Error(secret));
+    const { subsystem, emitted } = makeSubsystem({ cpuProfiler, logger });
+
+    await subsystem.handleCpuProfileRequest(
+      { type: "diagnostics.cpu_profile.request", requestId: "cpu-untyped", durationMs: 5 },
+      {},
+    );
+
+    expect(emitted).toEqual([
+      {
+        type: "rpc_error",
+        payload: {
+          requestId: "cpu-untyped",
+          requestType: "diagnostics.cpu_profile.request",
+          error: "The CPU profiler failed",
+          code: "cpu_profile_profiler_failed",
+        },
+      },
+    ]);
+    expect(logLines.join("")).not.toContain(secret);
+    expect(logLines.join("")).toContain("profiler_failed");
   });
 
   test("socket close cancels only its own capture and session cleanup cancels the rest", async () => {

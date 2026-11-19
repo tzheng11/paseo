@@ -340,15 +340,17 @@ export class DaemonSession {
         payload: { requestId: msg.requestId, profile },
       });
     } catch (error) {
-      if (!(error instanceof CpuProfileError)) throw error;
-      this.logger.warn({ code: error.code }, "CPU profile request failed");
+      // Never log or reply with an untyped error's message or stack.
+      const failure =
+        error instanceof CpuProfileError ? error : new CpuProfileError("profiler_failed");
+      this.logger.warn({ code: failure.code }, "CPU profile request failed");
       this.host.emit({
         type: "rpc_error",
         payload: {
           requestId: msg.requestId,
           requestType: msg.type,
-          error: error.message,
-          code: `cpu_profile_${error.code}`,
+          error: failure.message,
+          code: `cpu_profile_${failure.code}`,
         },
       });
     }
