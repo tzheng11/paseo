@@ -3670,3 +3670,114 @@ test("REV69 fallback skips an explicitly different ID but preserves matching cor
     await f.close();
   }
 });
+
+test.each([
+  ["stale main with landed remote default", "default", true],
+  ["unmerged remote default", "unmerged", false],
+  ["squash-only remote default", "squash", false],
+  ["dirty tracked source", "dirty", false],
+  ["untracked source", "untracked", false],
+  ["no remote or upstream", "no-remote", false],
+  ["sole remote without branch upstream", "sole-remote", true],
+  ["no upstream but landed in main HEAD", "main-landed", true],
+  ["detached main and unlanded", "detached", false],
+  ["detached main but landed in its HEAD", "detached-landed", true],
+  ["unset remote default", "unset-default", false],
+  ["non-symbolic remote default", "non-symbolic-default", false],
+  ["ambiguous remotes without upstream", "ambiguous", false],
+  ["multiple remotes with an upstream remote", "selected-remote", true],
+  ["personal upstream contains source but default does not", "personal-only", false],
+  ["invalid default commit", "invalid-commit", false],
+] as const)("NEW2 retirement source: %s", async (_name, scenario, removed) => {
+  const f = await canonicalArchiveFixture();
+  const git = (cwd: string, ...args: string[]) =>
+    execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", stdio: "pipe" }).trim();
+  try {
+    const mainHead = git(f.repoDir, "rev-parse", "HEAD");
+    writeFileSync(path.join(f.worktree.worktreePath, "landed-source"), "released source\n");
+    git(f.worktree.worktreePath, "add", "landed-source");
+    git(f.worktree.worktreePath, "-c", "commit.gpgsign=false", "commit", "-m", "released source");
+    const worktreeHead = git(f.worktree.worktreePath, "rev-parse", "HEAD");
+    if (!["no-remote", "main-landed"].includes(scenario)) {
+      // Deliberately unavailable: only the saved local remote-tracking refs may be used.
+      git(f.repoDir, "remote", "add", "origin", path.join(f.home, "no-remote-repository"));
+      if (!["sole-remote", "ambiguous"].includes(scenario)) {
+        git(f.repoDir, "config", "branch.main.remote", "origin");
+        git(f.repoDir, "config", "branch.main.merge", "refs/heads/personal");
+        git(f.repoDir, "update-ref", "refs/remotes/origin/personal", worktreeHead);
+      }
+      let mergedBase = worktreeHead;
+      if (["unmerged", "personal-only"].includes(scenario)) mergedBase = mainHead;
+      if (scenario === "squash") {
+        const tree = git(f.worktree.worktreePath, "rev-parse", "HEAD^{tree}");
+        mergedBase = git(
+          f.repoDir,
+          "-c",
+          "commit.gpgsign=false",
+          "commit-tree",
+          tree,
+          "-p",
+          mainHead,
+          "-m",
+          "squash-only source",
+        );
+      }
+      if (scenario === "invalid-commit")
+        mergedBase = git(f.worktree.worktreePath, "rev-parse", "HEAD:landed-source");
+      git(f.repoDir, "update-ref", "refs/remotes/origin/released-default", mergedBase);
+      if (scenario !== "unset-default") {
+        if (scenario === "non-symbolic-default")
+          git(f.repoDir, "update-ref", "refs/remotes/origin/HEAD", mergedBase);
+        else
+          git(
+            f.repoDir,
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/released-default",
+          );
+      }
+      if (["ambiguous", "selected-remote"].includes(scenario)) {
+        git(f.repoDir, "remote", "add", "authoritative", path.join(f.home, "also-no-remote"));
+        git(f.repoDir, "update-ref", "refs/remotes/authoritative/released-default", worktreeHead);
+        git(
+          f.repoDir,
+          "symbolic-ref",
+          "refs/remotes/authoritative/HEAD",
+          "refs/remotes/authoritative/released-default",
+        );
+        if (scenario === "selected-remote") {
+          git(f.repoDir, "update-ref", "refs/remotes/origin/released-default", mainHead);
+          git(f.repoDir, "config", "branch.main.remote", "authoritative");
+          git(f.repoDir, "update-ref", "refs/remotes/authoritative/personal", worktreeHead);
+        }
+      }
+    }
+    if (scenario === "detached" || scenario === "detached-landed")
+      git(f.repoDir, "checkout", "--detach", scenario === "detached" ? mainHead : worktreeHead);
+    if (scenario === "main-landed") git(f.repoDir, "merge", "--ff-only", worktreeHead);
+    if (scenario === "dirty")
+      writeFileSync(path.join(f.worktree.worktreePath, "landed-source"), "owner changes\n");
+    if (scenario === "untracked")
+      writeFileSync(path.join(f.worktree.worktreePath, "untracked-owner-source"), "keep\n");
+    writeFileSync(path.join(f.repoDir, "shared-checkout-owner-change"), "not this worktree\n");
+    if (scenario === "default") expect(git(f.repoDir, "rev-parse", "HEAD")).toBe(mainHead);
+    const result = await archiveByScope(f.deps, {
+      scope: { kind: "workspace", workspaceId: "old-a" },
+      operationId: randomUUID(),
+      requestId: `local-default-${scenario}`,
+    });
+    expect(result.retirement?.state).toBe("complete");
+    expect(result.removedDirectory).toBe(removed);
+    expect(existsSync(f.worktree.worktreePath)).toBe(!removed);
+    if (!removed) {
+      expect(result.slotKept).toBe(true);
+      expect(result.directoryLeftBehind?.reason).toBe("source_preserved");
+      expect(existsSync(path.join(f.worktree.worktreePath, "landed-source"))).toBe(true);
+    }
+    expect(readFileSync(path.join(f.repoDir, "shared-checkout-owner-change"), "utf8")).toBe(
+      "not this worktree\n",
+    );
+  } finally {
+    await f.close();
+  }
+});

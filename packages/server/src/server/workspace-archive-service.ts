@@ -956,9 +956,54 @@ async function retirementSourceIsCleanAndLanded(
     const { stdout: base } = await execFileAsync("git", ["-C", mainRepo, "rev-parse", "HEAD"], {
       timeout: 10000,
     });
+    try {
+      await execFileAsync(
+        "git",
+        ["-C", worktree, "merge-base", "--is-ancestor", "HEAD", base.trim()],
+        { timeout: 10000 },
+      );
+      return true;
+    } catch (error) {
+      // Exit 1 means non-ancestry; other errors cannot authorize source removal.
+      if ((error as { code?: unknown }).code !== 1) return false;
+    }
+    const { stdout: branchRef } = await execFileAsync(
+      "git",
+      ["-C", mainRepo, "symbolic-ref", "--quiet", "HEAD"],
+      { timeout: 10000 },
+    );
+    const { stdout: upstreamRemote } = await execFileAsync(
+      "git",
+      ["-C", mainRepo, "for-each-ref", "--format=%(upstream:remotename)", branchRef.trim()],
+      { timeout: 10000 },
+    );
+    const { stdout: remoteNames } = await execFileAsync("git", ["-C", mainRepo, "remote"], {
+      timeout: 10000,
+    });
+    const remotes = remoteNames.trim().split("\n").filter(Boolean);
+    let remote: string | null = null;
+    if (remotes.includes(upstreamRemote.trim())) remote = upstreamRemote.trim();
+    else if (remotes.length === 1) remote = remotes[0];
+    if (!remote) return false;
+    const { stdout: defaultRef } = await execFileAsync(
+      "git",
+      ["-C", mainRepo, "symbolic-ref", "--quiet", `refs/remotes/${remote}/HEAD`],
+      { timeout: 10000 },
+    );
+    // A personal upstream is not a merged base. Trust only the local symbolic remote default.
+    if (
+      !defaultRef.trim().startsWith(`refs/remotes/${remote}/`) ||
+      defaultRef.trim() === `refs/remotes/${remote}/HEAD`
+    )
+      return false;
+    const { stdout: mergedBase } = await execFileAsync(
+      "git",
+      ["-C", mainRepo, "rev-parse", "--verify", `${defaultRef.trim()}^{commit}`],
+      { timeout: 10000 },
+    );
     await execFileAsync(
       "git",
-      ["-C", worktree, "merge-base", "--is-ancestor", "HEAD", base.trim()],
+      ["-C", worktree, "merge-base", "--is-ancestor", "HEAD", mergedBase.trim()],
       { timeout: 10000 },
     );
     return true;

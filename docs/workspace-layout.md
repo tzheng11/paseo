@@ -500,7 +500,12 @@ journal history before a later fresh admission. Unrelated canonical branches
 remain writable while a reservation is outstanding.
 
 Directory removal requires owned backing, no remaining native references and a
-clean source checkout whose HEAD is proven landed in the main checkout. These
+clean source checkout whose HEAD is proven landed in the main checkout's HEAD or
+its configured remote default branch. The alternate proof reads only the local
+symbolic `refs/remotes/<remote>/HEAD`: select the attached main branch's upstream
+remote, or the sole remote. A personal branch's upstream is not a merged base.
+No fetch runs; missing, ambiguous or invalid refs preserve source. Detached main
+checkouts retain the main-HEAD-only behavior. These
 checks run before hooks and again before removal. The final Git removal is
 non-forcing: it cannot fall through to recursive deletion or broad prune. A source
 change, unknown proof or shared reference retains the directory. Results separate
@@ -567,7 +572,8 @@ A canonical synchronous `worktree.teardown` receives
 `PASEO_RETIREMENT_OPERATION_ID`, `PASEO_RETIREMENT_BACKING_GENERATION`,
 `PASEO_RETIREMENT_WORKSPACE_ID`, `PASEO_RETIREMENT_WORKTREE_PATH` and
 `PASEO_RETIREMENT_TEARDOWN_CWD`. It also receives `PASEO_HOME` set to the
-absolute owning daemon home, overriding an inherited home. Use explicit
+absolute owning daemon home, overriding an inherited home, and clears inherited
+`PASEO_HOST`. Use explicit
 `--home "$PASEO_HOME"` for verification so ambient endpoint settings cannot select
 another daemon. No-ID hooks on non-layout homes keep their inherited home.
 The generation includes canonical backing paths,
