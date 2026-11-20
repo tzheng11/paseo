@@ -124,3 +124,37 @@ test("dormant and inherited edges both participate in cycle refusal", () => {
   snapshot.entries[1].pinPlacement = { parentWorkspaceKey: "late:z", siblingOrder: 0, revision: 2 };
   expect(() => resolveEffectiveWorkspaceLayout(snapshot)).toThrow("workspace_layout_cycle");
 });
+
+test("retirement operation requests keep UUID identity separate from transport correlation", async () => {
+  const p = await import("./messages.js");
+  const operationId = "00000000-0000-4000-8000-000000000001";
+  expect(
+    p.ArchiveWorkspaceRequestSchema.parse({
+      type: "archive_workspace_request",
+      workspaceId: "a",
+      operationId,
+      requestId: "transport",
+    }),
+  ).toMatchObject({ operationId, requestId: "transport" });
+  expect(
+    p.ArchiveWorkspaceRequestSchema.safeParse({
+      type: "archive_workspace_request",
+      workspaceId: "a",
+      operationId: "../not-an-id",
+      requestId: "transport",
+    }).success,
+  ).toBe(false);
+  expect(
+    p.SessionInboundMessageSchema.safeParse({
+      type: "workspace.retirement.status.request",
+      operationId,
+      requestId: "read",
+    }).success,
+  ).toBe(true);
+  expect(
+    p.SessionOutboundMessageSchema.safeParse({
+      type: "workspace.retirement.status.response",
+      payload: { requestId: "read", operation: null },
+    }).success,
+  ).toBe(true);
+});

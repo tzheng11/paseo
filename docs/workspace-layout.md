@@ -528,3 +528,47 @@ test, old 0.14 proof, version label or missing new optional config field does no
 qualify a 0.15 recovery reader. Runtime/terminal compatibility, installed Desktop
 behavior, exact artifact identity and current operation/work custody remain
 separate release requirements.
+
+### Caller-owned retirement IDs and synchronous consumer cleanup
+
+Canonical exact-workspace archive accepts an optional caller-preallocated UUID:
+`paseo workspace archive <id> --operation-id <uuid> --json`, SDK
+`archiveWorkspace(id, {operationId, requestId?})`, and MCP
+`archive_workspace({workspaceId, operationId})`. The UUID identifies the durable
+operation; `requestId` only correlates a transport response. Persist the UUID before
+calling. A timeout means read that operation on the same owner host, never select by
+CWD/name/newest and never rerun cleanup. The SDK requires the additive
+`workspaceRetirementOperations` capability before sending an explicit ID. Ordinary
+no-ID archive and legacy homes retain their existing behavior; explicit IDs have no
+legacy fallback.
+
+`workspace retirement-status <uuid> --json` and SDK
+`getWorkspaceRetirementStatus(uuid)` only read evidence. Unknown IDs return
+`not-found`/`null`. The projection reports `pending`, terminal `refused`, `partial`
+or `complete`, a typed code, the backing generation and the recorded archive result
+(including receipt, directory removal, kept slot and preservation reason). It never
+repairs a journal, reconciles a write or starts an operation. Early holds are durable
+before effects; a refused ID cannot become a fresh attempt after its hold clears.
+Use a new UUID for a newly admitted request. Reuse with a different workspace
+conflicts. Incomplete evidence remains partial; lookup is not recovery authority.
+MCP exposes the equivalent scope-checked `get_workspace_retirement_status` tool.
+
+A canonical synchronous `worktree.teardown` receives
+`PASEO_RETIREMENT_OPERATION_ID`, `PASEO_RETIREMENT_BACKING_GENERATION`,
+`PASEO_RETIREMENT_WORKSPACE_ID`, `PASEO_RETIREMENT_WORKTREE_PATH` and
+`PASEO_RETIREMENT_TEARDOWN_CWD`. The generation includes canonical backing paths,
+filesystem identity, native creation identities and shared references. Inherited
+values cannot manufacture this binding. Before dependency/service cleanup, the hook
+uses normal existing authorization to call `workspace retirement-verify <uuid>`
+with `--workspace-id`, `--backing-generation`, `--worktree-path` and
+`--teardown-cwd` from those fields (SDK `verifyWorkspaceRetirementBinding`). A false
+verification exits nonzero. Status needs `workspace.read`; verification uses the
+archive `workspace.manage` or `hub.execute` permission.
+
+Verification requires the exact currently awaited hook, its live backing fence,
+started effect step and fresh authority/native/shared-reference checks. It takes no
+second backing lease, which would deadlock the hook. A durable receipt or started
+journal does not authorize cleanup after hook exit, failure, daemon restart or slot
+reuse. Keep cleanup synchronous: a successful verification is not a reusable permit
+for a detached callback. No credential, connection or layout configuration change
+is part of this interface.

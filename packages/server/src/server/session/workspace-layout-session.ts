@@ -1,3 +1,7 @@
+import {
+  getWorkspaceRetirementStatus,
+  verifyWorkspaceRetirementBinding,
+} from "../workspace-retirement.js";
 import type { Logger } from "pino";
 import type { SessionInboundMessage, SessionOutboundMessage } from "../messages.js";
 import type { WorkspaceLayoutService } from "../workspace-layout-service.js";
@@ -12,7 +16,9 @@ type LayoutRequest = Extract<
       | "workspace.layout.inspect.request"
       | "workspace.layout.initialize.request"
       | "workspace.layout.commit.request"
-      | "workspace.layout.receipt.request";
+      | "workspace.layout.receipt.request"
+      | "workspace.retirement.status.request"
+      | "workspace.retirement.verify.request";
   }
 >;
 
@@ -30,6 +36,8 @@ export class WorkspaceLayoutSession {
       case "workspace.layout.initialize.request":
       case "workspace.layout.commit.request":
       case "workspace.layout.receipt.request":
+      case "workspace.retirement.status.request":
+      case "workspace.retirement.verify.request":
         return this.handle(message);
       default:
         return undefined;
@@ -39,7 +47,23 @@ export class WorkspaceLayoutSession {
   private async handle(message: LayoutRequest): Promise<void> {
     try {
       if (!this.service) throw new WorkspaceLayoutRefusal("canonical_layout_not_configured");
-      if (message.type === "workspace.layout.receipt.request") {
+      if (message.type === "workspace.retirement.status.request") {
+        this.emit({
+          type: "workspace.retirement.status.response",
+          payload: {
+            requestId: message.requestId,
+            operation: await getWorkspaceRetirementStatus(this.service, message.operationId),
+          },
+        });
+      } else if (message.type === "workspace.retirement.verify.request") {
+        this.emit({
+          type: "workspace.retirement.verify.response",
+          payload: {
+            requestId: message.requestId,
+            ...(await verifyWorkspaceRetirementBinding(this.service.options.home, message)),
+          },
+        });
+      } else if (message.type === "workspace.layout.receipt.request") {
         this.emit({
           type: "workspace.layout.receipt.response",
           payload: {

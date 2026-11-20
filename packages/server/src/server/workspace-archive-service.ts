@@ -8,6 +8,8 @@ import {
   commitWorkspaceRetirementArchive,
   hasWorkspaceRetirement,
   workspaceRetirementStep,
+  withCallerRetirementOperation,
+  withWorkspaceRetirementHook,
 } from "./workspace-retirement.js";
 import { serializeWorkspaceBacking, nativeTransitionKey } from "./workspace-retirement-context.js";
 import { resolve } from "node:path";
@@ -102,6 +104,7 @@ export interface ArchiveResult {
 }
 
 export interface ArchiveByScopeRequest {
+  operationId?: string;
   scope: ArchiveScope;
   requestId: string;
 }
@@ -163,6 +166,36 @@ export async function archiveByScope(
   dependencies: ArchiveDependencies,
   request: ArchiveByScopeRequest,
 ): Promise<ArchiveResult> {
+  if (request.operationId) {
+    if (
+      !dependencies.retirementAuthority ||
+      !dependencies.getWorkspace ||
+      request.scope.kind !== "workspace"
+    )
+      throw new Error("canonical_retirement_operation_unavailable");
+    const { operationId, ...withoutOperation } = request;
+    return withCallerRetirementOperation({
+      authority: dependencies.retirementAuthority,
+      operationId,
+      workspaceId: request.scope.workspaceId,
+      getRecord: dependencies.getWorkspace,
+      run: (expectedNativeGeneration) =>
+        archiveCanonicalByScope(
+          dependencies,
+          withoutOperation,
+          operationId.toLowerCase(),
+          expectedNativeGeneration,
+        ),
+    });
+  }
+  return archiveCanonicalByScope(dependencies, request);
+}
+async function archiveCanonicalByScope(
+  dependencies: ArchiveDependencies,
+  request: ArchiveByScopeRequest,
+  operationId?: string,
+  expectedNativeGeneration?: string,
+): Promise<ArchiveResult> {
   if (dependencies.retirementAuthority) {
     const nativeInventory = dependencies.listRetirementRecords;
     if (!nativeInventory || !dependencies.getWorkspace)
@@ -209,6 +242,8 @@ export async function archiveByScope(
             return record;
           }),
         );
+        if (expectedNativeGeneration && nativeGeneration(records) !== expectedNativeGeneration)
+          throw new Error("retirement_operation_generation_changed");
         if (nativeGeneration(records) !== nativeGeneration(initialRecords))
           throw new Error("retirement_native_footprint_changed");
         if (
@@ -219,6 +254,7 @@ export async function archiveByScope(
           throw new Error("canonical_backing_generation_required_or_changed");
         const backing = target.backing?.path ?? records[0].cwd;
         return retireCanonicalWorkspace({
+          operationId,
           expectedProjectId: request.scope.kind === "project" ? request.scope.projectId : undefined,
           authority: dependencies.retirementAuthority!,
           records,
@@ -617,11 +653,20 @@ async function maybeRemoveDirectory(
     );
     for (const teardownTarget of uniqueTeardownTargets(allowedTeardownTargets)) {
       await workspaceRetirementStep(`path-teardown:${teardownTarget.cwd}`, () =>
-        runWorktreeTeardownCommands({
-          worktreePath: backing.path,
-          teardownCwd: teardownTarget.cwd,
-          repoRootPath: backing.mainRepoRoot ?? undefined,
-        }),
+        withWorkspaceRetirementHook(
+          {
+            workspaceId: teardownTarget.workspaceId,
+            worktreePath: backing.path,
+            teardownCwd: teardownTarget.cwd,
+          },
+          (retirementBinding) =>
+            runWorktreeTeardownCommands({
+              worktreePath: backing.path,
+              teardownCwd: teardownTarget.cwd,
+              repoRootPath: backing.mainRepoRoot ?? undefined,
+              retirementBinding,
+            }),
+        ),
       );
     }
   } catch (error) {

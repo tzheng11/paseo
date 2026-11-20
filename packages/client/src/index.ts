@@ -1,3 +1,7 @@
+import type {
+  WorkspaceRetirementOperation,
+  WorkspaceRetirementBinding,
+} from "@getpaseo/protocol/workspace-layout";
 export type { TerminalReplayEvent, TerminalStreamEvent } from "./terminal-stream-router.js";
 import type { AgentAddress } from "@getpaseo/protocol/addresses";
 import { parentAddressLabels } from "@getpaseo/protocol/agent-labels";
@@ -188,6 +192,8 @@ export interface PaseoWorkspaceMoveResult {
   siblingOrder: number;
 }
 
+export type PaseoWorkspaceArchiveOptions = string | { requestId?: string; operationId?: string };
+
 export interface PaseoWorkspaceHandle {
   readonly id: string;
   readonly projectId: string | null;
@@ -202,7 +208,7 @@ export interface PaseoWorkspaceHandle {
   refresh(options?: { requestId?: string }): Promise<PaseoWorkspace | null>;
   setTitle(title: string | null, requestId?: string): Promise<{ title: string | null }>;
   move(input: PaseoWorkspaceMoveOptions, requestId?: string): Promise<PaseoWorkspaceMoveResult>;
-  archive(requestId?: string): Promise<PaseoWorkspaceArchiveResult>;
+  archive(options?: PaseoWorkspaceArchiveOptions): Promise<PaseoWorkspaceArchiveResult>;
   /**
    * Subscribes to already-emitted daemon workspace_update events for this id.
    * This returns a local unsubscribe function; it does not own app cache state or
@@ -238,8 +244,16 @@ export interface PaseoWorkspaceActions {
   ): Promise<PaseoWorkspaceMoveResult>;
   archive(
     workspace: string | PaseoWorkspaceHandle,
-    requestId?: string,
+    options?: PaseoWorkspaceArchiveOptions,
   ): Promise<PaseoWorkspaceArchiveResult>;
+  getRetirementStatus(
+    operationId: string,
+    requestId?: string,
+  ): Promise<WorkspaceRetirementOperation | null>;
+  verifyRetirementBinding(
+    binding: WorkspaceRetirementBinding,
+    requestId?: string,
+  ): Promise<{ valid: boolean; code: string | null }>;
   /**
    * Local event subscription over the low-level driver's workspace_update stream.
    * The returned function only removes this SDK listener.
@@ -782,8 +796,12 @@ export function createPaseoApi(
         }
         return createWorkspaceHandle(result.workspace);
       },
-      archive: (workspace, requestId) =>
-        daemonClient.archiveWorkspace(resolveWorkspaceId(workspace), requestId),
+      archive: (workspace, options) =>
+        daemonClient.archiveWorkspace(resolveWorkspaceId(workspace), options),
+      getRetirementStatus: (operationId, requestId) =>
+        daemonClient.getWorkspaceRetirementStatus(operationId, requestId),
+      verifyRetirementBinding: (binding, requestId) =>
+        daemonClient.verifyWorkspaceRetirementBinding(binding, requestId),
       move: (workspace, input, requestId) =>
         daemonClient.moveWorkspace(resolveWorkspaceId(workspace), input, requestId),
       subscribe: listenWorkspaces,

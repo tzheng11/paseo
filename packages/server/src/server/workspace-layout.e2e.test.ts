@@ -379,6 +379,64 @@ test("derived authority fences legacy native writers before effects while the cu
   }
   advertised.workspaceLayout = derivedMode;
   expect((await client.getWorkspaceLayout()).stamp).toEqual(baseline.stamp);
+  expect(client.getLastServerInfoMessage()?.features?.workspaceRetirementOperations).toBe(true);
+  const operationRoot = path.join(root, "operation-target");
+  await mkdir(operationRoot, { recursive: true });
+  const operationTarget = await client.createWorkspace({
+    source: { kind: "directory", path: operationRoot },
+  });
+  const operationWorkspaceId = operationTarget.workspace!.id;
+  const heldId = randomUUID();
+  await client.setWorkspacePinned(operationWorkspaceId, true);
+  expect(
+    (await client.archiveWorkspace(operationWorkspaceId, { operationId: heldId })).error,
+  ).toContain("retirement_native_hold");
+  expect(await client.getWorkspaceRetirementStatus(heldId)).toMatchObject({
+    operationId: heldId,
+    workspaceId: operationWorkspaceId,
+    state: "refused",
+    terminal: true,
+  });
+  await client.setWorkspacePinned(operationWorkspaceId, false);
+  expect(
+    (await client.archiveWorkspace(operationWorkspaceId, { operationId: heldId })).error,
+  ).toContain("retirement_native_hold");
+  const completedId = randomUUID();
+  const completed = await client.archiveWorkspace(operationWorkspaceId, {
+    operationId: completedId,
+  });
+  expect(completed.error).toBeNull();
+  expect(completed.retirement).toMatchObject({ operationId: completedId, state: "complete" });
+  const readClient = createHostClient(`tcp://127.0.0.1:${fixture.port}?password=${password}`, {
+    clientId: randomUUID(),
+    reconnect: { enabled: false },
+    sessionPermissions: ["workspace.read"],
+  });
+  cleanup.push(() => readClient.close());
+  await readClient.connect();
+  expect(await readClient.getWorkspaceRetirementStatus(completedId)).toMatchObject({
+    state: "complete",
+    result: { retirement: completed.retirement, removedDirectory: false, slotKept: true },
+  });
+  expect(await readClient.getWorkspaceRetirementStatus(randomUUID())).toBeNull();
+  await expect(
+    readClient.verifyWorkspaceRetirementBinding({
+      operationId: completedId,
+      workspaceId: operationWorkspaceId,
+      backingGeneration: "a".repeat(64),
+      worktreePath: operationRoot,
+      teardownCwd: operationRoot,
+    }),
+  ).rejects.toMatchObject({ code: "access_denied" });
+  expect(
+    await client.verifyWorkspaceRetirementBinding({
+      operationId: completedId,
+      workspaceId: operationWorkspaceId,
+      backingGeneration: "a".repeat(64),
+      worktreePath: operationRoot,
+      teardownCwd: operationRoot,
+    }),
+  ).toEqual({ valid: false, code: "retirement_hook_not_active" });
   const created = await client.createWorkspace({ source: { kind: "directory", path: root } });
   expect(created.workspace).not.toBeNull();
   const id = created.workspace!.id;

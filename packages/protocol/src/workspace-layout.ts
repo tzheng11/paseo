@@ -212,6 +212,50 @@ export const WorkspaceArchiveOutcomeSchema = z.object({
   directoryLeftBehind: z.object({ path: z.string(), reason: z.string() }).optional(),
   retirement: WorkspaceRetirementOutcomeSchema.optional(),
 });
+export const WorkspaceRetirementResultSchema = WorkspaceArchiveOutcomeSchema.extend({
+  archivedAgentIds: z.array(z.string()),
+  archivedWorkspaceIds: z.array(z.string()),
+  removedDirectory: z.boolean(),
+});
+export const WorkspaceRetirementOperationSchema = z.object({
+  operationId: z.string().uuid(),
+  workspaceId: IdSchema,
+  ownerServerId: IdSchema,
+  state: z.enum(["pending", "refused", "partial", "complete"]),
+  terminal: z.boolean(),
+  code: z.string().nullable(),
+  backingGeneration: DigestSchema.nullable(),
+  result: WorkspaceRetirementResultSchema.nullable(),
+});
+export const WorkspaceRetirementBindingSchema = z.object({
+  operationId: z.string().uuid(),
+  workspaceId: IdSchema,
+  backingGeneration: DigestSchema,
+  worktreePath: z.string().min(1).max(4096),
+  teardownCwd: z.string().min(1).max(4096),
+});
+export type WorkspaceRetirementOperation = z.infer<typeof WorkspaceRetirementOperationSchema>;
+export type WorkspaceRetirementBinding = z.infer<typeof WorkspaceRetirementBindingSchema>;
+export const WorkspaceRetirementStatusRequestSchema = z.object({
+  type: z.literal("workspace.retirement.status.request"),
+  requestId: z.string(),
+  operationId: z.string().uuid(),
+});
+export const WorkspaceRetirementStatusResponseSchema = z.object({
+  type: z.literal("workspace.retirement.status.response"),
+  payload: z.object({
+    requestId: z.string(),
+    operation: WorkspaceRetirementOperationSchema.nullable(),
+  }),
+});
+export const WorkspaceRetirementVerifyRequestSchema = WorkspaceRetirementBindingSchema.extend({
+  type: z.literal("workspace.retirement.verify.request"),
+  requestId: z.string(),
+});
+export const WorkspaceRetirementVerifyResponseSchema = z.object({
+  type: z.literal("workspace.retirement.verify.response"),
+  payload: z.object({ requestId: z.string(), valid: z.boolean(), code: z.string().nullable() }),
+});
 export const WorkspaceLayoutInspectRequestSchema = z.object({
   type: z.literal("workspace.layout.inspect.request"),
   requestId: z.string(),

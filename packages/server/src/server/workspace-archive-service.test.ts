@@ -2869,3 +2869,569 @@ test("a project movement before reservation refuses the saved project footprint 
     await f.close();
   }
 });
+
+test("caller operation ID survives canonical archive and an exact replay", async () => {
+  const f = await canonicalArchiveFixture();
+  const operationId = randomUUID();
+  const request = {
+    scope: { kind: "workspace" as const, workspaceId: "old-a" },
+    requestId: "caller-first",
+    operationId,
+  };
+  try {
+    const first = await archiveByScope(f.deps, request);
+    expect(first.retirement).toMatchObject({ operationId, state: "complete" });
+    expect(await archiveByScope(f.deps, { ...request, requestId: "caller-lost-reply" })).toEqual(
+      first,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("caller operation records a native hold before effects and lookup never starts it", async () => {
+  const f = await canonicalArchiveFixture();
+  const operationId = randomUUID();
+  try {
+    vi.spyOn(f.deps.agentManager, "listAgents");
+    f.deps.assertWorkspaceAutomationAllowed = async () => {
+      throw new Error("retirement_native_hold");
+    };
+    await expect(
+      archiveByScope(f.deps, {
+        scope: { kind: "workspace", workspaceId: "old-a" },
+        requestId: "caller-hold",
+        operationId,
+      } as Parameters<typeof archiveByScope>[1]),
+    ).rejects.toThrow("retirement_native_hold");
+    const api = (await import("./workspace-retirement.js")) as unknown as {
+      getWorkspaceRetirementStatus: (authority: typeof f.layout, id: string) => Promise<unknown>;
+    };
+    expect(typeof api.getWorkspaceRetirementStatus).toBe("function");
+    expect(await api.getWorkspaceRetirementStatus(f.layout, operationId)).toMatchObject({
+      operationId,
+      workspaceId: "old-a",
+      state: "refused",
+      terminal: true,
+    });
+    expect(existsSync(f.worktree.worktreePath)).toBe(true);
+    expect(f.deps.agentManager.listAgents).not.toHaveBeenCalled();
+  } finally {
+    await f.close();
+  }
+});
+
+test("canonical synchronous teardown receives caller operation and backing generation", async () => {
+  const f = await canonicalArchiveFixture(
+    'node -e \'require("node:fs").writeFileSync(process.env.PASEO_WORKTREE_PATH + ".binding", JSON.stringify({operationId:process.env.PASEO_RETIREMENT_OPERATION_ID,backingGeneration:process.env.PASEO_RETIREMENT_BACKING_GENERATION,workspaceId:process.env.PASEO_RETIREMENT_WORKSPACE_ID,worktreePath:process.env.PASEO_RETIREMENT_WORKTREE_PATH,teardownCwd:process.env.PASEO_RETIREMENT_TEARDOWN_CWD}))\'',
+  );
+  const operationId = randomUUID();
+  try {
+    await archiveByScope(f.deps, {
+      scope: { kind: "workspace", workspaceId: "old-a" },
+      requestId: "caller-hook",
+      operationId,
+    } as Parameters<typeof archiveByScope>[1]);
+    expect(JSON.parse(readFileSync(f.worktree.worktreePath + ".binding", "utf8"))).toEqual({
+      operationId,
+      backingGeneration: expect.stringMatching(/^[a-f0-9]{64}$/),
+      workspaceId: "old-a",
+      worktreePath: f.worktree.worktreePath,
+      teardownCwd: f.worktree.worktreePath,
+    });
+  } finally {
+    await f.close();
+  }
+});
+
+test("caller UUID conflicts, pure readback, partial state and restart retain the original operation", async () => {
+  const f = await canonicalArchiveFixture();
+  const { getWorkspaceRetirementStatus } = await import("./workspace-retirement.js");
+  const operationId = randomUUID();
+  const request = {
+    scope: { kind: "workspace" as const, workspaceId: "old-a" },
+    requestId: "partial-first",
+    operationId,
+  };
+  try {
+    f.deps.killTerminalsForWorkspace = vi.fn(async () => {
+      throw new Error("fixture terminal failure");
+    });
+    const result = await archiveByScope(f.deps, request);
+    expect(result.retirement).toMatchObject({ operationId, state: "partial" });
+    const before = readFileSync(path.join(f.home, "workspace-layout.json"), "utf8");
+    const status = await getWorkspaceRetirementStatus(f.layout, operationId);
+    expect(status).toMatchObject({ operationId, state: "partial", terminal: false, result });
+    expect(await getWorkspaceRetirementStatus(f.layout, randomUUID())).toBeNull();
+    expect(await archiveByScope(f.deps, { ...request, requestId: "lost-reply" })).toEqual(result);
+    expect(f.deps.killTerminalsForWorkspace).toHaveBeenCalledTimes(1);
+    await expect(
+      archiveByScope(f.deps, { ...request, scope: { kind: "workspace", workspaceId: "new-b" } }),
+    ).rejects.toThrow("retirement_operation_id_conflict");
+    const reopened = new WorkspaceLayoutService(f.layout.options);
+    try {
+      expect(await getWorkspaceRetirementStatus(reopened, operationId)).toEqual(status);
+    } finally {
+      await reopened.close();
+    }
+    expect(readFileSync(path.join(f.home, "workspace-layout.json"), "utf8")).toBe(before);
+    expect(existsSync(f.worktree.worktreePath)).toBe(true);
+  } finally {
+    await f.close();
+  }
+});
+
+test("caller hold UUID stays terminal after the hold clears; a fresh UUID may proceed", async () => {
+  const f = await canonicalArchiveFixture();
+  const api = await import("./workspace-retirement.js");
+  const operationId = randomUUID();
+  const request = {
+    scope: { kind: "workspace" as const, workspaceId: "old-a" },
+    requestId: "hold",
+    operationId,
+  };
+  try {
+    f.deps.assertWorkspaceAutomationAllowed = async () => {
+      throw new Error("retirement_native_hold");
+    };
+    await expect(archiveByScope(f.deps, request)).rejects.toThrow("retirement_native_hold");
+    const held = await api.getWorkspaceRetirementStatus(f.layout, operationId);
+    expect(held).toMatchObject({
+      state: "refused",
+      code: "retirement_native_hold",
+      terminal: true,
+      result: null,
+    });
+    f.deps.assertWorkspaceAutomationAllowed = async () => {};
+    await expect(archiveByScope(f.deps, request)).rejects.toThrow("retirement_native_hold");
+    expect(await api.getWorkspaceRetirementStatus(f.layout, operationId)).toEqual(held);
+    const fresh = await archiveByScope(f.deps, { ...request, operationId: randomUUID() });
+    expect(fresh.retirement?.state).toBe("complete");
+    expect(f.deps.killTerminalsForWorkspace).toHaveBeenCalledTimes(1);
+  } finally {
+    await f.close();
+  }
+});
+
+test("caller readback during a lost reply is pending and never retries the paused operation", async () => {
+  const f = await canonicalArchiveFixture();
+  const api = await import("./workspace-retirement.js");
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let started!: () => void;
+  const entered = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const operationId = randomUUID();
+  f.deps.stopWorkspaceSetup = vi.fn(async () => {
+    started();
+    await gate;
+  });
+  const request = {
+    scope: { kind: "workspace" as const, workspaceId: "old-a" },
+    requestId: "timeout",
+    operationId,
+  };
+  const running = archiveByScope(f.deps, request);
+  try {
+    await entered;
+    expect(await api.getWorkspaceRetirementStatus(f.layout, operationId)).toMatchObject({
+      state: "pending",
+      terminal: false,
+      operationId,
+    });
+    expect(
+      (await archiveByScope(f.deps, { ...request, requestId: "duplicate" })).retirement,
+    ).toMatchObject({ operationId, state: "partial", code: "retirement_in_progress" });
+    expect(f.deps.stopWorkspaceSetup).toHaveBeenCalledTimes(1);
+    release();
+    const result = await running;
+    expect(await api.getWorkspaceRetirementStatus(f.layout, operationId)).toMatchObject({
+      state: "complete",
+      terminal: true,
+      result,
+    });
+    await expect(archiveByScope(f.deps, { ...request, operationId: randomUUID() })).rejects.toThrow(
+      "retirement_operation_id_conflict",
+    );
+  } finally {
+    release();
+    await running;
+    await f.close();
+  }
+});
+
+test("live synchronous hook verification expires before kept A's slot becomes B", async () => {
+  const f = await canonicalArchiveFixture(
+    'node -e \'const fs=require("node:fs");const p=process.env.PASEO_WORKTREE_PATH;fs.writeFileSync(p+".binding",JSON.stringify({operationId:process.env.PASEO_RETIREMENT_OPERATION_ID,backingGeneration:process.env.PASEO_RETIREMENT_BACKING_GENERATION,workspaceId:process.env.PASEO_RETIREMENT_WORKSPACE_ID,worktreePath:process.env.PASEO_RETIREMENT_WORKTREE_PATH,teardownCwd:process.env.PASEO_RETIREMENT_TEARDOWN_CWD}));const t=setInterval(()=>{if(fs.existsSync(p+".release")){fs.writeFileSync(p+"/keep-source","owned");clearInterval(t)}},25)\'',
+  );
+  const api = await import("./workspace-retirement.js");
+  const operationId = randomUUID();
+  const running = archiveByScope(f.deps, {
+    scope: { kind: "workspace", workspaceId: "old-a" },
+    operationId,
+    requestId: "hook-verify",
+  });
+  try {
+    await vi.waitFor(() => expect(existsSync(f.worktree.worktreePath + ".binding")).toBe(true), {
+      timeout: 10000,
+    });
+    const binding = JSON.parse(readFileSync(f.worktree.worktreePath + ".binding", "utf8"));
+    expect(await api.verifyWorkspaceRetirementBinding(f.home, binding)).toEqual({
+      valid: true,
+      code: null,
+    });
+    for (const changed of [
+      { operationId: randomUUID() },
+      { workspaceId: "new-b" },
+      { backingGeneration: "f".repeat(64) },
+      { worktreePath: path.dirname(binding.worktreePath) },
+      { teardownCwd: binding.teardownCwd + "/nested" },
+    ])
+      expect(
+        (await api.verifyWorkspaceRetirementBinding(f.home, { ...binding, ...changed })).valid,
+      ).toBe(false);
+    expect(
+      (await api.verifyWorkspaceRetirementBinding(path.join(f.home, "other"), binding)).valid,
+    ).toBe(false);
+    writeFileSync(f.worktree.worktreePath + ".release", "release");
+    const result = await running;
+    expect(result).toMatchObject({
+      slotKept: true,
+      removedDirectory: false,
+      directoryLeftBehind: { reason: "source_changed_before_removal" },
+    });
+    await f.registry.upsert({
+      ...f.record,
+      workspaceId: "new-b",
+      createdAt: "2026-11-19T23:00:00.000Z",
+      updatedAt: "2026-11-19T23:00:00.000Z",
+    });
+    const sentinel = path.join(f.worktree.worktreePath, "b-dependencies");
+    writeFileSync(sentinel, "B");
+    const before = await f.registry.get("new-b");
+    expect(await api.verifyWorkspaceRetirementBinding(f.home, binding)).toEqual({
+      valid: false,
+      code: "retirement_hook_not_active",
+    });
+    expect(await api.getWorkspaceRetirementStatus(f.layout, operationId)).toMatchObject({
+      state: "complete",
+      result,
+    });
+    expect(await f.registry.get("new-b")).toEqual(before);
+    expect(readFileSync(sentinel, "utf8")).toBe("B");
+  } finally {
+    writeFileSync(f.worktree.worktreePath + ".release", "release");
+    await running;
+    await f.close();
+  }
+});
+
+test("caller operation intent persistence failure produces zero teardown effects", async () => {
+  const f = await canonicalArchiveFixture();
+  const original = atomicFile.writeFileDurably;
+  const write = vi.spyOn(atomicFile, "writeFileDurably").mockImplementation((file, bytes) => {
+    if (file.includes("workspace-retirement-operations"))
+      return Promise.reject(new Error("fixture disk failure"));
+    return original(file, bytes);
+  });
+  try {
+    await expect(
+      archiveByScope(f.deps, {
+        scope: { kind: "workspace", workspaceId: "old-a" },
+        requestId: "disk-failure",
+        operationId: randomUUID(),
+      }),
+    ).rejects.toThrow("fixture disk failure");
+    expect(f.deps.killTerminalsForWorkspace).not.toHaveBeenCalled();
+    expect((await f.layout.inspect()).retirements ?? []).toHaveLength(0);
+    expect(existsSync(f.worktree.worktreePath)).toBe(true);
+  } finally {
+    write.mockRestore();
+    await f.close();
+  }
+});
+test("a failed synchronous hook has durable partial evidence and no live verification permit", async () => {
+  const f = await canonicalArchiveFixture(
+    'node -e \'require("fs").writeFileSync(process.env.PASEO_WORKTREE_PATH+".binding",JSON.stringify({operationId:process.env.PASEO_RETIREMENT_OPERATION_ID,backingGeneration:process.env.PASEO_RETIREMENT_BACKING_GENERATION,workspaceId:process.env.PASEO_RETIREMENT_WORKSPACE_ID,worktreePath:process.env.PASEO_RETIREMENT_WORKTREE_PATH,teardownCwd:process.env.PASEO_RETIREMENT_TEARDOWN_CWD}));process.exit(7)\'',
+  );
+  const api = await import("./workspace-retirement.js");
+  const operationId = randomUUID();
+  try {
+    const result = await archiveByScope(f.deps, {
+      scope: { kind: "workspace", workspaceId: "old-a" },
+      requestId: "hook-failed",
+      operationId,
+    });
+    expect(result.retirement?.state).toBe("partial");
+    const binding = JSON.parse(readFileSync(f.worktree.worktreePath + ".binding", "utf8"));
+    expect(await api.verifyWorkspaceRetirementBinding(f.home, binding)).toEqual({
+      valid: false,
+      code: "retirement_hook_not_active",
+    });
+    expect(await api.getWorkspaceRetirementStatus(f.layout, operationId)).toMatchObject({
+      state: "partial",
+      result,
+    });
+    expect(existsSync(f.worktree.worktreePath)).toBe(true);
+  } finally {
+    await f.close();
+  }
+});
+test("an old implicit operation UUID cannot fence an unrelated new target", async () => {
+  const f = await canonicalArchiveFixture();
+  const api = await import("./workspace-retirement.js");
+  try {
+    writeFileSync(path.join(f.worktree.worktreePath, "retain-a"), "A");
+    const original = await archiveByScope(f.deps, {
+      scope: { kind: "workspace", workspaceId: "old-a" },
+      requestId: "implicit-a",
+    });
+    const operationId = original.retirement!.operationId;
+    const other = path.join(f.repoDir, "other-b");
+    mkdirSync(other);
+    await f.registry.upsert({
+      ...f.record,
+      workspaceId: "new-b",
+      kind: "directory",
+      cwd: other,
+      worktreeRoot: null,
+      mainRepoRoot: null,
+      isPaseoOwnedWorktree: false,
+      createdAt: "2026-11-19T23:00:00.000Z",
+      updatedAt: "2026-11-19T23:00:00.000Z",
+    });
+    const killed = vi.mocked(f.deps.killTerminalsForWorkspace).mock.calls.length;
+    await expect(
+      archiveByScope(f.deps, {
+        scope: { kind: "workspace", workspaceId: "new-b" },
+        operationId,
+        requestId: "conflicting-b",
+      }),
+    ).rejects.toThrow("retirement_operation_id_conflict");
+    expect(await api.getWorkspaceRetirementStatus(f.layout, operationId)).toMatchObject({
+      workspaceId: "old-a",
+      state: "complete",
+      result: original,
+    });
+    expect((await f.registry.get("new-b"))?.archivedAt).toBeNull();
+    expect(f.deps.killTerminalsForWorkspace).toHaveBeenCalledTimes(killed);
+    await f.registry.update("new-b", (record) => ({ ...record, title: "still-admissible" }));
+    expect((await f.registry.get("new-b"))?.title).toBe("still-admissible");
+  } finally {
+    await f.close();
+  }
+});
+
+test("caller status is a pure read even with every durable write and commit forbidden", async () => {
+  const f = await canonicalArchiveFixture();
+  const api = await import("./workspace-retirement.js");
+  const operationId = randomUUID();
+  try {
+    const result = await archiveByScope(f.deps, {
+      scope: { kind: "workspace", workspaceId: "old-a" },
+      requestId: "read-only",
+      operationId,
+    });
+    const write = vi
+      .spyOn(atomicFile, "writeFileDurably")
+      .mockRejectedValue(new Error("READ_ONLY_WRITE_FORBIDDEN"));
+    const commit = vi
+      .spyOn(f.layout, "commit")
+      .mockRejectedValue(new Error("READ_ONLY_COMMIT_FORBIDDEN"));
+    try {
+      expect(await api.getWorkspaceRetirementStatus(f.layout, operationId)).toMatchObject({
+        state: "complete",
+        result,
+      });
+      expect(await api.getWorkspaceRetirementStatus(f.layout, randomUUID())).toBeNull();
+      expect(write).not.toHaveBeenCalled();
+      expect(commit).not.toHaveBeenCalled();
+    } finally {
+      write.mockRestore();
+      commit.mockRestore();
+    }
+  } finally {
+    await f.close();
+  }
+});
+test("restart with only a durable pending caller intent never restarts an uncertain archive", async () => {
+  const f = await canonicalArchiveFixture();
+  const api = await import("./workspace-retirement.js");
+  const operationId = randomUUID();
+  let indexWrites = 0;
+  const original = atomicFile.writeFileDurably;
+  const write = vi.spyOn(atomicFile, "writeFileDurably").mockImplementation((file, bytes) => {
+    if (file.includes("workspace-retirement-operations") && ++indexWrites > 2)
+      return Promise.reject(new Error("fixture outcome unavailable"));
+    if (file.includes("workspace-retirements"))
+      return Promise.reject(new Error("fixture cut before journal"));
+    return original(file, bytes);
+  });
+  const request = {
+    scope: { kind: "workspace" as const, workspaceId: "old-a" },
+    requestId: "cut",
+    operationId,
+  };
+  try {
+    await expect(archiveByScope(f.deps, request)).rejects.toThrow("fixture outcome unavailable");
+    write.mockRestore();
+    const reopened = new WorkspaceLayoutService(f.layout.options);
+    try {
+      expect(await api.getWorkspaceRetirementStatus(reopened, operationId)).toMatchObject({
+        state: "partial",
+        terminal: false,
+        code: "retirement_reconciliation_required",
+        result: null,
+      });
+    } finally {
+      await reopened.close();
+    }
+    expect(
+      (await archiveByScope(f.deps, { ...request, requestId: "after-restart" })).retirement,
+    ).toMatchObject({ operationId, state: "partial", code: "retirement_reconciliation_required" });
+    expect(f.deps.killTerminalsForWorkspace).not.toHaveBeenCalled();
+    expect(existsSync(f.worktree.worktreePath)).toBe(true);
+  } finally {
+    write.mockRestore();
+    await f.close();
+  }
+});
+test("MCP preserves caller UUID and scope-checks read-only status", async () => {
+  const f = await canonicalArchiveFixture();
+  const logger = createLogger();
+  const storage = new AgentStorage(path.join(f.home, "agents"), logger);
+  const manager = new AgentManager({ clients: {}, registry: storage, logger });
+  try {
+    const options = {
+      agentManager: manager,
+      agentStorage: storage,
+      providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+      workspaceRegistry: f.registry,
+      workspaceLayoutService: f.layout,
+      serverId: "owner",
+      paseoHome: f.home,
+      github: f.deps.github,
+      workspaceGitService: createNoopWorkspaceGitService(),
+      findWorkspaceIdForCwd: f.deps.findWorkspaceIdForCwd,
+      listActiveWorkspaces: f.deps.listActiveWorkspaces,
+      archiveWorkspaceRecord: f.deps.archiveWorkspaceRecord,
+      emitWorkspaceUpdatesForWorkspaceIds: f.deps.emitWorkspaceUpdatesForWorkspaceIds,
+      markWorkspaceArchiving: f.deps.markWorkspaceArchiving,
+      clearWorkspaceArchiving: f.deps.clearWorkspaceArchiving,
+      logger,
+    };
+    const catalog = createPaseoToolCatalog(options);
+    const operationId = randomUUID();
+    const result = await catalog.executeTool("archive_workspace", {
+      workspaceId: "old-a",
+      operationId,
+    });
+    expect(result.structuredContent).toMatchObject({
+      retirement: { operationId, state: "complete" },
+    });
+    expect(
+      (await catalog.executeTool("get_workspace_retirement_status", { operationId }))
+        .structuredContent,
+    ).toMatchObject({ operation: { workspaceId: "old-a", state: "complete", operationId } });
+    const scoped = createPaseoToolCatalog({
+      ...options,
+      callerAgentId: "scoped",
+      resolveCallerContext: () => ({ lockedCwd: path.join(f.repoDir, "outside") }),
+    });
+    await expect(
+      scoped.executeTool("get_workspace_retirement_status", { operationId }),
+    ).rejects.toThrow("outside the caller scope");
+  } finally {
+    await f.close();
+  }
+});
+test("caller untrusted-source refusal is recorded as a typed hold before reservation", async () => {
+  const f = await canonicalArchiveFixture();
+  const api = await import("./workspace-retirement.js");
+  const operationId = randomUUID();
+  try {
+    await f.registry.update("old-a", (r) => ({
+      ...r,
+      untrustedSource: {
+        kind: "change_request",
+        forge: "github",
+        number: 1,
+        headRepository: "fixture/untrusted",
+      },
+    }));
+    await expect(
+      archiveByScope(f.deps, {
+        scope: { kind: "workspace", workspaceId: "old-a" },
+        requestId: "untrusted",
+        operationId,
+      }),
+    ).rejects.toThrow("Scripts are blocked");
+    expect(await api.getWorkspaceRetirementStatus(f.layout, operationId)).toMatchObject({
+      state: "refused",
+      terminal: true,
+      code: "workspace_automation_blocked",
+    });
+    expect((await f.layout.inspect()).retirements ?? []).toHaveLength(0);
+    expect(f.deps.killTerminalsForWorkspace).not.toHaveBeenCalled();
+  } finally {
+    await f.close();
+  }
+});
+test("a caller ID lookup rejects a copied record for another operation", async () => {
+  const f = await canonicalArchiveFixture();
+  const api = await import("./workspace-retirement.js");
+  const operationId = randomUUID();
+  try {
+    await archiveByScope(f.deps, {
+      scope: { kind: "workspace", workspaceId: "old-a" },
+      requestId: "bound-index",
+      operationId,
+    });
+    const other = randomUUID();
+    const folder = path.join(f.home, "workspace-retirement-operations");
+    writeFileSync(
+      path.join(folder, `${other}.json`),
+      readFileSync(path.join(folder, `${operationId}.json`)),
+    );
+    await expect(api.getWorkspaceRetirementStatus(f.layout, other)).rejects.toThrow(
+      "retirement_operation_binding_changed",
+    );
+  } finally {
+    await f.close();
+  }
+});
+test("caller admission binds native generation before resolving the effect footprint", async () => {
+  const f = await canonicalArchiveFixture();
+  const api = await import("./workspace-retirement.js");
+  const operationId = randomUUID();
+  const get = f.deps.getWorkspace!;
+  let reads = 0;
+  f.deps.getWorkspace = async (id) => {
+    const record = await get(id);
+    if (++reads === 1)
+      await f.registry.update(id, (r) => ({ ...r, createdAt: "2026-11-19T23:59:00.000Z" }));
+    return record;
+  };
+  try {
+    await expect(
+      archiveByScope(f.deps, {
+        scope: { kind: "workspace", workspaceId: "old-a" },
+        requestId: "native-race",
+        operationId,
+      }),
+    ).rejects.toThrow("retirement_operation_generation_changed");
+    expect(await api.getWorkspaceRetirementStatus(f.layout, operationId)).toMatchObject({
+      state: "refused",
+      terminal: true,
+      code: "retirement_operation_generation_changed",
+    });
+    expect(f.deps.killTerminalsForWorkspace).not.toHaveBeenCalled();
+    expect(existsSync(f.worktree.worktreePath)).toBe(true);
+    expect((await f.layout.inspect()).retirements ?? []).toHaveLength(0);
+  } finally {
+    await f.close();
+  }
+});

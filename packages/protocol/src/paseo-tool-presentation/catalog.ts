@@ -245,6 +245,11 @@ export const PASEO_TOOL_CATALOG = {
     context: field("workspaceId"),
     detail: { inputOrder: ["workspaceId", "parentWorkspaceId", "beforeWorkspaceId"] },
   },
+  get_workspace_retirement_status: {
+    label: "Read retirement status",
+    completedLabel: "Read retirement status",
+    detail: { inputOrder: ["operationId"] },
+  },
   archive_workspace: {
     label: "Archive workspace",
     completedLabel: "Archived workspace",
