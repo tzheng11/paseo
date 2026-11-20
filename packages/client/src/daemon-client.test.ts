@@ -9726,3 +9726,105 @@ test("retirement writers are refused before dispatch when the authority lacks th
   ).rejects.toMatchObject({ code: "DAEMON_REQUEST_NOT_SENT", outcome: "not-sent" });
   expect(mock.sent).toHaveLength(0);
 });
+
+test("caller retirement UUID capability is required before archive or readback sends", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://fixture.invalid",
+    clientId: "retirement",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  const connected = client.connect();
+  mock.triggerOpen();
+  await connected;
+  try {
+    const operationId = "00000000-0000-4000-8000-000000000001";
+    await expect(client.archiveWorkspace("a", { operationId })).rejects.toThrow("Update the host");
+    await expect(client.getWorkspaceRetirementStatus(operationId)).rejects.toThrow(
+      "Update the host",
+    );
+    expect(mock.sent).toHaveLength(0);
+    const old = client.archiveWorkspace("a", "old-correlation");
+    const request = parseSentFrame(mock.sent.at(-1));
+    expect(request).toMatchObject({
+      type: "archive_workspace_request",
+      workspaceId: "a",
+      requestId: "old-correlation",
+    });
+    expect(request).not.toHaveProperty("operationId");
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "archive_workspace_response",
+        payload: { requestId: "old-correlation", workspaceId: "a", archivedAt: null, error: null },
+      }),
+    );
+    await old;
+  } finally {
+    await client.close();
+  }
+});
+test("caller retirement UUID and transport correlation stay separate across archive and lookup", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://fixture.invalid",
+    clientId: "retirement",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  const connected = client.connect();
+  mock.triggerOpen({ features: { workspaceRetirementOperations: true } });
+  await connected;
+  try {
+    const operationId = "00000000-0000-4000-8000-000000000001";
+    const archive = client.archiveWorkspace("a", { operationId, requestId: "transport-1" });
+    expect(parseSentFrame(mock.sent.at(-1))).toMatchObject({
+      type: "archive_workspace_request",
+      workspaceId: "a",
+      operationId,
+      requestId: "transport-1",
+    });
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "archive_workspace_response",
+        payload: { requestId: "transport-1", workspaceId: "a", archivedAt: null, error: null },
+      }),
+    );
+    await archive;
+    const status = client.getWorkspaceRetirementStatus(operationId, "transport-2");
+    expect(parseSentFrame(mock.sent.at(-1))).toMatchObject({
+      type: "workspace.retirement.status.request",
+      operationId,
+      requestId: "transport-2",
+    });
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "workspace.retirement.status.response",
+        payload: { requestId: "transport-2", operation: null },
+      }),
+    );
+    expect(await status).toBeNull();
+  } finally {
+    await client.close();
+  }
+});
+test("REV69 retirement capability refusal is typed and not sent", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://fixture.invalid",
+    clientId: "retirement-typed",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  const connected = client.connect();
+  mock.triggerOpen();
+  await connected;
+  try {
+    await expect(
+      client.archiveWorkspace("a", { operationId: "00000000-0000-4000-8000-000000000001" }),
+    ).rejects.toMatchObject({ code: "WORKSPACE_RETIREMENT_UNSUPPORTED", outcome: "not-sent" });
+    expect(mock.sent).toHaveLength(0);
+  } finally {
+    await client.close();
+  }
+});

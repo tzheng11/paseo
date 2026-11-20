@@ -5,9 +5,13 @@ import path from "node:path";
 import { z } from "zod";
 import {
   WorkspaceLayoutCommitSchema,
-  WorkspaceRetirementOutcomeSchema,
   WorkspaceLayoutIdentitySchema,
   WorkspaceLayoutHomeMarkerSchema,
+  WorkspaceRetirementResultSchema,
+  WorkspaceRetirementOperationSchema,
+  WorkspaceRetirementBindingSchema,
+  type WorkspaceRetirementOperation,
+  type WorkspaceRetirementBinding,
   workspaceReferenceKey,
   type WorkspaceLayoutCommit,
   type WorkspaceLayoutMutation,
@@ -19,9 +23,16 @@ import type { PersistedWorkspaceRecord } from "./workspace-registry.js";
 import { hashLayoutValue, WorkspaceLayoutRefusal } from "./workspace-layout-store.js";
 import { writeFileDurably } from "./atomic-file.js";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { assertWorkspaceAutomationAllowed } from "./workspace-automation-gate.js";
+import {
+  assertWorkspaceAutomationAllowed,
+  WorkspaceAutomationBlockedError,
+} from "./workspace-automation-gate.js";
+import { serializeWorkspaceBacking, nativeTransitionKey } from "./workspace-retirement-context.js";
 
 interface RetirementContext {
+  operationId: string;
+  backingGeneration: string;
+  verifyHook: (binding: WorkspaceRetirementBinding) => Promise<void>;
   active: boolean;
   archiveTimestamp: string;
   archive: () => Promise<void>;
@@ -88,14 +99,7 @@ export type RetirementAuthority = Pick<
   WorkspaceLayoutService,
   "inspect" | "commit" | "findReceipt" | "options"
 >;
-const ResultSchema = z.object({
-  archivedAgentIds: z.array(z.string()),
-  archivedWorkspaceIds: z.array(z.string()),
-  removedDirectory: z.boolean(),
-  directoryLeftBehind: z.object({ path: z.string(), reason: z.string() }).optional(),
-  slotKept: z.boolean().optional(),
-  retirement: WorkspaceRetirementOutcomeSchema.optional(),
-});
+const ResultSchema = WorkspaceRetirementResultSchema;
 export type RetirementResult = z.infer<typeof ResultSchema>;
 const JournalSchema = z.strictObject({
   schemaVersion: z.literal(1),
@@ -113,6 +117,7 @@ const JournalSchema = z.strictObject({
 });
 type RetirementJournal = z.infer<typeof JournalSchema>;
 interface RetirementInput {
+  operationId?: string;
   expectedProjectId?: string;
   authority: RetirementAuthority;
   records: PersistedWorkspaceRecord[];
@@ -192,13 +197,23 @@ export async function retireCanonicalWorkspace(input: RetirementInput): Promise<
   const generation = nativeGeneration(records);
   const journalDirectory = path.join(home, "workspace-retirements");
   const file = path.join(journalDirectory, `${generation}.json`);
-  const replay = await replayRetirement({ authority, records, generation, file, journalDirectory });
+  const replay = await replayRetirement({
+    authority,
+    records,
+    generation,
+    file,
+    journalDirectory,
+    operationId: input.operationId,
+  });
   if (replay) return replay;
   await requireLiveNativeTargets(input);
   const freshBefore = await authority.inspect();
   const identity = WorkspaceLayoutIdentitySchema.parse(authority.options.config);
   const backingPaths = [
-    ...new Set(records.map((record) => path.resolve(record.worktreeRoot ?? record.cwd))),
+    ...new Set([
+      path.resolve(backing),
+      ...records.map((record) => path.resolve(record.worktreeRoot ?? record.cwd)),
+    ]),
   ];
   for (const backingPath of backingPaths)
     await assertWorkspaceBackingAvailable(
@@ -274,7 +289,7 @@ export async function retireCanonicalWorkspace(input: RetirementInput): Promise<
   }
   await verifyNativeInventory(await authority.inspect());
   const backingGeneration = hashLayoutValue({ observed, generation });
-  const operationId = randomUUID();
+  const operationId = input.operationId ?? randomUUID();
   const journal: z.infer<typeof JournalSchema> = {
     schemaVersion: 1,
     identity,
@@ -387,6 +402,25 @@ export async function retireCanonicalWorkspace(input: RetirementInput): Promise<
     );
     const result = await withWorkspaceRetirement(
       {
+        operationId,
+        backingGeneration,
+        verifyHook: async (binding) => {
+          await verify();
+          const record = records.find((candidate) => candidate.workspaceId === binding.workspaceId);
+          if (
+            !record ||
+            journal.steps[`path-teardown:${binding.teardownCwd}`] !== "started" ||
+            path.resolve(record.cwd) !== path.resolve(binding.teardownCwd) ||
+            path.resolve(backing) !== path.resolve(binding.worktreePath)
+          )
+            throw new WorkspaceLayoutRefusal("retirement_hook_binding_changed");
+          const hookSnapshot = await authority.inspect();
+          if (
+            hookSnapshot.retirements?.find((operation) => operation.operationId === operationId)
+              ?.state !== "archived"
+          )
+            throw new WorkspaceLayoutRefusal("retirement_archive_receipt_required");
+        },
         home,
         workspaceIds: targetIds,
         archiveTimestamp: journal.archiveTimestamp,
@@ -445,6 +479,7 @@ export async function retireCanonicalWorkspace(input: RetirementInput): Promise<
   }
 }
 interface ReplayInput {
+  operationId?: string;
   authority: RetirementAuthority;
   records: PersistedWorkspaceRecord[];
   generation: string;
@@ -521,6 +556,12 @@ async function replayRetirement(input: ReplayInput): Promise<RetirementResult | 
     (candidate) => candidate.operationId === journal.operationId,
   );
   assertReplayBinding(journal, input, operation);
+  if (
+    input.operationId &&
+    input.operationId !== journal.operationId &&
+    !(journal.closedWithoutReservation && !operation)
+  )
+    throw new WorkspaceLayoutRefusal("retirement_operation_id_conflict");
   if (completionKnown(journal, operation)) return completedReplay(journal, input);
   if (journal.closedWithoutReservation && !operation) {
     const history = path.join(input.journalDirectory, "history");
@@ -705,5 +746,339 @@ export async function refuseRetirementObservationConflict(
       for (const reserved of journal.backingPaths)
         if (await backingPathsOverlap(reserved, candidate))
           throw new WorkspaceLayoutRefusal("retirement_backing_reserved");
+  }
+}
+
+const CallerOperationSchema = WorkspaceRetirementOperationSchema.extend({
+  schemaVersion: z.literal(1),
+  identity: WorkspaceLayoutIdentitySchema,
+  nativeGeneration: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .nullable(),
+});
+type CallerOperation = z.infer<typeof CallerOperationSchema>;
+const runningCallerOperations = new Set<string>();
+function operationFile(authority: RetirementAuthority, operationId: string): string {
+  const id = z.string().uuid().parse(operationId).toLowerCase();
+  return path.join(authority.options.home, "workspace-retirement-operations", `${id}.json`);
+}
+async function readCallerOperation(
+  authority: RetirementAuthority,
+  operationId: string,
+): Promise<CallerOperation | null> {
+  try {
+    const record = CallerOperationSchema.parse(
+      JSON.parse(await readFile(operationFile(authority, operationId), "utf8")),
+    );
+    if (
+      record.operationId !== z.string().uuid().parse(operationId).toLowerCase() ||
+      (record.result?.retirement && record.result.retirement.operationId !== record.operationId) ||
+      record.ownerServerId !== authority.options.serverId ||
+      hashLayoutValue(record.identity) !==
+        hashLayoutValue(WorkspaceLayoutIdentitySchema.parse(authority.options.config))
+    )
+      throw new WorkspaceLayoutRefusal("retirement_operation_binding_changed");
+    return record;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+async function callerJournal(
+  authority: RetirementAuthority,
+  record: CallerOperation,
+): Promise<RetirementJournal | null> {
+  if (!record.nativeGeneration) return null;
+  const journal = await readOptionalJournal(
+    path.join(authority.options.home, "workspace-retirements", `${record.nativeGeneration}.json`),
+  );
+  if (
+    journal?.operationId === record.operationId &&
+    (journal.nativeGeneration !== record.nativeGeneration ||
+      hashLayoutValue(journal.identity) !== hashLayoutValue(record.identity))
+  )
+    throw new WorkspaceLayoutRefusal("retirement_operation_binding_changed");
+  return journal?.operationId === record.operationId ? journal : null;
+}
+function operationState(
+  result: RetirementResult | null,
+  closedWithoutReservation: boolean,
+  running: boolean,
+): WorkspaceRetirementOperation["state"] {
+  if (result?.retirement?.state === "complete") return "complete";
+  if (closedWithoutReservation) return "refused";
+  if (!result && running) return "pending";
+  return "partial";
+}
+function setCallerOutcome(
+  record: CallerOperation,
+  journal: RetirementJournal | null,
+  result: RetirementResult | null,
+  error?: unknown,
+): void {
+  record.result = result;
+  record.backingGeneration = journal?.backingGeneration ?? null;
+  record.state = operationState(result, journal?.closedWithoutReservation ?? false, false);
+  if (error !== undefined && !journal) record.state = "refused";
+  record.terminal = record.state === "complete" || record.state === "refused";
+  record.code = result?.retirement?.code ?? null;
+  if (error !== undefined && record.state !== "complete") record.code = refusalCode(error);
+}
+async function readLookupJournal(
+  file: string,
+  operationId: string,
+  exact: boolean,
+): Promise<RetirementJournal | null> {
+  let bytes: string;
+  try {
+    bytes = await readFile(file, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(bytes);
+  } catch {
+    throw new WorkspaceLayoutRefusal("retirement_lookup_integrity_failed");
+  }
+  if (
+    !exact &&
+    raw &&
+    typeof raw === "object" &&
+    "operationId" in raw &&
+    typeof raw.operationId === "string" &&
+    raw.operationId !== operationId
+  )
+    return null;
+  const parsed = JournalSchema.safeParse(raw);
+  if (!parsed.success) throw new WorkspaceLayoutRefusal("retirement_lookup_integrity_failed");
+  if (parsed.data.operationId !== operationId)
+    throw new WorkspaceLayoutRefusal("retirement_operation_binding_changed");
+  return parsed.data;
+}
+async function unindexedOperation(
+  authority: RetirementAuthority,
+  operationId: string,
+): Promise<WorkspaceRetirementOperation | null> {
+  const id = z.string().uuid().parse(operationId).toLowerCase();
+  const directory = path.join(authority.options.home, "workspace-retirements");
+  let files: string[];
+  try {
+    files = (await readdir(directory)).filter((file) => /^[a-f0-9]{64}\.json$/.test(file));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+  const historyFile = path.join("history", `${id}.json`);
+  files.push(historyFile);
+  for (const file of files) {
+    const journal = await readLookupJournal(path.join(directory, file), id, file === historyFile);
+    if (!journal) continue;
+    if (
+      hashLayoutValue(journal.identity) !==
+      hashLayoutValue(WorkspaceLayoutIdentitySchema.parse(authority.options.config))
+    )
+      throw new WorkspaceLayoutRefusal("retirement_operation_binding_changed");
+    const reserve = journal.intents
+      .flatMap((intent) => intent.mutations)
+      .find((mutation) => mutation.kind === "reserve-retirement");
+    if (
+      !reserve ||
+      reserve.kind !== "reserve-retirement" ||
+      reserve.targets.length !== 1 ||
+      reserve.ownerServerId !== authority.options.serverId
+    )
+      throw new WorkspaceLayoutRefusal("retirement_operation_scope_unavailable");
+    const state = operationState(journal.result, journal.closedWithoutReservation, false);
+    return WorkspaceRetirementOperationSchema.parse({
+      operationId: id,
+      workspaceId: reserve.targets[0].ref.workspaceId,
+      ownerServerId: authority.options.serverId,
+      state,
+      terminal: state !== "partial",
+      code:
+        journal.result?.retirement?.code ??
+        (state === "partial" ? "retirement_reconciliation_required" : null),
+      backingGeneration: journal.backingGeneration,
+      result: journal.result,
+    });
+  }
+  return null;
+}
+/** Pure projection: never reconciles receipts, repairs a journal or authorizes an effect. */
+export async function getWorkspaceRetirementStatus(
+  authority: RetirementAuthority,
+  operationId: string,
+): Promise<WorkspaceRetirementOperation | null> {
+  const record = await readCallerOperation(authority, operationId);
+  if (!record) return unindexedOperation(authority, operationId);
+  if (record.state !== "pending") return WorkspaceRetirementOperationSchema.parse(record);
+  const journal = await callerJournal(authority, record);
+  const result = journal?.result ?? null;
+  const running = runningCallerOperations.has(operationFile(authority, operationId));
+  const state = operationState(result, journal?.closedWithoutReservation ?? false, running);
+  return WorkspaceRetirementOperationSchema.parse({
+    ...record,
+    state,
+    terminal: state === "complete" || state === "refused",
+    backingGeneration: journal?.backingGeneration ?? null,
+    result,
+    code:
+      result?.retirement?.code ??
+      (state === "partial" ? "retirement_reconciliation_required" : null),
+  });
+}
+function replayCallerOperation(record: WorkspaceRetirementOperation): RetirementResult {
+  if (record.state === "refused" && !record.result)
+    throw new WorkspaceLayoutRefusal(record.code ?? "retirement_refused");
+  return record.result ?? partial(record.operationId, record.code ?? "retirement_in_progress");
+}
+function refusalCode(error: unknown): string {
+  if (error instanceof WorkspaceLayoutRefusal) return error.code;
+  if (error instanceof WorkspaceAutomationBlockedError) return "workspace_automation_blocked";
+  if (error instanceof Error && /^[a-z][a-z0-9_]{1,127}$/.test(error.message)) return error.message;
+  return "workspace_archive_failed";
+}
+export async function withCallerRetirementOperation(input: {
+  authority: RetirementAuthority;
+  operationId: string;
+  workspaceId: string;
+  getRecord: (id: string) => Promise<PersistedWorkspaceRecord | null>;
+  backingPaths: (record: PersistedWorkspaceRecord) => Promise<readonly string[]>;
+  run: (expectedNativeGeneration: string) => Promise<RetirementResult>;
+}): Promise<RetirementResult> {
+  const { authority, workspaceId } = input;
+  const operationId = z.string().uuid().parse(input.operationId).toLowerCase();
+  const file = operationFile(authority, operationId);
+  async function replay() {
+    const record = await getWorkspaceRetirementStatus(authority, operationId);
+    if (record && record.workspaceId !== workspaceId)
+      throw new WorkspaceLayoutRefusal("retirement_operation_id_conflict");
+    return record ? replayCallerOperation(record) : null;
+  }
+  const existing = await replay();
+  if (existing) return existing;
+  const observed = await input.getRecord(workspaceId);
+  const paths = observed ? await input.backingPaths(observed) : [];
+  return serializeWorkspaceBacking(
+    {
+      paths,
+      keys: [
+        nativeTransitionKey(authority.options.home, "workspace", workspaceId),
+        nativeTransitionKey(
+          authority.options.home,
+          "workspace",
+          `retirement-operation:${operationId}`,
+        ),
+      ],
+    },
+    async () => {
+      const afterAcquisition = await replay();
+      if (afterAcquisition) return afterAcquisition;
+      const record: CallerOperation = {
+        schemaVersion: 1,
+        identity: WorkspaceLayoutIdentitySchema.parse(authority.options.config),
+        ownerServerId: authority.options.serverId,
+        operationId,
+        workspaceId,
+        nativeGeneration: null,
+        backingGeneration: null,
+        state: "pending",
+        terminal: false,
+        code: null,
+        result: null,
+      };
+      await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+      const persist = () => writeFileDurably(file, `${JSON.stringify(record)}\n`);
+      // After acquiring the full read set, this intent precedes policy checks and effects.
+      await persist();
+      runningCallerOperations.add(file);
+      try {
+        if (
+          (await authority.inspect()).retirements?.some(
+            (operation) => operation.operationId === operationId,
+          )
+        )
+          throw new WorkspaceLayoutRefusal("retirement_operation_id_conflict");
+        const native = await input.getRecord(workspaceId);
+        if (!native) throw new WorkspaceLayoutRefusal("workspace_not_found");
+        if (!observed || nativeGeneration([native]) !== nativeGeneration([observed]))
+          throw new WorkspaceLayoutRefusal("retirement_operation_generation_changed");
+        record.nativeGeneration = nativeGeneration([native]);
+        await persist();
+        const result = await input.run(record.nativeGeneration);
+        const journal = await callerJournal(authority, record);
+        setCallerOutcome(record, journal, result);
+        await persist();
+        return result;
+      } catch (error) {
+        const refusal =
+          error instanceof Error && error.message === "workspace_backing_scope_conflict"
+            ? new WorkspaceLayoutRefusal("retirement_admission_contended")
+            : error;
+        const journal = await callerJournal(authority, record);
+        setCallerOutcome(record, journal, journal?.result ?? null, refusal);
+        await persist();
+        throw refusal;
+      } finally {
+        runningCallerOperations.delete(file);
+      }
+    },
+  );
+}
+
+interface LiveHook {
+  binding: WorkspaceRetirementBinding;
+  verify: () => Promise<void>;
+  active: boolean;
+}
+const liveHooks = new Map<string, LiveHook>();
+function hookKey(home: string, binding: WorkspaceRetirementBinding): string {
+  return `${path.resolve(home)}:${hashLayoutValue(binding)}`;
+}
+/** Only a synchronous, currently awaited hook may use this lease. Durable evidence is insufficient. */
+export async function withWorkspaceRetirementHook<T>(
+  input: { workspaceId: string | null; worktreePath: string; teardownCwd: string },
+  run: (binding?: WorkspaceRetirementBinding, ownerHome?: string) => Promise<T>,
+): Promise<T> {
+  const context = currentRetirement.getStore();
+  if (!context) return run();
+  if (!context.active || !input.workspaceId || !context.workspaceIds.has(input.workspaceId))
+    throw new WorkspaceLayoutRefusal("retirement_hook_not_active");
+  const binding = WorkspaceRetirementBindingSchema.parse({
+    ...input,
+    operationId: context.operationId,
+    backingGeneration: context.backingGeneration,
+  });
+  await context.verifyHook(binding);
+  const entry: LiveHook = { binding, active: true, verify: () => context.verifyHook(binding) };
+  const key = hookKey(context.home, binding);
+  if (liveHooks.has(key)) throw new WorkspaceLayoutRefusal("retirement_hook_already_active");
+  liveHooks.set(key, entry);
+  try {
+    return await run(binding, path.resolve(context.home));
+  } finally {
+    entry.active = false;
+    liveHooks.delete(key);
+  }
+}
+export async function verifyWorkspaceRetirementBinding(
+  home: string,
+  input: WorkspaceRetirementBinding,
+): Promise<{ valid: boolean; code: string | null }> {
+  const binding = WorkspaceRetirementBindingSchema.parse(input);
+  const key = hookKey(home, binding),
+    entry = liveHooks.get(key);
+  if (!entry?.active) return { valid: false, code: "retirement_hook_not_active" };
+  try {
+    // No reacquisition: the archive already holds the backing fence while awaiting its hook.
+    await entry.verify();
+    if (!entry.active || liveHooks.get(key) !== entry)
+      return { valid: false, code: "retirement_hook_not_active" };
+    return { valid: true, code: null };
+  } catch (error) {
+    return { valid: false, code: refusalCode(error) };
   }
 }

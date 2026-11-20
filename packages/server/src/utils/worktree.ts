@@ -1,3 +1,4 @@
+import type { WorkspaceRetirementBinding } from "@getpaseo/protocol/workspace-layout";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import { constants as fsConstants, realpath } from "fs";
@@ -733,12 +734,16 @@ export async function resolveWorktreeRuntimeEnv(options: {
 }
 
 export async function runWorktreeTeardownCommands(options: {
+  retirementBinding?: WorkspaceRetirementBinding;
+  retirementHome?: string;
   worktreePath: string;
   teardownCwd?: string;
   branchName?: string;
   repoRootPath?: string;
 }): Promise<WorktreeTeardownCommandResult[]> {
   const teardownCwd = options.teardownCwd ?? options.worktreePath;
+  if (options.retirementBinding && !options.retirementHome)
+    throw new Error("retirement_owner_home_required");
   if ((await getOwnershipRelativePath(options.worktreePath, teardownCwd)) === null) {
     throw new Error(`Worktree teardown cwd is outside the worktree: ${teardownCwd}`);
   }
@@ -761,6 +766,12 @@ export async function runWorktreeTeardownCommands(options: {
       PASEO_SOURCE_CHECKOUT_PATH: repoRootPath,
       // Backward-compatible alias.
       PASEO_ROOT_PATH: repoRootPath,
+      ...(options.retirementBinding ? { PASEO_HOME: options.retirementHome } : {}),
+      PASEO_RETIREMENT_OPERATION_ID: options.retirementBinding?.operationId,
+      PASEO_RETIREMENT_BACKING_GENERATION: options.retirementBinding?.backingGeneration,
+      PASEO_RETIREMENT_WORKSPACE_ID: options.retirementBinding?.workspaceId,
+      PASEO_RETIREMENT_WORKTREE_PATH: options.retirementBinding?.worktreePath,
+      PASEO_RETIREMENT_TEARDOWN_CWD: options.retirementBinding?.teardownCwd,
       PASEO_WORKTREE_PATH: options.worktreePath,
       PASEO_BRANCH_NAME: branchName,
       ...(worktreePort !== null ? { PASEO_WORKTREE_PORT: String(worktreePort) } : {}),

@@ -528,3 +528,76 @@ test, old 0.14 proof, version label or missing new optional config field does no
 qualify a 0.15 recovery reader. Runtime/terminal compatibility, installed Desktop
 behavior, exact artifact identity and current operation/work custody remain
 separate release requirements.
+
+### Caller-owned retirement IDs and synchronous consumer cleanup
+
+Canonical exact-workspace archive accepts an optional caller-preallocated UUID:
+`paseo workspace archive <id> --operation-id <uuid> --json`, SDK
+`archiveWorkspace(id, {operationId, requestId?})`, and MCP
+`archive_workspace({workspaceId, operationId})`. The UUID identifies the durable
+operation; `requestId` only correlates a transport response. Persist the UUID before
+calling. A timeout means read that operation on the same owner host, never select by
+CWD/name/newest and never rerun cleanup. The SDK requires the additive
+`workspaceRetirementOperations` capability before sending an explicit ID. Ordinary
+no-ID archive and legacy homes retain their existing behavior; explicit IDs have no
+legacy fallback.
+
+`workspace retirement-status <uuid> --json` and SDK
+`getWorkspaceRetirementStatus(uuid)` only read evidence. Unknown IDs return
+`not-found`/`null`. The projection reports `pending`, terminal `refused`, `partial`
+or `complete`, a typed code, the backing generation and the recorded archive result
+(including receipt, directory removal, kept slot and preservation reason). It never
+repairs a journal, reconciles a write or starts an operation. Early holds are durable
+before effects; a refused ID cannot become a fresh attempt after its hold clears.
+Backing contention waits before durable admission with the original UUID; status
+may still be `not-found` while that call is queued. Unknown is not proof that the
+request was never sent. An already-pending same-ID archive response uses
+`retirement.state: partial` with `retirement_in_progress` (MCP also sets `isError`);
+read status to distinguish pending from a finished partial teardown. No effects
+are retried by that response.
+
+A dynamic read-set expansion that still cannot be admitted returns the terminal
+refusal code `retirement_admission_contended`, not a workspace hold. Recheck
+eligibility and retry with a **new UUID** after that known transient refusal.
+Use a new UUID for a newly admitted request. Reuse with a different workspace
+conflicts. Incomplete evidence remains partial; lookup is not recovery authority.
+MCP exposes the equivalent scope-checked `get_workspace_retirement_status` tool.
+
+A canonical synchronous `worktree.teardown` receives
+`PASEO_RETIREMENT_OPERATION_ID`, `PASEO_RETIREMENT_BACKING_GENERATION`,
+`PASEO_RETIREMENT_WORKSPACE_ID`, `PASEO_RETIREMENT_WORKTREE_PATH` and
+`PASEO_RETIREMENT_TEARDOWN_CWD`. It also receives `PASEO_HOME` set to the
+absolute owning daemon home, overriding an inherited home. Use explicit
+`--home "$PASEO_HOME"` for verification so ambient endpoint settings cannot select
+another daemon. No-ID hooks on non-layout homes keep their inherited home.
+The generation includes canonical backing paths,
+filesystem identity, native creation identities and shared references. Inherited
+values cannot manufacture this binding. Before dependency/service cleanup, the hook
+uses normal existing authorization to call `workspace retirement-verify <uuid>`
+with `--workspace-id`, `--backing-generation`, `--worktree-path` and
+`--teardown-cwd` from those fields (SDK `verifyWorkspaceRetirementBinding`). A false
+verification exits nonzero. Status needs `workspace.read`; verification uses the
+archive `workspace.manage` or `hub.execute` permission.
+
+Verification requires the exact currently awaited hook, its live backing fence,
+started effect step and fresh authority/native/shared-reference checks. It takes no
+second backing lease, which would deadlock the hook. A durable receipt or started
+journal does not authorize cleanup after hook exit, failure, daemon restart or slot
+reuse. Keep cleanup synchronous: a successful verification is not a reusable permit
+for a detached callback. No credential, connection or layout configuration change
+is part of this interface.
+
+Install the new daemon packet and matching CLI on each target host before its
+consumer starts sending explicit IDs there. During a mixed fleet, hosts without
+`workspaceRetirementOperations` remain unavailable for this consumer; the SDK and
+CLI report `WORKSPACE_RETIREMENT_UNSUPPORTED` before sending, not a hold or an
+uncertain archive. Upgrade the layout authority first and finish every adopted
+writer before permitting retirement; this source provides no automatic fleet-wide
+build census. The six-host installation is supervised separately.
+
+Unknown-ID fallback reads only generation-named journals and the exact historical
+UUID. A foreign non-journal filename, or a parsed record explicitly carrying
+another operation ID, does not poison that lookup. Matching or indexed corruption,
+and an undecodable generation-named file whose ID cannot be determined, remain a
+typed `retirement_lookup_integrity_failed`/binding failure. Lookup never repairs or
+deletes that evidence; destructive admission retains its existing strict fences.

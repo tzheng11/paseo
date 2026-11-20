@@ -1,3 +1,7 @@
+import type {
+  WorkspaceRetirementBinding,
+  WorkspaceRetirementOperation,
+} from "@getpaseo/protocol/workspace-layout";
 import { NATIVE_WORKSPACE_LAYOUT_WRITER_REQUESTS } from "@getpaseo/protocol/workspace-layout";
 import type {
   WorkspaceLayoutIdentity,
@@ -1078,6 +1082,15 @@ export class DaemonConnectionError extends Error {
     this.serverId = context?.serverId;
     this.outcome = context?.outcome;
     this.name = "DaemonConnectionError";
+  }
+}
+
+export class WorkspaceRetirementUnsupportedError extends Error {
+  readonly code = "WORKSPACE_RETIREMENT_UNSUPPORTED";
+  readonly outcome = "not-sent";
+  constructor() {
+    super("Update the host to use workspace retirement operation IDs");
+    this.name = "WorkspaceRetirementUnsupportedError";
   }
 }
 
@@ -3176,16 +3189,49 @@ export class DaemonClient {
 
   async archiveWorkspace(
     workspaceId: string,
-    requestId?: string,
+    options?: string | { requestId?: string; operationId?: string },
   ): Promise<ArchiveWorkspacePayload> {
+    const { requestId, operationId } =
+      typeof options === "string" ? { requestId: options } : (options ?? {});
+    if (operationId) this.requireWorkspaceRetirementOperations();
     return this.sendCorrelatedSessionRequest({
       requestId,
       message: {
         type: "archive_workspace_request",
         workspaceId,
+        ...(operationId ? { operationId } : {}),
       },
       responseType: "archive_workspace_response",
     });
+  }
+
+  private requireWorkspaceRetirementOperations(): void {
+    if (this.lastServerInfoMessage?.features?.workspaceRetirementOperations !== true)
+      throw new WorkspaceRetirementUnsupportedError();
+  }
+  async getWorkspaceRetirementStatus(
+    operationId: string,
+    requestId?: string,
+  ): Promise<WorkspaceRetirementOperation | null> {
+    this.requireWorkspaceRetirementOperations();
+    const payload = await this.sendCorrelatedSessionRequest({
+      requestId,
+      message: { type: "workspace.retirement.status.request", operationId },
+      responseType: "workspace.retirement.status.response",
+    });
+    return payload.operation;
+  }
+  async verifyWorkspaceRetirementBinding(
+    binding: WorkspaceRetirementBinding,
+    requestId?: string,
+  ): Promise<{ valid: boolean; code: string | null }> {
+    this.requireWorkspaceRetirementOperations();
+    const payload = await this.sendCorrelatedSessionRequest({
+      requestId,
+      message: { type: "workspace.retirement.verify.request", ...binding },
+      responseType: "workspace.retirement.verify.response",
+    });
+    return { valid: payload.valid, code: payload.code };
   }
 
   observeWorkspaceSetup(

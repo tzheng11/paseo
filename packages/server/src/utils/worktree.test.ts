@@ -547,3 +547,44 @@ describe("slugify", () => {
     }
   });
 });
+
+it("legacy teardown clears inherited retirement bindings rather than manufacturing a fence", async () => {
+  const root = mkdtempSync(join(tmpdir(), "retirement-env-"));
+  const keys = [
+    "PASEO_RETIREMENT_OPERATION_ID",
+    "PASEO_RETIREMENT_BACKING_GENERATION",
+    "PASEO_RETIREMENT_WORKSPACE_ID",
+    "PASEO_RETIREMENT_WORKTREE_PATH",
+    "PASEO_RETIREMENT_TEARDOWN_CWD",
+  ];
+  const previous = keys.map((key) => process.env[key]);
+  try {
+    execFileSync("git", ["init", "-b", "main"], { cwd: root, stdio: "pipe" });
+    keys.forEach((key) => {
+      process.env[key] = "inherited-fake";
+    });
+    writeFileSync(
+      join(root, "paseo.json"),
+      JSON.stringify({
+        worktree: {
+          teardown: [
+            `node -e 'require("fs").writeFileSync("binding.json",JSON.stringify(Object.fromEntries(${JSON.stringify(keys)}.filter(k=>process.env[k]!==undefined).map(k=>[k,process.env[k]]))))'`,
+          ],
+        },
+      }),
+    );
+    await runWorktreeTeardownCommands({
+      worktreePath: root,
+      teardownCwd: root,
+      repoRootPath: root,
+      branchName: "fixture",
+    });
+    expect(JSON.parse(readFileSync(join(root, "binding.json"), "utf8"))).toEqual({});
+  } finally {
+    keys.forEach((key, i) => {
+      if (previous[i] === undefined) delete process.env[key];
+      else process.env[key] = previous[i];
+    });
+    rmSync(root, { recursive: true, force: true });
+  }
+});

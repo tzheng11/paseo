@@ -1,7 +1,11 @@
 import { Command } from "commander";
 import { withOutput } from "../../output/index.js";
 import { addJsonAndDaemonHostOptions } from "../../utils/command-options.js";
-import { runArchiveCommand } from "./archive.js";
+import {
+  runArchiveCommand,
+  runRetirementStatusCommand,
+  runRetirementVerifyCommand,
+} from "./archive.js";
 import { runCreateCommand } from "./create.js";
 import { runLsCommand } from "./ls.js";
 import { runMoveCommand } from "./move.js";
@@ -76,8 +80,25 @@ export function createWorkspaceCommand(): Command {
     workspace
       .command("archive")
       .description("Archive a workspace and everything it owns")
-      .argument("<workspace-id>", "Workspace id"),
+      .argument("<workspace-id>", "Workspace id")
+      .option("--operation-id <uuid>", "Caller-preallocated canonical retirement operation id"),
   ).action(withOutput(runArchiveCommand));
 
+  addJsonAndDaemonHostOptions(
+    workspace
+      .command("retirement-status")
+      .description("Read a retirement operation without starting or retrying it")
+      .argument("<operation-id>", "Retirement operation UUID"),
+  ).action(withOutput(runRetirementStatusCommand));
+  addJsonAndDaemonHostOptions(
+    workspace
+      .command("retirement-verify")
+      .description("Verify a currently running synchronous retirement hook binding")
+      .argument("<operation-id>", "Retirement operation UUID")
+      .requiredOption("--workspace-id <id>", "Original workspace id")
+      .requiredOption("--backing-generation <sha256>", "Backing/path generation")
+      .requiredOption("--worktree-path <path>", "Exact worktree path")
+      .requiredOption("--teardown-cwd <path>", "Exact teardown cwd"),
+  ).action(withOutput(runRetirementVerifyCommand));
   return workspace;
 }

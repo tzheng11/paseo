@@ -8106,13 +8106,14 @@ export class Session {
   ): Promise<void> {
     try {
       const existing = await this.workspaceRegistry.get(request.workspaceId);
-      if (!existing) {
+      if (!existing && !request.operationId) {
         throw new Error(`Workspace not found: ${request.workspaceId}`);
       }
 
       const result = await archiveByScope(this.workspaceArchiveDependencies(), {
-        scope: { kind: "workspace", workspaceId: existing.workspaceId },
+        scope: { kind: "workspace", workspaceId: request.workspaceId },
         requestId: request.requestId,
+        operationId: request.operationId,
       });
 
       const archivedWorkspace = await this.workspaceRegistry.get(request.workspaceId);

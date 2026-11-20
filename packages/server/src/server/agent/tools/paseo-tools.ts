@@ -1,3 +1,5 @@
+import { getWorkspaceRetirementStatus } from "../../workspace-retirement.js";
+import { WorkspaceRetirementOperationSchema } from "@getpaseo/protocol/workspace-layout";
 import { assertWorkspaceAutomationAllowedForWorkspace } from "../../workspace-automation-gate.js";
 import { WorkspaceArchiveOutcomeSchema } from "@getpaseo/protocol/workspace-layout";
 import {
@@ -2361,11 +2363,36 @@ function createToolCatalog(
   );
 
   registerTool(
+    "get_workspace_retirement_status",
+    {
+      title: "Read workspace retirement status",
+      description: "Read the original durable operation. Never starts or retries cleanup.",
+      inputSchema: { operationId: z.string().uuid() },
+      outputSchema: { operation: WorkspaceRetirementOperationSchema.nullable() },
+    },
+    async ({ operationId }) => {
+      if (!options.workspaceLayoutService)
+        throw new PaseoToolInputError("Canonical retirement is unavailable");
+      const operation = await getWorkspaceRetirementStatus(
+        options.workspaceLayoutService,
+        operationId,
+      );
+      const lockedCwd = callerContext?.lockedCwd?.trim();
+      if (operation && lockedCwd) {
+        const workspace = await options.workspaceRegistry?.get(operation.workspaceId);
+        if (!workspace || !isSameOrDescendantPath(expandUserPath(lockedCwd), workspace.cwd))
+          throw new PaseoToolInputError("Workspace is outside the caller scope");
+      }
+      return { content: [], structuredContent: ensureValidJson({ operation }) };
+    },
+  );
+
+  registerTool(
     "archive_workspace",
     {
       title: "Archive workspace",
       description: "Archive a workspace and everything it owns.",
-      inputSchema: { workspaceId: z.string().min(1) },
+      inputSchema: { workspaceId: z.string().min(1), operationId: z.string().uuid().optional() },
       outputSchema: {
         workspaceId: z.string(),
         ...WorkspaceArchiveOutcomeSchema.shape,
@@ -2373,7 +2400,7 @@ function createToolCatalog(
         removedDirectory: z.boolean(),
       },
     },
-    async ({ workspaceId }) => {
+    async ({ workspaceId, operationId }) => {
       if (!options.listActiveWorkspaces) {
         throw new Error("Active workspace lister is required to archive workspaces");
       }
@@ -2395,6 +2422,7 @@ function createToolCatalog(
           logger: childLogger,
         }),
         {
+          operationId,
           requestId: randomUUID(),
           scope: { kind: "workspace", workspaceId: workspace.workspaceId },
         },
