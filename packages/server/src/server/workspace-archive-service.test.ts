@@ -3409,10 +3409,11 @@ test("caller admission binds native generation before resolving the effect footp
   const operationId = randomUUID();
   const get = f.deps.getWorkspace!;
   let reads = 0;
+  const movedCwd = path.join(f.worktree.worktreePath, "moved-cwd");
+  mkdirSync(movedCwd);
   f.deps.getWorkspace = async (id) => {
     const record = await get(id);
-    if (++reads === 1)
-      await f.registry.update(id, (r) => ({ ...r, createdAt: "2026-11-19T23:59:00.000Z" }));
+    if (++reads === 1) await f.registry.update(id, (r) => ({ ...r, cwd: movedCwd }));
     return record;
   };
   try {
