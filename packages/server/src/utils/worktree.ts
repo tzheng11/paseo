@@ -766,7 +766,9 @@ export async function runWorktreeTeardownCommands(options: {
       PASEO_SOURCE_CHECKOUT_PATH: repoRootPath,
       // Backward-compatible alias.
       PASEO_ROOT_PATH: repoRootPath,
-      ...(options.retirementBinding ? { PASEO_HOME: options.retirementHome } : {}),
+      ...(options.retirementBinding
+        ? { PASEO_HOME: options.retirementHome, PASEO_HOST: undefined }
+        : {}),
       PASEO_RETIREMENT_OPERATION_ID: options.retirementBinding?.operationId,
       PASEO_RETIREMENT_BACKING_GENERATION: options.retirementBinding?.backingGeneration,
       PASEO_RETIREMENT_WORKSPACE_ID: options.retirementBinding?.workspaceId,
