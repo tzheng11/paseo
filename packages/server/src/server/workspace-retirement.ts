@@ -210,7 +210,10 @@ export async function retireCanonicalWorkspace(input: RetirementInput): Promise<
   const freshBefore = await authority.inspect();
   const identity = WorkspaceLayoutIdentitySchema.parse(authority.options.config);
   const backingPaths = [
-    ...new Set(records.map((record) => path.resolve(record.worktreeRoot ?? record.cwd))),
+    ...new Set([
+      path.resolve(backing),
+      ...records.map((record) => path.resolve(record.worktreeRoot ?? record.cwd)),
+    ]),
   ];
   for (const backingPath of backingPaths)
     await assertWorkspaceBackingAvailable(
@@ -408,7 +411,7 @@ export async function retireCanonicalWorkspace(input: RetirementInput): Promise<
             !record ||
             journal.steps[`path-teardown:${binding.teardownCwd}`] !== "started" ||
             path.resolve(record.cwd) !== path.resolve(binding.teardownCwd) ||
-            path.resolve(record.worktreeRoot ?? record.cwd) !== path.resolve(binding.worktreePath)
+            path.resolve(backing) !== path.resolve(binding.worktreePath)
           )
             throw new WorkspaceLayoutRefusal("retirement_hook_binding_changed");
           const hookSnapshot = await authority.inspect();
@@ -822,6 +825,39 @@ function setCallerOutcome(
   record.code = result?.retirement?.code ?? null;
   if (error !== undefined && record.state !== "complete") record.code = refusalCode(error);
 }
+async function readLookupJournal(
+  file: string,
+  operationId: string,
+  exact: boolean,
+): Promise<RetirementJournal | null> {
+  let bytes: string;
+  try {
+    bytes = await readFile(file, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(bytes);
+  } catch {
+    throw new WorkspaceLayoutRefusal("retirement_lookup_integrity_failed");
+  }
+  if (
+    !exact &&
+    raw &&
+    typeof raw === "object" &&
+    "operationId" in raw &&
+    typeof raw.operationId === "string" &&
+    raw.operationId !== operationId
+  )
+    return null;
+  const parsed = JournalSchema.safeParse(raw);
+  if (!parsed.success) throw new WorkspaceLayoutRefusal("retirement_lookup_integrity_failed");
+  if (parsed.data.operationId !== operationId)
+    throw new WorkspaceLayoutRefusal("retirement_operation_binding_changed");
+  return parsed.data;
+}
 async function unindexedOperation(
   authority: RetirementAuthority,
   operationId: string,
@@ -830,15 +866,16 @@ async function unindexedOperation(
   const directory = path.join(authority.options.home, "workspace-retirements");
   let files: string[];
   try {
-    files = (await readdir(directory)).filter((file) => file.endsWith(".json"));
+    files = (await readdir(directory)).filter((file) => /^[a-f0-9]{64}\.json$/.test(file));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;
   }
-  files.push(path.join("history", `${id}.json`));
+  const historyFile = path.join("history", `${id}.json`);
+  files.push(historyFile);
   for (const file of files) {
-    const journal = await readOptionalJournal(path.join(directory, file));
-    if (!journal || journal.operationId !== id) continue;
+    const journal = await readLookupJournal(path.join(directory, file), id, file === historyFile);
+    if (!journal) continue;
     if (
       hashLayoutValue(journal.identity) !==
       hashLayoutValue(WorkspaceLayoutIdentitySchema.parse(authority.options.config))
@@ -888,7 +925,9 @@ export async function getWorkspaceRetirementStatus(
     terminal: state === "complete" || state === "refused",
     backingGeneration: journal?.backingGeneration ?? null,
     result,
-    code: result?.retirement?.code ?? (!running ? "retirement_reconciliation_required" : null),
+    code:
+      result?.retirement?.code ??
+      (state === "partial" ? "retirement_reconciliation_required" : null),
   });
 }
 function replayCallerOperation(record: WorkspaceRetirementOperation): RetirementResult {
@@ -907,6 +946,7 @@ export async function withCallerRetirementOperation(input: {
   operationId: string;
   workspaceId: string;
   getRecord: (id: string) => Promise<PersistedWorkspaceRecord | null>;
+  backingPaths: (record: PersistedWorkspaceRecord) => Promise<readonly string[]>;
   run: (expectedNativeGeneration: string) => Promise<RetirementResult>;
 }): Promise<RetirementResult> {
   const { authority, workspaceId } = input;
@@ -920,10 +960,13 @@ export async function withCallerRetirementOperation(input: {
   }
   const existing = await replay();
   if (existing) return existing;
+  const observed = await input.getRecord(workspaceId);
+  const paths = observed ? await input.backingPaths(observed) : [];
   return serializeWorkspaceBacking(
     {
-      paths: [],
+      paths,
       keys: [
+        nativeTransitionKey(authority.options.home, "workspace", workspaceId),
         nativeTransitionKey(
           authority.options.home,
           "workspace",
@@ -949,7 +992,7 @@ export async function withCallerRetirementOperation(input: {
       };
       await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
       const persist = () => writeFileDurably(file, `${JSON.stringify(record)}\n`);
-      // This intent precedes even admission/hold checks, not only teardown.
+      // After acquiring the full read set, this intent precedes policy checks and effects.
       await persist();
       runningCallerOperations.add(file);
       try {
@@ -961,6 +1004,8 @@ export async function withCallerRetirementOperation(input: {
           throw new WorkspaceLayoutRefusal("retirement_operation_id_conflict");
         const native = await input.getRecord(workspaceId);
         if (!native) throw new WorkspaceLayoutRefusal("workspace_not_found");
+        if (!observed || nativeGeneration([native]) !== nativeGeneration([observed]))
+          throw new WorkspaceLayoutRefusal("retirement_operation_generation_changed");
         record.nativeGeneration = nativeGeneration([native]);
         await persist();
         const result = await input.run(record.nativeGeneration);
@@ -969,10 +1014,14 @@ export async function withCallerRetirementOperation(input: {
         await persist();
         return result;
       } catch (error) {
+        const refusal =
+          error instanceof Error && error.message === "workspace_backing_scope_conflict"
+            ? new WorkspaceLayoutRefusal("retirement_admission_contended")
+            : error;
         const journal = await callerJournal(authority, record);
-        setCallerOutcome(record, journal, journal?.result ?? null, error);
+        setCallerOutcome(record, journal, journal?.result ?? null, refusal);
         await persist();
-        throw error;
+        throw refusal;
       } finally {
         runningCallerOperations.delete(file);
       }
@@ -992,7 +1041,7 @@ function hookKey(home: string, binding: WorkspaceRetirementBinding): string {
 /** Only a synchronous, currently awaited hook may use this lease. Durable evidence is insufficient. */
 export async function withWorkspaceRetirementHook<T>(
   input: { workspaceId: string | null; worktreePath: string; teardownCwd: string },
-  run: (binding?: WorkspaceRetirementBinding) => Promise<T>,
+  run: (binding?: WorkspaceRetirementBinding, ownerHome?: string) => Promise<T>,
 ): Promise<T> {
   const context = currentRetirement.getStore();
   if (!context) return run();
@@ -1009,7 +1058,7 @@ export async function withWorkspaceRetirementHook<T>(
   if (liveHooks.has(key)) throw new WorkspaceLayoutRefusal("retirement_hook_already_active");
   liveHooks.set(key, entry);
   try {
-    return await run(binding);
+    return await run(binding, path.resolve(context.home));
   } finally {
     entry.active = false;
     liveHooks.delete(key);

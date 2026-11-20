@@ -9808,3 +9808,23 @@ test("caller retirement UUID and transport correlation stay separate across arch
     await client.close();
   }
 });
+test("REV69 retirement capability refusal is typed and not sent", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://fixture.invalid",
+    clientId: "retirement-typed",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  const connected = client.connect();
+  mock.triggerOpen();
+  await connected;
+  try {
+    await expect(
+      client.archiveWorkspace("a", { operationId: "00000000-0000-4000-8000-000000000001" }),
+    ).rejects.toMatchObject({ code: "WORKSPACE_RETIREMENT_UNSUPPORTED", outcome: "not-sent" });
+    expect(mock.sent).toHaveLength(0);
+  } finally {
+    await client.close();
+  }
+});

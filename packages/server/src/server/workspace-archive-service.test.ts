@@ -3436,3 +3436,237 @@ test("caller admission binds native generation before resolving the effect footp
     await f.close();
   }
 });
+
+test("REV69 explicit-ID contention waits without burning the caller UUID", async () => {
+  const f = await canonicalArchiveFixture();
+  const { serializeWorkspaceBacking } = await import("./workspace-retirement-context.js");
+  let release!: () => void, entered!: () => void;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  const ready = new Promise<void>((r) => {
+    entered = r;
+  });
+  const holder = serializeWorkspaceBacking(f.worktree.worktreePath, async () => {
+    entered();
+    await gate;
+  });
+  const operationId = randomUUID();
+  let settled = false;
+  let pending: Promise<{ result?: ArchiveResult; error?: unknown }> | undefined;
+  try {
+    await ready;
+    pending = archiveByScope(f.deps, {
+      scope: { kind: "workspace", workspaceId: "old-a" },
+      requestId: "contended",
+      operationId,
+    }).then(
+      (result) => {
+        settled = true;
+        return { result };
+      },
+      (error) => {
+        settled = true;
+        return { error };
+      },
+    );
+    await new Promise<void>((r) => setTimeout(r, 75));
+    expect(settled).toBe(false);
+    release();
+    await holder;
+    const outcome = await pending;
+    expect(outcome.error).toBeUndefined();
+    expect(outcome.result?.retirement).toMatchObject({ operationId, state: "complete" });
+    expect(
+      await archiveByScope(f.deps, {
+        scope: { kind: "workspace", workspaceId: "old-a" },
+        requestId: "contended-replay",
+        operationId,
+      }),
+    ).toEqual(outcome.result);
+  } finally {
+    release();
+    await holder;
+    await pending;
+    await f.close();
+  }
+});
+test("REV69 completed journal with a pending caller index has no reconciliation code", async () => {
+  const f = await canonicalArchiveFixture();
+  const api = await import("./workspace-retirement.js");
+  const operationId = randomUUID();
+  try {
+    const result = await archiveByScope(f.deps, {
+      scope: { kind: "workspace", workspaceId: "old-a" },
+      requestId: "completion-gap",
+      operationId,
+    });
+    const file = path.join(f.home, "workspace-retirement-operations", `${operationId}.json`);
+    const record = JSON.parse(readFileSync(file, "utf8"));
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        state: "pending",
+        terminal: false,
+        result: null,
+        backingGeneration: null,
+        code: null,
+      }),
+    );
+    expect(await api.getWorkspaceRetirementStatus(f.layout, operationId)).toMatchObject({
+      state: "complete",
+      terminal: true,
+      code: null,
+      result,
+    });
+  } finally {
+    await f.close();
+  }
+});
+test("REV69 unrelated invalid journal names do not poison unknown-ID lookup", async () => {
+  const f = await canonicalArchiveFixture();
+  const api = await import("./workspace-retirement.js");
+  try {
+    const dir = path.join(f.home, "workspace-retirements");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, "deadbeef.json"), "{not json");
+    expect(await api.getWorkspaceRetirementStatus(f.layout, randomUUID())).toBeNull();
+  } finally {
+    await f.close();
+  }
+});
+test("REV69 canonical hook receives its owner home over an inherited different home", async () => {
+  const f = await canonicalArchiveFixture(
+    'node -e \'require("fs").writeFileSync(process.env.PASEO_WORKTREE_PATH+".home",process.env.PASEO_HOME||"")\'',
+  );
+  const previous = process.env.PASEO_HOME;
+  try {
+    process.env.PASEO_HOME = f.home + "-wrong";
+    const result = await archiveByScope(f.deps, {
+      scope: { kind: "workspace", workspaceId: "old-a" },
+      requestId: "owner-home",
+    });
+    expect(result.retirement?.state).toBe("complete");
+    expect(readFileSync(f.worktree.worktreePath + ".home", "utf8")).toBe(f.home);
+  } finally {
+    if (previous === undefined) delete process.env.PASEO_HOME;
+    else process.env.PASEO_HOME = previous;
+    await f.close();
+  }
+});
+test("REV69 no-ID nested legacy worktree record retains base teardown and removal", async () => {
+  const f = await canonicalArchiveFixture(
+    'node -e \'require("fs").writeFileSync(process.env.PASEO_SOURCE_CHECKOUT_PATH+"/legacy-hook-ran","yes")\'',
+  );
+  try {
+    const nested = "legacy/nested";
+    mkdirSync(path.join(f.repoDir, nested), { recursive: true });
+    writeFileSync(
+      path.join(f.repoDir, nested, "paseo.json"),
+      readFileSync(path.join(f.repoDir, "paseo.json")),
+    );
+    execFileSync("git", ["add", nested], { cwd: f.repoDir, stdio: "pipe" });
+    execFileSync("git", ["-c", "commit.gpgsign=false", "commit", "-m", "nested fixture config"], {
+      cwd: f.repoDir,
+      stdio: "pipe",
+    });
+    execFileSync("git", ["merge", "--ff-only", "main"], {
+      cwd: f.worktree.worktreePath,
+      stdio: "pipe",
+    });
+    await f.registry.update("old-a", (r) => ({
+      ...r,
+      cwd: path.join(f.worktree.worktreePath, nested),
+      worktreeRoot: null,
+    }));
+    const result = await archiveByScope(f.deps, {
+      scope: { kind: "workspace", workspaceId: "old-a" },
+      requestId: "legacy-nested-no-id",
+    });
+    expect(result.retirement?.state).toBe("complete");
+    expect(result.removedDirectory).toBe(true);
+    expect(readFileSync(path.join(f.repoDir, "legacy-hook-ran"), "utf8")).toBe("yes");
+    expect(existsSync(f.worktree.worktreePath)).toBe(false);
+  } finally {
+    await f.close();
+  }
+});
+test("REV69 remaining scope-extension contention is typed transient rather than a hold", async () => {
+  const f = await canonicalArchiveFixture();
+  const { serializeWorkspaceBacking } = await import("./workspace-retirement-context.js");
+  const api = await import("./workspace-retirement.js");
+  const other = path.join(f.repoDir, "separate-backing");
+  mkdirSync(other);
+  let release!: () => void, entered!: () => void;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  const ready = new Promise<void>((r) => {
+    entered = r;
+  });
+  const holder = serializeWorkspaceBacking(other, async () => {
+    entered();
+    await gate;
+  });
+  const operationId = randomUUID();
+  try {
+    await ready;
+    f.deps.assertWorkspaceAutomationAllowed = () =>
+      serializeWorkspaceBacking(other, async () => {});
+    await expect(
+      archiveByScope(f.deps, {
+        scope: { kind: "workspace", workspaceId: "old-a" },
+        requestId: "dynamic-scope",
+        operationId,
+      }),
+    ).rejects.toThrow("retirement_admission_contended");
+    expect(await api.getWorkspaceRetirementStatus(f.layout, operationId)).toMatchObject({
+      state: "refused",
+      terminal: true,
+      code: "retirement_admission_contended",
+    });
+    expect(f.deps.killTerminalsForWorkspace).not.toHaveBeenCalled();
+    release();
+    await holder;
+    f.deps.assertWorkspaceAutomationAllowed = async () => {};
+    expect(
+      (
+        await archiveByScope(f.deps, {
+          scope: { kind: "workspace", workspaceId: "old-a" },
+          requestId: "fresh-after-contention",
+          operationId: randomUUID(),
+        })
+      ).retirement?.state,
+    ).toBe("complete");
+  } finally {
+    release();
+    await holder;
+    await f.close();
+  }
+});
+test("REV69 fallback skips an explicitly different ID but preserves matching corruption", async () => {
+  const f = await canonicalArchiveFixture();
+  const api = await import("./workspace-retirement.js");
+  const id = randomUUID();
+  const dir = path.join(f.home, "workspace-retirements");
+  mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, "a".repeat(64) + ".json");
+  try {
+    writeFileSync(
+      file,
+      JSON.stringify({ operationId: randomUUID(), unrelatedInvalidSchema: true }),
+    );
+    expect(await api.getWorkspaceRetirementStatus(f.layout, id)).toBeNull();
+    writeFileSync(file, JSON.stringify({ operationId: id, broken: true }));
+    await expect(api.getWorkspaceRetirementStatus(f.layout, id)).rejects.toMatchObject({
+      code: "retirement_lookup_integrity_failed",
+    });
+    writeFileSync(file, "{not json");
+    await expect(api.getWorkspaceRetirementStatus(f.layout, id)).rejects.toMatchObject({
+      code: "retirement_lookup_integrity_failed",
+    });
+  } finally {
+    await f.close();
+  }
+});

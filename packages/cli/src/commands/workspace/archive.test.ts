@@ -110,3 +110,14 @@ it("verification refuses a closed hook without an archive or retry", async () =>
   expect(archiveWorkspace).not.toHaveBeenCalled();
   expect(close).toHaveBeenCalledTimes(1);
 });
+it("REV69 capability refusal stays typed at the CLI with its caller ID", async () => {
+  const { archiveWorkspace, close } = fixtureClient();
+  await expect(
+    runArchiveCommand("a", { daemonTarget: target, operationId }, new Command()),
+  ).rejects.toMatchObject({
+    code: "WORKSPACE_RETIREMENT_UNSUPPORTED",
+    details: { operationId, workspaceId: "a" },
+  });
+  expect(archiveWorkspace).toHaveBeenCalledTimes(1);
+  expect(close).toHaveBeenCalledTimes(1);
+});

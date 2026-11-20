@@ -735,12 +735,15 @@ export async function resolveWorktreeRuntimeEnv(options: {
 
 export async function runWorktreeTeardownCommands(options: {
   retirementBinding?: WorkspaceRetirementBinding;
+  retirementHome?: string;
   worktreePath: string;
   teardownCwd?: string;
   branchName?: string;
   repoRootPath?: string;
 }): Promise<WorktreeTeardownCommandResult[]> {
   const teardownCwd = options.teardownCwd ?? options.worktreePath;
+  if (options.retirementBinding && !options.retirementHome)
+    throw new Error("retirement_owner_home_required");
   if ((await getOwnershipRelativePath(options.worktreePath, teardownCwd)) === null) {
     throw new Error(`Worktree teardown cwd is outside the worktree: ${teardownCwd}`);
   }
@@ -763,6 +766,7 @@ export async function runWorktreeTeardownCommands(options: {
       PASEO_SOURCE_CHECKOUT_PATH: repoRootPath,
       // Backward-compatible alias.
       PASEO_ROOT_PATH: repoRootPath,
+      ...(options.retirementBinding ? { PASEO_HOME: options.retirementHome } : {}),
       PASEO_RETIREMENT_OPERATION_ID: options.retirementBinding?.operationId,
       PASEO_RETIREMENT_BACKING_GENERATION: options.retirementBinding?.backingGeneration,
       PASEO_RETIREMENT_WORKSPACE_ID: options.retirementBinding?.workspaceId,

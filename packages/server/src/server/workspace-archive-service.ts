@@ -179,6 +179,11 @@ export async function archiveByScope(
       operationId,
       workspaceId: request.scope.workspaceId,
       getRecord: dependencies.getWorkspace,
+      backingPaths: async (record) => [
+        record.cwd,
+        record.worktreeRoot ?? record.cwd,
+        (await resolveWorkspaceBackingDirectory(record, dependencies)).path,
+      ],
       run: (expectedNativeGeneration) =>
         archiveCanonicalByScope(
           dependencies,
@@ -209,7 +214,10 @@ async function archiveCanonicalByScope(
     );
     return serializeWorkspaceBacking(
       {
-        paths: initialRecords.flatMap((record) => [record.cwd, record.worktreeRoot ?? record.cwd]),
+        paths: [
+          ...(initial.backing ? [initial.backing.path] : []),
+          ...initialRecords.flatMap((record) => [record.cwd, record.worktreeRoot ?? record.cwd]),
+        ],
         keys: [
           ...initialIds.map((id) =>
             nativeTransitionKey(dependencies.retirementAuthority!.options.home, "workspace", id),
@@ -659,12 +667,13 @@ async function maybeRemoveDirectory(
             worktreePath: backing.path,
             teardownCwd: teardownTarget.cwd,
           },
-          (retirementBinding) =>
+          (retirementBinding, retirementHome) =>
             runWorktreeTeardownCommands({
               worktreePath: backing.path,
               teardownCwd: teardownTarget.cwd,
               repoRootPath: backing.mainRepoRoot ?? undefined,
               retirementBinding,
+              retirementHome,
             }),
         ),
       );

@@ -1085,6 +1085,15 @@ export class DaemonConnectionError extends Error {
   }
 }
 
+export class WorkspaceRetirementUnsupportedError extends Error {
+  readonly code = "WORKSPACE_RETIREMENT_UNSUPPORTED";
+  readonly outcome = "not-sent";
+  constructor() {
+    super("Update the host to use workspace retirement operation IDs");
+    this.name = "WorkspaceRetirementUnsupportedError";
+  }
+}
+
 export class CredentialReloadUnsupportedError extends Error {
   readonly code = "UNSUPPORTED_HOST";
 
@@ -3198,7 +3207,7 @@ export class DaemonClient {
 
   private requireWorkspaceRetirementOperations(): void {
     if (this.lastServerInfoMessage?.features?.workspaceRetirementOperations !== true)
-      throw new Error("Update the host to use workspace retirement operation IDs");
+      throw new WorkspaceRetirementUnsupportedError();
   }
   async getWorkspaceRetirementStatus(
     operationId: string,
