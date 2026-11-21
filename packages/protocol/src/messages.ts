@@ -1,4 +1,14 @@
 import {
+  WorkspaceBackingReclaimPreviewRequestSchema,
+  WorkspaceBackingReclaimPreviewResponseSchema,
+  WorkspaceBackingReclaimApplyRequestSchema,
+  WorkspaceBackingReclaimApplyResponseSchema,
+  WorkspaceBackingReclaimStatusRequestSchema,
+  WorkspaceBackingReclaimStatusResponseSchema,
+  WorkspaceBackingReclaimVerifyRequestSchema,
+  WorkspaceBackingReclaimVerifyResponseSchema,
+} from "./workspace-backing-reclaim.js";
+import {
   WorkspaceArchiveOutcomeSchema,
   WorkspaceRetirementStatusRequestSchema,
   WorkspaceRetirementStatusResponseSchema,
@@ -3486,6 +3496,10 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceLayoutInitializeRequestSchema,
   WorkspaceLayoutCommitRequestSchema,
   WorkspaceLayoutReceiptRequestSchema,
+  WorkspaceBackingReclaimPreviewRequestSchema,
+  WorkspaceBackingReclaimApplyRequestSchema,
+  WorkspaceBackingReclaimStatusRequestSchema,
+  WorkspaceBackingReclaimVerifyRequestSchema,
   WorkspaceRetirementStatusRequestSchema,
   WorkspaceRetirementVerifyRequestSchema,
   MainHostGetRequestSchema,
@@ -3904,6 +3918,7 @@ export const ServerInfoStatusPayloadSchema = z
         workspaceLayoutDerivedSections: z.boolean().optional(),
         workspaceLayoutRetirement: z.boolean().optional(),
         workspaceRetirementOperations: z.boolean().optional(),
+        workspaceBackingReclaim: z.boolean().optional(),
         // COMPAT(agentRequestReceipts): added in v0.8.0; remove gate after 2027-03-05.
         agentRequestReceipts: z.boolean().optional(),
         // COMPAT(workspaceRequestReceipts): added in v0.8.0; remove gate after 2027-03-07.
@@ -7448,6 +7463,10 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceLayoutInitializeResponseSchema,
   WorkspaceLayoutCommitResponseSchema,
   WorkspaceLayoutReceiptResponseSchema,
+  WorkspaceBackingReclaimPreviewResponseSchema,
+  WorkspaceBackingReclaimApplyResponseSchema,
+  WorkspaceBackingReclaimStatusResponseSchema,
+  WorkspaceBackingReclaimVerifyResponseSchema,
   WorkspaceRetirementStatusResponseSchema,
   WorkspaceRetirementVerifyResponseSchema,
   WorkspaceLayoutChangedSchema,

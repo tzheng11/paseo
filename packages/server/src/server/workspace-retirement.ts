@@ -1,3 +1,7 @@
+import {
+  assertReclaimBackingAvailable,
+  readReclaimJournal,
+} from "./workspace-backing-reclaim-journal.js";
 import { DaemonRpcError } from "@getpaseo/client/internal/daemon-client";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir, stat, realpath } from "node:fs/promises";
@@ -396,7 +400,7 @@ export async function retireCanonicalWorkspace(input: RetirementInput): Promise<
       path.join(home, "workspace-layout-mode.json"),
       JSON.stringify({
         ...authority.options.config,
-        schemaVersion: 3,
+        schemaVersion: Math.max(3, marker.schemaVersion),
         destructiveRetirement: "refuse",
       }),
     );
@@ -668,7 +672,9 @@ export async function assertWorkspaceBackingAvailable(
   backing: string,
   snapshot: WorkspaceLayoutSnapshot,
   ownerServerId: string,
+  reclaimOperationId?: string,
 ): Promise<void> {
+  await assertReclaimBackingAvailable(home, backing, reclaimOperationId);
   let files: string[];
   const directory = path.join(home, "workspace-retirements");
   try {
@@ -718,6 +724,7 @@ export async function refuseRetirementObservationConflict(
   id: string,
   paths: string[],
 ): Promise<void> {
+  for (const candidate of paths) await assertReclaimBackingAvailable(home, candidate);
   const directory = path.join(home, "workspace-retirements");
   let files: string[];
   try {
@@ -953,6 +960,8 @@ export async function withCallerRetirementOperation(input: {
   const operationId = z.string().uuid().parse(input.operationId).toLowerCase();
   const file = operationFile(authority, operationId);
   async function replay() {
+    if (await readReclaimJournal(authority.options.home, operationId))
+      throw new WorkspaceLayoutRefusal("retirement_operation_id_conflict");
     const record = await getWorkspaceRetirementStatus(authority, operationId);
     if (record && record.workspaceId !== workspaceId)
       throw new WorkspaceLayoutRefusal("retirement_operation_id_conflict");
@@ -1080,5 +1089,99 @@ export async function verifyWorkspaceRetirementBinding(
     return { valid: true, code: null };
   } catch (error) {
     return { valid: false, code: refusalCode(error) };
+  }
+}
+
+function requirePreservedReclaimJournal(
+  journal: RetirementJournal | null,
+  operationId: string,
+  expectedBackingGeneration: string,
+  authority: RetirementAuthority,
+  operation: WorkspaceRetirement,
+): asserts journal is RetirementJournal {
+  if (
+    !journal ||
+    journal.operationId !== operationId ||
+    hashLayoutValue(journal.identity) !==
+      hashLayoutValue(WorkspaceLayoutIdentitySchema.parse(authority.options.config)) ||
+    !completionKnown(journal, operation) ||
+    journal.backingGeneration !== expectedBackingGeneration ||
+    journal.result?.removedDirectory !== false ||
+    journal.result.slotKept !== true ||
+    journal.result.directoryLeftBehind?.reason !== "source_preserved"
+  )
+    throw new WorkspaceLayoutRefusal("reclaim_source_preserved_receipt_required");
+}
+/** Pure historical validation for reclaim. Never reconcile or rewrite the archive receipt. */
+export async function readCompletedRetirementForReclaim(
+  authority: RetirementAuthority,
+  operationId: string,
+  expectedBackingGeneration: string,
+  records: PersistedWorkspaceRecord[],
+) {
+  const snapshot = await authority.inspect();
+  const operation = snapshot.retirements?.find(
+    (candidate) => candidate.operationId === operationId,
+  );
+  if (
+    !operation ||
+    operation.state !== "complete" ||
+    operation.ownerServerId !== authority.options.serverId ||
+    operation.backingGeneration !== expectedBackingGeneration
+  )
+    throw new WorkspaceLayoutRefusal("reclaim_original_operation_unverified");
+  const journal = await readOptionalJournal(
+    path.join(authority.options.home, "workspace-retirements", `${nativeGeneration(records)}.json`),
+  );
+  requirePreservedReclaimJournal(
+    journal,
+    operationId,
+    expectedBackingGeneration,
+    authority,
+    operation,
+  );
+  assertReplayBinding(
+    journal,
+    { authority, records, generation: nativeGeneration(records), file: "", journalDirectory: "" },
+    operation,
+  );
+  if (
+    journal.result?.retirement?.operationId !== operationId ||
+    journal.result.retirement.state !== "complete" ||
+    operation.archivedAt !== journal.archiveTimestamp ||
+    records.some((r) => r.archivedAt !== journal.archiveTimestamp)
+  )
+    throw new WorkspaceLayoutRefusal("reclaim_original_receipt_unverified");
+  const intent = journal.intents.at(-1),
+    receipt = intent ? await authority.findReceipt(intent.requestId) : null;
+  if (
+    !intent ||
+    !receipt ||
+    hashLayoutValue(journal.result?.retirement?.receipt) !== hashLayoutValue(receipt) ||
+    receipt.requestSha256 !== hashLayoutValue(intent) ||
+    !intent.mutations.some((m) => m.kind === "complete-retirement" && m.operationId === operationId)
+  )
+    throw new WorkspaceLayoutRefusal("reclaim_original_receipt_unverified");
+  return { journal, operation };
+}
+
+export async function assertNoRetirementHistoryAtBacking(
+  home: string,
+  backing: string,
+): Promise<void> {
+  const directory = path.join(home, "workspace-retirements");
+  let files: string[];
+  try {
+    files = await readdir(directory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  for (const file of files.filter((f) => f.endsWith(".json"))) {
+    const journal = await readOptionalJournal(path.join(directory, file));
+    if (!journal || journal.closedWithoutReservation) continue;
+    for (const original of journal.backingPaths)
+      if (await backingPathsOverlap(original, backing))
+        throw new WorkspaceLayoutRefusal("reclaim_orphan_history_present");
   }
 }

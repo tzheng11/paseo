@@ -9828,3 +9828,56 @@ test("REV69 retirement capability refusal is typed and not sent", async () => {
     await client.close();
   }
 });
+
+test("RECLAIM capability refusal is typed and sends no request", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://fixture.invalid",
+    clientId: "reclaim",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  const connected = client.connect();
+  mock.triggerOpen();
+  await connected;
+  try {
+    await expect(
+      client.previewWorkspaceBackingReclaim({
+        target: { kind: "orphan", path: "/fixture" },
+        releaseEvidence: "a".repeat(64),
+      }),
+    ).rejects.toMatchObject({ code: "WORKSPACE_BACKING_RECLAIM_UNSUPPORTED", outcome: "not-sent" });
+    expect(mock.sent).toHaveLength(0);
+  } finally {
+    await client.close();
+  }
+});
+test("RECLAIM status transport correlation never starts an operation", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://fixture.invalid",
+    clientId: "reclaim",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  const connected = client.connect();
+  mock.triggerOpen({ features: { workspaceBackingReclaim: true } });
+  await connected;
+  try {
+    const operationId = "00000000-0000-4000-8000-000000000001";
+    const status = client.getWorkspaceBackingReclaimStatus(operationId);
+    const request = parseSentFrame(mock.sent.at(-1));
+    expect(request).toMatchObject({ type: "workspace.reclaim.get_status.request", operationId });
+    expect(request.requestId).not.toBe(operationId);
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "workspace.reclaim.get_status.response",
+        payload: { requestId: request.requestId, operation: null },
+      }),
+    );
+    expect(await status).toBeNull();
+    expect(mock.sent).toHaveLength(1);
+  } finally {
+    await client.close();
+  }
+});

@@ -521,6 +521,99 @@ reservation consumer. The Impower retirement routine's external dependency/resou
 adapter is a separate integration change; deploying this fork alone does not
 qualify that routine.
 
+### Reclaiming a preserved backing (ISS-10191)
+
+`features.workspaceBackingReclaim` advertises the separate owner-daemon reclaim
+protocol. Upgrade the authority and each participating owner before using it.
+The owner must be adopted in an active semantics-v2 layout. This does not activate,
+re-import, archive, resurrect, or delete any native workspace identity. Historical
+retirement operations, tombstones and receipts remain unchanged.
+
+A reclaim has its own caller-preallocated UUID, separate from the original archive
+UUID. Its target is an **absolute canonical Git worktree root**, never a cwd search:
+
+- `retired`: `{kind, path, workspaceId, retirementOperationId, backingGeneration}`.
+  The original operation must be terminal complete, with `source_preserved`,
+  `removedDirectory=false`, and `slotKept=true`. The owner verifies its durable
+  effect journal, authority receipt, archived identities and original backing
+  generation. All original aliases must still match.
+- `orphan`: `{kind, path}`. The owner proves a Paseo managed marker, Git's actual
+  worktree registration and admin-directory identity, and that no native identity
+  overlaps it. A path with retirement history cannot evade its receipt checks by
+  being relabelled as an orphan.
+
+The SDK methods are `DaemonClient.previewWorkspaceBackingReclaim(input)`,
+`reclaimWorkspaceBacking({...input,operationId,expectedGeneration})`,
+`getWorkspaceBackingReclaimStatus(operationId)` and
+`verifyWorkspaceBackingReclaim(binding)`. Input is `{target,releaseEvidence}`;
+`releaseEvidence` is the SHA-256 of the consumer's exact owner-release and external
+reference evidence. It is an opaque binding, not a replacement for those checks.
+An older owner returns typed `WORKSPACE_BACKING_RECLAIM_UNSUPPORTED` before sending.
+Preview, apply and hook verification require `workspace.manage`; status requires
+`workspace.read`, using ordinary daemon authentication.
+
+CLI equivalents (use `--json` for the complete structured result):
+
+```sh
+paseo workspace reclaim /absolute/root --release-evidence SHA256
+paseo workspace reclaim /absolute/root --release-evidence SHA256 \
+  --workspace-id OLD_ID --original-operation-id ARCHIVE_UUID \
+  --original-backing-generation ORIGINAL_SHA256
+# Add these to the identical preview request to execute that observed generation:
+# --apply --operation-id NEW_UUID --expected-generation PREVIEW_SHA256
+paseo workspace reclaim-status NEW_UUID
+```
+
+Preview is read-only and returns `{target,eligible,code,generation}`. Eligibility
+is conditional on the synchronous guard also succeeding at execution. Git reads
+use local refs only and suppress optional index refresh; no fetch is performed.
+The clean-and-landed predicate is unchanged. Unknown ownership, history, refs,
+holds, live agent/terminal cwds, native aliases, protected ancestry or changed
+source refuses removal. Removal uses non-forcing `git worktree remove`; it never
+falls back to recursive deletion, prune or force.
+
+The existing trusted `worktree.teardown` script is the consumer's release guard.
+While the daemon holds the same backing lease used by native registration and
+terminal creation, the script must check the exact owner release and absence of
+external process, compose/service and LaunchAgent references. The daemon checks
+its own native/layout and managed agent/terminal references. It does **not** claim
+an OS-wide process census. The script then calls:
+
+```sh
+paseo workspace reclaim-verify "$PASEO_RECLAIM_OPERATION_ID" \
+  --expected-generation "$PASEO_RECLAIM_BACKING_GENERATION" \
+  --path "$PASEO_RECLAIM_PATH" \
+  --release-evidence "$PASEO_RECLAIM_RELEASE_EVIDENCE" \
+  --owner-released --external-references-clear --json
+```
+
+Those two flags explicitly attest the synchronous consumer checks. They must not
+be supplied from a cached preview alone. The hook receives the canonical owner
+`PASEO_HOME`; inherited `PASEO_HOST` is cleared. No fake native ID is invented for
+an orphan. Verification succeeds only inside this operation's live teardown
+lease, rechecks the generation and current native/layout evidence, and records
+that the guard qualified. A historical UUID cannot authorize later cleanup.
+Missing hooks or a hook that never qualifies cannot remove the directory. The
+owner rechecks again after teardown and before Git removal.
+
+Apply durably records intent before effects. Repeating the same UUID and request
+returns the same operation; changing its request/generation conflicts. After a
+lost reply or timeout, read **that UUID**, never the newest operation or cwd. Status
+is pure and returns not-found for unknown UUIDs. The operation exposes pending,
+refused, partial or complete, a typed code, `removedDirectory` and its own digest
+receipt. A crash/uncertain partial retains a durable registration/observation
+fence and never reruns teardown automatically. An uncertain final receipt write
+can report partial with `removedDirectory=true`; it must be reconciled rather than
+retried under a new UUID. A completed reclaim releases its backing fence, so a
+new native ID can later reuse the slot; replaying the old UUID cannot touch it.
+
+Before effects, the owner raises its home marker minimum-reader version to 4.
+Prior binaries fail closed rather than ignoring an unresolved reclaim journal.
+Ordinary subsequent archives preserve that version. No rollback/config deletion,
+live reclaim, packet installation or adapter-wide apply is authorized by this
+source change. The consumer remains responsible for its release and external
+reference guard, candidate holds and later live acceptance.
+
 ## Recovery limits
 
 The [runtime provenance and write-intent contract](runtime-provenance.md) records

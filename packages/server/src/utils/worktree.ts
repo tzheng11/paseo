@@ -1,3 +1,4 @@
+import type { WorkspaceBackingReclaimBinding } from "@getpaseo/protocol/workspace-backing-reclaim";
 import type { WorkspaceRetirementBinding } from "@getpaseo/protocol/workspace-layout";
 import { execFile } from "child_process";
 import { promisify } from "util";
@@ -733,7 +734,27 @@ export async function resolveWorktreeRuntimeEnv(options: {
   };
 }
 
+function reclaimOwnerEnv(
+  options: Parameters<typeof runWorktreeTeardownCommands>[0],
+): NodeJS.ProcessEnv {
+  if ((options.retirementBinding || options.paseoReclaimBinding) && !options.retirementHome)
+    throw new Error("retirement_owner_home_required");
+  return {
+    ...(options.retirementBinding || options.paseoReclaimBinding
+      ? { PASEO_HOME: options.retirementHome, PASEO_HOST: undefined }
+      : {}),
+    PASEO_RECLAIM_OPERATION_ID: options.paseoReclaimBinding?.operationId,
+    PASEO_RECLAIM_BACKING_GENERATION: options.paseoReclaimBinding?.generation,
+    PASEO_RECLAIM_PATH: options.paseoReclaimBinding?.path,
+    PASEO_RECLAIM_RELEASE_EVIDENCE: options.paseoReclaimBinding?.releaseEvidence,
+  };
+}
+
 export async function runWorktreeTeardownCommands(options: {
+  paseoReclaimBinding?: Omit<
+    WorkspaceBackingReclaimBinding,
+    "ownerReleased" | "externalReferencesClear"
+  >;
   retirementBinding?: WorkspaceRetirementBinding;
   retirementHome?: string;
   worktreePath: string;
@@ -742,8 +763,7 @@ export async function runWorktreeTeardownCommands(options: {
   repoRootPath?: string;
 }): Promise<WorktreeTeardownCommandResult[]> {
   const teardownCwd = options.teardownCwd ?? options.worktreePath;
-  if (options.retirementBinding && !options.retirementHome)
-    throw new Error("retirement_owner_home_required");
+
   if ((await getOwnershipRelativePath(options.worktreePath, teardownCwd)) === null) {
     throw new Error(`Worktree teardown cwd is outside the worktree: ${teardownCwd}`);
   }
@@ -766,9 +786,7 @@ export async function runWorktreeTeardownCommands(options: {
       PASEO_SOURCE_CHECKOUT_PATH: repoRootPath,
       // Backward-compatible alias.
       PASEO_ROOT_PATH: repoRootPath,
-      ...(options.retirementBinding
-        ? { PASEO_HOME: options.retirementHome, PASEO_HOST: undefined }
-        : {}),
+      ...reclaimOwnerEnv(options),
       PASEO_RETIREMENT_OPERATION_ID: options.retirementBinding?.operationId,
       PASEO_RETIREMENT_BACKING_GENERATION: options.retirementBinding?.backingGeneration,
       PASEO_RETIREMENT_WORKSPACE_ID: options.retirementBinding?.workspaceId,

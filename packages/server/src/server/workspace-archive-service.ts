@@ -941,7 +941,7 @@ export async function archivePersistedWorkspaceRecord(input: {
 }
 
 const execFileAsync = promisify(execFile);
-async function retirementSourceIsCleanAndLanded(
+export async function retirementSourceIsCleanAndLanded(
   worktree: string,
   mainRepo: string | null,
 ): Promise<boolean> {
@@ -950,7 +950,7 @@ async function retirementSourceIsCleanAndLanded(
     const { stdout: status } = await execFileAsync(
       "git",
       ["-C", worktree, "status", "--porcelain", "--untracked-files=all"],
-      { timeout: 10000, maxBuffer: 1024 * 1024 },
+      { timeout: 10000, maxBuffer: 1024 * 1024, env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" } },
     );
     if (status.trim()) return false;
     const { stdout: base } = await execFileAsync("git", ["-C", mainRepo, "rev-parse", "HEAD"], {

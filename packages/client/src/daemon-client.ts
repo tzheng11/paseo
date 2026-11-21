@@ -1,4 +1,9 @@
 import type {
+  WorkspaceBackingReclaimInput,
+  WorkspaceBackingReclaimOperation,
+  WorkspaceBackingReclaimBinding,
+} from "@getpaseo/protocol/workspace-backing-reclaim";
+import type {
   WorkspaceRetirementBinding,
   WorkspaceRetirementOperation,
 } from "@getpaseo/protocol/workspace-layout";
@@ -3205,6 +3210,52 @@ export class DaemonClient {
     });
   }
 
+  private requireBackingReclaim(): void {
+    if (this.lastServerInfoMessage?.features?.workspaceBackingReclaim !== true)
+      throw Object.assign(new Error("Update the host to reclaim preserved workspace backings"), {
+        code: "WORKSPACE_BACKING_RECLAIM_UNSUPPORTED",
+        outcome: "not-sent",
+      });
+  }
+  async previewWorkspaceBackingReclaim(input: WorkspaceBackingReclaimInput) {
+    this.requireBackingReclaim();
+    return (
+      await this.sendCorrelatedSessionRequest({
+        message: { type: "workspace.reclaim.preview.request", ...input },
+        responseType: "workspace.reclaim.preview.response",
+      })
+    ).preview;
+  }
+  async reclaimWorkspaceBacking(
+    input: WorkspaceBackingReclaimInput & { operationId: string; expectedGeneration: string },
+  ): Promise<WorkspaceBackingReclaimOperation> {
+    this.requireBackingReclaim();
+    return (
+      await this.sendCorrelatedSessionRequest({
+        message: { type: "workspace.reclaim.apply.request", ...input },
+        responseType: "workspace.reclaim.apply.response",
+      })
+    ).operation;
+  }
+  async getWorkspaceBackingReclaimStatus(
+    operationId: string,
+  ): Promise<WorkspaceBackingReclaimOperation | null> {
+    this.requireBackingReclaim();
+    return (
+      await this.sendCorrelatedSessionRequest({
+        message: { type: "workspace.reclaim.get_status.request", operationId },
+        responseType: "workspace.reclaim.get_status.response",
+      })
+    ).operation;
+  }
+  async verifyWorkspaceBackingReclaim(binding: WorkspaceBackingReclaimBinding) {
+    this.requireBackingReclaim();
+    const result = await this.sendCorrelatedSessionRequest({
+      message: { type: "workspace.reclaim.verify.request", ...binding },
+      responseType: "workspace.reclaim.verify.response",
+    });
+    return { valid: result.valid, code: result.code };
+  }
   private requireWorkspaceRetirementOperations(): void {
     if (this.lastServerInfoMessage?.features?.workspaceRetirementOperations !== true)
       throw new WorkspaceRetirementUnsupportedError();

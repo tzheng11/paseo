@@ -1,6 +1,7 @@
 import type { TerminalReplaySink, TerminalReplayMetadata } from "./terminal-replay.js";
 import { randomBytes, randomUUID } from "node:crypto";
 import { access } from "node:fs/promises";
+import { admitReclaimReference } from "../server/workspace-backing-reclaim-journal.js";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Logger } from "pino";
 import { createExternalProcessEnv } from "../server/paseo-env.js";
@@ -112,6 +113,7 @@ export interface TerminalCreateEnvironment {
 }
 
 interface WorkerTerminalManagerOptions {
+  paseoHome?: string;
   worker: TerminalWorkerConnection;
   /** Reconnects a surviving worker; null means it is confirmed gone or the owner stopped. */
   reconnect?: () => Promise<TerminalWorkerConnection | null>;
@@ -819,35 +821,37 @@ export function createWorkerTerminalManager(
     async createTerminal(
       options: WorkerCreateTerminalOptions & { workspaceId: string },
     ): Promise<TerminalSession> {
-      const terminalId = options.id ?? randomUUID();
-      const activityToken = createActivityToken();
-      const terminalActivityUrl = managerOptions.getTerminalActivityUrl?.() ?? null;
-      terminalActivityTokenById.set(terminalId, activityToken);
-      const creation = { session: null as TerminalSession | null };
-      pendingCreationsById.set(terminalId, creation);
-      try {
-        const environment = resolveCreateEnvironment();
-        await sendRequest({
-          type: "createTerminal",
-          options: {
-            ...options,
-            id: terminalId,
-            activityToken,
-            activityUrl: terminalActivityUrl,
-            baseEnv: environment.baseEnv,
-            paseoCliPath: environment.paseoCliPath,
-          },
-        });
-        if (!creation.session) {
-          throw new Error("Terminal worker completed creation without a terminalCreated event");
+      return admitReclaimReference(managerOptions.paseoHome, options.cwd, async () => {
+        const terminalId = options.id ?? randomUUID();
+        const activityToken = createActivityToken();
+        const terminalActivityUrl = managerOptions.getTerminalActivityUrl?.() ?? null;
+        terminalActivityTokenById.set(terminalId, activityToken);
+        const creation = { session: null as TerminalSession | null };
+        pendingCreationsById.set(terminalId, creation);
+        try {
+          const environment = resolveCreateEnvironment();
+          await sendRequest({
+            type: "createTerminal",
+            options: {
+              ...options,
+              id: terminalId,
+              activityToken,
+              activityUrl: terminalActivityUrl,
+              baseEnv: environment.baseEnv,
+              paseoCliPath: environment.paseoCliPath,
+            },
+          });
+          if (!creation.session) {
+            throw new Error("Terminal worker completed creation without a terminalCreated event");
+          }
+          return creation.session;
+        } catch (error) {
+          terminalActivityTokenById.delete(terminalId);
+          throw error;
+        } finally {
+          pendingCreationsById.delete(terminalId);
         }
-        return creation.session;
-      } catch (error) {
-        terminalActivityTokenById.delete(terminalId);
-        throw error;
-      } finally {
-        pendingCreationsById.delete(terminalId);
-      }
+      });
     },
 
     registerCwdEnv(options: { cwd: string; env: Record<string, string> }): void {
@@ -1177,6 +1181,7 @@ export async function startWorkerTerminalManager(
       return recovery;
     };
     const manager = createWorkerTerminalManager({
+      paseoHome: options.paseoHome,
       worker: connection,
       reconnect,
       ...(options.requestTimeoutMs === undefined

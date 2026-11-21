@@ -3781,3 +3781,633 @@ test.each([
     await f.close();
   }
 });
+
+async function reclaimFixture(kind: "retired" | "orphan" = "retired") {
+  const f = await canonicalArchiveFixture();
+  const api = await import("./workspace-backing-reclaim.js");
+  const git = (...args: string[]) =>
+    execFileSync("git", ["-C", f.worktree.worktreePath, ...args], {
+      encoding: "utf8",
+      stdio: "pipe",
+    }).trim();
+  let target: import("@getpaseo/protocol/workspace-backing-reclaim").WorkspaceBackingReclaimTarget;
+  let original: ArchiveResult | null = null;
+  if (kind === "retired") {
+    writeFileSync(path.join(f.worktree.worktreePath, "released-source"), "owner source");
+    git("add", "released-source");
+    git("-c", "commit.gpgsign=false", "commit", "-m", "unlanded at archive");
+    original = await archiveByScope(f.deps, {
+      scope: { kind: "workspace", workspaceId: "old-a" },
+      operationId: randomUUID(),
+      requestId: "preserved",
+    });
+    expect(original).toMatchObject({
+      removedDirectory: false,
+      slotKept: true,
+      directoryLeftBehind: { reason: "source_preserved" },
+      retirement: { state: "complete" },
+    });
+    execFileSync("git", ["-C", f.repoDir, "merge", "--ff-only", git("rev-parse", "HEAD")], {
+      stdio: "pipe",
+    });
+    const status = await (
+      await import("./workspace-retirement.js")
+    ).getWorkspaceRetirementStatus(f.layout, original.retirement!.operationId);
+    target = {
+      kind: "retired",
+      path: f.worktree.worktreePath,
+      workspaceId: "old-a",
+      retirementOperationId: original.retirement!.operationId,
+      backingGeneration: status!.backingGeneration!,
+    };
+  } else {
+    const orphan = await createPaseoOwnedWorktree(f.repoDir, f.home, "orphan-reclaim");
+    target = { kind: "orphan", path: orphan.worktreePath };
+  }
+  const input = { target, releaseEvidence: "e".repeat(64) };
+  const deps: import("./workspace-backing-reclaim.js").BackingReclaimDependencies = {
+    authority: f.layout,
+    inventory: () => f.registry.listRetirementRecords(),
+    liveReferences: async () => [],
+    assertHolds: async () => {},
+    teardown: async (options) => {
+      expect(options.paseoReclaimBinding).toBeDefined();
+      const result = await api.verifyBackingReclaimHook(f.home, {
+        ...options.paseoReclaimBinding!,
+        ownerReleased: true,
+        externalReferencesClear: true,
+      });
+      expect(result).toEqual({ valid: true, code: null });
+      return [];
+    },
+  };
+  return { ...f, api, target, input, deps, original, archiveDeps: f.deps };
+}
+
+test.each(["retired", "orphan"] as const)(
+  "RECLAIM %s preview is pure and exact UUID removes once while preserving original evidence",
+  async (kind) => {
+    const f = await reclaimFixture(kind);
+    const clone = await import("./workspace-retirement.js");
+    try {
+      const layoutBefore = await f.layout.inspect();
+      const journalDir = path.join(f.home, "workspace-retirements");
+      const io = await import("node:fs/promises");
+      const oldBytes =
+        kind === "retired"
+          ? await Promise.all(
+              (await io.readdir(journalDir))
+                .filter((name) => name.endsWith(".json"))
+                .map(async (name) => ({
+                  name,
+                  bytes: await io.readFile(path.join(journalDir, name), "utf8"),
+                })),
+            )
+          : [];
+      const before =
+        kind === "retired"
+          ? execFileSync("git", ["-C", f.repoDir, "status", "--porcelain"], { encoding: "utf8" })
+          : null;
+      const preview = await f.api.previewBackingReclaim(f.deps, f.input);
+      expect(preview).toMatchObject({ eligible: true, code: null, generation: expect.any(String) });
+      expect(existsSync(path.join(f.home, "workspace-backing-reclaims"))).toBe(false);
+      const operationId = randomUUID(),
+        request = { ...f.input, operationId, expectedGeneration: preview.generation! };
+      const result = await f.api.applyBackingReclaim(f.deps, request);
+      expect(result).toMatchObject({
+        operationId,
+        state: "complete",
+        terminal: true,
+        removedDirectory: true,
+        receipt: { id: expect.stringContaining(`reclaim:${operationId}:`) },
+      });
+      expect(existsSync(f.target.path)).toBe(false);
+      expect(await f.api.getBackingReclaimStatus(f.deps, operationId)).toEqual(result);
+      expect(await f.api.applyBackingReclaim(f.deps, request)).toEqual(result);
+      await expect(
+        f.api.applyBackingReclaim(f.deps, { ...request, releaseEvidence: "f".repeat(64) }),
+      ).rejects.toThrow("reclaim_operation_id_conflict");
+      expect(await f.layout.inspect()).toEqual(layoutBefore);
+      for (const original of oldBytes)
+        expect(await io.readFile(path.join(journalDir, original.name), "utf8")).toBe(
+          original.bytes,
+        );
+      if (f.original) {
+        expect(
+          (await clone.getWorkspaceRetirementStatus(f.layout, f.original.retirement!.operationId))
+            ?.result,
+        ).toEqual(f.original);
+        expect(
+          execFileSync("git", ["-C", f.repoDir, "status", "--porcelain"], { encoding: "utf8" }),
+        ).toBe(before);
+      }
+    } finally {
+      await f.close();
+    }
+  },
+);
+
+test.each([
+  "identity",
+  "nested-reference",
+  "live-cwd",
+  "dirty",
+  "hold",
+  "generation",
+  "missing-marker",
+  "missing-registration",
+  "ref-probe-error",
+  "missing-release-guard",
+])("RECLAIM refuses %s and never removes unknown backing", async (condition) => {
+  const f = await reclaimFixture();
+  try {
+    const preview = await f.api.previewBackingReclaim(f.deps, f.input);
+    expect(preview.eligible).toBe(true);
+    if (condition === "identity" || condition === "nested-reference")
+      await f.registry.upsert({
+        ...f.record,
+        workspaceId: "new-b",
+        cwd: condition === "identity" ? f.target.path : path.join(f.target.path, "nested"),
+        createdAt: "2026-11-21T01:00:00.000Z",
+        updatedAt: "2026-11-21T01:00:00.000Z",
+      });
+    if (condition === "live-cwd")
+      f.deps.liveReferences = async () => [path.join(f.target.path, "running-child")];
+    if (condition === "dirty") writeFileSync(path.join(f.target.path, "owner-untracked"), "keep");
+    if (condition === "hold") {
+      const inventory = f.deps.inventory;
+      f.deps.inventory = async () =>
+        (await inventory()).map((r) =>
+          Object.assign({}, r, { pinnedAt: new Date().toISOString() }),
+        );
+    }
+    if (condition === "generation") {
+      writeFileSync(path.join(f.target.path, "fresh-commit"), "new");
+      execFileSync("git", ["-C", f.target.path, "add", "fresh-commit"]);
+      execFileSync(
+        "git",
+        ["-C", f.target.path, "-c", "commit.gpgsign=false", "commit", "-m", "not previewed"],
+        { stdio: "pipe" },
+      );
+    }
+    if (condition === "missing-marker") rmSync(await getPaseoWorktreeMetadataPath(f.target.path));
+    if (condition === "missing-registration")
+      execFileSync("git", ["-C", f.repoDir, "worktree", "lock", f.target.path], { stdio: "pipe" });
+    if (condition === "ref-probe-error")
+      f.deps.liveReferences = async () => {
+        throw Error("probe unknown");
+      };
+    if (condition === "missing-release-guard") f.deps.teardown = async () => [];
+    const result = await f.api.applyBackingReclaim(f.deps, {
+      ...f.input,
+      operationId: randomUUID(),
+      expectedGeneration: preview.generation!,
+    });
+    expect(result.state).not.toBe("complete");
+    expect(result.removedDirectory).toBe(false);
+    expect(existsSync(f.target.path)).toBe(true);
+  } finally {
+    await f.close();
+  }
+});
+
+test("RECLAIM partial teardown fences registration after restart and UUID replay never repeats cleanup", async () => {
+  const f = await reclaimFixture();
+  let calls = 0;
+  try {
+    const preview = await f.api.previewBackingReclaim(f.deps, f.input);
+    f.deps.teardown = async () => {
+      calls++;
+      throw Error("partial external cleanup");
+    };
+    const id = randomUUID(),
+      request = { ...f.input, operationId: id, expectedGeneration: preview.generation! };
+    expect(await f.api.applyBackingReclaim(f.deps, request)).toMatchObject({
+      state: "partial",
+      terminal: false,
+      removedDirectory: false,
+    });
+    expect(await f.api.applyBackingReclaim(f.deps, request)).toMatchObject({ state: "partial" });
+    expect(calls).toBe(1);
+    await expect(f.registry.upsert({ ...f.record, workspaceId: "new-b" })).rejects.toThrow(
+      "reclaim_backing_reserved",
+    );
+    expect(await f.api.getBackingReclaimStatus(f.deps, id)).toMatchObject({ state: "partial" });
+  } finally {
+    await f.close();
+  }
+});
+
+test("RECLAIM delayed old apply cannot touch B and a completed reclaim does not permanently fence a slot", async () => {
+  const f = await reclaimFixture();
+  try {
+    const preview = await f.api.previewBackingReclaim(f.deps, f.input);
+    const request = {
+      ...f.input,
+      operationId: randomUUID(),
+      expectedGeneration: preview.generation!,
+    };
+    const result = await f.api.applyBackingReclaim(f.deps, request);
+    expect(result.state).toBe("complete");
+    mkdirSync(f.target.path, { recursive: true });
+    writeFileSync(path.join(f.target.path, "b-dependencies"), "B");
+    await f.registry.upsert({ ...f.record, workspaceId: "new-b" });
+    expect(await f.api.applyBackingReclaim(f.deps, request)).toEqual(result);
+    expect(readFileSync(path.join(f.target.path, "b-dependencies"), "utf8")).toBe("B");
+  } finally {
+    await f.close();
+  }
+});
+
+test("RECLAIM final outcome persistence failure stays readable partial with no replayed effect", async () => {
+  const f = await reclaimFixture();
+  const original = atomicFile.writeFileDurably;
+  let fault = true;
+  const writer = vi.spyOn(atomicFile, "writeFileDurably").mockImplementation((file, bytes) => {
+    if (
+      fault &&
+      file.includes("workspace-backing-reclaims") &&
+      JSON.parse(String(bytes)).operation?.state === "complete"
+    ) {
+      fault = false;
+      return Promise.reject(Error("final result write failed"));
+    }
+    return original(file, bytes);
+  });
+  try {
+    const preview = await f.api.previewBackingReclaim(f.deps, f.input);
+    const id = randomUUID(),
+      request = { ...f.input, operationId: id, expectedGeneration: preview.generation! };
+    const result = await f.api.applyBackingReclaim(f.deps, request);
+    expect(result).toMatchObject({
+      state: "partial",
+      terminal: false,
+      receipt: null,
+      removedDirectory: true,
+    });
+    expect(await f.api.getBackingReclaimStatus(f.deps, id)).toEqual(result);
+    expect(await f.api.applyBackingReclaim(f.deps, request)).toEqual(result);
+  } finally {
+    writer.mockRestore();
+    await f.close();
+  }
+});
+
+test("RECLAIM durable started intent projects partial after restart without any repair writes", async () => {
+  const f = await reclaimFixture();
+  try {
+    const preview = await f.api.previewBackingReclaim(f.deps, f.input);
+    f.deps.teardown = async () => {
+      throw Error("cut");
+    };
+    const id = randomUUID(),
+      request = { ...f.input, operationId: id, expectedGeneration: preview.generation! };
+    await f.api.applyBackingReclaim(f.deps, request);
+    const file = path.join(f.home, "workspace-backing-reclaims", `${id}.json`),
+      stored = JSON.parse(readFileSync(file, "utf8"));
+    stored.operation.state = "pending";
+    stored.operation.code = null;
+    writeFileSync(file, JSON.stringify(stored));
+    const before = readFileSync(file, "utf8");
+    const forbid = vi
+      .spyOn(atomicFile, "writeFileDurably")
+      .mockRejectedValue(Error("status must not write"));
+    try {
+      expect(await f.api.getBackingReclaimStatus(f.deps, id)).toMatchObject({
+        state: "partial",
+        code: "reclaim_reconciliation_required",
+      });
+      expect(await f.api.applyBackingReclaim(f.deps, request)).toMatchObject({ state: "partial" });
+      expect(forbid).not.toHaveBeenCalled();
+      expect(readFileSync(file, "utf8")).toBe(before);
+    } finally {
+      forbid.mockRestore();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+test("RECLAIM completed archived history cannot be relabelled as an ID-less orphan", async () => {
+  const f = await reclaimFixture();
+  try {
+    f.deps.inventory = async () => [];
+    const target = { kind: "orphan" as const, path: f.target.path };
+    expect(await f.api.previewBackingReclaim(f.deps, { ...f.input, target })).toMatchObject({
+      eligible: false,
+      code: "reclaim_orphan_history_present",
+    });
+  } finally {
+    await f.close();
+  }
+});
+
+test.each(["native-generation", "result-id"])(
+  "RECLAIM rejects contradictory original %s without rewriting old receipts",
+  async (field) => {
+    const f = await reclaimFixture();
+    try {
+      const { nativeGeneration } = await import("./workspace-retirement.js");
+      const rows = await f.registry.listRetirementRecords();
+      const file = path.join(f.home, "workspace-retirements", `${nativeGeneration(rows)}.json`);
+      const journal = JSON.parse(readFileSync(file, "utf8"));
+      if (field === "native-generation") journal.nativeGeneration = "f".repeat(64);
+      else journal.result.retirement.operationId = randomUUID();
+      const before = JSON.stringify(journal);
+      writeFileSync(file, before);
+      expect(await f.api.previewBackingReclaim(f.deps, f.input)).toMatchObject({ eligible: false });
+      expect(readFileSync(file, "utf8")).toBe(before);
+    } finally {
+      await f.close();
+    }
+  },
+);
+
+test("RECLAIM ignores unrelated unresolved remote ancestry but refuses affected ancestry", async () => {
+  const f = await reclaimFixture();
+  const inspect = f.layout.inspect.bind(f.layout);
+  try {
+    f.layout.inspect = async () => {
+      const snapshot = await inspect();
+      return {
+        ...snapshot,
+        entries: [
+          ...snapshot.entries,
+          {
+            ...snapshot.entries[0],
+            ref: { serverId: "unrelated-unknown", workspaceId: "unknown-child" },
+            parent: { serverId: "unrelated-unknown", workspaceId: "missing-parent" },
+            archivedAt: null,
+          },
+        ],
+      };
+    };
+    expect(await f.api.previewBackingReclaim(f.deps, f.input)).toMatchObject({ eligible: true });
+    f.layout.inspect = async () => {
+      const snapshot = await inspect();
+      return {
+        ...snapshot,
+        entries: snapshot.entries.map((e) =>
+          Object.assign({}, e, {
+            parent: { serverId: "unrelated-unknown", workspaceId: "missing-parent" },
+          }),
+        ),
+      };
+    };
+    expect(await f.api.previewBackingReclaim(f.deps, f.input)).toMatchObject({
+      eligible: false,
+      code: "reclaim_ancestry_unknown",
+    });
+  } finally {
+    await f.close();
+  }
+});
+
+test.each(["state", "digest", "target", "receipt"])(
+  "RECLAIM damaged %s never releases a partial backing fence",
+  async (field) => {
+    const f = await reclaimFixture();
+    try {
+      const preview = await f.api.previewBackingReclaim(f.deps, f.input),
+        id = randomUUID();
+      f.deps.teardown = async () => {
+        throw Error("fixture interrupted");
+      };
+      await f.api.applyBackingReclaim(f.deps, {
+        ...f.input,
+        operationId: id,
+        expectedGeneration: preview.generation!,
+      });
+      const file = path.join(f.home, "workspace-backing-reclaims", `${id}.json`),
+        journal = JSON.parse(readFileSync(file, "utf8"));
+      if (field === "state") journal.operation.state = "complete";
+      if (field === "digest") journal.requestSha256 = "f".repeat(64);
+      if (field === "target") journal.operation.target.path = path.join(f.home, "different");
+      if (field === "receipt") {
+        journal.operation.state = "complete";
+        journal.operation.terminal = true;
+        journal.operation.removedDirectory = true;
+        journal.operation.code = null;
+        journal.step = "remove-done";
+        journal.operation.receipt = {
+          id: "forged",
+          requestSha256: journal.requestSha256,
+          resultSha256: "f".repeat(64),
+        };
+      }
+      writeFileSync(file, JSON.stringify(journal));
+      await expect(f.api.getBackingReclaimStatus(f.deps, id)).rejects.toThrow(
+        "reclaim_journal_unverified",
+      );
+      const { assertReclaimBackingAvailable } =
+        await import("./workspace-backing-reclaim-journal.js");
+      await expect(assertReclaimBackingAvailable(f.home, f.target.path)).rejects.toThrow(
+        "reclaim_journal_unverified",
+      );
+      expect(existsSync(f.target.path)).toBe(true);
+    } finally {
+      await f.close();
+    }
+  },
+);
+test("RECLAIM relative paths refuse before creating a cwd-dependent durable fence", async () => {
+  const f = await reclaimFixture();
+  try {
+    const input = {
+      ...f.input,
+      target: { ...f.target, path: path.relative(process.cwd(), f.target.path) },
+    };
+    await expect(
+      f.api.applyBackingReclaim(f.deps, {
+        ...input,
+        operationId: randomUUID(),
+        expectedGeneration: "f".repeat(64),
+      }),
+    ).rejects.toThrow("reclaim_exact_canonical_path_required");
+    expect(existsSync(path.join(f.home, "workspace-backing-reclaims"))).toBe(false);
+  } finally {
+    await f.close();
+  }
+});
+test("RECLAIM valid convergent ancestor edges pass, actual cycle refuses", async () => {
+  const f = await reclaimFixture();
+  const inspect = f.layout.inspect.bind(f.layout);
+  try {
+    f.layout.inspect = async () => {
+      const snapshot = await inspect(),
+        entry = snapshot.entries[0];
+      const ref = { serverId: f.layout.options.serverId, workspaceId: "ancestor" };
+      return {
+        ...snapshot,
+        entries: [
+          {
+            ...entry,
+            parent: ref,
+            pinPlacement: {
+              parentWorkspaceKey: `${ref.serverId}:${ref.workspaceId}`,
+              siblingOrder: 1,
+              revision: 1,
+            },
+          },
+          { ...entry, ref, parent: null, pinPlacement: null, archivedAt: entry.archivedAt },
+        ],
+      };
+    };
+    expect(await f.api.previewBackingReclaim(f.deps, f.input)).toMatchObject({ eligible: true });
+    const valid = f.layout.inspect;
+    f.layout.inspect = async () => {
+      const snapshot = await valid();
+      snapshot.entries[1].parent = snapshot.entries[0].ref;
+      return snapshot;
+    };
+    expect(await f.api.previewBackingReclaim(f.deps, f.input)).toMatchObject({
+      eligible: false,
+      code: "reclaim_ancestry_unknown",
+    });
+  } finally {
+    await f.close();
+  }
+});
+test("RECLAIM requires a configured production guard before journaling teardown", async () => {
+  const f = await reclaimFixture();
+  try {
+    delete f.deps.teardown;
+    expect(await f.api.previewBackingReclaim(f.deps, f.input)).toMatchObject({
+      eligible: false,
+      code: "reclaim_release_guard_required",
+    });
+    expect(existsSync(path.join(f.home, "workspace-backing-reclaims"))).toBe(false);
+  } finally {
+    await f.close();
+  }
+});
+test("RECLAIM holds live cwd admission across teardown and preserves minimum-reader marker", async () => {
+  const f = await reclaimFixture();
+  try {
+    const preview = await f.api.previewBackingReclaim(f.deps, f.input);
+    let release!: () => void, entered!: () => void;
+    const enteredHook = new Promise<void>((r) => (entered = r)),
+      pause = new Promise<void>((r) => (release = r)),
+      original = f.deps.teardown!;
+    f.deps.teardown = async (options) => {
+      entered();
+      await pause;
+      return original(options);
+    };
+    const apply = f.api.applyBackingReclaim(f.deps, {
+      ...f.input,
+      operationId: randomUUID(),
+      expectedGeneration: preview.generation!,
+    });
+    await enteredHook;
+    const { admitReclaimReference } = await import("./workspace-backing-reclaim-journal.js");
+    let spawned = false;
+    const terminal = admitReclaimReference(f.home, f.target.path, async () => {
+      spawned = true;
+      if (!existsSync(f.target.path)) throw Error("cwd removed");
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(spawned).toBe(false);
+    release();
+    expect((await apply).state).toBe("complete");
+    await expect(terminal).rejects.toThrow("cwd removed");
+    const marker = JSON.parse(
+      readFileSync(path.join(f.home, "workspace-layout-mode.json"), "utf8"),
+    );
+    expect(marker.schemaVersion).toBe(4);
+    expect(await resolveWorkspaceLayoutMode(f.home, undefined)).toEqual(f.layout.options.config);
+  } finally {
+    await f.close();
+  }
+});
+test("RECLAIM UUID cannot later identify a distinct native archive", async () => {
+  const f = await reclaimFixture();
+  try {
+    const preview = await f.api.previewBackingReclaim(f.deps, f.input),
+      id = randomUUID();
+    expect(
+      (
+        await f.api.applyBackingReclaim(f.deps, {
+          ...f.input,
+          operationId: id,
+          expectedGeneration: preview.generation!,
+        })
+      ).state,
+    ).toBe("complete");
+    await expect(
+      archiveByScope(f.archiveDeps, {
+        scope: { kind: "workspace", workspaceId: "old-a" },
+        operationId: id,
+        requestId: "different-operation",
+      }),
+    ).rejects.toThrow("retirement_operation_id_conflict");
+  } finally {
+    await f.close();
+  }
+});
+
+test("RECLAIM an unrelated archive cannot downgrade the owner reclaim fence version", async () => {
+  const f = await reclaimFixture("orphan");
+  try {
+    const preview = await f.api.previewBackingReclaim(f.deps, f.input);
+    f.deps.teardown = async () => {
+      throw Error("interrupted");
+    };
+    expect(
+      (
+        await f.api.applyBackingReclaim(f.deps, {
+          ...f.input,
+          operationId: randomUUID(),
+          expectedGeneration: preview.generation!,
+        })
+      ).state,
+    ).toBe("partial");
+    const result = await archiveByScope(f.archiveDeps, {
+      scope: { kind: "workspace", workspaceId: "old-a" },
+      operationId: randomUUID(),
+      requestId: "unrelated-archive",
+    });
+    expect(result.retirement?.state).toBe("complete");
+    expect(
+      JSON.parse(readFileSync(path.join(f.home, "workspace-layout-mode.json"), "utf8"))
+        .schemaVersion,
+    ).toBe(4);
+  } finally {
+    await f.close();
+  }
+});
+
+test("RECLAIM and archive share UUID admission even for disjoint physical paths", async () => {
+  const f = await reclaimFixture("orphan");
+  try {
+    const preview = await f.api.previewBackingReclaim(f.deps, f.input),
+      id = randomUUID();
+    let release!: () => void, entered!: () => void;
+    const pause = new Promise<void>((r) => (release = r)),
+      started = new Promise<void>((r) => (entered = r)),
+      teardown = f.deps.teardown!;
+    f.deps.teardown = async (options) => {
+      entered();
+      await pause;
+      return teardown(options);
+    };
+    const reclaim = f.api.applyBackingReclaim(f.deps, {
+      ...f.input,
+      operationId: id,
+      expectedGeneration: preview.generation!,
+    });
+    await started;
+    const archive = archiveByScope(f.archiveDeps, {
+      scope: { kind: "workspace", workspaceId: "old-a" },
+      operationId: id,
+      requestId: "concurrent",
+    });
+    const refusal = expect(archive).rejects.toThrow("retirement_operation_id_conflict");
+    release();
+    expect((await reclaim).state).toBe("complete");
+    await refusal;
+    expect((await f.registry.get("old-a"))?.archivedAt).toBeNull();
+  } finally {
+    await f.close();
+  }
+});

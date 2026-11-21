@@ -784,3 +784,198 @@ if(result.status!==0)throw new Error("fixture retirement-verify refused");const 
     readFile(path.join(workspace.workspaceDirectory!, "paseo.json")),
   ).rejects.toMatchObject({ code: "ENOENT" });
 }, 45000);
+
+test.each(["retired", "orphan"] as const)(
+  "RECLAIM real daemon %s runs a live generation-qualified CLI guard and removes once",
+  async (kind) => {
+    const { execFileSync } = await import("node:child_process");
+    const { fileURLToPath } = await import("node:url");
+    const { acquirePidLock, releasePidLock } = await import("./pid-lock.js");
+    const ownerRoot = path.join(root, "non-default-owner");
+    const home = path.join(ownerRoot, ".paseo");
+    await mkdir(home, { recursive: true });
+    vi.stubEnv("PASEO_HOME", path.join(root, "different-inherited-home"));
+    vi.stubEnv("PASEO_HOST", "127.0.0.1:1");
+    vi.stubEnv("PASEO_PASSWORD", undefined);
+    const serverId = "srv_hook_owner_fixture";
+    await writeFile(path.join(home, "server-id"), serverId);
+    const logger = pino({ level: "silent" });
+    const keys = await loadOrCreateDaemonKeyPair(home, logger);
+    const mode = {
+      role: "authority" as const,
+      semanticsVersion: 2 as const,
+      authorityServerId: serverId,
+      authorityKeySha256: createHash("sha256").update(keys.publicKeyB64).digest("hex"),
+      authorityId: randomUUID(),
+      epoch: randomUUID(),
+    };
+    const fixturePassword = "fixture-positive-hook-only";
+    const fixture = await createTestPaseoDaemon({
+      auth: { password: hashSync(fixturePassword, 4) },
+      paseoHomeRoot: ownerRoot,
+      cleanup: false,
+      workspaceLayout: mode,
+      agentClients: {},
+      pluginsEnabled: false,
+      relayEnabled: false,
+      logger,
+    });
+    cleanup.push(() => fixture.close());
+    await acquirePidLock(home, `127.0.0.1:${fixture.port}`);
+    cleanup.push(() => releasePidLock(home));
+    const client = createHostClient(`tcp://127.0.0.1:${fixture.port}`, {
+      clientId: randomUUID(),
+      password: fixturePassword,
+      reconnect: { enabled: false },
+    });
+    cleanup.push(() => client.close());
+    await client.connect();
+    const initial = (await client.initializeWorkspaceLayout(mode)).snapshot;
+    await client.commitWorkspaceLayout({
+      writerVersion: 2,
+      requestId: "hook-import",
+      expected: initial.stamp,
+      mutations: [
+        {
+          kind: "import-host",
+          previousSourceSha256: null,
+          source: { serverId, sourceSha256: "a".repeat(64), resolutionSha256: "b".repeat(64) },
+          entries: [],
+        },
+        {
+          kind: "put-navigation",
+          expectedRevision: 0,
+          preferences: emptyWorkspaceNavigationPreferences(),
+          importResolution: { clientSources: [], resolutionSha256: "c".repeat(64) },
+        },
+      ],
+    });
+    const imported = await client.getWorkspaceLayout();
+    await client.commitWorkspaceLayout({
+      writerVersion: 2,
+      requestId: "hook-activate",
+      expected: imported.stamp,
+      mutations: [
+        {
+          kind: "activate",
+          requiredImports: imported.imports,
+          requiredOwnerDomains: imported.ownerDomains,
+        },
+      ],
+    });
+    const repo = path.join(root, "hook-repo");
+    await mkdir(repo);
+    execFileSync("git", ["init", "-b", "main"], { cwd: repo, stdio: "pipe" });
+    execFileSync("git", ["config", "user.name", "Fixture"], { cwd: repo });
+    execFileSync("git", ["config", "user.email", "fixture@example.invalid"], { cwd: repo });
+    const marker = path.join(root, "verified-hook.json");
+    const cli = fileURLToPath(new URL("../../../cli/src/index.ts", import.meta.url));
+    const tsx = import.meta.resolve("tsx");
+    await writeFile(
+      path.join(repo, "verify-hook.mjs"),
+      `import {spawnSync} from "node:child_process";import {writeFileSync} from "node:fs";
+const e=process.env;const result=spawnSync(process.execPath,["--conditions=source","--import",${JSON.stringify(tsx)},${JSON.stringify(cli)},"workspace","reclaim-verify",e.PASEO_RECLAIM_OPERATION_ID,"--expected-generation",e.PASEO_RECLAIM_BACKING_GENERATION,"--path",e.PASEO_RECLAIM_PATH,"--release-evidence",e.PASEO_RECLAIM_RELEASE_EVIDENCE,"--owner-released","--external-references-clear","--json"],{env:e,encoding:"utf8",timeout:15000});
+if(result.status!==0)throw new Error("fixture reclaim-verify refused");const parsed=JSON.parse(result.stdout);const data=parsed.data??parsed;if(data.valid!==true)throw new Error("fixture verification not valid");writeFileSync(${JSON.stringify(marker)},JSON.stringify({valid:data.valid,operationId:e.PASEO_RECLAIM_OPERATION_ID,ownerHome:e.PASEO_HOME}));`,
+    );
+    const quote = (value: string) => "'" + value.replace(/'/g, "'\\''") + "'";
+    await writeFile(
+      path.join(repo, "paseo.json"),
+      JSON.stringify({ worktree: { teardown: [quote(process.execPath) + " verify-hook.mjs"] } }),
+    );
+    execFileSync("git", ["add", "."], { cwd: repo });
+    execFileSync("git", ["-c", "commit.gpgsign=false", "commit", "-m", "owned hook fixture"], {
+      cwd: repo,
+      stdio: "pipe",
+    });
+    let target: import("@getpaseo/protocol/workspace-backing-reclaim").WorkspaceBackingReclaimTarget;
+    let oldOperation: string | undefined;
+    if (kind === "retired") {
+      const created = await client.createWorkspace({
+        source: {
+          kind: "worktree",
+          cwd: repo,
+          worktreeSlug: "reclaim-retired",
+          baseBranch: "main",
+        },
+      });
+      expect(created.error).toBeNull();
+      const workspace = created.workspace!;
+      const cwd = workspace.workspaceDirectory!;
+      await writeFile(path.join(cwd, "released-source"), "owner source");
+      execFileSync("git", ["-C", cwd, "add", "released-source"]);
+      execFileSync(
+        "git",
+        ["-C", cwd, "-c", "commit.gpgsign=false", "commit", "-m", "not yet landed"],
+        { stdio: "pipe" },
+      );
+      const preserved = await client.archiveWorkspace(workspace.id, { operationId: randomUUID() });
+      expect(preserved).toMatchObject({
+        removedDirectory: false,
+        slotKept: true,
+        directoryLeftBehind: { reason: "source_preserved" },
+        retirement: { state: "complete" },
+      });
+      oldOperation = preserved.retirement!.operationId;
+      const old = await client.getWorkspaceRetirementStatus(oldOperation);
+      const head = execFileSync("git", ["-C", cwd, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+      execFileSync("git", ["-C", repo, "merge", "--ff-only", head], { stdio: "pipe" });
+      target = {
+        kind: "retired",
+        path: cwd,
+        workspaceId: workspace.id,
+        retirementOperationId: oldOperation,
+        backingGeneration: old!.backingGeneration!,
+      };
+    } else {
+      const { createWorktree } = await import("../utils/worktree.js");
+      const worktree = await createWorktree({
+        cwd: repo,
+        paseoHome: home,
+        worktreeSlug: "reclaim-orphan",
+        source: { kind: "branch-off", baseBranch: "main", branchName: "reclaim-orphan" },
+      });
+      target = { kind: "orphan", path: worktree.worktreePath };
+    }
+    expect(client.getLastServerInfoMessage()?.features?.workspaceBackingReclaim).toBe(true);
+    const input = { target, releaseEvidence: "e".repeat(64) };
+    const preview = await client.previewWorkspaceBackingReclaim(input);
+    expect(preview).toMatchObject({ eligible: true, code: null, generation: expect.any(String) });
+    const operationId = randomUUID();
+    const request = { ...input, operationId, expectedGeneration: preview.generation! };
+    const result = await client.reclaimWorkspaceBacking(request);
+    expect(result).toMatchObject({
+      state: "complete",
+      removedDirectory: true,
+      terminal: true,
+      receipt: { id: expect.stringContaining(`reclaim:${operationId}:`) },
+    });
+    expect(JSON.parse(await readFile(marker, "utf8"))).toEqual({
+      valid: true,
+      operationId,
+      ownerHome: home,
+    });
+    expect(await client.getWorkspaceBackingReclaimStatus(operationId)).toEqual(result);
+    expect(await client.reclaimWorkspaceBacking(request)).toEqual(result);
+    expect(
+      await client.verifyWorkspaceBackingReclaim({
+        operationId,
+        generation: preview.generation!,
+        path: target.path,
+        releaseEvidence: input.releaseEvidence,
+        ownerReleased: true,
+        externalReferencesClear: true,
+      }),
+    ).toEqual({ valid: false, code: "reclaim_hook_not_active" });
+    if (oldOperation)
+      expect(await client.getWorkspaceRetirementStatus(oldOperation)).toMatchObject({
+        state: "complete",
+        result: { removedDirectory: false, directoryLeftBehind: { reason: "source_preserved" } },
+      });
+    await expect(readFile(path.join(target.path, "paseo.json"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  },
+  60000,
+);
