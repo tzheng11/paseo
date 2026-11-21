@@ -23,7 +23,15 @@ import {
 import { execFileSync, fork, type ChildProcess } from "node:child_process";
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import { pathToFileURL } from "node:url";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+  renameSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import pino, { type Logger } from "pino";
@@ -4522,3 +4530,238 @@ test("RECLAIM provider admission rejects old A but accepts active replacement B 
     await f.close();
   }
 });
+
+test.each(["git-listed", "other-repository"])(
+  "RECLAIM CORRECTION refuses a parent containing an ignored nested %s worktree",
+  async (kind) => {
+    const f = await reclaimFixture("orphan");
+    try {
+      const preview = await f.api.previewBackingReclaim(f.deps, f.input);
+      expect(preview.eligible).toBe(true);
+      const nested = path.join(f.target.path, "nested retained checkout");
+      const ownerRepo = kind === "git-listed" ? f.repoDir : createGitRepo().repoDir;
+      const exclude = execFileSync(
+        "git",
+        ["-C", f.target.path, "rev-parse", "--git-path", "info/exclude"],
+        { encoding: "utf8" },
+      ).trim();
+      writeFileSync(exclude, readFileSync(exclude, "utf8") + "\n/nested retained checkout/\n");
+      execFileSync("git", ["-C", ownerRepo, "worktree", "add", "-b", "nested-retained", nested], {
+        stdio: "pipe",
+      });
+      const sentinel = path.join(nested, "owner-source");
+      writeFileSync(sentinel, "preserve the nested worktree\n");
+      const teardown = vi.fn(f.deps.teardown!);
+      f.deps.teardown = teardown;
+      const result = await f.api.applyBackingReclaim(f.deps, {
+        ...f.input,
+        operationId: randomUUID(),
+        expectedGeneration: preview.generation!,
+      });
+      expect(result).toMatchObject({
+        state: "refused",
+        terminal: true,
+        code: "reclaim_nested_worktree",
+        removedDirectory: false,
+      });
+      expect(teardown).not.toHaveBeenCalled();
+      expect(readFileSync(sentinel, "utf8")).toBe("preserve the nested worktree\n");
+      expect(
+        execFileSync("git", ["-C", nested, "rev-parse", "--show-toplevel"], {
+          encoding: "utf8",
+        }).trim(),
+      ).toBe(nested);
+    } finally {
+      await f.close();
+    }
+  },
+);
+
+test("RECLAIM CORRECTION a paused archive cannot lower the reclaim marker while its fence is live", async () => {
+  const f = await reclaimFixture("orphan");
+  let resumeArchive!: () => void, archiveEntered!: () => void;
+  let resumeReclaim!: () => void, reclaimEntered!: () => void;
+  const archivePause = new Promise<void>((r) => (resumeArchive = r));
+  const archiveStarted = new Promise<void>((r) => (archiveEntered = r));
+  const reclaimPause = new Promise<void>((r) => (resumeReclaim = r));
+  const reclaimStarted = new Promise<void>((r) => (reclaimEntered = r));
+  const originalCommit = f.layout.commit.bind(f.layout);
+  const commit = vi.spyOn(f.layout, "commit").mockImplementation(async (input) => {
+    if (input.mutations.some((mutation) => mutation.kind === "reserve-retirement")) {
+      archiveEntered();
+      await archivePause;
+    }
+    return originalCommit(input);
+  });
+  let archive: ReturnType<typeof archiveByScope> | undefined;
+  let reclaim: ReturnType<typeof f.api.applyBackingReclaim> | undefined;
+  try {
+    const preview = await f.api.previewBackingReclaim(f.deps, f.input);
+    archive = archiveByScope(f.archiveDeps, {
+      scope: { kind: "workspace", workspaceId: "old-a" },
+      operationId: randomUUID(),
+      requestId: "paused-before-marker-promotion",
+    });
+    await archiveStarted;
+    const teardown = f.deps.teardown!;
+    f.deps.teardown = async (options) => {
+      reclaimEntered();
+      await reclaimPause;
+      return teardown(options);
+    };
+    reclaim = f.api.applyBackingReclaim(f.deps, {
+      ...f.input,
+      operationId: randomUUID(),
+      expectedGeneration: preview.generation!,
+    });
+    await reclaimStarted;
+    const markerVersion = () =>
+      JSON.parse(readFileSync(path.join(f.home, "workspace-layout-mode.json"), "utf8"))
+        .schemaVersion;
+    expect(markerVersion()).toBe(4);
+    resumeArchive();
+    expect((await archive).retirement?.state).toBe("complete");
+    // The unrelated archive completes while reclaim still owns its backing fence.
+    expect(markerVersion()).toBe(4);
+    resumeReclaim();
+    expect((await reclaim).state).toBe("complete");
+    expect(markerVersion()).toBe(4);
+  } finally {
+    resumeArchive();
+    resumeReclaim();
+    await Promise.allSettled([archive, reclaim]);
+    commit.mockRestore();
+    await f.close();
+  }
+});
+
+test("RECLAIM CORRECTION refuses a registered descendant even without Git registration", async () => {
+  const f = await reclaimFixture("orphan");
+  try {
+    const nested = path.join(f.target.path, "registered-only");
+    mkdirSync(nested);
+    const exclude = execFileSync(
+      "git",
+      ["-C", f.target.path, "rev-parse", "--git-path", "info/exclude"],
+      { encoding: "utf8" },
+    ).trim();
+    writeFileSync(exclude, readFileSync(exclude, "utf8") + "\n/registered-only/\n");
+    await f.registry.upsert({
+      ...f.record,
+      workspaceId: "registered-child",
+      cwd: nested,
+      worktreeRoot: nested,
+    });
+    expect(await f.api.previewBackingReclaim(f.deps, f.input)).toMatchObject({
+      eligible: false,
+      code: "reclaim_native_reference",
+      generation: null,
+    });
+    expect(existsSync(nested)).toBe(true);
+  } finally {
+    await f.close();
+  }
+});
+
+test("RECLAIM CORRECTION rechecks nested worktrees after teardown before removing the parent", async () => {
+  const f = await reclaimFixture("orphan");
+  try {
+    const nested = path.join(f.target.path, "late-checkout");
+    const exclude = execFileSync(
+      "git",
+      ["-C", f.target.path, "rev-parse", "--git-path", "info/exclude"],
+      { encoding: "utf8" },
+    ).trim();
+    writeFileSync(exclude, readFileSync(exclude, "utf8") + "\n/late-checkout/\n");
+    const preview = await f.api.previewBackingReclaim(f.deps, f.input);
+    const teardown = f.deps.teardown!;
+    f.deps.teardown = async (options) => {
+      await teardown(options);
+      execFileSync("git", ["-C", f.repoDir, "worktree", "add", "-b", "late-checkout", nested], {
+        stdio: "pipe",
+      });
+      return [];
+    };
+    const result = await f.api.applyBackingReclaim(f.deps, {
+      ...f.input,
+      operationId: randomUUID(),
+      expectedGeneration: preview.generation!,
+    });
+    expect(result).toMatchObject({
+      state: "partial",
+      terminal: false,
+      code: "reclaim_nested_worktree",
+      removedDirectory: false,
+    });
+    expect(existsSync(path.join(nested, ".git"))).toBe(true);
+  } finally {
+    await f.close();
+  }
+});
+
+test("RECLAIM CORRECTION preserves an ignored nested bare repository", async () => {
+  const f = await reclaimFixture("orphan");
+  try {
+    const nested = path.join(f.target.path, "retained-bare.git");
+    const exclude = execFileSync(
+      "git",
+      ["-C", f.target.path, "rev-parse", "--git-path", "info/exclude"],
+      { encoding: "utf8" },
+    ).trim();
+    writeFileSync(exclude, readFileSync(exclude, "utf8") + "\n/retained-bare.git/\n");
+    const preview = await f.api.previewBackingReclaim(f.deps, f.input);
+    execFileSync("git", ["init", "--bare", nested], { stdio: "pipe" });
+    const result = await f.api.applyBackingReclaim(f.deps, {
+      ...f.input,
+      operationId: randomUUID(),
+      expectedGeneration: preview.generation!,
+    });
+    expect(result).toMatchObject({
+      state: "refused",
+      code: "reclaim_nested_worktree",
+      removedDirectory: false,
+    });
+    expect(
+      execFileSync("git", ["-C", nested, "rev-parse", "--is-bare-repository"], {
+        encoding: "utf8",
+      }).trim(),
+    ).toBe("true");
+  } finally {
+    await f.close();
+  }
+});
+
+test.skipIf(process.platform !== "darwin" && process.platform !== "win32")(
+  "RECLAIM CORRECTION preserves a nested worktree with a case-aliased Git marker",
+  async () => {
+    const f = await reclaimFixture("orphan");
+    try {
+      const other = createGitRepo();
+      const nested = path.join(f.target.path, "case-aliased");
+      const exclude = execFileSync(
+        "git",
+        ["-C", f.target.path, "rev-parse", "--git-path", "info/exclude"],
+        { encoding: "utf8" },
+      ).trim();
+      writeFileSync(exclude, readFileSync(exclude, "utf8") + "\n/case-aliased/\n");
+      const preview = await f.api.previewBackingReclaim(f.deps, f.input);
+      execFileSync("git", ["-C", other.repoDir, "worktree", "add", "-b", "case-aliased", nested], {
+        stdio: "pipe",
+      });
+      renameSync(path.join(nested, ".git"), path.join(nested, ".GIT"));
+      const result = await f.api.applyBackingReclaim(f.deps, {
+        ...f.input,
+        operationId: randomUUID(),
+        expectedGeneration: preview.generation!,
+      });
+      expect(result).toMatchObject({
+        state: "refused",
+        code: "reclaim_nested_worktree",
+        removedDirectory: false,
+      });
+      expect(existsSync(path.join(nested, ".GIT"))).toBe(true);
+    } finally {
+      await f.close();
+    }
+  },
+);

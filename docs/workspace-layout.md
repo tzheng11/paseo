@@ -542,6 +542,13 @@ UUID. Its target is an **absolute canonical Git worktree root**, never a cwd sea
   overlaps it. A path with retirement history cannot evade its receipt checks by
   being relabelled as an orphan.
 
+Preview and every fenced revalidation refuse a parent of another native or
+Git-registered worktree. The owner also scans ignored descendant directories for
+Git boundaries from other repositories. The scan never follows symlink targets;
+unreadable evidence or more than 100,000 directory entries refuses reclamation.
+External Git/filesystem writers do not participate in the daemon's backing lease;
+the synchronous external-reference guard remains required.
+
 The SDK methods are `DaemonClient.previewWorkspaceBackingReclaim(input)`,
 `reclaimWorkspaceBacking({...input,operationId,expectedGeneration})`,
 `getWorkspaceBackingReclaimStatus(operationId)` and
@@ -617,7 +624,11 @@ Worker terminal admission also rejects an expired original identity.
 
 Before effects, the owner raises its home marker minimum-reader version to 4.
 Prior binaries fail closed rather than ignoring an unresolved reclaim journal.
-Ordinary subsequent archives preserve that version. No rollback/config deletion,
+Archive and reclaim promote the latest validated marker under a short shared
+marker-file lock, independent of their backing leases. Concurrent archives cannot
+lower it. A competing process or retained lock refuses with `home_marker_busy`;
+neither operation deletes another process's lock or reconstructs a missing marker.
+No rollback/config deletion,
 live reclaim, packet installation or adapter-wide apply is authorized by this
 source change. The consumer remains responsible for its release and external
 reference guard, candidate holds and later live acceptance.

@@ -32,6 +32,7 @@ import {
   WorkspaceAutomationBlockedError,
 } from "./workspace-automation-gate.js";
 import { serializeWorkspaceBacking, nativeTransitionKey } from "./workspace-retirement-context.js";
+import { promoteWorkspaceLayoutHomeMarker } from "./workspace-layout-home-marker.js";
 
 interface RetirementContext {
   operationId: string;
@@ -396,14 +397,7 @@ export async function retireCanonicalWorkspace(input: RetirementInput): Promise<
       }),
     });
     // A rollback binary must refuse this owner home before it can run legacy teardown.
-    await writeFileDurably(
-      path.join(home, "workspace-layout-mode.json"),
-      JSON.stringify({
-        ...authority.options.config,
-        schemaVersion: Math.max(3, marker.schemaVersion),
-        destructiveRetirement: "refuse",
-      }),
-    );
+    await promoteWorkspaceLayoutHomeMarker(home, authority.options.config, 3);
     const result = await withWorkspaceRetirement(
       {
         operationId,

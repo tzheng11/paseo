@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { readFile, stat, realpath, mkdir } from "node:fs/promises";
+import { readFile, stat, realpath, mkdir, opendir } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import {
@@ -26,7 +26,11 @@ import {
   getWorkspaceRetirementStatus,
   type RetirementAuthority,
 } from "./workspace-retirement.js";
-import { serializeWorkspaceBacking, nativeTransitionKey } from "./workspace-retirement-context.js";
+import {
+  serializeWorkspaceBacking,
+  nativeTransitionKey,
+  canonicalWorkspaceBacking,
+} from "./workspace-retirement-context.js";
 import {
   readReclaimJournal,
   reclaimFile,
@@ -35,6 +39,7 @@ import {
   type ReclaimJournal,
 } from "./workspace-backing-reclaim-journal.js";
 import { writeFileDurably } from "./atomic-file.js";
+import { promoteWorkspaceLayoutHomeMarker } from "./workspace-layout-home-marker.js";
 import type { PersistedWorkspaceRecord } from "./workspace-registry.js";
 import { retirementSourceIsCleanAndLanded } from "./workspace-archive-service.js";
 import {
@@ -71,14 +76,17 @@ const identityStat = async (p: string) => {
   const s = await stat(p);
   return { dev: s.dev, ino: s.ino, birthtimeMs: s.birthtimeMs };
 };
-async function git(cwd: string, ...args: string[]): Promise<string> {
+async function gitOutput(cwd: string, ...args: string[]): Promise<string> {
   return (
     await exec("git", ["-C", cwd, ...args], {
       timeout: 10000,
       maxBuffer: 2 * 1024 * 1024,
       env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
     })
-  ).stdout.trim();
+  ).stdout;
+}
+async function git(cwd: string, ...args: string[]): Promise<string> {
+  return (await gitOutput(cwd, ...args)).trim();
 }
 function validateIdentity(deps: BackingReclaimDependencies, journal: ReclaimJournal, id: string) {
   if (
@@ -227,13 +235,71 @@ async function observeManagedGit(deps: BackingReclaimDependencies, targetPath: s
   if (repo === canonical) refuse("reclaim_main_checkout_forbidden");
   const metadata = await readPaseoWorktreeMetadata(targetPath);
   if (!metadata) refuse("reclaim_managed_marker_required");
-  const list = await git(repo, "worktree", "list", "--porcelain");
-  if (!list.split("\n").includes(`worktree ${targetPath}`))
-    refuse("reclaim_git_registration_required");
+  // NUL framing preserves spaces, newlines and Git's unquoted path bytes.
+  const registrations = (await gitOutput(repo, "worktree", "list", "--porcelain", "-z"))
+    .split("\0\0")
+    .filter(Boolean);
+  let registration: string | undefined;
+  for (const entry of registrations) {
+    const first = entry.split("\0", 1)[0];
+    if (!first.startsWith("worktree ")) refuse("reclaim_git_inventory_unknown");
+    const registeredPath = first.slice("worktree ".length);
+    if (registeredPath === targetPath) registration = entry;
+    else {
+      if (!path.isAbsolute(registeredPath)) refuse("reclaim_git_inventory_unknown");
+      const normalize = (value: string) =>
+        process.platform === "darwin" || process.platform === "win32"
+          ? value.normalize("NFC").toLowerCase()
+          : value;
+      const relative = path.relative(
+        normalize(targetPath),
+        normalize(await canonicalWorkspaceBacking(registeredPath)),
+      );
+      if (
+        relative &&
+        relative !== ".." &&
+        !relative.startsWith(`..${path.sep}`) &&
+        !path.isAbsolute(relative)
+      )
+        refuse("reclaim_nested_worktree");
+    }
+  }
+  if (!registration) refuse("reclaim_git_registration_required");
+  await assertNoNestedGitBoundary(targetPath);
   const top = await realpath(await git(targetPath, "rev-parse", "--show-toplevel"));
   if (top !== targetPath) refuse("reclaim_exact_root_required");
   const gitDir = await realpath(await git(targetPath, "rev-parse", "--absolute-git-dir"));
-  return { repo, metadata, list, gitDir };
+  return { repo, metadata, registration, gitDir };
+}
+
+/** Ignored and other-repository worktrees are absent from the owner's Git registry. */
+async function assertNoNestedGitBoundary(root: string): Promise<void> {
+  const pending = [root];
+  let remaining = 100000;
+  while (pending.length) {
+    const directory = pending.pop()!;
+    // Streaming keeps traversal memory bounded even for a large ignored directory.
+    const entries = await opendir(directory);
+    const bareMarkers = new Set<string>();
+    for await (const entry of entries) {
+      if (--remaining < 0) refuse("reclaim_git_inventory_unknown");
+      const name =
+        process.platform === "darwin" || process.platform === "win32"
+          ? entry.name.toLowerCase()
+          : entry.name;
+      if (directory !== root && ["head", "HEAD", "objects", "refs"].includes(name)) {
+        bareMarkers.add(name.toLowerCase());
+        if (bareMarkers.size === 3) refuse("reclaim_nested_worktree");
+      }
+      if (name === ".git") {
+        if (directory !== root) refuse("reclaim_nested_worktree");
+        continue;
+      }
+      // Git removal unlinks symlinks; it does not traverse their targets.
+      if (entry.isDirectory()) pending.push(path.join(directory, entry.name));
+      else if (!entry.isFile() && !entry.isSymbolicLink()) refuse("reclaim_git_inventory_unknown");
+    }
+  }
 }
 async function observeOriginal(
   deps: BackingReclaimDependencies,
@@ -330,7 +396,7 @@ async function observe(
     refuse("home_authority_binding_changed");
   const targetPath = path.resolve(input.target.path);
   if (!path.isAbsolute(input.target.path)) refuse("reclaim_exact_canonical_path_required");
-  const { repo, metadata, list, gitDir } = await observeManagedGit(deps, targetPath);
+  const { repo, metadata, registration, gitDir } = await observeManagedGit(deps, targetPath);
   const rows = await deps.inventory(),
     snapshot = await authority.inspect();
   const originals =
@@ -368,7 +434,7 @@ async function observe(
     gitIdentity: await identityStat(gitDir),
     metadata,
     head: await git(targetPath, "rev-parse", "HEAD"),
-    registration: list.split("\n\n").find((e) => e.startsWith(`worktree ${targetPath}\n`)),
+    registration,
   };
   return {
     generation: hashLayoutValue(operands),
@@ -482,14 +548,7 @@ export async function applyBackingReclaim(
       const current = await verify();
       // Older owner binaries do not understand the new durable reclaim fence.
       // Their marker parser must refuse this home before observing or registering paths.
-      await writeFileDurably(
-        path.join(home, "workspace-layout-mode.json"),
-        JSON.stringify({
-          ...deps.authority.options.config,
-          schemaVersion: 4,
-          destructiveRetirement: "refuse",
-        }),
-      );
+      await promoteWorkspaceLayoutHomeMarker(home, deps.authority.options.config, 4);
       const binding = {
         operationId: id,
         generation,
