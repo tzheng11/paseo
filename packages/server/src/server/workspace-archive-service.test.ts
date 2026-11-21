@@ -5167,3 +5167,137 @@ test("RECLAIM REGISTRATION normalizes absolute target parent aliases for durable
     await f.close();
   }
 });
+
+test("RECLAIM GIT LOCK retains its administrative identity across an external prune", async () => {
+  const f = await reclaimFixture("orphan");
+  const originalWrite = atomicFile.writeFileDurably;
+  let checked = false,
+    preserved = false,
+    reuseExit: number | null = null;
+  try {
+    const admin = execFileSync("git", ["-C", f.target.path, "rev-parse", "--absolute-git-dir"], {
+      encoding: "utf8",
+    }).trim();
+    const identity = await (await import("node:fs/promises")).stat(admin);
+    const preview = await f.api.previewBackingReclaim(f.deps, f.input);
+    vi.spyOn(atomicFile, "writeFileDurably").mockImplementation(async (...args) => {
+      await originalWrite(...args);
+      if (
+        !checked &&
+        String(args[0]).includes("workspace-backing-reclaims") &&
+        JSON.parse(String(args[1])).step === "quarantine-done"
+      ) {
+        checked = true;
+        execFileSync("git", ["-C", f.repoDir, "worktree", "prune", "--expire", "now"], {
+          stdio: "pipe",
+        });
+        preserved =
+          existsSync(admin) &&
+          (await (await import("node:fs/promises")).stat(admin)).ino === identity.ino;
+        const result = (await import("node:child_process")).spawnSync(
+          "git",
+          [
+            "-C",
+            f.repoDir,
+            "worktree",
+            "add",
+            path.join(f.home, "external", "orphan-reclaim"),
+            "orphan-reclaim",
+          ],
+          { stdio: "pipe" },
+        );
+        reuseExit = result.status;
+      }
+    });
+    const result = await f.api.applyBackingReclaim(f.deps, {
+      ...f.input,
+      operationId: randomUUID(),
+      expectedGeneration: preview.generation!,
+    });
+    expect(checked).toBe(true);
+    expect(preserved).toBe(true);
+    expect(reuseExit).not.toBe(0);
+    expect(result).toMatchObject({ state: "complete", removedDirectory: true });
+  } finally {
+    vi.restoreAllMocks();
+    await f.close();
+  }
+});
+
+test("RECLAIM GIT LOCK refuses a pre-existing lock without replacing or unlocking it", async () => {
+  const f = await reclaimFixture("orphan");
+  try {
+    execFileSync(
+      "git",
+      ["-C", f.repoDir, "worktree", "lock", "--reason", "fixture foreign owner", f.target.path],
+      { stdio: "pipe" },
+    );
+    const admin = execFileSync("git", ["-C", f.target.path, "rev-parse", "--absolute-git-dir"], {
+      encoding: "utf8",
+    }).trim();
+    const before = readFileSync(path.join(admin, "locked"), "utf8");
+    expect(await f.api.previewBackingReclaim(f.deps, f.input)).toMatchObject({
+      eligible: false,
+      code: "reclaim_git_worktree_locked",
+    });
+    expect(readFileSync(path.join(admin, "locked"), "utf8")).toBe(before);
+    expect(existsSync(f.target.path)).toBe(true);
+  } finally {
+    await f.close();
+  }
+});
+
+test("RECLAIM GIT LOCK never releases a replacement foreign lock", async () => {
+  const f = await reclaimFixture("orphan");
+  const originalWrite = atomicFile.writeFileDurably;
+  let replaced = false;
+  try {
+    const preview = await f.api.previewBackingReclaim(f.deps, f.input);
+    vi.spyOn(atomicFile, "writeFileDurably").mockImplementation(async (...args) => {
+      await originalWrite(...args);
+      const data = String(args[0]).includes("workspace-backing-reclaims")
+        ? JSON.parse(String(args[1]))
+        : null;
+      if (!replaced && data?.step === "remove-started") {
+        replaced = true;
+        execFileSync("git", ["-C", f.repoDir, "worktree", "unlock", data.quarantinePath], {
+          stdio: "pipe",
+        });
+        execFileSync(
+          "git",
+          [
+            "-C",
+            f.repoDir,
+            "worktree",
+            "lock",
+            "--reason",
+            "foreign fixture hold",
+            data.quarantinePath,
+          ],
+          { stdio: "pipe" },
+        );
+      }
+    });
+    const result = await f.api.applyBackingReclaim(f.deps, {
+      ...f.input,
+      operationId: randomUUID(),
+      expectedGeneration: preview.generation!,
+    });
+    expect(replaced).toBe(true);
+    expect(result).toMatchObject({
+      state: "partial",
+      code: "reclaim_git_lock_unverified",
+      removedDirectory: false,
+    });
+    const admin = execFileSync(
+      "git",
+      ["-C", result.quarantinePath!, "rev-parse", "--absolute-git-dir"],
+      { encoding: "utf8" },
+    ).trim();
+    expect(readFileSync(path.join(admin, "locked"), "utf8")).toBe("foreign fixture hold\n");
+    expect(existsSync(result.quarantinePath!)).toBe(true);
+  } finally {
+    vi.restoreAllMocks();
+    await f.close();
+  }
+});

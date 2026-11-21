@@ -277,6 +277,8 @@ async function observeManagedGit(deps: BackingReclaimDependencies, targetPath: s
     }
   }
   if (!registration) refuse("reclaim_git_registration_required");
+  if (registration.split("\0").some((field) => field === "locked" || field.startsWith("locked ")))
+    refuse("reclaim_git_worktree_locked");
   await assertNoNestedGitBoundary(targetPath);
   const top = await realpath(await git(targetPath, "rev-parse", "--show-toplevel"));
   if (top !== targetPath) refuse("reclaim_exact_root_required");
@@ -664,6 +666,43 @@ export async function applyBackingReclaim(
       journal.quarantinePath = quarantined;
       journal.quarantineIdentity = { root: current.observed.root, gitDir: current.gitDir };
       journal.operation.quarantinePath = quarantined;
+      // Git's own lock prevents an external prune from discarding/reusing the
+      // captured administration while the original backing pathname is absent.
+      journal.gitLock = { reason: `paseo-reclaim:${id}:${generation}`, released: false };
+      journal.step = "git-lock-started";
+      await persist();
+      await git(
+        current.repo,
+        "worktree",
+        "lock",
+        "--reason",
+        journal.gitLock.reason,
+        current.targetPath,
+      );
+      const readOwnedGitLock = async () => {
+        if (
+          hashLayoutValue(await identityStat(current.gitDir)) !==
+          hashLayoutValue(current.observed.gitIdentity)
+        )
+          refuse("reclaim_generation_changed");
+        const lockPath = path.join(current.gitDir, "locked");
+        const lockStat = await lstat(lockPath);
+        if (
+          !lockStat.isFile() ||
+          (await readFile(lockPath, "utf8")) !== `${journal.gitLock!.reason}\n`
+        )
+          refuse("reclaim_git_lock_unverified");
+        return { dev: lockStat.dev, ino: lockStat.ino, birthtimeMs: lockStat.birthtimeMs };
+      };
+      journal.gitLock.identity = await readOwnedGitLock();
+      const assertOwnedGitLock = async () => {
+        if (
+          hashLayoutValue(await readOwnedGitLock()) !== hashLayoutValue(journal.gitLock!.identity)
+        )
+          refuse("reclaim_git_lock_unverified");
+      };
+      journal.step = "git-lock-held";
+      await persist();
       journal.step = "quarantine-started";
       await persist();
       await serializeWorkspaceBacking({ paths: [container] }, async () => {
@@ -693,6 +732,7 @@ export async function applyBackingReclaim(
         await assertHistoryOutside(deps, [current.targetPath, quarantined]);
         journal.step = "repair-started";
         await persist();
+        await assertOwnedGitLock();
         // Repair only this exact captured admin directory, after the private tree qualifies.
         const gitfile = await readFile(path.join(quarantined, ".git"), "utf8");
         if ((await realpath(gitfile.slice(8).trim())) !== current.gitDir)
@@ -728,10 +768,16 @@ export async function applyBackingReclaim(
               current.ids.has(entry.ref.workspaceId),
           ),
           root: await identityStat(quarantined),
+          gitIdentity: await identityStat(current.gitDir),
           head: await git(quarantined, "rev-parse", "HEAD"),
         };
         if (hashLayoutValue(detached) !== hashLayoutValue(current.observed))
           refuse("reclaim_generation_changed");
+        await assertOwnedGitLock();
+        await git(current.repo, "worktree", "unlock", quarantined);
+        journal.gitLock!.released = true;
+        // No journal wait after unlocking: final evidence and non-forcing
+        // removal now address the registered, relocated tree only.
         const moved = await observeManagedGit(deps, quarantined);
         if (
           hashLayoutValue(moved.registration.split("\0").slice(1)) !==

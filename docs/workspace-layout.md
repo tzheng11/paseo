@@ -620,6 +620,10 @@ that quarantined tree; non-forcing Git removal targets only that captured path.
 The original path is never removed after the rename, so late external Git writers
 there cannot cause deletion of a replacement. Enclosing Git worktrees are refused
 as well as contained worktrees, including those from other repositories.
+An operation-owned Git worktree lock preserves the captured administration
+against external pruning during relocation. A pre-existing lock refuses preview.
+Only the captured lock and admin identities may be repaired or unlocked; an
+uncertain operation may retain its lock for explicit reconciliation.
 
 Uncertain quarantine/repair/removal is partial and reports `quarantinePath` (the
 planned location, not proof of a completed rename). Both original and quarantine

@@ -29,10 +29,21 @@ export const ReclaimJournalSchema = z
         gitDir: z.string(),
       })
       .optional(),
+    gitLock: z
+      .strictObject({
+        reason: z.string(),
+        identity: z
+          .object({ dev: z.number(), ino: z.number(), birthtimeMs: z.number() })
+          .optional(),
+        released: z.boolean(),
+      })
+      .optional(),
     step: z.enum([
       "intent",
       "teardown-started",
       "teardown-done",
+      "git-lock-started",
+      "git-lock-held",
       "quarantine-started",
       "quarantine-done",
       "repair-started",
@@ -63,6 +74,16 @@ export const ReclaimJournalSchema = z
       (!journal.quarantinePath || !path.isAbsolute(journal.quarantineIdentity.gitDir))
     )
       ctx.addIssue({ code: "custom", message: "Unverified quarantine identity" });
+  })
+  .superRefine((journal, ctx) => {
+    const op = journal.operation;
+    if (
+      journal.gitLock &&
+      (journal.gitLock.reason !== `paseo-reclaim:${op.operationId}:${op.generation}` ||
+        !journal.quarantineIdentity ||
+        (op.state === "complete" && !journal.gitLock.released))
+    )
+      ctx.addIssue({ code: "custom", message: "Unverified reclaim Git lock" });
   });
 export type ReclaimJournal = z.infer<typeof ReclaimJournalSchema>;
 export function reclaimFile(home: string, id: string): string {
