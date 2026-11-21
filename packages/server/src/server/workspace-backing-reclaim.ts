@@ -734,6 +734,11 @@ export async function applyBackingReclaim(
           refuse("reclaim_generation_changed");
         const moved = await observeManagedGit(deps, quarantined);
         if (
+          hashLayoutValue(moved.registration.split("\0").slice(1)) !==
+          hashLayoutValue(current.observed.registration.split("\0").slice(1))
+        )
+          refuse("reclaim_generation_changed");
+        if (
           moved.gitDir !== current.gitDir ||
           hashLayoutValue(moved.metadata) !== hashLayoutValue(current.observed.metadata)
         )

@@ -84,7 +84,7 @@ export async function readReclaimJournal(home: string, id: string): Promise<Recl
       (journal.quarantinePath !== undefined &&
         (!path.isAbsolute(journal.quarantinePath) ||
           path.dirname(path.dirname(journal.quarantinePath)) !==
-            path.dirname(journal.operation.target.path) ||
+            path.dirname(path.resolve(journal.operation.target.path)) ||
           path.basename(path.dirname(journal.quarantinePath)) !==
             `.paseo-reclaim-${id.toLowerCase()}` ||
           path.basename(journal.quarantinePath) !== "backing")) ||

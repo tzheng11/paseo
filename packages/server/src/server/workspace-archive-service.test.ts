@@ -5107,3 +5107,63 @@ test("RECLAIM QUARANTINE rejects a contradictory durable status path", async () 
     await f.close();
   }
 });
+
+test("RECLAIM REGISTRATION refuses changed Git registration fields after quarantine repair", async () => {
+  const f = await reclaimFixture("orphan");
+  const originalWrite = atomicFile.writeFileDurably;
+  let changed = false;
+  try {
+    const preview = await f.api.previewBackingReclaim(f.deps, f.input);
+    vi.spyOn(atomicFile, "writeFileDurably").mockImplementation(async (...args) => {
+      await originalWrite(...args);
+      const data = String(args[0]).includes("workspace-backing-reclaims")
+        ? JSON.parse(String(args[1]))
+        : null;
+      if (!changed && data?.step === "remove-started") {
+        changed = true;
+        execFileSync(
+          "git",
+          ["-C", data.quarantinePath, "branch", "-m", "unreleased-registration"],
+          { stdio: "pipe" },
+        );
+      }
+    });
+    const result = await f.api.applyBackingReclaim(f.deps, {
+      ...f.input,
+      operationId: randomUUID(),
+      expectedGeneration: preview.generation!,
+    });
+    expect(changed).toBe(true);
+    expect(result).toMatchObject({
+      state: "partial",
+      code: "reclaim_generation_changed",
+      removedDirectory: false,
+    });
+    expect(
+      execFileSync("git", ["-C", result.quarantinePath!, "symbolic-ref", "--short", "HEAD"], {
+        encoding: "utf8",
+      }).trim(),
+    ).toBe("unreleased-registration");
+  } finally {
+    vi.restoreAllMocks();
+    await f.close();
+  }
+});
+
+test("RECLAIM REGISTRATION normalizes absolute target parent aliases for durable readback", async () => {
+  const f = await reclaimFixture("orphan");
+  try {
+    const alias = `${path.dirname(f.target.path)}/unused-segment/../${path.basename(f.target.path)}`;
+    const input = { ...f.input, target: { kind: "orphan" as const, path: alias } };
+    const preview = await f.api.previewBackingReclaim(f.deps, input);
+    expect(preview.eligible).toBe(true);
+    const id = randomUUID();
+    const request = { ...input, operationId: id, expectedGeneration: preview.generation! };
+    const result = await f.api.applyBackingReclaim(f.deps, request);
+    expect(result).toMatchObject({ state: "complete", removedDirectory: true });
+    expect(await f.api.getBackingReclaimStatus(f.deps, id)).toEqual(result);
+    expect(await f.api.applyBackingReclaim(f.deps, request)).toEqual(result);
+  } finally {
+    await f.close();
+  }
+});
