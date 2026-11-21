@@ -1,3 +1,4 @@
+import { createReclaimAgentAdmission } from "./workspace-backing-reclaim-journal.js";
 import {
   CanonicalWorkspaceRegistry,
   createWorkspaceRegistry,
@@ -1077,6 +1078,11 @@ export async function createPaseoDaemon(
     directory: path.join(config.paseoHome, "runtime", "timeline-cache"),
   });
   const agentManager = new AgentManager({
+    admitBacking: createReclaimAgentAdmission(
+      Boolean(workspaceLayoutService),
+      config.paseoHome,
+      (id) => workspaceRegistry!.get(id),
+    ),
     recoveryMessages: new MessageReceipts(path.join(config.paseoHome, "agent-requests")),
     reloadOperations: new ReloadOperationStore(
       path.join(config.paseoHome, "reload-operations"),

@@ -330,8 +330,6 @@ async function observe(
     refuse("home_authority_binding_changed");
   const targetPath = path.resolve(input.target.path);
   if (!path.isAbsolute(input.target.path)) refuse("reclaim_exact_canonical_path_required");
-  if (!deps.teardown && !(await getWorktreeTeardownCommands(targetPath)).length)
-    refuse("reclaim_release_guard_required");
   const { repo, metadata, list, gitDir } = await observeManagedGit(deps, targetPath);
   const rows = await deps.inventory(),
     snapshot = await authority.inspect();
@@ -339,6 +337,9 @@ async function observe(
     input.target.kind === "retired"
       ? await observeOriginal(deps, input.target, rows, snapshot, targetPath)
       : [];
+  const teardownCwd = originals[0]?.cwd ?? targetPath;
+  if (!deps.teardown && !(await getWorktreeTeardownCommands(teardownCwd)).length)
+    refuse("reclaim_release_guard_required");
   if (input.target.kind === "orphan") await assertNoRetirementHistoryAtBacking(home, targetPath);
   const ids = new Set(originals.map((r) => r.workspaceId));
   checkLayout(snapshot, rows, ids, authority.options.serverId);
@@ -373,7 +374,7 @@ async function observe(
     generation: hashLayoutValue(operands),
     repo,
     targetPath,
-    teardownCwd: originals[0]?.cwd ?? targetPath,
+    teardownCwd,
   };
 }
 export async function previewBackingReclaim(

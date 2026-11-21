@@ -16838,3 +16838,146 @@ test("secret answer preparation cannot steer a newer turn after a delayed contex
   session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-2" });
   await second;
 });
+
+test.each(["create", "resume", "reload", "commands", "features"] as const)(
+  "RECLAIM %s backing refusal precedes provider open and preserves an existing runtime",
+  async (operation) => {
+    const cwd = mkdtempSync(join(tmpdir(), "reclaim-agent-admission-"));
+    const client = new SessionRecordingAgentClient();
+    let refuse = false;
+    const manager = new AgentManager({
+      clients: { codex: client },
+      logger,
+      admitBacking: async (input, open) => {
+        expect(input.cwd).toBe(cwd);
+        if (refuse) throw Error("reclaim_backing_reserved");
+        return open();
+      },
+    });
+    let existing: ManagedAgent | undefined;
+    try {
+      if (operation === "reload")
+        existing = await manager.createAgent({ provider: "codex", cwd }, undefined, {
+          workspaceId: "old-a",
+        });
+      const create = vi.spyOn(client, "createSession"),
+        resume = vi.spyOn(client, "resumeSession");
+      const close = existing ? vi.spyOn(client.sessions[0], "close") : undefined;
+      refuse = true;
+      const calls = {
+        create: () =>
+          manager.createAgent({ provider: "codex", cwd }, undefined, { workspaceId: "old-a" }),
+        resume: () =>
+          manager.resumeAgentFromPersistence(
+            { provider: "codex", sessionId: "stored", metadata: { cwd } },
+            { cwd },
+            undefined,
+            { workspaceId: "old-a" },
+          ),
+        reload: () => manager.reloadAgentSession(existing!.id),
+        commands: () => manager.listDraftCommands({ provider: "codex", cwd, model: "gpt-5.4" }),
+        features: () => manager.listDraftFeatures({ provider: "codex", cwd, model: "gpt-5.4" }),
+      };
+      const call = calls[operation]();
+      await expect(call).rejects.toThrow("reclaim_backing_reserved");
+      expect(create).not.toHaveBeenCalled();
+      expect(resume).not.toHaveBeenCalled();
+      expect(close?.mock.calls.length ?? 0).toBe(0);
+    } finally {
+      refuse = false;
+      await Promise.all(
+        manager.listAgents({ includeInternal: true }).map((agent) => manager.closeAgent(agent.id)),
+      );
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  },
+);
+test("RECLAIM provider admission holds its lease until runtime publication completes", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "reclaim-agent-publication-"));
+  const { admitReclaimReference } = await import("../workspace-backing-reclaim-journal.js");
+  const { serializeWorkspaceBacking } = await import("../workspace-retirement-context.js");
+  let entered!: () => void, release!: () => void;
+  const published = new Promise<void>((r) => (entered = r)),
+    pause = new Promise<void>((r) => (release = r));
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    logger,
+    admitBacking: (input, open) =>
+      admitReclaimReference(
+        cwd,
+        input.cwd,
+        async () => {
+          const result = await open();
+          entered();
+          await pause;
+          return result;
+        },
+        undefined,
+        true,
+      ),
+  });
+  try {
+    const opening = manager.createAgent({ provider: "codex", cwd }, undefined, {
+      workspaceId: "new-b",
+    });
+    await published;
+    let removed = false;
+    const retirement = serializeWorkspaceBacking(cwd, async () => {
+      removed = true;
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(removed).toBe(false);
+    release();
+    const agent = await opening;
+    expect(manager.getAgent(agent.id)).not.toBeNull();
+    await retirement;
+  } finally {
+    release();
+    await Promise.all(
+      manager.listAgents({ includeInternal: true }).map((agent) => manager.closeAgent(agent.id)),
+    );
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("RECLAIM busy backing refuses a closed-agent resume without holding its lifecycle lane", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "reclaim-agent-busy-"));
+  const { createReclaimAgentAdmission } = await import("../workspace-backing-reclaim-journal.js");
+  const { serializeWorkspaceBacking } = await import("../workspace-retirement-context.js");
+  const client = new TestAgentClient(),
+    id = randomUUID();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    logger,
+    admitBacking: createReclaimAgentAdmission(true, cwd, async () => null),
+  });
+  let entered!: () => void, release!: () => void;
+  const ready = new Promise<void>((r) => (entered = r)),
+    pause = new Promise<void>((r) => (release = r));
+  const holder = serializeWorkspaceBacking(cwd, async () => {
+    entered();
+    await pause;
+  });
+  const handle = { provider: "codex" as const, sessionId: "closed", metadata: { cwd } };
+  try {
+    await ready;
+    await expect(
+      manager.resumeAgentFromPersistence(handle, { cwd }, id, { workspaceId: "old-a" }),
+    ).rejects.toThrow("reclaim_backing_busy");
+    expect(client.resumeOverrides).toHaveLength(0);
+    release();
+    await holder;
+    const resumed = await manager.resumeAgentFromPersistence(handle, { cwd }, id, {
+      workspaceId: "new-b",
+    });
+    expect(resumed.id).toBe(id);
+    expect(client.resumeOverrides).toHaveLength(1);
+  } finally {
+    release();
+    await holder;
+    await Promise.all(
+      manager.listAgents({ includeInternal: true }).map((agent) => manager.closeAgent(agent.id)),
+    );
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});

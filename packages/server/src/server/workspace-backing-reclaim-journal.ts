@@ -1,14 +1,18 @@
+import type { PersistedWorkspaceRecord } from "./workspace-registry.js";
+import { isSameOrDescendantPath } from "./path-utils.js";
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import {
   WorkspaceBackingReclaimOperationSchema,
   WorkspaceBackingReclaimInputSchema,
+  type WorkspaceBackingReclaimTarget,
 } from "@getpaseo/protocol/workspace-backing-reclaim";
 import { WorkspaceLayoutIdentitySchema } from "@getpaseo/protocol/workspace-layout";
 import {
   canonicalWorkspaceBacking,
   serializeWorkspaceBacking,
+  WorkspaceBackingBusyError,
 } from "./workspace-retirement-context.js";
 import { hashLayoutValue, WorkspaceLayoutRefusal } from "./workspace-layout-store.js";
 export const ReclaimJournalSchema = z
@@ -118,10 +122,60 @@ export async function admitReclaimReference<T>(
   home: string | undefined,
   cwd: string,
   create: () => Promise<T>,
+  validateReplacement?: (target: WorkspaceBackingReclaimTarget) => Promise<void>,
+  rejectIfBusy = false,
 ): Promise<T> {
   if (!home) return create();
-  return serializeWorkspaceBacking(cwd, async () => {
+  return serializeWorkspaceBacking({ paths: [cwd], rejectIfBusy }, async () => {
     await assertReclaimBackingAvailable(home, cwd);
+    const directory = path.join(home, "workspace-backing-reclaims");
+    const files = await readdir(directory).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    });
+    for (const file of files.filter((name) => name.endsWith(".json"))) {
+      const journal = await readReclaimJournal(home, file.slice(0, -5));
+      if (
+        journal?.operation.state !== "complete" ||
+        !(await backingPathsOverlap(cwd, journal.operation.target.path))
+      )
+        continue;
+      if (!validateReplacement)
+        throw new WorkspaceLayoutRefusal("reclaim_reference_generation_required");
+      await validateReplacement(journal.operation.target);
+    }
     return create();
+  }).catch((error) => {
+    if (error instanceof WorkspaceBackingBusyError)
+      throw new WorkspaceLayoutRefusal("reclaim_backing_busy");
+    throw error;
   });
+}
+
+export function createReclaimAgentAdmission(
+  enabled: boolean,
+  home: string,
+  getWorkspace: (id: string) => Promise<PersistedWorkspaceRecord | null>,
+) {
+  if (!enabled) return undefined;
+  return function <T>(
+    input: { cwd: string; workspaceId?: string },
+    launch: () => Promise<T>,
+  ): Promise<T> {
+    return admitReclaimReference(
+      home,
+      input.cwd,
+      launch,
+      async () => {
+        const row = input.workspaceId ? await getWorkspace(input.workspaceId) : null;
+        if (
+          !row ||
+          row.archivedAt ||
+          !isSameOrDescendantPath(row.worktreeRoot ?? row.cwd, input.cwd)
+        )
+          throw new WorkspaceLayoutRefusal("reclaim_reference_generation_changed");
+      },
+      true,
+    );
+  };
 }

@@ -435,6 +435,11 @@ function resolveResumeSessionOpening(input: ResumeSessionOpeningInput): AgentSes
 }
 
 export interface AgentManagerOptions {
+  /** Holds native backing admission through provider open and runtime publication. */
+  admitBacking?: <T>(
+    input: { cwd: string; workspaceId?: string },
+    open: () => Promise<T>,
+  ) => Promise<T>;
   reloadOperations?: ReloadOperationStore;
   recoveryMessages?: Pick<MessageReceipts, "send">;
   pluginLifecycle?: PluginLifecycle;
@@ -971,6 +976,7 @@ export class AgentManager {
   private readonly subscribers = new Set<SubscriptionRecord>();
   private readonly idFactory: () => string;
   private readonly registry?: AgentStorage;
+  private readonly admitBacking: NonNullable<AgentManagerOptions["admitBacking"]>;
   private readonly durableTimelineStore?: AgentTimelineStore;
   private readonly previousStatuses = new Map<string, AgentLifecycleStatus>();
   private readonly backgroundTasks = new Set<Promise<void>>();
@@ -1020,6 +1026,7 @@ export class AgentManager {
     this.pluginLifecycle = options.pluginLifecycle;
     this.idFactory = options.idFactory ?? (() => randomUUID());
     this.registry = options.registry;
+    this.admitBacking = options.admitBacking ?? ((_input, open) => open());
     this.durableTimelineStore = options?.durableTimelineStore;
     this.onAgentAttention = options?.onAgentAttention;
     this.onWorkspaceStateMayHaveChanged = options?.onWorkspaceStateMayHaveChanged;
@@ -1571,28 +1578,30 @@ export class AgentManager {
       );
     }
 
-    if (client.listCommands) {
-      return await client.listCommands(normalizedConfig);
-    }
+    return this.admitBacking({ cwd: normalizedConfig.cwd }, async () => {
+      if (client.listCommands) {
+        return await client.listCommands(normalizedConfig);
+      }
 
-    const session = await client.createSession(normalizedConfig);
-    try {
-      if (!session.listCommands) {
-        throw new Error(
-          `Provider '${normalizedConfig.provider}' does not support listing commands`,
-        );
-      }
-      return await session.listCommands();
-    } finally {
+      const session = await client.createSession(normalizedConfig);
       try {
-        await session.close();
-      } catch (error) {
-        this.logger.warn(
-          { err: error, provider: normalizedConfig.provider },
-          "Failed to close draft command listing session",
-        );
+        if (!session.listCommands) {
+          throw new Error(
+            `Provider '${normalizedConfig.provider}' does not support listing commands`,
+          );
+        }
+        return await session.listCommands();
+      } finally {
+        try {
+          await session.close();
+        } catch (error) {
+          this.logger.warn(
+            { err: error, provider: normalizedConfig.provider },
+            "Failed to close draft command listing session",
+          );
+        }
       }
-    }
+    });
   }
 
   async listDraftFeatures(config: AgentSessionConfig): Promise<AgentFeature[]> {
@@ -1608,23 +1617,25 @@ export class AgentManager {
       );
     }
 
-    if (client.listFeatures) {
-      return await client.listFeatures(normalizedConfig);
-    }
-
-    const session = await client.createSession(normalizedConfig);
-    try {
-      return session.features ?? [];
-    } finally {
-      try {
-        await session.close();
-      } catch (error) {
-        this.logger.warn(
-          { err: error, provider: normalizedConfig.provider },
-          "Failed to close draft feature listing session",
-        );
+    return this.admitBacking({ cwd: normalizedConfig.cwd }, async () => {
+      if (client.listFeatures) {
+        return await client.listFeatures(normalizedConfig);
       }
-    }
+
+      const session = await client.createSession(normalizedConfig);
+      try {
+        return session.features ?? [];
+      } finally {
+        try {
+          await session.close();
+        } catch (error) {
+          this.logger.warn(
+            { err: error, provider: normalizedConfig.provider },
+            "Failed to close draft feature listing session",
+          );
+        }
+      }
+    });
   }
 
   usageSession(id: string) {
@@ -1879,7 +1890,6 @@ export class AgentManager {
       config = { ...request.config, internal: config.internal };
       options = { ...options, env: request.env };
     }
-    await this.deleteAgentState(resolvedAgentId);
     const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
       config,
       resolvedAgentId,
@@ -1889,39 +1899,49 @@ export class AgentManager {
     const client = await this.requireAvailableClient({
       provider: storedConfig.provider,
     });
-    this.paseoToolPolicies.set(resolvedAgentId, paseoToolPolicy);
-    const launchContext = await this.buildLaunchContext(
-      resolvedAgentId,
-      client,
-      storedConfig.cwd,
-      paseoToolPolicy,
-      options?.env,
-      {
-        reason: "create",
-        purpose: "interactive",
-        workspaceId: options.workspaceId ?? null,
-        title: options.initialTitle ?? storedConfig.title ?? null,
-        labels: options.labels ?? {},
+    return this.admitBacking(
+      { cwd: launchConfig.cwd, workspaceId: options.workspaceId },
+      async () => {
+        await this.deleteAgentState(resolvedAgentId);
+        this.paseoToolPolicies.set(resolvedAgentId, paseoToolPolicy);
+        const launchContext = await this.buildLaunchContext(
+          resolvedAgentId,
+          client,
+          storedConfig.cwd,
+          paseoToolPolicy,
+          options?.env,
+          {
+            reason: "create",
+            purpose: "interactive",
+            workspaceId: options.workspaceId ?? null,
+            title: options.initialTitle ?? storedConfig.title ?? null,
+            labels: options.labels ?? {},
+          },
+        );
+        const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
+        const createOptions = this.buildCreateSessionOptions(options);
+        const session = await client.createSession(
+          providerLaunchConfig,
+          launchContext,
+          createOptions,
+        );
+        await this.requireExternalMcpSupport(session, providerLaunchConfig, launchContext);
+        const agent = await this.registerSession(session, storedConfig, resolvedAgentId, {
+          labels: options.labels,
+          initialTitle: options.initialTitle,
+          workspaceId: options.workspaceId,
+          owner: options.owner,
+          launchEnv: options.env ? { ...options.env } : undefined,
+          historyPrimed: true,
+        });
+        if (!agent.internal) {
+          this.pluginLifecycle?.emit("agent.create.after", {
+            agent: describeHookAgent({ ...agent, title: agent.config.title }),
+          });
+        }
+        return agent;
       },
     );
-    const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
-    const createOptions = this.buildCreateSessionOptions(options);
-    const session = await client.createSession(providerLaunchConfig, launchContext, createOptions);
-    await this.requireExternalMcpSupport(session, providerLaunchConfig, launchContext);
-    const agent = await this.registerSession(session, storedConfig, resolvedAgentId, {
-      labels: options.labels,
-      initialTitle: options.initialTitle,
-      workspaceId: options.workspaceId,
-      owner: options.owner,
-      launchEnv: options.env ? { ...options.env } : undefined,
-      historyPrimed: true,
-    });
-    if (!agent.internal) {
-      this.pluginLifecycle?.emit("agent.create.after", {
-        agent: describeHookAgent({ ...agent, title: agent.config.title }),
-      });
-    }
-    return agent;
   }
 
   private buildCreateSessionOptions(options?: {
@@ -2024,32 +2044,37 @@ export class AgentManager {
         `Provider '${handle.provider}' is not available. Please ensure the CLI is installed.`,
       );
     }
-    this.paseoToolPolicies.set(resolvedAgentId, paseoToolPolicy);
-    const launchContext = await this.buildLaunchContext(
-      resolvedAgentId,
-      client,
-      storedConfig.cwd,
-      paseoToolPolicy,
-      launchEnv,
-      resolveResumeSessionOpening({ record, config: mergedConfig, purpose, ...options }),
+    return this.admitBacking(
+      { cwd: launchConfig.cwd, workspaceId: record?.workspaceId ?? options?.workspaceId },
+      async () => {
+        this.paseoToolPolicies.set(resolvedAgentId, paseoToolPolicy);
+        const launchContext = await this.buildLaunchContext(
+          resolvedAgentId,
+          client,
+          storedConfig.cwd,
+          paseoToolPolicy,
+          launchEnv,
+          resolveResumeSessionOpening({ record, config: mergedConfig, purpose, ...options }),
+        );
+        const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
+        const session = await client.resumeSession(
+          handle,
+          providerLaunchConfig,
+          launchContext,
+          currentResumeOptions,
+        );
+        await this.requireExternalMcpSupport(session, providerLaunchConfig, launchContext);
+        return this.registerSession(session, storedConfig, resolvedAgentId, {
+          ...options,
+          launchEnv,
+          persistence: handle,
+          credentialGeneration: record?.credentialGeneration,
+          credentialChangedAt: record?.credentialChangedAt,
+          quotaTurnCheckpoint: record?.archivedAt ? undefined : record?.quotaTurnCheckpoint,
+          restoring: true,
+        });
+      },
     );
-    const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
-    const session = await client.resumeSession(
-      handle,
-      providerLaunchConfig,
-      launchContext,
-      currentResumeOptions,
-    );
-    await this.requireExternalMcpSupport(session, providerLaunchConfig, launchContext);
-    return this.registerSession(session, storedConfig, resolvedAgentId, {
-      ...options,
-      launchEnv,
-      persistence: handle,
-      credentialGeneration: record?.credentialGeneration,
-      credentialChangedAt: record?.credentialChangedAt,
-      quotaTurnCheckpoint: record?.archivedAt ? undefined : record?.quotaTurnCheckpoint,
-      restoring: true,
-    });
   }
 
   importProviderSession(input: {
@@ -2485,112 +2510,118 @@ export class AgentManager {
       agentId,
       { env: existing.launchEnv },
     );
-    const hadPreviousPaseoToolPolicy = this.paseoToolPolicies.has(agentId);
-    const previousPaseoToolPolicy = this.paseoToolPolicies.get(agentId);
-    const launchContext = await this.buildLaunchContext(
-      agentId,
-      client,
-      storedConfig.cwd,
-      paseoToolPolicy,
-      existing.launchEnv,
-      {
-        reason: "refresh",
-        purpose: "interactive",
-        workspaceId: existing.workspaceId,
-        title: await this.resolveInitialPersistedTitle(agentId, existing.config, null),
-        labels: existing.labels,
+    return this.admitBacking(
+      { cwd: launchConfig.cwd, workspaceId: existing.workspaceId },
+      async () => {
+        const hadPreviousPaseoToolPolicy = this.paseoToolPolicies.has(agentId);
+        const previousPaseoToolPolicy = this.paseoToolPolicies.get(agentId);
+        const launchContext = await this.buildLaunchContext(
+          agentId,
+          client,
+          storedConfig.cwd,
+          paseoToolPolicy,
+          existing.launchEnv,
+          {
+            reason: "refresh",
+            purpose: "interactive",
+            workspaceId: existing.workspaceId,
+            title: await this.resolveInitialPersistedTitle(agentId, existing.config, null),
+            labels: existing.labels,
+          },
+          options.writerClaim,
+        );
+        const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
+        if (
+          Object.keys(stripInternalPaseoMcpServer(providerLaunchConfig).mcpServers ?? {}).length >
+            0 &&
+          existing.session.capabilities.supportsMcpServers !== true
+        ) {
+          throw this.unsupportedMcpError(providerLaunchConfig, launchContext);
+        }
+
+        let session: AgentSession | undefined;
+        let closedExisting: ManagedAgentClosed | undefined;
+        let handedToRegistration = false;
+        try {
+          // A persisted thread can have only one writer, even when its turn is idle.
+          await this.closeReloadedSession(existing.session, agentId, options.preserveHistory);
+          await this.drainHistoryReads(agentId);
+          await this.drainSessionEvents(agentId);
+          this.cancelRunningProviderSubagents(agentId);
+          closedExisting = this.prepareAgentForClosure(
+            existing,
+            "agent reloaded",
+            options.preserveHistory,
+          );
+          await this.persistSnapshot(closedExisting);
+          this.assertAcceptingAgentRegistrations();
+
+          this.paseoToolPolicies.set(agentId, paseoToolPolicy);
+          session = handle
+            ? await client.resumeSession(
+                handle,
+                providerLaunchConfig,
+                launchContext,
+                reloadResumeOptions(existing.session, options.preserveHistory),
+              )
+            : await client.createSession(providerLaunchConfig, launchContext);
+          await this.requireExternalMcpSupport(session, providerLaunchConfig, launchContext);
+          this.assertAcceptingAgentRegistrations();
+
+          if (rehydrateFromDisk) {
+            // Wipe the in-memory timeline so registerSession mints a new epoch and
+            // hydrateTimelineFromProvider re-streams the freshly read provider history.
+            this.providerSubagentEventCoalescer.flushAndDiscardParent(agentId);
+            this.timelineStore.delete(agentId);
+            for (const event of this.providerSubagents.deleteParent(agentId)) {
+              this.providerSubagentEventCoalescer.publish(event, { coalesce: false });
+            }
+          }
+
+          // Preserve existing labels and timeline during reload.
+          handedToRegistration = true;
+          return this.registerSession(session, storedConfig, agentId, {
+            labels: existing.labels,
+            workspaceId: existing.workspaceId,
+            owner: existing.owner,
+            launchEnv: existing.launchEnv,
+            createdAt: existing.createdAt,
+            updatedAt: existing.updatedAt,
+            lastUserMessageAt: existing.lastUserMessageAt,
+            historyPrimed: rehydrateFromDisk ? false : preservedHistoryPrimed,
+            lastUsage: preservedLastUsage,
+            lastError: preservedLastError,
+            credentialGeneration: existing.credentialGeneration,
+            credentialChangedAt: existing.credentialChangedAt,
+            quotaTurnCheckpoint: existing.quotaTurnCheckpoint,
+            attention: preservedAttention,
+            restoring: true,
+            maintenanceReload: options.preserveHistory,
+          });
+        } catch (error) {
+          if (closedExisting) {
+            this.emitClosedAgent(closedExisting, { persist: false });
+          } else if (this.agents.get(agentId) === existing) {
+            existing.lifecycle = "error";
+            existing.lastError = error instanceof Error ? error.message : String(error);
+            this.emitState(existing);
+          }
+          throw error;
+        } finally {
+          if (!handedToRegistration) {
+            this.detachPluginTools(agentId);
+            if (hadPreviousPaseoToolPolicy) {
+              this.paseoToolPolicies.set(agentId, previousPaseoToolPolicy);
+            } else {
+              this.paseoToolPolicies.delete(agentId);
+            }
+            if (session) {
+              await this.closeUnregisteredSession(session, options.preserveHistory);
+            }
+          }
+        }
       },
-      options.writerClaim,
     );
-    const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
-    if (
-      Object.keys(stripInternalPaseoMcpServer(providerLaunchConfig).mcpServers ?? {}).length > 0 &&
-      existing.session.capabilities.supportsMcpServers !== true
-    ) {
-      throw this.unsupportedMcpError(providerLaunchConfig, launchContext);
-    }
-
-    let session: AgentSession | undefined;
-    let closedExisting: ManagedAgentClosed | undefined;
-    let handedToRegistration = false;
-    try {
-      // A persisted thread can have only one writer, even when its turn is idle.
-      await this.closeReloadedSession(existing.session, agentId, options.preserveHistory);
-      await this.drainHistoryReads(agentId);
-      await this.drainSessionEvents(agentId);
-      this.cancelRunningProviderSubagents(agentId);
-      closedExisting = this.prepareAgentForClosure(
-        existing,
-        "agent reloaded",
-        options.preserveHistory,
-      );
-      await this.persistSnapshot(closedExisting);
-      this.assertAcceptingAgentRegistrations();
-
-      this.paseoToolPolicies.set(agentId, paseoToolPolicy);
-      session = handle
-        ? await client.resumeSession(
-            handle,
-            providerLaunchConfig,
-            launchContext,
-            reloadResumeOptions(existing.session, options.preserveHistory),
-          )
-        : await client.createSession(providerLaunchConfig, launchContext);
-      await this.requireExternalMcpSupport(session, providerLaunchConfig, launchContext);
-      this.assertAcceptingAgentRegistrations();
-
-      if (rehydrateFromDisk) {
-        // Wipe the in-memory timeline so registerSession mints a new epoch and
-        // hydrateTimelineFromProvider re-streams the freshly read provider history.
-        this.providerSubagentEventCoalescer.flushAndDiscardParent(agentId);
-        this.timelineStore.delete(agentId);
-        for (const event of this.providerSubagents.deleteParent(agentId)) {
-          this.providerSubagentEventCoalescer.publish(event, { coalesce: false });
-        }
-      }
-
-      // Preserve existing labels and timeline during reload.
-      handedToRegistration = true;
-      return this.registerSession(session, storedConfig, agentId, {
-        labels: existing.labels,
-        workspaceId: existing.workspaceId,
-        owner: existing.owner,
-        launchEnv: existing.launchEnv,
-        createdAt: existing.createdAt,
-        updatedAt: existing.updatedAt,
-        lastUserMessageAt: existing.lastUserMessageAt,
-        historyPrimed: rehydrateFromDisk ? false : preservedHistoryPrimed,
-        lastUsage: preservedLastUsage,
-        lastError: preservedLastError,
-        credentialGeneration: existing.credentialGeneration,
-        credentialChangedAt: existing.credentialChangedAt,
-        quotaTurnCheckpoint: existing.quotaTurnCheckpoint,
-        attention: preservedAttention,
-        restoring: true,
-        maintenanceReload: options.preserveHistory,
-      });
-    } catch (error) {
-      if (closedExisting) {
-        this.emitClosedAgent(closedExisting, { persist: false });
-      } else if (this.agents.get(agentId) === existing) {
-        existing.lifecycle = "error";
-        existing.lastError = error instanceof Error ? error.message : String(error);
-        this.emitState(existing);
-      }
-      throw error;
-    } finally {
-      if (!handedToRegistration) {
-        this.detachPluginTools(agentId);
-        if (hadPreviousPaseoToolPolicy) {
-          this.paseoToolPolicies.set(agentId, previousPaseoToolPolicy);
-        } else {
-          this.paseoToolPolicies.delete(agentId);
-        }
-        if (session) {
-          await this.closeUnregisteredSession(session, options.preserveHistory);
-        }
-      }
-    }
   }
 
   private async closeReloadedSession(

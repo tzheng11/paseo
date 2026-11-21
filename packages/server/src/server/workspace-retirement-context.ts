@@ -5,6 +5,13 @@ import path from "node:path";
 export interface WorkspaceBackingScope {
   paths: readonly string[];
   keys?: readonly string[];
+  /** A provider lifecycle lane must not wait behind an archive that needs that lane. */
+  rejectIfBusy?: boolean;
+}
+export class WorkspaceBackingBusyError extends Error {
+  constructor() {
+    super("workspace_backing_busy");
+  }
 }
 interface Lease {
   active: boolean;
@@ -97,6 +104,12 @@ export async function serializeWorkspaceBacking<T>(
     for (const key of requested.keys) inherited.keys.add(key);
     return run();
   }
+  if (
+    scope.rejectIfBusy &&
+    ([...leases].some((lease) => conflicts(lease, requested)) ||
+      waiting.some((waiter) => conflicts(waiter.lease, requested)))
+  )
+    throw new WorkspaceBackingBusyError();
   await new Promise<void>((ready) => {
     waiting.push({ lease: requested, ready });
     admitWaiting();

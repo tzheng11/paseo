@@ -3782,7 +3782,7 @@ test.each([
   }
 });
 
-async function reclaimFixture(kind: "retired" | "orphan" = "retired") {
+async function reclaimFixture(kind: "retired" | "orphan" = "retired", subdirectoryHook = false) {
   const f = await canonicalArchiveFixture();
   const api = await import("./workspace-backing-reclaim.js");
   const git = (...args: string[]) =>
@@ -3790,6 +3790,17 @@ async function reclaimFixture(kind: "retired" | "orphan" = "retired") {
       encoding: "utf8",
       stdio: "pipe",
     }).trim();
+  if (subdirectoryHook) {
+    const cwd = path.join(f.worktree.worktreePath, "nested");
+    mkdirSync(cwd);
+    writeFileSync(
+      path.join(cwd, "paseo.json"),
+      JSON.stringify({ worktree: { teardown: ["true"] } }),
+    );
+    git("add", "nested/paseo.json");
+    git("-c", "commit.gpgsign=false", "commit", "-m", "nested guard fixture");
+    await f.registry.update("old-a", (row) => ({ ...row, cwd }));
+  }
   let target: import("@getpaseo/protocol/workspace-backing-reclaim").WorkspaceBackingReclaimTarget;
   let original: ArchiveResult | null = null;
   if (kind === "retired") {
@@ -4302,10 +4313,15 @@ test("RECLAIM holds live cwd admission across teardown and preserves minimum-rea
     await enteredHook;
     const { admitReclaimReference } = await import("./workspace-backing-reclaim-journal.js");
     let spawned = false;
-    const terminal = admitReclaimReference(f.home, f.target.path, async () => {
-      spawned = true;
-      if (!existsSync(f.target.path)) throw Error("cwd removed");
-    });
+    const terminal = admitReclaimReference(
+      f.home,
+      f.target.path,
+      async () => {
+        spawned = true;
+        if (!existsSync(f.target.path)) throw Error("cwd removed");
+      },
+      async () => {},
+    );
     await new Promise((r) => setTimeout(r, 10));
     expect(spawned).toBe(false);
     release();
@@ -4407,6 +4423,101 @@ test("RECLAIM and archive share UUID admission even for disjoint physical paths"
     expect((await reclaim).state).toBe("complete");
     await refusal;
     expect((await f.registry.get("old-a"))?.archivedAt).toBeNull();
+  } finally {
+    await f.close();
+  }
+});
+
+test("RECLAIM archived guard discovery uses its original teardown cwd below the root", async () => {
+  const f = await reclaimFixture("retired", true);
+  try {
+    delete f.deps.teardown;
+    expect(await f.api.previewBackingReclaim(f.deps, f.input)).toMatchObject({
+      eligible: true,
+      code: null,
+      generation: expect.any(String),
+    });
+  } finally {
+    await f.close();
+  }
+});
+
+test("RECLAIM completed backing admission requires a current identity and permits a validated replacement", async () => {
+  const f = await reclaimFixture();
+  try {
+    const preview = await f.api.previewBackingReclaim(f.deps, f.input);
+    await f.api.applyBackingReclaim(f.deps, {
+      ...f.input,
+      operationId: randomUUID(),
+      expectedGeneration: preview.generation!,
+    });
+    const { admitReclaimReference } = await import("./workspace-backing-reclaim-journal.js");
+    let opened = 0;
+    await expect(
+      admitReclaimReference(f.home, f.target.path, async () => {
+        opened++;
+      }),
+    ).rejects.toThrow("reclaim_reference_generation_required");
+    await expect(
+      admitReclaimReference(
+        f.home,
+        f.target.path,
+        async () => {
+          opened++;
+        },
+        async () => {
+          throw Error("old identity");
+        },
+      ),
+    ).rejects.toThrow("old identity");
+    expect(opened).toBe(0);
+    await admitReclaimReference(
+      f.home,
+      f.target.path,
+      async () => {
+        opened++;
+      },
+      async (target) => {
+        expect(target).toEqual(f.target);
+      },
+    );
+    expect(opened).toBe(1);
+  } finally {
+    await f.close();
+  }
+});
+
+test("RECLAIM provider admission rejects old A but accepts active replacement B at the kept path", async () => {
+  const f = await reclaimFixture();
+  try {
+    const preview = await f.api.previewBackingReclaim(f.deps, f.input);
+    await f.api.applyBackingReclaim(f.deps, {
+      ...f.input,
+      operationId: randomUUID(),
+      expectedGeneration: preview.generation!,
+    });
+    const { createReclaimAgentAdmission } = await import("./workspace-backing-reclaim-journal.js");
+    expect(createReclaimAgentAdmission(false, f.home, (id) => f.registry.get(id))).toBeUndefined();
+    const admit = createReclaimAgentAdmission(true, f.home, (id) => f.registry.get(id))!;
+    let opened = 0;
+    const open = async () => {
+      opened++;
+      return "opened";
+    };
+    await expect(admit({ cwd: f.target.path, workspaceId: "old-a" }, open)).rejects.toThrow(
+      "reclaim_reference_generation_changed",
+    );
+    mkdirSync(f.target.path);
+    await f.registry.upsert({
+      ...f.record,
+      workspaceId: "new-b",
+      createdAt: "2026-11-21T20:00:00.000Z",
+    });
+    await expect(admit({ cwd: f.target.path, workspaceId: "new-b" }, open)).resolves.toBe("opened");
+    await expect(admit({ cwd: f.target.path, workspaceId: "old-a" }, open)).rejects.toThrow(
+      "reclaim_reference_generation_changed",
+    );
+    expect(opened).toBe(1);
   } finally {
     await f.close();
   }

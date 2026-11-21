@@ -607,6 +607,14 @@ can report partial with `removedDirectory=true`; it must be reconciled rather th
 retried under a new UUID. A completed reclaim releases its backing fence, so a
 new native ID can later reuse the slot; replaying the old UUID cannot touch it.
 
+Canonical provider create/resume/reload and draft-session opens hold backing
+admission through provider opening and runtime publication. A busy backing refuses
+provider opening with `reclaim_backing_busy` rather than waiting while holding an
+agent lifecycle lane needed by archival. After a completed reclaim, reopening on
+that path requires a current active native identity: an old closed agent cannot
+launch into replacement B. Legacy homes retain their provider opening behavior.
+Worker terminal admission also rejects an expired original identity.
+
 Before effects, the owner raises its home marker minimum-reader version to 4.
 Prior binaries fail closed rather than ignoring an unresolved reclaim journal.
 Ordinary subsequent archives preserve that version. No rollback/config deletion,
