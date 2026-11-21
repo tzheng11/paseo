@@ -614,8 +614,31 @@ can report partial with `removedDirectory=true`; it must be reconciled rather th
 retried under a new UUID. A completed reclaim releases its backing fence, so a
 new native ID can later reuse the slot; replaying the old UUID cannot touch it.
 
+Before removal, reclaim atomically renames the exact backing into a private,
+same-volume sibling quarantine. All journal waits precede final revalidation of
+that quarantined tree; non-forcing Git removal targets only that captured path.
+The original path is never removed after the rename, so late external Git writers
+there cannot cause deletion of a replacement. Enclosing Git worktrees are refused
+as well as contained worktrees, including those from other repositories.
+
+Uncertain quarantine/repair/removal is partial and reports `quarantinePath` (the
+planned location, not proof of a completed rename). Both original and quarantine
+locations remain durably fenced. Status/replay never restores or removes them.
+There is no automatic rename-back: Node rename can overwrite a replacement, so
+reconciliation must preserve both generations. Quarantine isolates later writes
+through the old pathname; it does not revoke pre-existing open descriptors. The
+trusted synchronous external-reference guard must still qualify those references.
+
+Every persisted agent version, including archived/closed records and duplicate
+old storage files, participates in history preservation. Stored transcript/file
+handles, metadata paths and configured/default history stores are checked by
+lexical path and realpath. An in-backing link pointing out is also preserved.
+Unreadable, corrupt, dangling or unverifiable relative-path evidence refuses
+reclamation. No provider/catalog session is started to resolve these references.
+
 Canonical provider create/resume/reload and draft-session opens hold backing
-admission through provider opening and runtime publication. A busy backing refuses
+admission before default-model catalog/availability discovery, through provider
+opening and runtime publication. A busy backing refuses
 provider opening with `reclaim_backing_busy` rather than waiting while holding an
 agent lifecycle lane needed by archival. After a completed reclaim, reopening on
 that path requires a current active native identity: an old closed agent cannot
@@ -719,3 +742,8 @@ another operation ID, does not poison that lookup. Matching or indexed corruptio
 and an undecodable generation-named file whose ID cannot be determined, remain a
 typed `retirement_lookup_integrity_failed`/binding failure. Lookup never repairs or
 deletes that evidence; destructive admission retains its existing strict fences.
+
+A retained marker lock is a no-effect `home_marker_busy` refusal before an archive
+reservation or effect journal. An explicit caller UUID records that refusal; after
+reconciliation of the lock, a newly admitted request uses a fresh UUID. The refused
+operation does not strand an authority reservation or run teardown on replay.

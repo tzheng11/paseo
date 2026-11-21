@@ -295,6 +295,8 @@ export async function retireCanonicalWorkspace(input: RetirementInput): Promise<
   await verifyNativeInventory(await authority.inspect());
   const backingGeneration = hashLayoutValue({ observed, generation });
   const operationId = input.operationId ?? randomUUID();
+  // A busy marker is a no-effect refusal, before any reservation or effect journal.
+  await promoteWorkspaceLayoutHomeMarker(home, authority.options.config, 3);
   const journal: z.infer<typeof JournalSchema> = {
     schemaVersion: 1,
     identity,
@@ -396,8 +398,6 @@ export async function retireCanonicalWorkspace(input: RetirementInput): Promise<
         return { ref, revision: entry.revision };
       }),
     });
-    // A rollback binary must refuse this owner home before it can run legacy teardown.
-    await promoteWorkspaceLayoutHomeMarker(home, authority.options.config, 3);
     const result = await withWorkspaceRetirement(
       {
         operationId,

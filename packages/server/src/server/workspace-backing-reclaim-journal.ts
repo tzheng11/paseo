@@ -22,7 +22,24 @@ export const ReclaimJournalSchema = z
     request: WorkspaceBackingReclaimInputSchema,
     requestSha256: z.string(),
     operation: WorkspaceBackingReclaimOperationSchema,
-    step: z.enum(["intent", "teardown-started", "teardown-done", "remove-started", "remove-done"]),
+    quarantinePath: z.string().optional(),
+    quarantineIdentity: z
+      .object({
+        root: z.object({ dev: z.number(), ino: z.number(), birthtimeMs: z.number() }),
+        gitDir: z.string(),
+      })
+      .optional(),
+    step: z.enum([
+      "intent",
+      "teardown-started",
+      "teardown-done",
+      "quarantine-started",
+      "quarantine-done",
+      "repair-started",
+      "repair-done",
+      "remove-started",
+      "remove-done",
+    ]),
   })
   .superRefine((journal, ctx) => {
     const op = journal.operation;
@@ -41,6 +58,11 @@ export const ReclaimJournalSchema = z
                 ? op.code === null && !op.removedDirectory
                 : op.code !== null));
     if (!consistent) ctx.addIssue({ code: "custom", message: "Inconsistent reclaim outcome" });
+    if (
+      journal.quarantineIdentity &&
+      (!journal.quarantinePath || !path.isAbsolute(journal.quarantineIdentity.gitDir))
+    )
+      ctx.addIssue({ code: "custom", message: "Unverified quarantine identity" });
   });
 export type ReclaimJournal = z.infer<typeof ReclaimJournalSchema>;
 export function reclaimFile(home: string, id: string): string {
@@ -59,8 +81,18 @@ export async function readReclaimJournal(home: string, id: string): Promise<Recl
     if (
       journal.operation.operationId !== id.toLowerCase() ||
       !path.isAbsolute(journal.operation.target.path) ||
+      (journal.quarantinePath !== undefined &&
+        (!path.isAbsolute(journal.quarantinePath) ||
+          path.dirname(path.dirname(journal.quarantinePath)) !==
+            path.dirname(journal.operation.target.path) ||
+          path.basename(path.dirname(journal.quarantinePath)) !==
+            `.paseo-reclaim-${id.toLowerCase()}` ||
+          path.basename(journal.quarantinePath) !== "backing")) ||
       journal.requestSha256 !== hashLayoutValue(journal.request) ||
       hashLayoutValue(journal.request.target) !== hashLayoutValue(journal.operation.target) ||
+      (journal.operation.quarantinePath !== undefined &&
+        (journal.operation.quarantinePath !== journal.quarantinePath ||
+          journal.operation.terminal)) ||
       (receipt &&
         (receipt.id !== `reclaim:${id.toLowerCase()}:${receipt.resultSha256}` ||
           receipt.requestSha256 !== journal.requestSha256 ||
@@ -112,7 +144,11 @@ export async function assertReclaimBackingAvailable(
       journal.operation.state === "refused"
     )
       continue;
-    if (await backingPathsOverlap(backing, journal.operation.target.path))
+    if (
+      (await backingPathsOverlap(backing, journal.operation.target.path)) ||
+      (journal.quarantinePath &&
+        (await backingPathsOverlap(backing, path.dirname(journal.quarantinePath))))
+    )
       throw new WorkspaceLayoutRefusal("reclaim_backing_reserved");
   }
 }

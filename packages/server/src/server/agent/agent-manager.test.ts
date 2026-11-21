@@ -16981,3 +16981,32 @@ test("RECLAIM busy backing refuses a closed-agent resume without holding its lif
     rmSync(cwd, { recursive: true, force: true });
   }
 });
+
+test("RECLAIM FINAL model-less history is admitted before any catalog runtime discovery", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "reclaim-model-less-history-"));
+  const client = new SessionRecordingAgentClient();
+  const catalog = vi.spyOn(client, "fetchCatalog");
+  const resume = vi.spyOn(client, "resumeSession");
+  const manager = new AgentManager({
+    clients: { pi: client },
+    logger,
+    admitBacking: async () => {
+      throw Error("reclaim_reference_generation_changed");
+    },
+  });
+  try {
+    await expect(
+      manager.resumeAgentFromPersistence(
+        { provider: "pi", sessionId: "closed-old-id", metadata: { cwd } },
+        { cwd },
+        randomUUID(),
+        { workspaceId: "old-a" },
+        { purpose: "history" },
+      ),
+    ).rejects.toThrow("reclaim_reference_generation_changed");
+    expect(catalog).not.toHaveBeenCalled();
+    expect(resume).not.toHaveBeenCalled();
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});

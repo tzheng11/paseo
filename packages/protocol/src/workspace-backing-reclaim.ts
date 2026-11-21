@@ -30,6 +30,7 @@ export const WorkspaceBackingReclaimOperationSchema = z.object({
   terminal: z.boolean(),
   code: z.string().nullable(),
   removedDirectory: z.boolean(),
+  quarantinePath: BackingPath.optional(),
   receipt: z.object({ id: z.string(), requestSha256: Digest, resultSha256: Digest }).nullable(),
 });
 export const WorkspaceBackingReclaimBindingSchema = z.object({

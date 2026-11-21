@@ -1571,14 +1571,14 @@ export class AgentManager {
     if (!normalizedConfig.model) {
       return [];
     }
-    const available = await client.isAvailable();
-    if (!available) {
-      throw new Error(
-        `Provider '${normalizedConfig.provider}' is not available. Please ensure the CLI is installed.`,
-      );
-    }
-
     return this.admitBacking({ cwd: normalizedConfig.cwd }, async () => {
+      const available = await client.isAvailable();
+      if (!available) {
+        throw new Error(
+          `Provider '${normalizedConfig.provider}' is not available. Please ensure the CLI is installed.`,
+        );
+      }
+
       if (client.listCommands) {
         return await client.listCommands(normalizedConfig);
       }
@@ -1610,14 +1610,14 @@ export class AgentManager {
     if (!normalizedConfig.model && !client.listFeatures) {
       return [];
     }
-    const available = await client.isAvailable();
-    if (!available) {
-      throw new Error(
-        `Provider '${normalizedConfig.provider}' is not available. Please ensure the CLI is installed.`,
-      );
-    }
-
     return this.admitBacking({ cwd: normalizedConfig.cwd }, async () => {
+      const available = await client.isAvailable();
+      if (!available) {
+        throw new Error(
+          `Provider '${normalizedConfig.provider}' is not available. Please ensure the CLI is installed.`,
+        );
+      }
+
       if (client.listFeatures) {
         return await client.listFeatures(normalizedConfig);
       }
@@ -1890,18 +1890,19 @@ export class AgentManager {
       config = { ...request.config, internal: config.internal };
       options = { ...options, env: request.env };
     }
-    const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
-      config,
-      resolvedAgentId,
-      { env: options?.env },
-    );
-    this.requireEnabledProvider(storedConfig.provider);
-    const client = await this.requireAvailableClient({
-      provider: storedConfig.provider,
-    });
     return this.admitBacking(
-      { cwd: launchConfig.cwd, workspaceId: options.workspaceId },
+      { cwd: resolve(config.cwd), workspaceId: options.workspaceId },
       async () => {
+        const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
+          config,
+          resolvedAgentId,
+          { env: options?.env },
+        );
+        this.requireEnabledProvider(storedConfig.provider);
+        const client = await this.requireAvailableClient({
+          provider: storedConfig.provider,
+        });
+
         await this.deleteAgentState(resolvedAgentId);
         this.paseoToolPolicies.set(resolvedAgentId, paseoToolPolicy);
         const launchContext = await this.buildLaunchContext(
@@ -2026,27 +2027,28 @@ export class AgentManager {
     const purpose = currentResumeOptions?.purpose ?? "interactive";
 
     const launchEnv = record?.launchEnv;
-    const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
-      mergedConfig,
-      resolvedAgentId,
-      { purpose, env: launchEnv },
-    );
-    const client = this.requireClient(handle.provider);
-    if (
-      currentResumeOptions?.historyReadMode === "bounded" &&
-      !client.capabilities.supportsBoundedHistory
-    ) {
-      throw new Error(`Provider '${handle.provider}' does not support bounded history loading`);
-    }
-    const available = await client.isAvailable();
-    if (!available) {
-      throw new Error(
-        `Provider '${handle.provider}' is not available. Please ensure the CLI is installed.`,
-      );
-    }
     return this.admitBacking(
-      { cwd: launchConfig.cwd, workspaceId: record?.workspaceId ?? options?.workspaceId },
+      { cwd: resolve(mergedConfig.cwd), workspaceId: record?.workspaceId ?? options?.workspaceId },
       async () => {
+        const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
+          mergedConfig,
+          resolvedAgentId,
+          { purpose, env: launchEnv },
+        );
+        const client = this.requireClient(handle.provider);
+        if (
+          currentResumeOptions?.historyReadMode === "bounded" &&
+          !client.capabilities.supportsBoundedHistory
+        ) {
+          throw new Error(`Provider '${handle.provider}' does not support bounded history loading`);
+        }
+        const available = await client.isAvailable();
+        if (!available) {
+          throw new Error(
+            `Provider '${handle.provider}' is not available. Please ensure the CLI is installed.`,
+          );
+        }
+
         this.paseoToolPolicies.set(resolvedAgentId, paseoToolPolicy);
         const launchContext = await this.buildLaunchContext(
           resolvedAgentId,
@@ -2098,70 +2100,80 @@ export class AgentManager {
     const resolvedAgentId = validateAgentId(this.idFactory(), "importProviderSession");
     this.requireEnabledProvider(input.provider);
 
-    const client = await this.requireAvailableClient({ provider: input.provider });
-    if (!client.importSession) {
-      throw new Error(`Provider '${input.provider}' does not support importing sessions`);
-    }
+    return this.admitBacking(
+      { cwd: resolve(input.cwd), workspaceId: input.workspaceId },
+      async () => {
+        const client = await this.requireAvailableClient({ provider: input.provider });
+        if (!client.importSession) {
+          throw new Error(`Provider '${input.provider}' does not support importing sessions`);
+        }
 
-    const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
-      {
-        provider: input.provider,
-        cwd: input.cwd,
-      },
-      resolvedAgentId,
-    );
-    this.paseoToolPolicies.set(resolvedAgentId, paseoToolPolicy);
-    const launchContext = await this.buildLaunchContext(
-      resolvedAgentId,
-      client,
-      storedConfig.cwd,
-      paseoToolPolicy,
-      undefined,
-      {
-        reason: "import",
-        purpose: "interactive",
-        workspaceId: input.workspaceId,
-        labels: input.labels ?? {},
-      },
-    );
-    const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
-    const imported = await client.importSession(
-      {
-        providerHandleId: input.providerHandleId,
-        cwd: input.cwd,
-      },
-      { config: providerLaunchConfig, storedConfig, launchContext },
-    );
-    await this.requireExternalMcpSupport(imported.session, providerLaunchConfig, launchContext);
-    let handedToRegistration = false;
-    try {
-      const importedConfig = await this.normalizeConfig(
-        stripInternalPaseoMcpServer(imported.config),
-      );
-      const timelineRows = buildImportedTimelineRows(imported.timeline);
-      const initialTitle = resolveImportedAgentTitle(importedConfig, timelineRows);
+        const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
+          {
+            provider: input.provider,
+            cwd: input.cwd,
+          },
+          resolvedAgentId,
+        );
+        this.paseoToolPolicies.set(resolvedAgentId, paseoToolPolicy);
+        const launchContext = await this.buildLaunchContext(
+          resolvedAgentId,
+          client,
+          storedConfig.cwd,
+          paseoToolPolicy,
+          undefined,
+          {
+            reason: "import",
+            purpose: "interactive",
+            workspaceId: input.workspaceId,
+            labels: input.labels ?? {},
+          },
+        );
+        const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
+        const imported = await client.importSession(
+          {
+            providerHandleId: input.providerHandleId,
+            cwd: input.cwd,
+          },
+          { config: providerLaunchConfig, storedConfig, launchContext },
+        );
+        await this.requireExternalMcpSupport(imported.session, providerLaunchConfig, launchContext);
+        let handedToRegistration = false;
+        try {
+          const importedConfig = await this.normalizeConfig(
+            stripInternalPaseoMcpServer(imported.config),
+          );
+          const timelineRows = buildImportedTimelineRows(imported.timeline);
+          const initialTitle = resolveImportedAgentTitle(importedConfig, timelineRows);
 
-      handedToRegistration = true;
-      const agent = await this.registerSession(imported.session, importedConfig, resolvedAgentId, {
-        labels: input.labels,
-        workspaceId: input.workspaceId,
-        timelineRows,
-        timelineNextSeq: timelineRows.length + 1,
-        persistence: imported.persistence,
-        historyPrimed: true,
-        initialTitle,
-        publishWhenReady: true,
-      });
-      for (const event of imported.providerSubagentEvents ?? []) {
-        const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
-        this.providerSubagentEventCoalescer.publish(update, { coalesce: false });
-      }
-      return agent;
-    } finally {
-      if (!handedToRegistration) {
-        await this.closeUnregisteredSession(imported.session);
-      }
-    }
+          handedToRegistration = true;
+          const agent = await this.registerSession(
+            imported.session,
+            importedConfig,
+            resolvedAgentId,
+            {
+              labels: input.labels,
+              workspaceId: input.workspaceId,
+              timelineRows,
+              timelineNextSeq: timelineRows.length + 1,
+              persistence: imported.persistence,
+              historyPrimed: true,
+              initialTitle,
+              publishWhenReady: true,
+            },
+          );
+          for (const event of imported.providerSubagentEvents ?? []) {
+            const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
+            this.providerSubagentEventCoalescer.publish(update, { coalesce: false });
+          }
+          return agent;
+        } finally {
+          if (!handedToRegistration) {
+            await this.closeUnregisteredSession(imported.session);
+          }
+        }
+      },
+    );
   }
 
   reloadAgentCredentials(
@@ -2505,14 +2517,15 @@ export class AgentManager {
       ...overrides,
       provider,
     } as AgentSessionConfig;
-    const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
-      refreshConfig,
-      agentId,
-      { env: existing.launchEnv },
-    );
     return this.admitBacking(
-      { cwd: launchConfig.cwd, workspaceId: existing.workspaceId },
+      { cwd: resolve(refreshConfig.cwd), workspaceId: existing.workspaceId },
       async () => {
+        const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
+          refreshConfig,
+          agentId,
+          { env: existing.launchEnv },
+        );
+
         const hadPreviousPaseoToolPolicy = this.paseoToolPolicies.has(agentId);
         const previousPaseoToolPolicy = this.paseoToolPolicies.get(agentId);
         const launchContext = await this.buildLaunchContext(

@@ -1,6 +1,16 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { readFile, stat, realpath, mkdir, opendir } from "node:fs/promises";
+import {
+  readFile,
+  stat,
+  realpath,
+  mkdir,
+  opendir,
+  lstat,
+  rename,
+  open,
+  rmdir,
+} from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import {
@@ -61,6 +71,7 @@ const hooks = new Map<string, LiveHook>();
 export interface BackingReclaimDependencies {
   authority: RetirementAuthority;
   inventory: () => Promise<PersistedWorkspaceRecord[]>;
+  historyReferences: () => Promise<readonly string[]>;
   liveReferences: () => Promise<readonly string[]>;
   assertHolds: (workspaceId: string) => Promise<void>;
   worktreesRoot?: string;
@@ -122,6 +133,7 @@ export async function getBackingReclaimStatus(
   )
     return {
       ...journal.operation,
+      ...(journal.quarantinePath ? { quarantinePath: journal.quarantinePath } : {}),
       state: "partial",
       terminal: false,
       code: "reclaim_reconciliation_required",
@@ -221,6 +233,7 @@ async function observeManagedGit(deps: BackingReclaimDependencies, targetPath: s
   const home = deps.authority.options.home,
     canonical = await realpath(targetPath);
   if (canonical !== targetPath) refuse("reclaim_exact_canonical_path_required");
+  await assertNoEnclosingGit(targetPath);
   const ownership = await isPaseoOwnedWorktreeCwd(targetPath, {
     paseoHome: home,
     worktreesRoot: deps.worktreesRoot,
@@ -255,13 +268,12 @@ async function observeManagedGit(deps: BackingReclaimDependencies, targetPath: s
         normalize(targetPath),
         normalize(await canonicalWorkspaceBacking(registeredPath)),
       );
-      if (
-        relative &&
-        relative !== ".." &&
-        !relative.startsWith(`..${path.sep}`) &&
-        !path.isAbsolute(relative)
-      )
-        refuse("reclaim_nested_worktree");
+      if (await backingPathsOverlap(targetPath, registeredPath))
+        refuse(
+          relative.startsWith(`..${path.sep}`) || relative === ".."
+            ? "reclaim_enclosing_worktree"
+            : "reclaim_nested_worktree",
+        );
     }
   }
   if (!registration) refuse("reclaim_git_registration_required");
@@ -269,7 +281,68 @@ async function observeManagedGit(deps: BackingReclaimDependencies, targetPath: s
   const top = await realpath(await git(targetPath, "rev-parse", "--show-toplevel"));
   if (top !== targetPath) refuse("reclaim_exact_root_required");
   const gitDir = await realpath(await git(targetPath, "rev-parse", "--absolute-git-dir"));
+  const gitfile = await readFile(path.join(targetPath, ".git"), "utf8");
+  if (!gitfile.startsWith("gitdir: ") || !path.isAbsolute(gitfile.slice(8).trim()))
+    refuse("reclaim_git_relocation_unverified");
   return { repo, metadata, registration, gitDir };
+}
+
+async function assertNoEnclosingGit(root: string): Promise<void> {
+  for (let parent = path.dirname(root); ; parent = path.dirname(parent)) {
+    const exists = async (name: string) => {
+      try {
+        await lstat(path.join(parent, name));
+        return true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+      }
+    };
+    if (
+      (await exists(".git")) ||
+      ((await exists("HEAD")) && (await exists("objects")) && (await exists("refs")))
+    )
+      refuse("reclaim_enclosing_worktree");
+    if (path.dirname(parent) === parent) return;
+  }
+}
+
+async function assertHistoryOutside(deps: BackingReclaimDependencies, roots: string[]) {
+  const references = [...new Set(await deps.historyReferences())].sort();
+  for (const reference of references) {
+    if (!path.isAbsolute(reference)) refuse("reclaim_history_inventory_unverified");
+    const resolveHistory = async (value: string): Promise<string> => {
+      try {
+        return await realpath(value);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        const entry = await lstat(value).catch((missing: NodeJS.ErrnoException) => {
+          if (missing.code === "ENOENT") return null;
+          throw missing;
+        });
+        if (entry?.isSymbolicLink()) refuse("reclaim_history_inventory_unverified");
+        const parent = path.dirname(value);
+        if (parent === value) throw error;
+        return path.join(await resolveHistory(parent), path.basename(value));
+      }
+    };
+    const physical = await resolveHistory(reference);
+    for (const root of roots) {
+      // Preserve lexical links inside the backing as well as outside links into it.
+      const inside = (value: string) => {
+        const key = (s: string) =>
+          process.platform === "darwin" || process.platform === "win32"
+            ? s.normalize("NFC").toLowerCase()
+            : s;
+        const relative = path.relative(key(root), key(value));
+        return (
+          relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)
+        );
+      };
+      if (inside(path.resolve(reference)) || inside(physical)) refuse("reclaim_history_reference");
+    }
+  }
+  return references;
 }
 
 /** Ignored and other-repository worktrees are absent from the owner's Git registry. */
@@ -397,6 +470,7 @@ async function observe(
   const targetPath = path.resolve(input.target.path);
   if (!path.isAbsolute(input.target.path)) refuse("reclaim_exact_canonical_path_required");
   const { repo, metadata, registration, gitDir } = await observeManagedGit(deps, targetPath);
+  const histories = await assertHistoryOutside(deps, [targetPath]);
   const rows = await deps.inventory(),
     snapshot = await authority.inspect();
   const originals =
@@ -425,6 +499,7 @@ async function observe(
     identity: bound,
     target: input.target,
     releaseEvidence: input.releaseEvidence,
+    histories,
     native: rows.filter((r) => ids.has(r.workspaceId)),
     layout: snapshot.entries.filter(
       (e) => e.ref.serverId === authority.options.serverId && ids.has(e.ref.workspaceId),
@@ -440,6 +515,9 @@ async function observe(
     generation: hashLayoutValue(operands),
     repo,
     targetPath,
+    gitDir,
+    observed: operands,
+    ids,
     teardownCwd,
   };
 }
@@ -581,15 +659,98 @@ export async function applyBackingReclaim(
       journal.step = "teardown-done";
       await persist();
       await verify();
-      journal.step = "remove-started";
+      const container = path.join(path.dirname(current.targetPath), `.paseo-reclaim-${id}`);
+      const quarantined = path.join(container, "backing");
+      journal.quarantinePath = quarantined;
+      journal.quarantineIdentity = { root: current.observed.root, gitDir: current.gitDir };
+      journal.operation.quarantinePath = quarantined;
+      journal.step = "quarantine-started";
       await persist();
-      await deletePaseoWorktree({
-        cwd: current.repo,
-        worktreePath: current.targetPath,
-        paseoHome: home,
-        worktreesBaseRoot: deps.worktreesRoot,
-        teardownCwds: [],
-        requireCleanRemoval: true,
+      await serializeWorkspaceBacking({ paths: [container] }, async () => {
+        await mkdir(container, { mode: 0o700 });
+        // Same-parent, same-volume rename; never copy or remove using the old pathname.
+        await rename(current.targetPath, quarantined);
+        if (
+          hashLayoutValue(await identityStat(quarantined)) !==
+          hashLayoutValue(current.observed.root)
+        )
+          refuse("reclaim_generation_changed");
+        journal.operation.quarantinePath = quarantined;
+        if (process.platform !== "win32") {
+          for (const directory of [container, path.dirname(container)]) {
+            const fd = await open(directory, "r");
+            try {
+              await fd.sync();
+            } finally {
+              await fd.close();
+            }
+          }
+        }
+        journal.step = "quarantine-done";
+        await persist();
+        await assertNoNestedGitBoundary(quarantined);
+        await assertNoEnclosingGit(quarantined);
+        await assertHistoryOutside(deps, [current.targetPath, quarantined]);
+        journal.step = "repair-started";
+        await persist();
+        // Repair only this exact captured admin directory, after the private tree qualifies.
+        const gitfile = await readFile(path.join(quarantined, ".git"), "utf8");
+        if ((await realpath(gitfile.slice(8).trim())) !== current.gitDir)
+          refuse("reclaim_git_relocation_unverified");
+        await git(current.repo, "worktree", "repair", quarantined);
+        journal.step = "repair-done";
+        await persist();
+        journal.step = "remove-started";
+        await persist();
+        // All journal waits precede the final scan. Late writers at the OLD path
+        // can create another generation, but can never make us delete that path.
+        const reused = await lstat(current.targetPath).then(
+          () => true,
+          (error: NodeJS.ErrnoException) => {
+            if (error.code === "ENOENT") return false;
+            throw error;
+          },
+        );
+        if (reused) refuse("reclaim_original_path_reused");
+        const rows = await deps.inventory(),
+          snapshot = await deps.authority.inspect();
+        checkLayout(snapshot, rows, current.ids, deps.authority.options.serverId);
+        await checkNativeReferences(deps, rows, snapshot, current.ids, current.targetPath);
+        await checkNativeReferences(deps, rows, snapshot, current.ids, quarantined);
+        const histories = await assertHistoryOutside(deps, [current.targetPath, quarantined]);
+        const detached = {
+          ...current.observed,
+          histories,
+          native: rows.filter((row) => current.ids.has(row.workspaceId)),
+          layout: snapshot.entries.filter(
+            (entry) =>
+              entry.ref.serverId === deps.authority.options.serverId &&
+              current.ids.has(entry.ref.workspaceId),
+          ),
+          root: await identityStat(quarantined),
+          head: await git(quarantined, "rev-parse", "HEAD"),
+        };
+        if (hashLayoutValue(detached) !== hashLayoutValue(current.observed))
+          refuse("reclaim_generation_changed");
+        const moved = await observeManagedGit(deps, quarantined);
+        if (
+          moved.gitDir !== current.gitDir ||
+          hashLayoutValue(moved.metadata) !== hashLayoutValue(current.observed.metadata)
+        )
+          refuse("reclaim_git_relocation_unverified");
+        if (!(await retirementSourceIsCleanAndLanded(quarantined, current.repo)))
+          refuse("reclaim_source_preserved");
+        await deletePaseoWorktree({
+          cwd: current.repo,
+          worktreePath: quarantined,
+          paseoHome: home,
+          worktreesBaseRoot: deps.worktreesRoot,
+          teardownCwds: [],
+          requireCleanRemoval: true,
+        });
+        journal.operation.removedDirectory = true;
+        delete journal.operation.quarantinePath;
+        await rmdir(container);
       });
       journal.step = "remove-done";
       journal.operation = {

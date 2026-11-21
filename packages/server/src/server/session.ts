@@ -980,6 +980,10 @@ export class Session {
       () => ({
         authority: this.workspaceLayoutService!,
         inventory: () => this.readRetirementRecords(),
+        historyReferences: async () => [
+          this.paseoHome,
+          ...(await this.agentStorage.retainedHistoryPaths()),
+        ],
         liveReferences: async () => {
           const agents = this.agentManager
             .listAgents({ includeInternal: true })

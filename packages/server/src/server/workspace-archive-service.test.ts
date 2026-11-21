@@ -3847,6 +3847,7 @@ async function reclaimFixture(kind: "retired" | "orphan" = "retired", subdirecto
   const deps: import("./workspace-backing-reclaim.js").BackingReclaimDependencies = {
     authority: f.layout,
     inventory: () => f.registry.listRetirementRecords(),
+    historyReferences: async () => [],
     liveReferences: async () => [],
     assertHolds: async () => {},
     teardown: async (options) => {
@@ -4765,3 +4766,344 @@ test.skipIf(process.platform !== "darwin" && process.platform !== "win32")(
     }
   },
 );
+
+test.each(["same", "different"])(
+  "RECLAIM FINAL refuses a target enclosed by a %s-repository worktree",
+  async (kind) => {
+    const f = await reclaimFixture("orphan");
+    try {
+      const outside = createGitRepo();
+      const outer = path.join(
+        await (await import("node:fs/promises")).realpath(outside.tempDir),
+        "enclosing-worktree",
+      );
+      execFileSync(
+        "git",
+        [
+          "-C",
+          kind === "same" ? f.repoDir : outside.repoDir,
+          "worktree",
+          "add",
+          "-b",
+          "enclosing",
+          outer,
+        ],
+        { stdio: "pipe" },
+      );
+      const nestedTarget = path.join(outer, "managed-inner");
+      execFileSync("git", ["-C", f.repoDir, "worktree", "move", f.target.path, nestedTarget], {
+        stdio: "pipe",
+      });
+      const input = { ...f.input, target: { kind: "orphan" as const, path: nestedTarget } };
+      expect(await f.api.previewBackingReclaim(f.deps, input)).toMatchObject({
+        eligible: false,
+        code: "reclaim_enclosing_worktree",
+        generation: null,
+      });
+      expect(existsSync(path.join(nestedTarget, ".git"))).toBe(true);
+    } finally {
+      await f.close();
+    }
+  },
+);
+
+test("RECLAIM FINAL retains an external worktree added at the persisted removal boundary", async () => {
+  const f = await reclaimFixture("orphan");
+  const originalWrite = atomicFile.writeFileDurably;
+  let injected = false;
+  try {
+    const nested = path.join(f.target.path, "external-checkout");
+    const exclude = execFileSync(
+      "git",
+      ["-C", f.target.path, "rev-parse", "--git-path", "info/exclude"],
+      { encoding: "utf8" },
+    ).trim();
+    writeFileSync(exclude, readFileSync(exclude, "utf8") + "\n/external-checkout/\n");
+    const preview = await f.api.previewBackingReclaim(f.deps, f.input);
+    const write = vi.spyOn(atomicFile, "writeFileDurably").mockImplementation(async (...args) => {
+      await originalWrite(...args);
+      if (
+        !injected &&
+        String(args[0]).includes("workspace-backing-reclaims") &&
+        JSON.parse(String(args[1])).step === "remove-started"
+      ) {
+        injected = true;
+        execFileSync(
+          "git",
+          ["-C", f.repoDir, "worktree", "add", "-b", "external-checkout", nested],
+          { stdio: "pipe" },
+        );
+        writeFileSync(path.join(nested, "retained-source"), "external generation\n");
+      }
+    });
+    const result = await f.api.applyBackingReclaim(f.deps, {
+      ...f.input,
+      operationId: randomUUID(),
+      expectedGeneration: preview.generation!,
+    });
+    write.mockRestore();
+    expect(injected).toBe(true);
+    expect(result.removedDirectory).toBe(false);
+    expect(result.state).toBe("partial");
+    expect(readFileSync(path.join(nested, "retained-source"), "utf8")).toBe(
+      "external generation\n",
+    );
+  } finally {
+    vi.restoreAllMocks();
+    await f.close();
+  }
+});
+
+test("RECLAIM FINAL preserves a closed Pi transcript reached through a realpath alias", async () => {
+  const f = await reclaimFixture("retired");
+  try {
+    const transcript = path.join(f.target.path, "ignored-session.jsonl");
+    const exclude = execFileSync(
+      "git",
+      ["-C", f.target.path, "rev-parse", "--git-path", "info/exclude"],
+      { encoding: "utf8" },
+    ).trim();
+    writeFileSync(exclude, readFileSync(exclude, "utf8") + "\n/ignored-session.jsonl\n");
+    const preview = await f.api.previewBackingReclaim(f.deps, f.input);
+    writeFileSync(transcript, "synthetic retained transcript\n");
+    const alias = path.join(f.home, "session-alias.jsonl");
+    await (await import("node:fs/promises")).symlink(transcript, alias);
+    const storage = new AgentStorage(path.join(f.home, "agents"), createLogger());
+    await storage.upsert({
+      id: randomUUID(),
+      provider: "pi",
+      cwd: f.repoDir,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      lastStatus: "closed",
+      labels: {},
+      archivedAt: new Date().toISOString(),
+      persistence: { provider: "pi", sessionId: "retained", nativeHandle: alias },
+    });
+    Object.assign(f.deps, {
+      historyReferences: async () =>
+        (await storage.list()).map((r) => String(r.persistence!.nativeHandle)),
+    });
+    const result = await f.api.applyBackingReclaim(f.deps, {
+      ...f.input,
+      operationId: randomUUID(),
+      expectedGeneration: preview.generation!,
+    });
+    expect(result).toMatchObject({
+      state: "refused",
+      code: "reclaim_history_reference",
+      removedDirectory: false,
+    });
+    expect(readFileSync(transcript, "utf8")).toBe("synthetic retained transcript\n");
+    expect((await storage.list())[0].persistence?.nativeHandle).toBe(alias);
+  } finally {
+    await f.close();
+  }
+});
+
+test("RECLAIM FINAL a retained marker lock refuses before any authority reservation", async () => {
+  const f = await canonicalArchiveFixture();
+  const lock = path.join(f.home, "workspace-layout-mode.json.lock");
+  try {
+    mkdirSync(lock);
+    const id = randomUUID();
+    await expect(
+      archiveByScope(f.deps, {
+        scope: { kind: "workspace", workspaceId: "old-a" },
+        operationId: id,
+        requestId: "locked-marker",
+      }),
+    ).rejects.toThrow("home_marker_busy");
+    expect(
+      await (await import("./workspace-retirement.js")).getWorkspaceRetirementStatus(f.layout, id),
+    ).toMatchObject({ state: "refused", terminal: true, code: "home_marker_busy" });
+    expect((await f.layout.inspect()).retirements ?? []).toHaveLength(0);
+    expect((await f.registry.get("old-a"))?.archivedAt).toBeNull();
+    rmSync(lock, { recursive: true });
+    const retry = await archiveByScope(f.deps, {
+      scope: { kind: "workspace", workspaceId: "old-a" },
+      operationId: randomUUID(),
+      requestId: "fresh-after-marker-release",
+    });
+    expect(retry.retirement?.state).toBe("complete");
+    expect(retry.removedDirectory).toBe(true);
+  } finally {
+    await f.close();
+  }
+});
+
+test("RECLAIM QUARANTINE preserves a late nested Git tree and fences both paths after restart readback", async () => {
+  const f = await reclaimFixture("orphan");
+  const originalWrite = atomicFile.writeFileDurably;
+  let injected = false;
+  try {
+    const preview = await f.api.previewBackingReclaim(f.deps, f.input);
+    const id = randomUUID();
+    vi.spyOn(atomicFile, "writeFileDurably").mockImplementation(async (...args) => {
+      await originalWrite(...args);
+      if (
+        !injected &&
+        String(args[0]).includes("workspace-backing-reclaims") &&
+        JSON.parse(String(args[1])).step === "quarantine-done"
+      ) {
+        injected = true;
+        const moved = JSON.parse(String(args[1])).quarantinePath;
+        execFileSync(
+          "git",
+          [
+            "-C",
+            f.repoDir,
+            "worktree",
+            "add",
+            "-b",
+            "quarantine-child",
+            path.join(moved, "nested"),
+          ],
+          { stdio: "pipe" },
+        );
+      }
+    });
+    const result = await f.api.applyBackingReclaim(f.deps, {
+      ...f.input,
+      operationId: id,
+      expectedGeneration: preview.generation!,
+    });
+    expect(result).toMatchObject({
+      state: "partial",
+      code: "reclaim_nested_worktree",
+      removedDirectory: false,
+      quarantinePath: expect.any(String),
+    });
+    expect(existsSync(path.join(result.quarantinePath!, "nested", ".git"))).toBe(true);
+    expect(await f.api.getBackingReclaimStatus(f.deps, id)).toEqual(result);
+    expect(
+      await f.api.applyBackingReclaim(f.deps, {
+        ...f.input,
+        operationId: id,
+        expectedGeneration: preview.generation!,
+      }),
+    ).toEqual(result);
+    const { assertReclaimBackingAvailable } =
+      await import("./workspace-backing-reclaim-journal.js");
+    await expect(assertReclaimBackingAvailable(f.home, f.target.path)).rejects.toThrow(
+      "reclaim_backing_reserved",
+    );
+    await expect(assertReclaimBackingAvailable(f.home, result.quarantinePath!)).rejects.toThrow(
+      "reclaim_backing_reserved",
+    );
+  } finally {
+    vi.restoreAllMocks();
+    await f.close();
+  }
+});
+
+test("RECLAIM QUARANTINE preserves generation proof before any Git repair", async () => {
+  const f = await reclaimFixture("orphan");
+  const originalWrite = atomicFile.writeFileDurably;
+  let injected = false;
+  try {
+    const preview = await f.api.previewBackingReclaim(f.deps, f.input);
+    const old = `${f.target.path}-preserved-original`;
+    vi.spyOn(atomicFile, "writeFileDurably").mockImplementation(async (...args) => {
+      await originalWrite(...args);
+      if (
+        !injected &&
+        String(args[0]).includes("workspace-backing-reclaims") &&
+        JSON.parse(String(args[1])).step === "quarantine-started"
+      ) {
+        injected = true;
+        renameSync(f.target.path, old);
+        mkdirSync(f.target.path);
+        writeFileSync(path.join(f.target.path, ".git"), readFileSync(path.join(old, ".git")));
+        writeFileSync(path.join(f.target.path, "replacement-source"), "new physical generation");
+      }
+    });
+    const result = await f.api.applyBackingReclaim(f.deps, {
+      ...f.input,
+      operationId: randomUUID(),
+      expectedGeneration: preview.generation!,
+    });
+    expect(result).toMatchObject({
+      state: "partial",
+      code: "reclaim_generation_changed",
+      removedDirectory: false,
+    });
+    expect(readFileSync(path.join(result.quarantinePath!, "replacement-source"), "utf8")).toBe(
+      "new physical generation",
+    );
+    expect(existsSync(old)).toBe(true);
+    expect(
+      execFileSync("git", ["-C", f.repoDir, "worktree", "list", "--porcelain"], {
+        encoding: "utf8",
+      }),
+    ).not.toContain(`worktree ${result.quarantinePath}`);
+  } finally {
+    vi.restoreAllMocks();
+    await f.close();
+  }
+});
+
+test("RECLAIM HISTORY refuses an in-backing symlink even when its transcript is physically outside", async () => {
+  const f = await reclaimFixture("orphan");
+  try {
+    const transcript = path.join(f.home, "outside-session.jsonl");
+    const alias = path.join(f.target.path, "history-alias.jsonl");
+    writeFileSync(transcript, "retained outside");
+    const exclude = execFileSync(
+      "git",
+      ["-C", f.target.path, "rev-parse", "--git-path", "info/exclude"],
+      { encoding: "utf8" },
+    ).trim();
+    writeFileSync(exclude, readFileSync(exclude, "utf8") + "\n/history-alias.jsonl\n");
+    await (await import("node:fs/promises")).symlink(transcript, alias);
+    f.deps.historyReferences = async () => [alias];
+    expect(await f.api.previewBackingReclaim(f.deps, f.input)).toMatchObject({
+      eligible: false,
+      code: "reclaim_history_reference",
+    });
+    expect(readFileSync(transcript, "utf8")).toBe("retained outside");
+  } finally {
+    await f.close();
+  }
+});
+
+test("RECLAIM QUARANTINE rejects a contradictory durable status path", async () => {
+  const f = await reclaimFixture("orphan");
+  const originalWrite = atomicFile.writeFileDurably;
+  let interrupted = false;
+  try {
+    const preview = await f.api.previewBackingReclaim(f.deps, f.input);
+    const id = randomUUID();
+    vi.spyOn(atomicFile, "writeFileDurably").mockImplementation(async (...args) => {
+      await originalWrite(...args);
+      if (
+        !interrupted &&
+        String(args[0]).includes("workspace-backing-reclaims") &&
+        JSON.parse(String(args[1])).step === "quarantine-done"
+      ) {
+        interrupted = true;
+        throw Error("fixture crash boundary");
+      }
+    });
+    const result = await f.api.applyBackingReclaim(f.deps, {
+      ...f.input,
+      operationId: id,
+      expectedGeneration: preview.generation!,
+    });
+    vi.restoreAllMocks();
+    expect(result.state).toBe("partial");
+    const file = path.join(f.home, "workspace-backing-reclaims", `${id}.json`);
+    const journal = JSON.parse(readFileSync(file, "utf8"));
+    const actual = await (await import("node:fs/promises")).stat(result.quarantinePath!);
+    expect(journal.quarantineIdentity.root.ino).toBe(actual.ino);
+    journal.operation.quarantinePath = path.join(f.home, "contradictory-path");
+    writeFileSync(file, JSON.stringify(journal));
+    await expect(f.api.getBackingReclaimStatus(f.deps, id)).rejects.toThrow(
+      "reclaim_journal_unverified",
+    );
+    expect(existsSync(result.quarantinePath!)).toBe(true);
+  } finally {
+    vi.restoreAllMocks();
+    await f.close();
+  }
+});
