@@ -1,3 +1,4 @@
+import { runReclaimCommand, runReclaimStatusCommand, runReclaimVerifyCommand } from "./reclaim.js";
 import { Command } from "commander";
 import { withOutput } from "../../output/index.js";
 import { addJsonAndDaemonHostOptions } from "../../utils/command-options.js";
@@ -100,5 +101,34 @@ export function createWorkspaceCommand(): Command {
       .requiredOption("--worktree-path <path>", "Exact worktree path")
       .requiredOption("--teardown-cwd <path>", "Exact teardown cwd"),
   ).action(withOutput(runRetirementVerifyCommand));
+  addJsonAndDaemonHostOptions(
+    workspace
+      .command("reclaim")
+      .description("Preview or apply exact managed backing reclaim; never archives an identity")
+      .argument("<path>")
+      .requiredOption("--release-evidence <sha256>", "Opaque released-owner evidence digest")
+      .option("--workspace-id <id>")
+      .option("--original-operation-id <uuid>")
+      .option("--original-backing-generation <sha256>")
+      .option("--apply")
+      .option("--operation-id <uuid>")
+      .option("--expected-generation <sha256>"),
+  ).action(withOutput(runReclaimCommand));
+  addJsonAndDaemonHostOptions(
+    workspace.command("reclaim-status").argument("<operation-id>"),
+  ).action(withOutput(runReclaimStatusCommand));
+  addJsonAndDaemonHostOptions(
+    workspace
+      .command("reclaim-verify")
+      .description(
+        "Qualify the live synchronous reclaim guard after owner release and external-reference checks",
+      )
+      .argument("<operation-id>")
+      .requiredOption("--expected-generation <sha256>")
+      .requiredOption("--path <path>")
+      .requiredOption("--release-evidence <sha256>")
+      .option("--owner-released")
+      .option("--external-references-clear"),
+  ).action(withOutput(runReclaimVerifyCommand));
   return workspace;
 }

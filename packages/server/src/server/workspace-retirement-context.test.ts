@@ -196,3 +196,23 @@ test.skipIf(process.platform !== "darwin" && process.platform !== "win32")(
     expect(order).toEqual(["closed", "alias"]);
   },
 );
+
+test("RECLAIM provider admission refuses a busy backing instead of waiting with an agent lifecycle lane", async () => {
+  const f = await fixture(),
+    started = deferred(),
+    release = deferred();
+  const retirement = serializeWorkspaceBacking(f.a, async () => {
+    started.resolve();
+    await release.promise;
+  });
+  await started.promise;
+  try {
+    await expect(
+      serializeWorkspaceBacking({ paths: [f.a], rejectIfBusy: true }, async () => {}),
+    ).rejects.toThrow("workspace_backing_busy");
+    await serializeWorkspaceBacking({ paths: [f.b], rejectIfBusy: true }, async () => {});
+  } finally {
+    release.resolve();
+    await retirement;
+  }
+});

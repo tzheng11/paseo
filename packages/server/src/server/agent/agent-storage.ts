@@ -1,4 +1,5 @@
 import { QuotaTurnCheckpointSchema } from "./quota-turn-recovery.js";
+import { persistedHistoryPaths } from "./persisted-history-paths.js";
 import { promises as fs, type Dirent } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
@@ -125,6 +126,32 @@ export class AgentStorage {
   async list(): Promise<StoredAgentRecord[]> {
     await this.load();
     return Array.from(this.cache.values());
+  }
+
+  /** Destructive admission cannot use a stale cache or skip an unreadable durable record. */
+  async retainedHistoryPaths(): Promise<string[]> {
+    await Promise.all(Array.from(this.pendingWrites.values()));
+    const records = [...this.cache.values()];
+    const scan = async (directory: string, projects: boolean): Promise<void> => {
+      let entries: Dirent[];
+      try {
+        entries = await fs.readdir(directory, { withFileTypes: true });
+      } catch (error) {
+        if (directory === this.baseDir && (error as NodeJS.ErrnoException).code === "ENOENT")
+          return;
+        throw error;
+      }
+      for (const entry of entries) {
+        const file = path.join(directory, entry.name);
+        if (entry.isFile() && entry.name.endsWith(".json")) {
+          const record = parseStoredAgentRecord(JSON.parse(await fs.readFile(file, "utf8")));
+          records.push(record);
+        } else if (projects && entry.isDirectory()) await scan(file, false);
+        else if (entry.isSymbolicLink()) throw new Error("reclaim_history_inventory_unverified");
+      }
+    };
+    await scan(this.baseDir, true);
+    return [path.resolve(this.baseDir), ...(await persistedHistoryPaths(records))];
   }
 
   async get(agentId: string): Promise<StoredAgentRecord | null> {

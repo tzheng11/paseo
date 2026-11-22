@@ -32,7 +32,7 @@ export const WorkspaceLayoutConfigSchema = WorkspaceLayoutIdentitySchema.extend(
 });
 export const WORKSPACE_LAYOUT_MODE_FILENAME = "workspace-layout-mode.json";
 export const WorkspaceLayoutHomeMarkerSchema = WorkspaceLayoutConfigSchema.extend({
-  schemaVersion: z.union([z.literal(1), z.literal(2), z.literal(3)]),
+  schemaVersion: z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4)]),
   destructiveRetirement: z.literal("refuse"),
 }).refine(
   (marker) => marker.schemaVersion >= 2 === (marker.semanticsVersion === 2),

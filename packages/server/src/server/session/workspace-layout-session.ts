@@ -1,4 +1,11 @@
 import {
+  applyBackingReclaim,
+  previewBackingReclaim,
+  getBackingReclaimStatus,
+  verifyBackingReclaimHook,
+  type BackingReclaimDependencies,
+} from "../workspace-backing-reclaim.js";
+import {
   getWorkspaceRetirementStatus,
   verifyWorkspaceRetirementBinding,
 } from "../workspace-retirement.js";
@@ -22,12 +29,24 @@ type LayoutRequest = Extract<
   }
 >;
 
+type ReclaimRequest = Extract<
+  SessionInboundMessage,
+  {
+    type:
+      | "workspace.reclaim.preview.request"
+      | "workspace.reclaim.apply.request"
+      | "workspace.reclaim.get_status.request"
+      | "workspace.reclaim.verify.request";
+  }
+>;
+
 export class WorkspaceLayoutSession {
   constructor(
     private readonly service: WorkspaceLayoutService | undefined,
     private readonly delivery: SessionDelivery,
     private readonly emit: (message: SessionOutboundMessage) => void,
     private readonly logger: Logger,
+    private readonly reclaimDependencies?: () => BackingReclaimDependencies,
   ) {}
 
   dispatch(message: SessionInboundMessage): Promise<void> | undefined {
@@ -39,11 +58,66 @@ export class WorkspaceLayoutSession {
       case "workspace.retirement.status.request":
       case "workspace.retirement.verify.request":
         return this.handle(message);
+      case "workspace.reclaim.preview.request":
+      case "workspace.reclaim.apply.request":
+      case "workspace.reclaim.get_status.request":
+      case "workspace.reclaim.verify.request":
+        return this.handleReclaim(message);
       default:
         return undefined;
     }
   }
 
+  private async handleReclaim(message: ReclaimRequest): Promise<void> {
+    try {
+      if (!this.service || !this.reclaimDependencies)
+        throw new WorkspaceLayoutRefusal("reclaim_inventory_unavailable");
+      const deps = this.reclaimDependencies();
+      if (message.type === "workspace.reclaim.preview.request")
+        this.emit({
+          type: "workspace.reclaim.preview.response",
+          payload: {
+            requestId: message.requestId,
+            preview: await previewBackingReclaim(deps, message),
+          },
+        });
+      else if (message.type === "workspace.reclaim.apply.request")
+        this.emit({
+          type: "workspace.reclaim.apply.response",
+          payload: {
+            requestId: message.requestId,
+            operation: await applyBackingReclaim(deps, message),
+          },
+        });
+      else if (message.type === "workspace.reclaim.get_status.request")
+        this.emit({
+          type: "workspace.reclaim.get_status.response",
+          payload: {
+            requestId: message.requestId,
+            operation: await getBackingReclaimStatus(deps, message.operationId),
+          },
+        });
+      else
+        this.emit({
+          type: "workspace.reclaim.verify.response",
+          payload: {
+            requestId: message.requestId,
+            ...(await verifyBackingReclaimHook(this.service.options.home, message)),
+          },
+        });
+    } catch (error) {
+      this.emit({
+        type: "rpc_error",
+        payload: {
+          requestId: message.requestId,
+          requestType: message.type,
+          code:
+            error instanceof WorkspaceLayoutRefusal ? error.code : "reclaim_evidence_unverified",
+          error: "Backing reclaim evidence could not be verified.",
+        },
+      });
+    }
+  }
   private async handle(message: LayoutRequest): Promise<void> {
     try {
       if (!this.service) throw new WorkspaceLayoutRefusal("canonical_layout_not_configured");

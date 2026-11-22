@@ -2662,3 +2662,47 @@ it.each([false, true])(
   },
   45000,
 );
+
+it("RECLAIM worker terminal admission rejects an unresolved backing before sending a spawn", async () => {
+  const home = mkdtempSync(join(tmpdir(), "paseo-reclaim-terminal-"));
+  try {
+    const { hashLayoutValue } = await import("../server/workspace-layout-store.js");
+    const id = "00000000-0000-4000-8000-000000000001",
+      target = { kind: "orphan", path: join(home, "target") };
+    const request = { target, releaseEvidence: "e".repeat(64) };
+    mkdirSync(join(home, "workspace-backing-reclaims"));
+    writeFileSync(
+      join(home, "workspace-backing-reclaims", `${id}.json`),
+      JSON.stringify({
+        schemaVersion: 1,
+        identity: {
+          authorityServerId: "owner",
+          authorityKeySha256: "a".repeat(64),
+          authorityId: id,
+          epoch: id,
+        },
+        request,
+        requestSha256: hashLayoutValue(request),
+        step: "teardown-started",
+        operation: {
+          operationId: id,
+          ownerServerId: "owner",
+          target,
+          generation: "f".repeat(64),
+          state: "partial",
+          terminal: false,
+          code: "interrupted",
+          removedDirectory: false,
+          receipt: null,
+        },
+      }),
+    );
+    const worker = new FakeTerminalWorker();
+    manager = createWorkerTerminalManager({ worker, paseoHome: home, requestTimeoutMs: 5 });
+    await expect(
+      manager.createTerminal({ cwd: target.path, workspaceId: "unrelated-active" }),
+    ).rejects.toThrow("reclaim_backing_reserved");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});

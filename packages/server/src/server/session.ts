@@ -977,6 +977,31 @@ export class Session {
       this.delivery,
       (message) => this.emit(message),
       this.sessionLogger,
+      () => ({
+        authority: this.workspaceLayoutService!,
+        inventory: () => this.readRetirementRecords(),
+        historyReferences: async () => [
+          this.paseoHome,
+          ...(await this.agentStorage.retainedHistoryPaths()),
+        ],
+        liveReferences: async () => {
+          const agents = this.agentManager
+            .listAgents({ includeInternal: true })
+            .filter((a) => a.lifecycle !== "closed")
+            .map((a) => a.cwd);
+          const manager = this.terminalManager;
+          const terminals = manager
+            ? (await Promise.all(manager.listDirectories().map((cwd) => manager.getTerminals(cwd))))
+                .flat()
+                .filter((t) => !t.getExitInfo())
+                .map((t) => t.cwd)
+            : [];
+          return [...agents, ...terminals];
+        },
+        assertHolds: (id) =>
+          assertWorkspaceAutomationAllowedForWorkspace(this.workspaceRegistry, id),
+        worktreesRoot: this.worktreesRoot,
+      }),
     );
     this.workspaceFilesSession = new WorkspaceFilesSession({
       host: {
