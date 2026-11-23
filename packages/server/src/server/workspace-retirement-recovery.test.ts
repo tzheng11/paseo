@@ -46,6 +46,7 @@ const confirmations = [
   "gen-match",
   "gen-mismatch",
   "closed-bound",
+  "closed-mismatch",
   "closed-unbound",
 ] as const;
 const backings = [
@@ -77,7 +78,7 @@ function literalExpected(cell: Cell) {
     };
   if (cell.confirmation === "closed-unbound")
     return { kind: "reject", code: "retirement_recovery_confirmation_binding_required" };
-  if (cell.confirmation === "gen-mismatch")
+  if (["gen-mismatch", "closed-mismatch"].includes(cell.confirmation))
     return { kind: "reject", code: "retirement_backing_generation_changed" };
   if (cell.receipt === "missing")
     return { kind: "fence", code: "retirement_archive_receipt_required" };
@@ -110,6 +111,8 @@ function confirmationInput(cell: Cell, generation: string): RecoveryConfirmation
       return { expectedBackingGeneration: "0".repeat(64) };
     case "closed-bound":
       return { effectsClosed: true, expectedBackingGeneration: generation };
+    case "closed-mismatch":
+      return { effectsClosed: true, expectedBackingGeneration: "0".repeat(64) };
     case "closed-unbound":
       return { effectsClosed: true };
   }

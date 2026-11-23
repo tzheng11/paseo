@@ -53,6 +53,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { recoverWorkspaceRetirement } from "./workspace-archive-service.js";
 import { recoverCanonicalWorkspaceRetirement } from "./workspace-retirement.js";
+import { WorkspaceLayoutRefusal } from "./workspace-layout-store.js";
 import {
   recoveryFixture,
   INTEGRATION_RECOVERY_STATES,
@@ -4868,22 +4869,32 @@ test.each(
   }
 });
 
-test("B S7 wrong-generation confirmation changes no durable bytes", async () => {
-  const f = await interruptedRemovalFixture();
-  try {
-    bJournal(f, "S7");
-    const before = bReadBytes(f);
-    await expect(
-      recoverWorkspaceRetirement(f.deps, f.operationId, undefined, {
-        expectedBackingGeneration: "0".repeat(64),
-      }),
-    ).rejects.toThrow("retirement_backing_generation_changed");
-    expect(bReadBytes(f)).toEqual(before);
-  } finally {
-    vi.restoreAllMocks();
-    await f.close();
-  }
-});
+test.each([false, true])(
+  "B S7 wrong-generation confirmation effectsClosed=%s changes no bytes or Git",
+  async (effectsClosed) => {
+    const f = await interruptedRemovalFixture();
+    try {
+      bJournal(f, "S7");
+      const before = bReadBytes(f);
+      const git = vi.spyOn(gitCommands, "runGitCommand");
+      const write = vi.spyOn(atomicFile, "writeFileDurably");
+      await expect(
+        recoverWorkspaceRetirement(f.deps, f.operationId, undefined, {
+          effectsClosed,
+          expectedBackingGeneration: "0".repeat(64),
+        }),
+      ).rejects.toThrow("retirement_backing_generation_changed");
+      expect(bReadBytes(f)).toEqual(before);
+      expect(git).not.toHaveBeenCalled();
+      expect(
+        write.mock.calls.filter(([file]) => String(file).includes("workspace-retirement")),
+      ).toHaveLength(0);
+    } finally {
+      vi.restoreAllMocks();
+      await f.close();
+    }
+  },
+);
 
 test("B rejected authority completion reuses v2 settlement with zero removals and identical rerun", async () => {
   const f = await interruptedRemovalFixture();
@@ -4914,11 +4925,35 @@ test("B rejected authority completion reuses v2 settlement with zero removals an
   }
 });
 
-test("B replaces the R3 no-launch probe with retained settlement, zero removal and released fence", async () => {
+test("B replaces the R3 pre-persist verification fault with unchanged bytes, zero removal and retained rerun", async () => {
   const f = await interruptedRemovalFixture();
+  const inspect = f.layout.inspect.bind(f.layout);
+  let inspectReads = 0;
+  let faultInjected = false;
   try {
+    // Original R3 setup: the owned journal has no removal intent yet.
     fixtureBeforeFirstRemoval(f.journalFile);
+    const before = bReadBytes(f);
+    vi.spyOn(f.layout, "inspect").mockImplementation(async () => {
+      // Read 1 gathers the observation. Read 2 is the verified settlement's
+      // pre-persist recheck; preserve the original R3 refusal and message.
+      if (++inspectReads === 2) {
+        faultInjected = true;
+        throw new WorkspaceLayoutRefusal("fixture_pre_effect_verification_unavailable");
+      }
+      return inspect();
+    });
     const git = vi.spyOn(gitCommands, "runGitCommand");
+    const write = vi.spyOn(atomicFile, "writeFileDurably");
+    await expect(f.recover()).rejects.toThrow("fixture_pre_effect_verification_unavailable");
+    expect(faultInjected).toBe(true);
+    expect(inspectReads).toBe(2);
+    expect(bReadBytes(f)).toEqual(before);
+    expect(git).not.toHaveBeenCalled();
+    expect(
+      write.mock.calls.filter(([file]) => String(file).includes("workspace-retirement")),
+    ).toHaveLength(0);
+    await expect(f.createPinned()).rejects.toThrow("retirement_conflict");
     const result = await f.recover();
     expect(result).toMatchObject({
       removedDirectory: false,
@@ -4928,9 +4963,7 @@ test("B replaces the R3 no-launch probe with retained settlement, zero removal a
     });
     expect(existsSync(f.worktree.worktreePath)).toBe(true);
     expect(await f.recover()).toEqual(result);
-    expect(
-      git.mock.calls.filter(([args]) => args[0] === "worktree" && args[1] === "remove"),
-    ).toHaveLength(0);
+    expect(git).not.toHaveBeenCalled();
     await expect(f.createPinned()).resolves.toMatchObject({ parentWorkspaceId: "pin-parent" });
   } finally {
     vi.restoreAllMocks();

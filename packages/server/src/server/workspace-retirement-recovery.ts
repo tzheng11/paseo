@@ -165,15 +165,12 @@ export function classifyRetirementRecovery(
   const binding = recoveryBindingFailure(record);
   if (binding) return { kind: "reject", code: binding };
   if (
-    confirmation.effectsClosed &&
-    confirmation.expectedBackingGeneration !== record.backingGeneration
-  )
-    return { kind: "reject", code: "retirement_recovery_confirmation_binding_required" };
-  if (
-    confirmation.expectedBackingGeneration &&
+    confirmation.expectedBackingGeneration !== undefined &&
     confirmation.expectedBackingGeneration !== record.backingGeneration
   )
     return { kind: "reject", code: "retirement_backing_generation_changed" };
+  if (confirmation.effectsClosed && confirmation.expectedBackingGeneration === undefined)
+    return { kind: "reject", code: "retirement_recovery_confirmation_binding_required" };
   if (observation.receipt.kind === "missing")
     return { kind: "fence", code: "retirement_archive_receipt_required" };
   if (observation.receipt.kind === "outage")

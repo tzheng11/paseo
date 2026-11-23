@@ -529,12 +529,18 @@ For a legacy started step without close proof, its owner must establish producer
 exit before `--effects-closed --backing-generation <digest-from-retirement-status>`.
 Never use argv. Use one of these read-only proofs on the original owner:
 
-- Process window: `ps -A -o pid=,ppid=,lstart=,comm=`, converting local `lstart` to
+- Process window, **only when the sole started destructive step is
+  `remove-directory` and every `path-teardown:*` step is `done`**:
+  `ps -A -o pid=,ppid=,lstart=,comm=`, converting local `lstart` to
   UTC and retaining only `git`/`git-*` basenames started between the archive timestamp
   floored to a second and the first recorded read that already showed the failed
-  step. No matching row proves exit; any match blocks that proof.
+  step. No matching row proves the Git removal child's exit; any match blocks that
+  proof. This Git-only check does not establish teardown-hook exit.
 - Boot time: `sysctl -n kern.boottime` later than that failure-observation time
-  proves the old producer has exited.
+  proves the old producer has exited. **This proof is required whenever any
+  `path-teardown:*` step is `started`**, including S13. A surviving shell or Node
+  teardown hook could pass a Git-only check, so the process window cannot be used
+  for those records. Without qualifying boot-time proof, keep the fence.
 
 A matching confirmation is exit proof only. When it is needed, its audit and the
 v2 settlement are written together after the decision and a read-only guard/backing
