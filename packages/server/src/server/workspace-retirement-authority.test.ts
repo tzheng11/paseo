@@ -370,3 +370,36 @@ it("refuses a known cross-owner ancestor rather than silently severing the edge"
   await expect(f.commit([f.reserve()])).rejects.toThrow("retirement_cross_owner_dependency");
   expect(await f.store.inspect()).toEqual(before);
 });
+
+it("RECOVERY create conflict identifies its fencing operation and retiring target", async () => {
+  const f = await fixture();
+  await f.commit([
+    {
+      kind: "put",
+      entry: {
+        ...f.snapshot().entries[0],
+        parent: f.snapshot().entries[1].ref,
+        sectionIntent: { ...f.snapshot().entries[0].sectionIntent!, mode: "explicit" },
+      },
+    },
+  ]);
+  await f.commit([f.reserve()]);
+  const child = {
+    ...f.snapshot().entries[1],
+    ref: { serverId: "owner", workspaceId: "new-pinned-child" },
+    parent: f.snapshot().entries[1].ref,
+    pinnedAt: null,
+    revision: 0,
+  };
+  try {
+    await f.commit([{ kind: "put", entry: child }]);
+    throw Error("fixture expected conflict");
+  } catch (error) {
+    expect(error).toMatchObject({ code: "retirement_conflict" });
+    expect((error as Error).message).toContain(f.operationId);
+    expect((error as Error).message).toContain("owner/a");
+  }
+  expect(f.snapshot().entries.some((row) => row.ref.workspaceId === "new-pinned-child")).toBe(
+    false,
+  );
+});

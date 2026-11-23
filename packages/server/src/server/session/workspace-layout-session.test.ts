@@ -138,3 +138,35 @@ test.each([undefined, 1] as const)(
       });
   },
 );
+
+test("the safe retirement conflict diagnostic survives authority forwarding", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const diagnostic =
+    "Workspace layout refused: retirement_conflict; operation=00000000-0000-4000-8000-000000000001; target=owner/original";
+  const service = createStub<WorkspaceLayoutService>({
+    commit: async () => {
+      throw new DaemonRpcError({
+        requestId: request.requestId,
+        requestType: request.type,
+        code: "retirement_conflict",
+        error: diagnostic,
+      });
+    },
+  });
+  const session = new WorkspaceLayoutSession(
+    service,
+    createStub<SessionDelivery>({}),
+    (message) => messages.push(message),
+    createTestLogger(),
+  );
+  await session.dispatch(request);
+  expect(messages).toContainEqual({
+    type: "rpc_error",
+    payload: {
+      requestId: request.requestId,
+      requestType: request.type,
+      code: "retirement_conflict",
+      error: diagnostic,
+    },
+  });
+});

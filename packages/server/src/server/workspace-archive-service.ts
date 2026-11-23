@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import {
   retireCanonicalWorkspace,
+  recoverCanonicalWorkspaceRetirement,
   type RetirementAuthority,
   nativeGeneration,
   commitWorkspaceRetirementArchive,
@@ -104,6 +105,7 @@ export interface ArchiveResult {
 }
 
 export interface ArchiveByScopeRequest {
+  recoverRetirement?: boolean;
   operationId?: string;
   scope: ArchiveScope;
   requestId: string;
@@ -166,6 +168,12 @@ export async function archiveByScope(
   dependencies: ArchiveDependencies,
   request: ArchiveByScopeRequest,
 ): Promise<ArchiveResult> {
+  if (request.recoverRetirement) {
+    if (!request.operationId || request.scope.kind !== "workspace")
+      throw new Error("retirement_recovery_operation_required");
+    return recoverWorkspaceRetirement(dependencies, request.operationId, request.scope.workspaceId);
+  }
+
   if (request.operationId) {
     if (
       !dependencies.retirementAuthority ||
@@ -1010,4 +1018,47 @@ async function retirementSourceIsCleanAndLanded(
   } catch {
     return false;
   } // Failure retains the directory; it never authorizes forced deletion.
+}
+
+export async function recoverWorkspaceRetirement(
+  dependencies: ArchiveDependencies,
+  operationId: string,
+  expectedWorkspaceId?: string,
+  confirmation?: { expectedBackingGeneration?: string; effectsClosed?: boolean },
+): Promise<ArchiveResult> {
+  const authority = dependencies.retirementAuthority;
+  if (!authority || !dependencies.getWorkspace || !dependencies.listRetirementRecords)
+    throw new Error("canonical_retirement_recovery_required");
+  return recoverCanonicalWorkspaceRetirement({
+    authority,
+    operationId,
+    expectedWorkspaceId,
+    ...confirmation,
+    getRecord: dependencies.getWorkspace,
+    nativeInventory: dependencies.listRetirementRecords,
+    assertHolds: async (id) => {
+      await dependencies.assertWorkspaceAutomationAllowed?.(id);
+    },
+    retryDirectory: async (records, backingPath) => {
+      const backing = await resolveWorkspaceBackingDirectory(records[0], dependencies);
+      if (resolve(backing.path) !== resolve(backingPath))
+        throw new Error("retirement_backing_generation_changed");
+      const outcome = await maybeRemoveDirectory(
+        dependencies,
+        { requestId: `recover:${operationId}` },
+        {
+          backing,
+          workspaceIds: records.map((row) => row.workspaceId),
+          teardownTargets: [],
+          setupWorkspaceIds: [],
+        },
+        records.map((row) => row.workspaceId),
+      );
+      return {
+        archivedWorkspaceIds: records.map((row) => row.workspaceId),
+        archivedAgentIds: [],
+        ...outcome,
+      };
+    },
+  });
 }

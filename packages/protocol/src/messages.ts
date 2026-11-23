@@ -1,7 +1,9 @@
 import {
   WorkspaceArchiveOutcomeSchema,
   WorkspaceRetirementStatusRequestSchema,
+  WorkspaceRetirementRecoverRequestSchema,
   WorkspaceRetirementStatusResponseSchema,
+  WorkspaceRetirementRecoverResponseSchema,
   WorkspaceRetirementVerifyRequestSchema,
   WorkspaceRetirementVerifyResponseSchema,
   WorkspaceLayoutInspectRequestSchema,
@@ -3487,6 +3489,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceLayoutCommitRequestSchema,
   WorkspaceLayoutReceiptRequestSchema,
   WorkspaceRetirementStatusRequestSchema,
+  WorkspaceRetirementRecoverRequestSchema,
   WorkspaceRetirementVerifyRequestSchema,
   MainHostGetRequestSchema,
   MainHostSetRequestSchema,
@@ -3904,6 +3907,7 @@ export const ServerInfoStatusPayloadSchema = z
         workspaceLayoutDerivedSections: z.boolean().optional(),
         workspaceLayoutRetirement: z.boolean().optional(),
         workspaceRetirementOperations: z.boolean().optional(),
+        workspaceRetirementRecovery: z.boolean().optional(),
         // COMPAT(agentRequestReceipts): added in v0.8.0; remove gate after 2027-03-05.
         agentRequestReceipts: z.boolean().optional(),
         // COMPAT(workspaceRequestReceipts): added in v0.8.0; remove gate after 2027-03-07.
@@ -7449,6 +7453,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceLayoutCommitResponseSchema,
   WorkspaceLayoutReceiptResponseSchema,
   WorkspaceRetirementStatusResponseSchema,
+  WorkspaceRetirementRecoverResponseSchema,
   WorkspaceRetirementVerifyResponseSchema,
   WorkspaceLayoutChangedSchema,
   MainHostGetResponseSchema,

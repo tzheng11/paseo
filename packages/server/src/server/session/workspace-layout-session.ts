@@ -5,7 +5,10 @@ import {
 import type { Logger } from "pino";
 import type { SessionInboundMessage, SessionOutboundMessage } from "../messages.js";
 import type { WorkspaceLayoutService } from "../workspace-layout-service.js";
-import { WorkspaceLayoutRefusal } from "../workspace-layout-store.js";
+import {
+  WorkspaceLayoutRefusal,
+  isRetirementConflictDiagnostic,
+} from "../workspace-layout-store.js";
 import { DaemonRpcError } from "@getpaseo/client/internal/daemon-client";
 import type { SessionDelivery } from "./owned-subscriptions/index.js";
 
@@ -107,13 +110,21 @@ export class WorkspaceLayoutSession {
           { err: error, operation: message.type },
           "Workspace layout request failed",
         );
+      let diagnostic: string | undefined;
+      if (error instanceof DaemonRpcError) diagnostic = error.userMessage;
+      else if (error instanceof WorkspaceLayoutRefusal) diagnostic = error.message;
       this.emit({
         type: "rpc_error",
         payload: {
           requestId: message.requestId,
           requestType: message.type,
           code: code ?? "layout_failed",
-          error: "Workspace layout could not be verified. Refresh the authority before writing.",
+          error:
+            code === "retirement_conflict" &&
+            typeof diagnostic === "string" &&
+            isRetirementConflictDiagnostic(diagnostic)
+              ? diagnostic
+              : "Workspace layout could not be verified. Refresh the authority before writing.",
         },
       });
     }

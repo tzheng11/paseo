@@ -47,6 +47,7 @@ import {
 import { WorkspaceAutomationBlockedError } from "./workspace-automation-gate.js";
 import { NativeWatchHost } from "./file-observer/internal/native-watch-client.js";
 import * as atomicFile from "./atomic-file.js";
+import * as gitCommands from "../utils/run-git-command.js";
 
 const cleanupPaths: string[] = [];
 
@@ -3778,6 +3779,435 @@ test.each([
       "not this worktree\n",
     );
   } finally {
+    await f.close();
+  }
+});
+
+async function recoveryPinnedFixture(teardown?: string) {
+  const f = await canonicalArchiveFixture(teardown);
+  const parent = createPersistedWorkspaceRecord({
+    ...f.record,
+    workspaceId: "pin-parent",
+    cwd: f.repoDir,
+    kind: "local_checkout",
+    worktreeRoot: undefined,
+    isPaseoOwnedWorktree: false,
+    pinnedAt: "2026-11-23T06:00:00.000Z",
+    parentWorkspaceId: null,
+  });
+  await f.registry.upsert(parent);
+  const snapshot = await f.layout.inspect();
+  const target = snapshot.entries.find((row) => row.ref.workspaceId === "old-a")!;
+  await f.layout.commit({
+    writerVersion: 3,
+    requestId: randomUUID(),
+    expected: snapshot.stamp,
+    mutations: [
+      {
+        kind: "put",
+        entry: {
+          ...target,
+          parent: { serverId: "owner", workspaceId: parent.workspaceId },
+          sectionIntent: { ...target.sectionIntent!, mode: "explicit" },
+        },
+      },
+    ],
+  });
+  const candidate = await createPaseoOwnedWorktree(f.repoDir, f.home, "next-pinned-worktree");
+  const createPinned = async () => {
+    await f.registry.upsert(
+      createPersistedWorkspaceRecord({
+        ...parent,
+        workspaceId: "new-child",
+        kind: "worktree",
+        cwd: candidate.worktreePath,
+        worktreeRoot: candidate.worktreePath,
+        mainRepoRoot: f.repoDir,
+        isPaseoOwnedWorktree: true,
+        pinnedAt: null,
+        parentWorkspaceId: parent.workspaceId,
+      }),
+    );
+    return f.registry.get("new-child");
+  };
+  return { ...f, createPinned };
+}
+
+test.each(["timeout", "interruption"])(
+  "RECOVERY failed remove-directory (%s) reaches terminal and admits the pinned parent's next child",
+  async (failure) => {
+    const f = await recoveryPinnedFixture();
+    const operationId = randomUUID();
+    const originalGit = gitCommands.runGitCommand;
+    const originalWrite = atomicFile.writeFileDurably;
+    let removeCalls = 0,
+      cut = false;
+    try {
+      vi.spyOn(gitCommands, "runGitCommand").mockImplementation(async (args, options) => {
+        if (args[0] === "worktree" && args[1] === "remove") {
+          removeCalls++;
+          if (failure === "timeout" && removeCalls === 1)
+            throw Error("Git command timed out after 120000ms");
+        }
+        return originalGit(args, options);
+      });
+      if (failure === "interruption")
+        vi.spyOn(atomicFile, "writeFileDurably").mockImplementation(async (...args) => {
+          await originalWrite(...args);
+          if (
+            !cut &&
+            String(args[0]).includes("workspace-retirements") &&
+            JSON.parse(String(args[1])).steps?.["remove-directory"] === "started"
+          ) {
+            cut = true;
+            throw Error("fixture interrupted after durable remove intent");
+          }
+        });
+      const request = {
+        scope: { kind: "workspace" as const, workspaceId: "old-a" },
+        requestId: "recoverable-archive",
+        operationId,
+      };
+      const failed = await archiveByScope(f.deps, request);
+      expect(failed.retirement?.state).toBe("partial");
+      expect(existsSync(f.worktree.worktreePath)).toBe(true);
+      expect(
+        (await f.layout.inspect()).retirements?.[0].dependencies.some(
+          (row) => row.ref.workspaceId === "pin-parent",
+        ),
+      ).toBe(true);
+      await expect(f.createPinned()).rejects.toThrow("retirement_conflict");
+      vi.restoreAllMocks();
+      const remove = vi.spyOn(gitCommands, "runGitCommand");
+      // Base ignores this prospective flag and returns the old unresolved operation.
+      const recovered = await archiveByScope(f.deps, { ...request, recoverRetirement: true });
+      expect(recovered.retirement?.state).toBe("complete");
+      expect(recovered.removedDirectory).toBe(true);
+      expect(existsSync(f.worktree.worktreePath)).toBe(false);
+      expect(
+        remove.mock.calls.filter(([args]) => args[0] === "worktree" && args[1] === "remove"),
+      ).toHaveLength(1);
+      await expect(f.createPinned()).resolves.toMatchObject({ parentWorkspaceId: "pin-parent" });
+      expect(await archiveByScope(f.deps, { ...request, recoverRetirement: true })).toEqual(
+        recovered,
+      );
+      expect(
+        remove.mock.calls.filter(([args]) => args[0] === "worktree" && args[1] === "remove"),
+      ).toHaveLength(1);
+    } finally {
+      vi.restoreAllMocks();
+      await f.close();
+    }
+  },
+);
+
+async function interruptedRemovalFixture() {
+  const f = await recoveryPinnedFixture();
+  const operationId = randomUUID();
+  const original = gitCommands.runGitCommand;
+  vi.spyOn(gitCommands, "runGitCommand").mockImplementation(async (args, options) => {
+    if (args[0] === "worktree" && args[1] === "remove") throw Error("fixture removal timeout");
+    return original(args, options);
+  });
+  const request = {
+    scope: { kind: "workspace" as const, workspaceId: "old-a" },
+    operationId,
+    requestId: "interrupted-remove",
+  };
+  expect((await archiveByScope(f.deps, request)).retirement?.state).toBe("partial");
+  vi.restoreAllMocks();
+  const journalFile = path.join(
+    f.home,
+    "workspace-retirements",
+    `${(await import("./workspace-retirement.js")).nativeGeneration([f.record])}.json`,
+  );
+  return {
+    ...f,
+    request,
+    operationId,
+    journalFile,
+    recover: () => archiveByScope(f.deps, { ...request, recoverRetirement: true }),
+  };
+}
+
+test("RECOVERY observes an already-gone directory without a second deletion", async () => {
+  const f = await interruptedRemovalFixture();
+  try {
+    rmSync(f.worktree.worktreePath, { recursive: true, force: true });
+    const git = vi.spyOn(gitCommands, "runGitCommand");
+    const result = await f.recover();
+    expect(result).toMatchObject({
+      removedDirectory: true,
+      retirement: { operationId: f.operationId, state: "complete" },
+    });
+    expect(git.mock.calls.some(([args]) => args[0] === "worktree" && args[1] === "remove")).toBe(
+      false,
+    );
+    expect(await f.recover()).toEqual(result);
+    await expect(f.createPinned()).resolves.toMatchObject({ parentWorkspaceId: "pin-parent" });
+  } finally {
+    vi.restoreAllMocks();
+    await f.close();
+  }
+});
+
+test.each([false, true])(
+  "RECOVERY legacy live-op journal shape with agents=%s completes honestly without deleting an unverified backing",
+  async (agents) => {
+    const f = await interruptedRemovalFixture();
+    try {
+      const journal = JSON.parse(readFileSync(f.journalFile, "utf8"));
+      delete journal.backingObservations;
+      if (agents) {
+        journal.steps["agent:fixture-agent"] = "done";
+        journal.result.archivedAgentIds = ["fixture-agent"];
+      }
+      writeFileSync(f.journalFile, JSON.stringify(journal));
+      rmSync(path.join(f.home, "workspace-retirement-operations", `${f.operationId}.json`));
+      const git = vi.spyOn(gitCommands, "runGitCommand");
+      const result = await f.recover();
+      expect(result).toMatchObject({
+        removedDirectory: false,
+        slotKept: true,
+        directoryLeftBehind: { reason: "recovery_backing_identity_unverified" },
+        retirement: { operationId: f.operationId, state: "complete" },
+      });
+      expect(existsSync(f.worktree.worktreePath)).toBe(true);
+      expect(git.mock.calls.some(([args]) => args[0] === "worktree" && args[1] === "remove")).toBe(
+        false,
+      );
+      expect(
+        (await import("./workspace-retirement.js")).getWorkspaceRetirementStatus,
+      ).toBeDefined();
+      const api = await import("./workspace-retirement.js");
+      expect(await api.getWorkspaceRetirementStatus(f.layout, f.operationId)).toMatchObject({
+        terminal: true,
+        state: "complete",
+        result: { removedDirectory: false },
+      });
+      expect(await f.recover()).toEqual(result);
+      await expect(f.createPinned()).resolves.toMatchObject({ parentWorkspaceId: "pin-parent" });
+    } finally {
+      vi.restoreAllMocks();
+      await f.close();
+    }
+  },
+);
+
+test("RECOVERY repeated large-tree timeout terminates retained instead of stranding dependencies", async () => {
+  const f = await interruptedRemovalFixture();
+  try {
+    const original = gitCommands.runGitCommand;
+    let calls = 0;
+    vi.spyOn(gitCommands, "runGitCommand").mockImplementation(async (args, options) => {
+      if (args[0] === "worktree" && args[1] === "remove") {
+        calls++;
+        expect(options?.timeout).toBe(120000);
+        throw Error("Git command timed out after 120000ms");
+      }
+      return original(args, options);
+    });
+    const result = await f.recover();
+    expect(result).toMatchObject({
+      removedDirectory: false,
+      slotKept: true,
+      directoryLeftBehind: { reason: "recovery_removal_failed" },
+      retirement: { state: "complete" },
+    });
+    expect(calls).toBe(1);
+    expect(await f.recover()).toEqual(result);
+    expect(calls).toBe(1);
+    await expect(f.createPinned()).resolves.toMatchObject({ parentWorkspaceId: "pin-parent" });
+  } finally {
+    vi.restoreAllMocks();
+    await f.close();
+  }
+});
+
+test("RECOVERY preserves changed source and releases only the completed operation", async () => {
+  const f = await interruptedRemovalFixture();
+  try {
+    writeFileSync(path.join(f.worktree.worktreePath, "new-source.txt"), "unlanded source");
+    const result = await f.recover();
+    expect(result).toMatchObject({
+      removedDirectory: false,
+      directoryLeftBehind: { reason: "source_preserved" },
+      retirement: { state: "complete" },
+    });
+    expect(readFileSync(path.join(f.worktree.worktreePath, "new-source.txt"), "utf8")).toBe(
+      "unlanded source",
+    );
+    await expect(f.createPinned()).resolves.toMatchObject({ parentWorkspaceId: "pin-parent" });
+  } finally {
+    await f.close();
+  }
+});
+
+test("RECOVERY never repeats an uncertain path-teardown command", async () => {
+  const f = await recoveryPinnedFixture(
+    `node -e "require('fs').appendFileSync('hook.count','x');process.exit(7)"`,
+  );
+  const operationId = randomUUID();
+  try {
+    const request = {
+      scope: { kind: "workspace" as const, workspaceId: "old-a" },
+      operationId,
+      requestId: "failed-hook",
+    };
+    expect((await archiveByScope(f.deps, request)).retirement?.state).toBe("partial");
+    const result = await archiveByScope(f.deps, { ...request, recoverRetirement: true });
+    expect(result).toMatchObject({
+      removedDirectory: false,
+      slotKept: true,
+      directoryLeftBehind: { reason: "recovery_uncertain_teardown_retained" },
+      retirement: { state: "complete" },
+    });
+    expect(readFileSync(path.join(f.worktree.worktreePath, "hook.count"), "utf8")).toBe("x");
+    expect(await archiveByScope(f.deps, { ...request, recoverRetirement: true })).toEqual(result);
+    expect(readFileSync(path.join(f.worktree.worktreePath, "hook.count"), "utf8")).toBe("x");
+    await expect(f.createPinned()).resolves.toMatchObject({ parentWorkspaceId: "pin-parent" });
+  } finally {
+    await f.close();
+  }
+});
+
+test("RECOVERY refuses while the original removal is still executing", async () => {
+  const f = await recoveryPinnedFixture();
+  const operationId = randomUUID();
+  let entered = () => {},
+    release = () => {};
+  const started = new Promise<void>((r) => (entered = r));
+  const gate = new Promise<void>((r) => (release = r));
+  const original = gitCommands.runGitCommand;
+  vi.spyOn(gitCommands, "runGitCommand").mockImplementation(async (args, options) => {
+    if (args[0] === "worktree" && args[1] === "remove") {
+      entered();
+      await gate;
+    }
+    return original(args, options);
+  });
+  const request = {
+    scope: { kind: "workspace" as const, workspaceId: "old-a" },
+    operationId,
+    requestId: "active-owner",
+  };
+  const running = archiveByScope(f.deps, request);
+  try {
+    await started;
+    await expect(archiveByScope(f.deps, { ...request, recoverRetirement: true })).rejects.toThrow(
+      "retirement_operation_in_progress",
+    );
+  } finally {
+    release();
+    await running;
+    vi.restoreAllMocks();
+    await f.close();
+  }
+});
+
+test("RECOVERY does not delete when a quarantined raw reference was absent from published views", async () => {
+  const f = await interruptedRemovalFixture();
+  try {
+    const original = f.deps.listRetirementRecords!;
+    f.deps.listRetirementRecords = async () => [
+      ...(await original()),
+      {
+        ...f.record,
+        workspaceId: "unimported-b",
+        archivedAt: null,
+        createdAt: "2026-11-23T07:00:00.000Z",
+      },
+    ];
+    const git = vi.spyOn(gitCommands, "runGitCommand");
+    await expect(f.recover()).rejects.toThrow("retirement_affected_owner_unknown");
+    expect(git.mock.calls.some(([args]) => args[0] === "worktree" && args[1] === "remove")).toBe(
+      false,
+    );
+    expect(existsSync(f.worktree.worktreePath)).toBe(true);
+  } finally {
+    vi.restoreAllMocks();
+    await f.close();
+  }
+});
+
+test("RECOVERY reconciles committed completion after a final journal write failed", async () => {
+  const f = await recoveryPinnedFixture();
+  const operationId = randomUUID();
+  const original = atomicFile.writeFileDurably;
+  let cut = false;
+  try {
+    vi.spyOn(atomicFile, "writeFileDurably").mockImplementation(async (...args) => {
+      const journal = String(args[0]).includes("workspace-retirements")
+        ? JSON.parse(String(args[1]))
+        : null;
+      if (!cut && journal?.result?.retirement?.state === "complete") {
+        cut = true;
+        throw Error("fixture final journal loss");
+      }
+      return original(...args);
+    });
+    const request = {
+      scope: { kind: "workspace" as const, workspaceId: "old-a" },
+      operationId,
+      requestId: "completion-journal-loss",
+    };
+    expect((await archiveByScope(f.deps, request)).retirement?.state).toBe("partial");
+    expect((await f.layout.inspect()).retirements?.[0].state).toBe("complete");
+    vi.restoreAllMocks();
+    const git = vi.spyOn(gitCommands, "runGitCommand");
+    const result = await archiveByScope(f.deps, { ...request, recoverRetirement: true });
+    expect(result).toMatchObject({ removedDirectory: true, retirement: { state: "complete" } });
+    expect(git.mock.calls.some(([args]) => args[0] === "worktree" && args[1] === "remove")).toBe(
+      false,
+    );
+    await expect(f.createPinned()).resolves.toMatchObject({ parentWorkspaceId: "pin-parent" });
+  } finally {
+    vi.restoreAllMocks();
+    await f.close();
+  }
+});
+
+test("RECOVERY cold legacy teardown needs an operation-bound producer-closure confirmation", async () => {
+  const f = await interruptedRemovalFixture();
+  try {
+    const journal = JSON.parse(readFileSync(f.journalFile, "utf8"));
+    delete journal.backingObservations;
+    delete journal.steps["remove-directory"];
+    journal.steps[`path-teardown:${f.worktree.worktreePath}`] = "started";
+    journal.result = null;
+    writeFileSync(f.journalFile, JSON.stringify(journal));
+    vi.resetModules();
+    const core = await import("./workspace-retirement.js");
+    const retry = vi.fn(async () => {
+      throw Error("No destructive retry allowed");
+    });
+    const input = {
+      authority: f.layout,
+      operationId: f.operationId,
+      getRecord: f.deps.getWorkspace!,
+      nativeInventory: f.deps.listRetirementRecords!,
+      assertHolds: async () => {},
+      retryDirectory: retry,
+    };
+    await expect(core.recoverCanonicalWorkspaceRetirement(input)).rejects.toThrow(
+      "retirement_recovery_effect_closure_required",
+    );
+    await expect(
+      core.recoverCanonicalWorkspaceRetirement({ ...input, effectsClosed: true }),
+    ).rejects.toThrow("retirement_recovery_confirmation_binding_required");
+    const result = await core.recoverCanonicalWorkspaceRetirement({
+      ...input,
+      effectsClosed: true,
+      expectedBackingGeneration: journal.backingGeneration,
+    });
+    expect(result).toMatchObject({
+      removedDirectory: false,
+      retirement: { state: "complete" },
+      directoryLeftBehind: { reason: "recovery_uncertain_teardown_retained" },
+    });
+    expect(retry).not.toHaveBeenCalled();
+  } finally {
+    vi.restoreAllMocks();
     await f.close();
   }
 });

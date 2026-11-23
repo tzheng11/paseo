@@ -3221,6 +3221,23 @@ export class DaemonClient {
     });
     return payload.operation;
   }
+  async recoverWorkspaceRetirement(
+    operationId: string,
+    options?:
+      | string
+      | { requestId?: string; expectedBackingGeneration?: string; effectsClosed?: boolean },
+  ) {
+    if (this.lastServerInfoMessage?.features?.workspaceRetirementRecovery !== true)
+      throw new WorkspaceRetirementUnsupportedError();
+    const { requestId, ...confirmation } =
+      typeof options === "string" ? { requestId: options } : (options ?? {});
+    const payload = await this.sendCorrelatedSessionRequest({
+      requestId,
+      message: { type: "workspace.retirement.recover.request", operationId, ...confirmation },
+      responseType: "workspace.retirement.recover.response",
+    });
+    return payload.result;
+  }
   async verifyWorkspaceRetirementBinding(
     binding: WorkspaceRetirementBinding,
     requestId?: string,

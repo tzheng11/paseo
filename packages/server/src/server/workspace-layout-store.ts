@@ -52,10 +52,19 @@ const GuardSchema = WorkspaceLayoutIdentitySchema.extend({
 });
 
 export class WorkspaceLayoutRefusal extends Error {
-  constructor(readonly code: string) {
-    super(`Workspace layout refused: ${code}`);
+  constructor(
+    readonly code: string,
+    diagnostic?: string,
+  ) {
+    super(`Workspace layout refused: ${code}${diagnostic ? `; ${diagnostic}` : ""}`);
     this.name = "WorkspaceLayoutRefusal";
   }
+}
+
+export function isRetirementConflictDiagnostic(message: string): boolean {
+  return /^Workspace layout refused: retirement_conflict; operation=[a-f0-9-]{36}; target=[A-Za-z0-9_%.-]+\/[A-Za-z0-9_%.-]+$/.test(
+    message,
+  );
 }
 
 export interface CapturedWorkspaceLayoutInput {
@@ -673,6 +682,21 @@ function assertRetirementMutationAllowed(
       retirementKeys(entry).some((k) => targets.has(k) || fenced.has(k))
     );
   };
+  const conflictError = (entry?: WorkspaceLayoutEntry) => {
+    const keys = entry ? [workspaceReferenceKey(entry.ref), ...retirementKeys(entry)] : [...fenced];
+    const op = operations.find((candidate) =>
+      [
+        ...candidate.targets,
+        ...(candidate.state !== "complete" ? candidate.dependencies : []),
+      ].some((row) => keys.includes(workspaceReferenceKey(row.ref))),
+    );
+    const ref = op?.targets[0]?.ref;
+    const diagnostic =
+      op && ref
+        ? `operation=${op.operationId}; target=${encodeURIComponent(ref.serverId)}/${encodeURIComponent(ref.workspaceId)}`
+        : undefined;
+    return new WorkspaceLayoutRefusal("retirement_conflict", diagnostic);
+  };
   if (
     mutation.kind === "put" &&
     snapshot.stamp.phase === "active" &&
@@ -684,10 +708,9 @@ function assertRetirementMutationAllowed(
     if (prior && prior.archivedAt !== mutation.entry.archivedAt)
       throw new WorkspaceLayoutRefusal("canonical_retirement_reservation_required");
   }
-  if (mutation.kind === "put" && conflicts(mutation.entry))
-    throw new WorkspaceLayoutRefusal("retirement_conflict");
+  if (mutation.kind === "put" && conflicts(mutation.entry)) throw conflictError(mutation.entry);
   if (mutation.kind === "import-host" && mutation.entries.some(conflicts))
-    throw new WorkspaceLayoutRefusal("retirement_conflict");
+    throw conflictError(mutation.entries.find(conflicts));
   if (mutation.kind === "put-navigation" && fenced.size) {
     const before = snapshot.navigation?.preferences;
     const after = mutation.preferences;
@@ -722,7 +745,7 @@ function assertRetirementMutationAllowed(
         ];
       });
     if (canonicalLayoutJson(positions(before)) !== canonicalLayoutJson(positions(after)))
-      throw new WorkspaceLayoutRefusal("retirement_conflict");
+      throw conflictError();
   }
 }
 

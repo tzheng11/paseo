@@ -158,7 +158,10 @@ export async function runCreateCommand(
       ...(callerAgentId ? { callerAgentId } : {}),
     });
     if (!payload.workspace) {
-      throw new Error(payload.error ?? "Workspace creation failed");
+      throw {
+        code: payload.errorCode ?? "WORKSPACE_CREATE_FAILED",
+        message: payload.error ?? "Workspace creation failed",
+      } satisfies CommandError;
     }
     return { type: "single", data: toWorkspaceRow(payload.workspace), schema: workspaceSchema };
   } catch (error) {

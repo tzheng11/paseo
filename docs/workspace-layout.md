@@ -493,11 +493,46 @@ the operation without repeating removal or icon cleanup. A completed request ret
 its original outcome without touching a later project or slot generation.
 
 An interrupted or uncertain effect remains journaled and fenced, without a TTL.
-A retry queries the same operation and reports partial/reconciliation-required;
-it does not repeat a completed or uncertain destructive command. A definite,
-receipt-checked reservation refusal with no effects is terminal and retained in
-journal history before a later fresh admission. Unrelated canonical branches
-remain writable while a reservation is outstanding.
+Status reads and ordinary archive replay never start recovery. An owner on a host
+advertising `features.workspaceRetirementRecovery` can explicitly run
+`paseo workspace retirement-recover <operation-id> --json`, or call
+`DaemonClient.recoverWorkspaceRetirement(operationId)`. This requires
+`workspace.manage` and reuses the original operation, target footprint and authority
+receipt; it never selects a workspace by path or newest receipt.
+
+Recovery refuses while the original owner is running, or while non-path effects
+are unresolved. A durable failed result records that the original awaited producer
+returned. A crash with no such closure evidence instead requires the owner to
+confirm that the previous producer has ended, using `--effects-closed` together
+with `--backing-generation <digest-from-retirement-status>`. This is an explicit,
+operation-bound owner assertion, not a timeout heuristic or an automatic retry.
+The daemon refuses a missing/mismatched generation and records the assertion.
+Without closure evidence, it retains the existing fence rather than allowing an
+old cleanup process to affect a reused backing. After verified native archival it holds the original backing and
+identity leases, rechecks native generations, holds and the archive receipt, then
+settles the remaining directory obligation. An already-absent directory needs no
+second removal. For a still-present backing, a saved inode observation must match
+before retrying the existing ownership/shared-reference/source checks and
+non-forcing Git removal. The retry keeps the 120-second Git bound. If removal
+cannot finish, the same operation completes with `removedDirectory:false`,
+`slotKept:true` and `directoryLeftBehind.reason`, releasing its dependency fence.
+That receipt does not claim bytes reclaimed.
+
+An uncertain teardown hook is never replayed. Its directory is retained. Version-1
+journals without the saved backing observation also finish conservatively with
+`recovery_backing_identity_unverified`; they cannot authorize deletion of a later
+backing generation. Recovery resolutions are durable alongside the original step
+history, so interruption of completion can reconcile the same authority receipt
+without another teardown or deletion. Old native identities remain tombstoned;
+a completed old operation cannot select a replacement workspace at the same path.
+The capability is required before sending a recovery request to an older owner.
+No configuration, import or activation change is involved.
+
+A definite, receipt-checked reservation refusal with no effects is terminal and
+retained in journal history before a later fresh admission. Unrelated canonical
+branches remain writable while a reservation is outstanding. A create blocked by
+a retirement reports its operation UUID and owner-qualified target, retaining the
+`retirement_conflict` code; it does not imply the create had no other effects.
 
 Directory removal requires owned backing, no remaining native references and a
 clean source checkout whose HEAD is proven landed in the main checkout's HEAD or

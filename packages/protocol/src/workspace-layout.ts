@@ -217,6 +217,7 @@ export const WorkspaceRetirementResultSchema = WorkspaceArchiveOutcomeSchema.ext
   archivedWorkspaceIds: z.array(z.string()),
   removedDirectory: z.boolean(),
 });
+export type WorkspaceRetirementResult = z.infer<typeof WorkspaceRetirementResultSchema>;
 export const WorkspaceRetirementOperationSchema = z.object({
   operationId: z.string().uuid(),
   workspaceId: IdSchema,
@@ -247,6 +248,17 @@ export const WorkspaceRetirementStatusResponseSchema = z.object({
     requestId: z.string(),
     operation: WorkspaceRetirementOperationSchema.nullable(),
   }),
+});
+export const WorkspaceRetirementRecoverRequestSchema = z.object({
+  type: z.literal("workspace.retirement.recover.request"),
+  expectedBackingGeneration: DigestSchema.optional(),
+  effectsClosed: z.boolean().optional(),
+  requestId: z.string(),
+  operationId: z.string().uuid(),
+});
+export const WorkspaceRetirementRecoverResponseSchema = z.object({
+  type: z.literal("workspace.retirement.recover.response"),
+  payload: z.object({ requestId: z.string(), result: WorkspaceRetirementResultSchema }),
 });
 export const WorkspaceRetirementVerifyRequestSchema = WorkspaceRetirementBindingSchema.extend({
   type: z.literal("workspace.retirement.verify.request"),

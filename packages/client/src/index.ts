@@ -246,6 +246,10 @@ export interface PaseoWorkspaceActions {
     workspace: string | PaseoWorkspaceHandle,
     options?: PaseoWorkspaceArchiveOptions,
   ): Promise<PaseoWorkspaceArchiveResult>;
+  recoverRetirement(
+    operationId: string,
+    options?: Parameters<DaemonClient["recoverWorkspaceRetirement"]>[1],
+  ): ReturnType<DaemonClient["recoverWorkspaceRetirement"]>;
   getRetirementStatus(
     operationId: string,
     requestId?: string,
@@ -798,6 +802,8 @@ export function createPaseoApi(
       },
       archive: (workspace, options) =>
         daemonClient.archiveWorkspace(resolveWorkspaceId(workspace), options),
+      recoverRetirement: (operationId, options) =>
+        daemonClient.recoverWorkspaceRetirement(operationId, options),
       getRetirementStatus: (operationId, requestId) =>
         daemonClient.getWorkspaceRetirementStatus(operationId, requestId),
       verifyRetirementBinding: (binding, requestId) =>

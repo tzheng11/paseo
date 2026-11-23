@@ -7,6 +7,7 @@ export type PermissionRequirement = DaemonPermission | readonly DaemonPermission
 
 const INBOUND_PERMISSION = {
   "workspace.retirement.status.request": "workspace.read",
+  "workspace.retirement.recover.request": "workspace.manage",
   "workspace.retirement.verify.request": ["workspace.manage", "hub.execute"],
   "workspace.layout.inspect.request": "workspace.read",
   "workspace.layout.receipt.request": "workspace.read",
@@ -247,6 +248,7 @@ const INBOUND_PERMISSION = {
 
 const OUTBOUND_PERMISSION = {
   "workspace.retirement.status.response": "workspace.read",
+  "workspace.retirement.recover.response": "workspace.manage",
   "workspace.retirement.verify.response": ["workspace.manage", "hub.execute"],
   "workspace.layout.inspect.response": "workspace.read",
   "workspace.layout.receipt.response": "workspace.read",

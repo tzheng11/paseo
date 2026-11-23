@@ -1,6 +1,7 @@
 import { WorkspaceRetirementBindingSchema } from "@getpaseo/protocol/workspace-layout";
 import type {
   WorkspaceRetirementOperation,
+  WorkspaceRetirementResult,
   WorkspaceRetirementBinding,
 } from "@getpaseo/protocol/workspace-layout";
 import type { ArchiveWorkspaceResponseMessage } from "@getpaseo/protocol/messages";
@@ -166,6 +167,49 @@ export async function runRetirementVerifyCommand(
         columns: [
           { header: "OPERATION ID", field: "operationId", width: 36 },
           { header: "VALID", field: "valid", width: 6 },
+        ],
+      },
+    };
+  } finally {
+    await client.close();
+  }
+}
+
+interface RetirementRecoverResult extends WorkspaceRetirementResult {
+  operationId: string;
+  state: "complete" | "partial";
+}
+export async function runRetirementRecoverCommand(
+  operationId: string,
+  options: RetirementReadOptions & { effectsClosed?: boolean; backingGeneration?: string },
+  _command: Command,
+): Promise<SingleResult<RetirementRecoverResult>> {
+  if (options.effectsClosed && !options.backingGeneration)
+    throw {
+      code: "RETIREMENT_RECOVERY_CONFIRMATION_BINDING_REQUIRED",
+      message: "--effects-closed requires --backing-generation from retirement-status.",
+    } satisfies CommandError;
+  const client = await connectToDaemon({ target: options.daemonTarget });
+  try {
+    const confirmation =
+      options.effectsClosed || options.backingGeneration
+        ? {
+            effectsClosed: options.effectsClosed,
+            expectedBackingGeneration: options.backingGeneration,
+          }
+        : undefined;
+    const result = confirmation
+      ? await client.recoverWorkspaceRetirement(operationId, confirmation)
+      : await client.recoverWorkspaceRetirement(operationId);
+    if (!result.retirement) throw new Error("Retirement recovery returned no operation outcome");
+    return {
+      type: "single" as const,
+      data: { operationId, state: result.retirement.state, ...result },
+      schema: {
+        idField: "operationId",
+        columns: [
+          { header: "OPERATION ID", field: "operationId", width: 36 },
+          { header: "STATE", field: "state", width: 12 },
         ],
       },
     };

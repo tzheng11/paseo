@@ -419,6 +419,15 @@ test("derived authority fences legacy native writers before effects while the cu
     result: { retirement: completed.retirement, removedDirectory: false, slotKept: true },
   });
   expect(await readClient.getWorkspaceRetirementStatus(randomUUID())).toBeNull();
+  expect(client.getLastServerInfoMessage()?.features?.workspaceRetirementRecovery).toBe(true);
+  expect(await client.recoverWorkspaceRetirement(completedId)).toMatchObject({
+    retirement: { operationId: completedId, state: "complete" },
+    removedDirectory: false,
+  });
+  await expect(readClient.recoverWorkspaceRetirement(completedId)).rejects.toMatchObject({
+    code: "access_denied",
+  });
+
   await expect(
     readClient.verifyWorkspaceRetirementBinding({
       operationId: completedId,

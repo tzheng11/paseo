@@ -4,6 +4,7 @@ import { beforeEach, expect, it, vi } from "vitest";
 import {
   runArchiveCommand,
   runRetirementStatusCommand,
+  runRetirementRecoverCommand,
   runRetirementVerifyCommand,
 } from "./archive.js";
 import { connectToDaemon } from "../../utils/client.js";
@@ -119,5 +120,62 @@ it("REV69 capability refusal stays typed at the CLI with its caller ID", async (
     details: { operationId, workspaceId: "a" },
   });
   expect(archiveWorkspace).toHaveBeenCalledTimes(1);
+  expect(close).toHaveBeenCalledTimes(1);
+});
+
+it("recovers only the requested owner operation and surfaces retained terminal outcomes", async () => {
+  const { client, archiveWorkspace, close } = fixtureClient();
+  const recovery = vi.spyOn(client, "recoverWorkspaceRetirement").mockResolvedValue({
+    archivedWorkspaceIds: ["a"],
+    archivedAgentIds: [],
+    removedDirectory: false,
+    slotKept: true,
+    directoryLeftBehind: { path: "/fixture/a", reason: "recovery_removal_failed" },
+    retirement: { operationId, state: "complete" },
+  });
+  const response = await runRetirementRecoverCommand(
+    operationId,
+    { daemonTarget: target },
+    new Command(),
+  );
+  expect(response.data).toMatchObject({
+    operationId,
+    state: "complete",
+    removedDirectory: false,
+    slotKept: true,
+  });
+  expect(recovery).toHaveBeenCalledExactlyOnceWith(operationId);
+  expect(archiveWorkspace).not.toHaveBeenCalled();
+  expect(close).toHaveBeenCalledTimes(1);
+});
+
+it("producer-closure confirmation needs its exact generation before any connection", async () => {
+  await expect(
+    runRetirementRecoverCommand(
+      operationId,
+      { daemonTarget: target, effectsClosed: true },
+      new Command(),
+    ),
+  ).rejects.toMatchObject({ code: "RETIREMENT_RECOVERY_CONFIRMATION_BINDING_REQUIRED" });
+  expect(connectToDaemon).not.toHaveBeenCalled();
+});
+it("passes an explicitly bound producer-closure assertion to the same operation", async () => {
+  const { client, close } = fixtureClient();
+  const backingGeneration = "b".repeat(64);
+  const recover = vi.spyOn(client, "recoverWorkspaceRetirement").mockResolvedValue({
+    archivedWorkspaceIds: ["a"],
+    archivedAgentIds: [],
+    removedDirectory: false,
+    retirement: { operationId, state: "complete" },
+  });
+  await runRetirementRecoverCommand(
+    operationId,
+    { daemonTarget: target, effectsClosed: true, backingGeneration },
+    new Command(),
+  );
+  expect(recover).toHaveBeenCalledExactlyOnceWith(operationId, {
+    effectsClosed: true,
+    expectedBackingGeneration: backingGeneration,
+  });
   expect(close).toHaveBeenCalledTimes(1);
 });
