@@ -51,9 +51,14 @@ import * as gitCommands from "../utils/run-git-command.js";
 import * as spawnTools from "../utils/spawn.js";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import { renameSync } from "node:fs";
 import { recoverWorkspaceRetirement } from "./workspace-archive-service.js";
-import { WorkspaceLayoutRefusal } from "./workspace-layout-store.js";
+import { recoverCanonicalWorkspaceRetirement } from "./workspace-retirement.js";
+import {
+  recoveryFixture,
+  INTEGRATION_RECOVERY_STATES,
+  LEGACY_RETIREMENT_FIELDS,
+  type RecoveryFixtureState,
+} from "./test-utils/workspace-retirement-recovery-fixtures.js";
 
 const cleanupPaths: string[] = [];
 
@@ -4197,16 +4202,12 @@ test("RECOVERY cold legacy teardown needs an operation-bound producer-closure co
     writeFileSync(f.journalFile, JSON.stringify(journal));
     vi.resetModules();
     const core = await import("./workspace-retirement.js");
-    const retry = vi.fn(async () => {
-      throw Error("No destructive retry allowed");
-    });
     const input = {
       authority: f.layout,
       operationId: f.operationId,
       getRecord: f.deps.getWorkspace!,
       nativeInventory: f.deps.listRetirementRecords!,
       assertHolds: async () => {},
-      retryDirectory: retry,
     };
     await expect(core.recoverCanonicalWorkspaceRetirement(input)).rejects.toThrow(
       "retirement_recovery_effect_closure_required",
@@ -4224,7 +4225,6 @@ test("RECOVERY cold legacy teardown needs an operation-bound producer-closure co
       retirement: { state: "complete" },
       directoryLeftBehind: { reason: "recovery_uncertain_teardown_retained" },
     });
-    expect(retry).not.toHaveBeenCalled();
   } finally {
     vi.restoreAllMocks();
     await f.close();
@@ -4261,9 +4261,6 @@ test("REVISION1 a legacy failed timeout result is not producer-exit proof", asyn
     writeFileSync(f.journalFile, JSON.stringify(journal));
     vi.resetModules();
     const core = await import("./workspace-retirement.js");
-    const retry = vi.fn(async () => {
-      throw Error("No retry without closure");
-    });
     await expect(
       core.recoverCanonicalWorkspaceRetirement({
         authority: f.layout,
@@ -4271,59 +4268,14 @@ test("REVISION1 a legacy failed timeout result is not producer-exit proof", asyn
         getRecord: f.deps.getWorkspace!,
         nativeInventory: f.deps.listRetirementRecords!,
         assertHolds: async () => {},
-        retryDirectory: retry,
       }),
     ).rejects.toThrow("retirement_recovery_effect_closure_required");
-    expect(retry).not.toHaveBeenCalled();
     expect((await f.layout.inspect()).retirements?.[0].state).toBe("archived");
   } finally {
     vi.restoreAllMocks();
     await f.close();
   }
 });
-
-test.each(["before-recovery", "after-first-removal-intent"])(
-  "REVISION1 a known backing replacement at %s refuses and keeps its fence",
-  async (when) => {
-    const f = await interruptedRemovalFixture();
-    let swapped = false;
-    const swap = () => {
-      renameSync(f.worktree.worktreePath, f.worktree.worktreePath + "-original");
-      mkdirSync(f.worktree.worktreePath);
-      writeFileSync(path.join(f.worktree.worktreePath, "replacement"), "new generation");
-      swapped = true;
-    };
-    try {
-      if (when === "before-recovery") swap();
-      else {
-        fixtureBeforeFirstRemoval(f.journalFile);
-        const original = atomicFile.writeFileDurably;
-        vi.spyOn(atomicFile, "writeFileDurably").mockImplementation(async (...args) => {
-          await original(...args);
-          if (
-            !swapped &&
-            String(args[0]) === f.journalFile &&
-            JSON.parse(String(args[1])).recoveryEffectPending === true
-          )
-            swap();
-        });
-      }
-      const git = vi.spyOn(gitCommands, "runGitCommand");
-      await expect(revisionRecovery(f)).rejects.toThrow("retirement_backing_generation_changed");
-      expect(readFileSync(path.join(f.worktree.worktreePath, "replacement"), "utf8")).toBe(
-        "new generation",
-      );
-      expect(git.mock.calls.some(([args]) => args[0] === "worktree" && args[1] === "remove")).toBe(
-        false,
-      );
-      expect((await f.layout.inspect()).retirements?.[0].state).toBe("archived");
-      await expect(f.createPinned()).rejects.toThrow("retirement_conflict");
-    } finally {
-      vi.restoreAllMocks();
-      await f.close();
-    }
-  },
-);
 
 test("REVISION1 completion rejection reuses its saved settlement without another removal", async () => {
   const f = await interruptedRemovalFixture();
@@ -4435,29 +4387,6 @@ test.each([false, true])(
   },
 );
 
-test("REVISION1 a first uncertain removal cannot reuse an earlier owner closure assertion", async () => {
-  const f = await interruptedRemovalFixture();
-  try {
-    fixtureBeforeFirstRemoval(f.journalFile);
-    const original = gitCommands.runGitCommand;
-    vi.spyOn(gitCommands, "runGitCommand").mockImplementation(async (args, options) => {
-      if (args[0] === "worktree" && args[1] === "remove") throw Error("unproven retry closure");
-      return original(args, options);
-    });
-    await expect(revisionRecovery(f)).rejects.toThrow(
-      "retirement_recovery_effect_closure_required",
-    );
-    await expect(recoverWorkspaceRetirement(f.deps, f.operationId)).rejects.toThrow(
-      "retirement_recovery_effect_closure_required",
-    );
-    expect(JSON.parse(readFileSync(f.journalFile, "utf8")).recoveryEffectPending).toBe(true);
-    expect((await f.layout.inspect()).retirements?.[0].state).toBe("archived");
-  } finally {
-    vi.restoreAllMocks();
-    await f.close();
-  }
-});
-
 test.each(["service", "archive-dispatch", "core", "session-rpc"])(
   "REVISION2 closed timeout survives unavailable archive receipt through %s without another removal",
   async (entry) => {
@@ -4506,12 +4435,6 @@ test.each(["service", "archive-dispatch", "core", "session-rpc"])(
       });
       expect((await archiveByScope(f.deps, request)).retirement?.state).toBe("partial");
       expect(archiveReads).toBe(1);
-      const retry = vi.fn(async () => {
-        await gitCommands.runGitCommand(["worktree", "remove", f.worktree.worktreePath], {
-          cwd: f.repoDir,
-        });
-        return { archivedWorkspaceIds: ["old-a"], archivedAgentIds: [], removedDirectory: true };
-      });
       const rpcMessages: Array<{
         type: string;
         payload: { code?: string; result?: ArchiveResult };
@@ -4537,7 +4460,6 @@ test.each(["service", "archive-dispatch", "core", "session-rpc"])(
             getRecord: f.deps.getWorkspace!,
             nativeInventory: f.deps.listRetirementRecords!,
             assertHolds: async () => {},
-            retryDirectory: retry,
           });
         await session.handleRetirementRecoveryRequest({
           type: "workspace.retirement.recover.request",
@@ -4566,9 +4488,8 @@ test.each(["service", "archive-dispatch", "core", "session-rpc"])(
         directoryLeftBehind: { reason: "git_removal_timed_out" },
         retirement: { operationId, state: "complete" },
       });
-      expect(archiveReads).toBe(3);
+      expect(archiveReads).toBe(4);
       expect(removals).toBe(1);
-      expect(retry).not.toHaveBeenCalled();
       expect(existsSync(f.worktree.worktreePath)).toBe(true);
       expect(await recover()).toEqual(result);
       expect(removals).toBe(1);
@@ -4580,7 +4501,7 @@ test.each(["service", "archive-dispatch", "core", "session-rpc"])(
   },
 );
 
-test.each(["not_started", "closed", "timed_out", "legacy-confirmed", "done"])(
+test.each(["closed", "timed_out", "legacy-confirmed", "done"])(
   "REVISION2 recorded attempt (%s) follows its proven launch state",
   async (closure) => {
     const f = await interruptedRemovalFixture();
@@ -4593,21 +4514,18 @@ test.each(["not_started", "closed", "timed_out", "legacy-confirmed", "done"])(
       writeFileSync(f.journalFile, JSON.stringify(journal));
       const git = vi.spyOn(gitCommands, "runGitCommand");
       const result = await f.recover();
-      const firstRemoval = closure === "not_started";
       expect(result).toMatchObject({
-        removedDirectory: firstRemoval,
-        slotKept: !firstRemoval,
+        removedDirectory: false,
+        slotKept: true,
         retirement: { operationId: f.operationId, state: "complete" },
       });
-      let reason: string | undefined;
-      if (!firstRemoval)
-        reason =
-          closure === "timed_out" ? "git_removal_timed_out" : "recovery_removal_attempt_retained";
+      const reason =
+        closure === "timed_out" ? "git_removal_timed_out" : "recovery_removal_attempt_retained";
       expect(result.directoryLeftBehind?.reason).toBe(reason);
       expect(
         git.mock.calls.filter(([args]) => args[0] === "worktree" && args[1] === "remove"),
-      ).toHaveLength(firstRemoval ? 1 : 0);
-      expect(existsSync(f.worktree.worktreePath)).toBe(!firstRemoval);
+      ).toHaveLength(0);
+      expect(existsSync(f.worktree.worktreePath)).toBe(true);
       await expect(f.createPinned()).resolves.toMatchObject({ parentWorkspaceId: "pin-parent" });
     } finally {
       vi.restoreAllMocks();
@@ -4615,295 +4533,6 @@ test.each(["not_started", "closed", "timed_out", "legacy-confirmed", "done"])(
     }
   },
 );
-
-const revision3States = [
-  "none",
-  "not_started",
-  "closed",
-  "timed_out",
-  "legacy-confirmed",
-  "done",
-  "unknown-close",
-  "ambiguous",
-  "pending-not_started",
-] as const;
-const revision3Entries = [
-  "service",
-  "archive-dispatch",
-  "core",
-  "session-rpc",
-  "routine-replay",
-  "status",
-] as const;
-const revision3Variants = [
-  { absent: false, receiptMissing: false },
-  { absent: true, receiptMissing: false },
-  { absent: false, receiptMissing: true },
-  { absent: true, receiptMissing: true },
-];
-const revision3Table = revision3States.flatMap((state) =>
-  revision3Entries.flatMap((entry) =>
-    revision3Variants.map(({ absent, receiptMissing }) => ({
-      state,
-      entry,
-      absent,
-      receiptMissing,
-    })),
-  ),
-);
-
-function revision3Journal(
-  f: Awaited<ReturnType<typeof interruptedRemovalFixture>>,
-  state: (typeof revision3States)[number],
-) {
-  const journal = JSON.parse(readFileSync(f.journalFile, "utf8"));
-  journal.effectClosures = {};
-  journal.recoveryEffectPending = false;
-  delete journal.recoveryClosure;
-  if (state === "none") delete journal.steps["remove-directory"];
-  else if (state === "done") journal.steps["remove-directory"] = "done";
-  else if (["not_started", "closed", "timed_out", "pending-not_started"].includes(state))
-    journal.effectClosures["remove-directory"] =
-      state === "pending-not_started" ? "not_started" : state;
-  else if (state === "ambiguous") {
-    delete journal.steps["remove-directory"];
-    journal.effectClosures["remove-directory"] = "not_started";
-  }
-  if (state === "unknown-close" || state === "pending-not_started")
-    journal.recoveryEffectPending = true;
-  if (state === "legacy-confirmed")
-    journal.recoveryClosure = {
-      schemaVersion: 2,
-      operationId: f.operationId,
-      backingGeneration: journal.backingGeneration,
-      acknowledgedAt: "2026-11-23T11:00:00.000Z",
-    };
-  writeFileSync(f.journalFile, JSON.stringify(journal));
-  return journal;
-}
-
-test.each(revision3Table)(
-  "REVISION3 table state=$state entry=$entry absent=$absent receiptMissing=$receiptMissing",
-  async ({ state, entry, absent, receiptMissing }) => {
-    const f = await interruptedRemovalFixture();
-    const api = await import("./workspace-retirement.js");
-    const pure = ["routine-replay", "status"].includes(entry);
-    const uncertain = ["unknown-close", "ambiguous", "pending-not_started"].includes(state);
-    const first = ["none", "not_started"].includes(state);
-    try {
-      revision3Journal(f, state);
-      if (absent) rmSync(f.worktree.worktreePath, { recursive: true });
-      const before = readFileSync(f.journalFile, "utf8");
-      const findReceipt = f.layout.findReceipt.bind(f.layout);
-      vi.spyOn(f.layout, "findReceipt").mockImplementation(async (id) => {
-        if (receiptMissing && id === `retire:${f.operationId}:1`)
-          throw Error("fixture receipt unavailable");
-        return findReceipt(id);
-      });
-      const git = vi.spyOn(gitCommands, "runGitCommand");
-      const confirmation = {};
-      const messages: Array<{ type: string; payload: { code?: string; result?: ArchiveResult } }> =
-        [];
-      const session = Object.assign(Object.create(Session.prototype), {
-        workspaceArchiveDependencies: () => f.deps,
-        emit: (message: (typeof messages)[number]) => messages.push(message),
-      }) as { handleRetirementRecoveryRequest: (request: object) => Promise<void> };
-      const invoke = async (): Promise<ArchiveResult | null> => {
-        if (entry === "status")
-          return (await api.getWorkspaceRetirementStatus(f.layout, f.operationId))?.result ?? null;
-        if (entry === "routine-replay") return archiveByScope(f.deps, f.request);
-        if (entry === "service")
-          return recoverWorkspaceRetirement(f.deps, f.operationId, undefined, confirmation);
-        if (entry === "archive-dispatch")
-          return archiveByScope(f.deps, { ...f.request, recoverRetirement: true, ...confirmation });
-        if (entry === "core")
-          return api.recoverCanonicalWorkspaceRetirement({
-            authority: f.layout,
-            operationId: f.operationId,
-            getRecord: f.deps.getWorkspace!,
-            nativeInventory: f.deps.listRetirementRecords!,
-            assertHolds: async () => {},
-            ...confirmation,
-            retryDirectory: () =>
-              api.workspaceRetirementStep("remove-directory", async () => {
-                await gitCommands.runGitCommand(["worktree", "remove", f.worktree.worktreePath], {
-                  cwd: f.repoDir,
-                });
-                return {
-                  archivedWorkspaceIds: ["old-a"],
-                  archivedAgentIds: [],
-                  removedDirectory: true,
-                };
-              }),
-          });
-        await session.handleRetirementRecoveryRequest({
-          type: "workspace.retirement.recover.request",
-          requestId: "state-table",
-          operationId: f.operationId,
-          ...confirmation,
-        });
-        const response = messages.at(-1)!;
-        if (response.type === "rpc_error") throw Error(response.payload.code);
-        return response.payload.result!;
-      };
-      const outcome = await invoke().then(
-        (result) => ({ result, error: null }),
-        (error: Error) => ({ result: null, error }),
-      );
-      const calls = () =>
-        git.mock.calls.filter(([args]) => args[0] === "worktree" && args[1] === "remove").length;
-      const partial = pure || receiptMissing || uncertain;
-      expect(calls()).toBe(!partial && first && !absent ? 1 : 0);
-      if (partial) {
-        if (!pure) expect(outcome.error).not.toBeNull();
-        expect((await f.layout.inspect()).retirements?.[0].state).toBe("archived");
-        expect(await api.getWorkspaceRetirementStatus(f.layout, f.operationId)).toMatchObject({
-          state: "partial",
-          terminal: false,
-        });
-        await expect(f.createPinned()).rejects.toThrow("retirement_conflict");
-        if (pure) expect(readFileSync(f.journalFile, "utf8")).toBe(before);
-      } else {
-        expect(outcome.error).toBeNull();
-        expect(outcome.result).toMatchObject({
-          removedDirectory: absent || first,
-          slotKept: !absent && !first,
-          retirement: { operationId: f.operationId, state: "complete" },
-        });
-        expect(existsSync(f.worktree.worktreePath)).toBe(!absent && !first);
-        if (state === "not_started" && !absent)
-          expect(
-            JSON.parse(readFileSync(f.journalFile, "utf8")).effectAttemptHistory?.[
-              "remove-directory"
-            ],
-          ).toContain("not_started");
-        expect(await invoke()).toEqual(outcome.result);
-        expect(calls()).toBe(first && !absent ? 1 : 0);
-        await expect(f.createPinned()).resolves.toMatchObject({ parentWorkspaceId: "pin-parent" });
-      }
-    } finally {
-      vi.restoreAllMocks();
-      await f.close();
-    }
-  },
-);
-
-test("REVISION3 proven not_started permits the first removal after verification recovers", async () => {
-  const f = await interruptedRemovalFixture();
-  const write = atomicFile.writeFileDurably;
-  const inspect = f.layout.inspect.bind(f.layout);
-  let rejectNextVerify = false;
-  let faultInjected = false;
-  try {
-    // Begin from the repo's isolated pre-removal journal fixture.
-    fixtureBeforeFirstRemoval(f.journalFile);
-    vi.spyOn(atomicFile, "writeFileDurably").mockImplementation(async (...args) => {
-      await write(...args);
-      if (
-        !faultInjected &&
-        String(args[0]) === f.journalFile &&
-        JSON.parse(String(args[1])).recoveryEffectPending === true
-      ) {
-        faultInjected = true;
-        rejectNextVerify = true;
-      }
-    });
-    vi.spyOn(f.layout, "inspect").mockImplementation(async () => {
-      if (rejectNextVerify) {
-        rejectNextVerify = false;
-        throw new WorkspaceLayoutRefusal("fixture_pre_effect_verification_unavailable");
-      }
-      return inspect();
-    });
-    const git = vi.spyOn(gitCommands, "runGitCommand");
-    const removals = () =>
-      git.mock.calls.filter(([args]) => args[0] === "worktree" && args[1] === "remove").length;
-    await expect(f.recover()).rejects.toThrow("fixture_pre_effect_verification_unavailable");
-    expect(JSON.parse(readFileSync(f.journalFile, "utf8"))).toMatchObject({
-      steps: { "remove-directory": "started" },
-      effectClosures: { "remove-directory": "not_started" },
-      recoveryEffectPending: false,
-    });
-    expect(removals()).toBe(0);
-    expect(existsSync(f.worktree.worktreePath)).toBe(true);
-    await expect(f.createPinned()).rejects.toThrow("retirement_conflict");
-    const result = await recoverWorkspaceRetirement(f.deps, f.operationId);
-    expect({
-      calls: removals(),
-      exists: existsSync(f.worktree.worktreePath),
-      removedDirectory: result.removedDirectory,
-      retainedReason: result.directoryLeftBehind?.reason,
-      state: (await f.layout.inspect()).retirements?.[0].state,
-    }).toEqual({
-      calls: 1,
-      exists: false,
-      removedDirectory: true,
-      retainedReason: undefined,
-      state: "complete",
-    });
-  } finally {
-    vi.restoreAllMocks();
-    await f.close();
-  }
-});
-
-test("REVISION3 preserves repeated pre-invocation failures before exactly one first removal", async () => {
-  const f = await interruptedRemovalFixture();
-  const write = atomicFile.writeFileDurably;
-  const inspect = f.layout.inspect.bind(f.layout);
-  let rejectNextVerify = false,
-    failures = 0;
-  try {
-    fixtureBeforeFirstRemoval(f.journalFile);
-    vi.spyOn(atomicFile, "writeFileDurably").mockImplementation(async (...args) => {
-      await write(...args);
-      if (
-        failures < 2 &&
-        String(args[0]) === f.journalFile &&
-        JSON.parse(String(args[1])).recoveryEffectPending === true
-      ) {
-        failures++;
-        rejectNextVerify = true;
-      }
-    });
-    vi.spyOn(f.layout, "inspect").mockImplementation(async () => {
-      if (rejectNextVerify) {
-        rejectNextVerify = false;
-        throw new WorkspaceLayoutRefusal("fixture_preflight_unavailable");
-      }
-      return inspect();
-    });
-    const git = vi.spyOn(gitCommands, "runGitCommand");
-    for (let attempt = 0; attempt < 2; attempt++) {
-      await expect(f.recover()).rejects.toThrow("fixture_preflight_unavailable");
-      const journal = JSON.parse(readFileSync(f.journalFile, "utf8"));
-      expect(journal.effectClosures["remove-directory"]).toBe("not_started");
-      expect(journal.effectAttemptHistory?.["remove-directory"] ?? []).toEqual(
-        Array(attempt).fill("not_started"),
-      );
-      expect(
-        git.mock.calls.filter(([args]) => args[0] === "worktree" && args[1] === "remove"),
-      ).toHaveLength(0);
-    }
-    expect(await f.recover()).toMatchObject({
-      removedDirectory: true,
-      retirement: { state: "complete" },
-    });
-    expect(
-      JSON.parse(readFileSync(f.journalFile, "utf8")).effectAttemptHistory["remove-directory"],
-    ).toEqual(["not_started", "not_started"]);
-    expect(await f.recover()).toMatchObject({
-      removedDirectory: true,
-      retirement: { state: "complete" },
-    });
-    expect(
-      git.mock.calls.filter(([args]) => args[0] === "worktree" && args[1] === "remove"),
-    ).toHaveLength(1);
-  } finally {
-    vi.restoreAllMocks();
-    await f.close();
-  }
-});
 
 test("REVISION3 a pre-invocation closure cannot erase ambiguous prior launch history", async () => {
   const f = await interruptedRemovalFixture();
@@ -4930,51 +4559,12 @@ test("REVISION3 a pre-invocation closure cannot erase ambiguous prior launch his
   }
 });
 
-test("REVISION3 a swallowed generic preflight failure stays partial before the first removal", async () => {
-  const f = await interruptedRemovalFixture();
-  const write = atomicFile.writeFileDurably;
-  const inspect = f.layout.inspect.bind(f.layout);
-  let rejectNextVerify = false,
-    injected = false;
-  try {
-    fixtureBeforeFirstRemoval(f.journalFile);
-    vi.spyOn(atomicFile, "writeFileDurably").mockImplementation(async (...args) => {
-      await write(...args);
-      if (
-        !injected &&
-        String(args[0]) === f.journalFile &&
-        JSON.parse(String(args[1])).recoveryEffectPending === true
-      ) {
-        injected = true;
-        rejectNextVerify = true;
-      }
-    });
-    vi.spyOn(f.layout, "inspect").mockImplementation(async () => {
-      if (rejectNextVerify) {
-        rejectNextVerify = false;
-        throw Error("fixture temporary read failure");
-      }
-      return inspect();
-    });
-    const git = vi.spyOn(gitCommands, "runGitCommand");
-    await expect(f.recover()).rejects.toThrow("retirement_partial_teardown");
-    expect(
-      git.mock.calls.filter(([args]) => args[0] === "worktree" && args[1] === "remove"),
-    ).toHaveLength(0);
-    await expect(f.createPinned()).rejects.toThrow("retirement_conflict");
-    expect(await recoverWorkspaceRetirement(f.deps, f.operationId)).toMatchObject({
-      removedDirectory: true,
-      retirement: { state: "complete" },
-    });
-    expect(
-      git.mock.calls.filter(([args]) => args[0] === "worktree" && args[1] === "remove"),
-    ).toHaveLength(1);
-  } finally {
-    vi.restoreAllMocks();
-    await f.close();
-  }
-});
-
+const revision3Variants = [
+  { absent: false, receiptMissing: false },
+  { absent: true, receiptMissing: false },
+  { absent: false, receiptMissing: true },
+  { absent: true, receiptMissing: true },
+];
 const revision3Automatic = revision3Variants.flatMap((variant) =>
   [false, true].map((closeProven) => ({
     absent: variant.absent,
@@ -5068,3 +4658,361 @@ test.each(revision3Automatic)(
     }
   },
 );
+
+const B_CLOSURE = "retirement_recovery_effect_closure_required";
+// Literal §3c outcomes for present backing; absent overrides retain except S5.
+const B_EXPECTED = {
+  S1: { none: "recovery_removal_not_attempted", closed: "recovery_removal_not_attempted" },
+  S2: { none: "recovery_removal_attempt_retained", closed: "recovery_removal_attempt_retained" },
+  S3: { none: "recovery_removal_attempt_retained", closed: "recovery_removal_attempt_retained" },
+  S4: { none: "git_removal_timed_out", closed: "git_removal_timed_out" },
+  S5: { none: "recovery_removal_attempt_retained", closed: "recovery_removal_attempt_retained" },
+  S6: { none: null, closed: "recovery_removal_attempt_retained" },
+  S7: { none: null, closed: "recovery_backing_identity_unverified" },
+  S8: {
+    none: "recovery_backing_identity_unverified",
+    closed: "recovery_backing_identity_unverified",
+  },
+  S9: { none: null, closed: "recovery_removal_attempt_retained" },
+  S10: { none: null, closed: "recovery_removal_attempt_retained" },
+  S11: { none: null, closed: "recovery_removal_attempt_retained" },
+  S12: { none: null, closed: "recovery_removal_attempt_retained" },
+  S13: { none: null, closed: "recovery_uncertain_teardown_retained" },
+  X1: { none: null, closed: null },
+  X2: { none: null, closed: null },
+  X3: { none: null, closed: null },
+} as const;
+const bEntries = ["service", "archive-dispatch", "core", "session-rpc"] as const;
+const bVariants = [
+  { closed: false, absent: false },
+  { closed: true, absent: false },
+  { closed: false, absent: true },
+  { closed: true, absent: true },
+];
+const bEntryVariants = bEntries.flatMap((entry) =>
+  bVariants.map(({ closed, absent }) => ({ entry, closed, absent, receipt: "ok" as const })),
+);
+const bReceiptVariants = ["missing", "outage"].flatMap((receipt) =>
+  bVariants.map(({ closed, absent }) => ({ entry: "service" as const, closed, absent, receipt })),
+);
+const bIntegrationCells = INTEGRATION_RECOVERY_STATES.flatMap((state) =>
+  [...bEntryVariants, ...bReceiptVariants].map((variant) => Object.assign({ state }, variant)),
+);
+type BFixture = Awaited<ReturnType<typeof interruptedRemovalFixture>>;
+
+function bJournal(f: BFixture, state: RecoveryFixtureState) {
+  const record = recoveryFixture(JSON.parse(readFileSync(f.journalFile, "utf8")), state);
+  writeFileSync(f.journalFile, JSON.stringify(record));
+  if (state === "S7") expect(Object.keys(record).sort()).toEqual(LEGACY_RETIREMENT_FIELDS);
+  return record;
+}
+function bInvoke(f: BFixture, entry: (typeof bEntries)[number], closed: boolean) {
+  const record = JSON.parse(readFileSync(f.journalFile, "utf8"));
+  const confirmation = closed
+    ? { effectsClosed: true, expectedBackingGeneration: record.backingGeneration }
+    : {};
+  const messages: Array<{ type: string; payload: { code?: string; result?: ArchiveResult } }> = [];
+  const session = Object.assign(Object.create(Session.prototype), {
+    workspaceArchiveDependencies: () => f.deps,
+    emit: (message: (typeof messages)[number]) => messages.push(message),
+  }) as { handleRetirementRecoveryRequest: (request: object) => Promise<void> };
+  return async () => {
+    if (entry === "service")
+      return recoverWorkspaceRetirement(f.deps, f.operationId, undefined, confirmation);
+    if (entry === "archive-dispatch")
+      return archiveByScope(f.deps, { ...f.request, recoverRetirement: true, ...confirmation });
+    if (entry === "core")
+      return recoverCanonicalWorkspaceRetirement({
+        authority: f.layout,
+        operationId: f.operationId,
+        getRecord: f.deps.getWorkspace!,
+        nativeInventory: f.deps.listRetirementRecords!,
+        assertHolds: async () => {},
+        ...confirmation,
+      });
+    await session.handleRetirementRecoveryRequest({
+      type: "workspace.retirement.recover.request",
+      requestId: "b-table",
+      operationId: f.operationId,
+      ...confirmation,
+    });
+    const message = messages.at(-1)!;
+    if (message.type === "rpc_error") throw Error(message.payload.code);
+    return message.payload.result!;
+  };
+}
+function bReadBytes(f: BFixture) {
+  return {
+    journal: readFileSync(f.journalFile, "utf8"),
+    caller: readFileSync(
+      path.join(f.home, "workspace-retirement-operations", `${f.operationId}.json`),
+      "utf8",
+    ),
+  };
+}
+
+test.each(bIntegrationCells)(
+  "B integration $state entry=$entry closed=$closed absent=$absent receipt=$receipt",
+  async ({ state, entry, closed, absent, receipt }) => {
+    const f = await interruptedRemovalFixture();
+    try {
+      bJournal(f, state);
+      if (absent) rmSync(f.worktree.worktreePath, { recursive: true });
+      const before = bReadBytes(f);
+      const write = atomicFile.writeFileDurably;
+      const durableWrites: Array<{ file: string; data: string }> = [];
+      vi.spyOn(atomicFile, "writeFileDurably").mockImplementation(async (...args) => {
+        if (String(args[0]).includes("workspace-retirement"))
+          durableWrites.push({ file: String(args[0]), data: String(args[1]) });
+        return write(...args);
+      });
+      const find = f.layout.findReceipt.bind(f.layout);
+      vi.spyOn(f.layout, "findReceipt").mockImplementation(async (id) => {
+        if (id === `retire:${f.operationId}:1`) {
+          if (receipt === "missing") return null;
+          if (receipt === "outage") throw Error("fixture receipt unavailable");
+        }
+        return find(id);
+      });
+      const git = vi.spyOn(gitCommands, "runGitCommand");
+      const invoke = bInvoke(f, entry, closed);
+      const outcome = await invoke().then(
+        (result) => ({ result, error: null }),
+        (error: Error) => ({ result: null, error }),
+      );
+      const confirmationUsed = closed;
+      const reason = B_EXPECTED[state][confirmationUsed ? "closed" : "none"];
+      const settles = reason !== null && receipt === "ok";
+      expect(
+        git.mock.calls.filter(([args]) => args[0] === "worktree" && args[1] === "remove"),
+      ).toHaveLength(0);
+      expect(existsSync(f.worktree.worktreePath)).toBe(!absent);
+      if (!settles) {
+        expect(outcome.error).not.toBeNull();
+        expect(outcome.error?.message).toContain(bExpectedFailure(state, receipt, entry));
+        expect(bReadBytes(f)).toEqual(before);
+        expect(durableWrites).toHaveLength(0);
+        expect((await f.layout.inspect()).retirements?.[0].state).toBe("archived");
+        await expect(f.createPinned()).rejects.toThrow("retirement_conflict");
+      } else {
+        expect(outcome.error).toBeNull();
+        const removed = absent && state !== "S5";
+        expect(outcome.result).toMatchObject({
+          removedDirectory: removed,
+          slotKept: !removed,
+          retirement: { operationId: f.operationId, state: "complete" },
+        });
+        expect(outcome.result?.directoryLeftBehind?.reason).toBe(removed ? undefined : reason);
+        const saved = JSON.parse(readFileSync(f.journalFile, "utf8"));
+        expect(saved.recoverySettlement.schemaVersion).toBe(2);
+        const firstWrite = JSON.parse(
+          durableWrites.find((row) => row.file === f.journalFile)!.data,
+        );
+        expect(firstWrite.recoverySettlement.schemaVersion).toBe(2);
+        if (["S6", "S7", "S9", "S10", "S11", "S12", "S13"].includes(state))
+          expect(firstWrite.recoveryClosure).toMatchObject({
+            schemaVersion: 2,
+            operationId: f.operationId,
+            backingGeneration: firstWrite.backingGeneration,
+          });
+        const original = JSON.parse(before.journal);
+        expect(saved.recoveryEffectPending).toEqual(original.recoveryEffectPending);
+        expect(saved.effectClosures).toEqual(original.effectClosures);
+        expect(saved.effectAttemptHistory).toEqual(original.effectAttemptHistory);
+        expect(await invoke()).toEqual(outcome.result);
+        expect(
+          git.mock.calls.filter(([args]) => args[0] === "worktree" && args[1] === "remove"),
+        ).toHaveLength(0);
+        await expect(f.createPinned()).resolves.toMatchObject({ parentWorkspaceId: "pin-parent" });
+      }
+    } finally {
+      vi.restoreAllMocks();
+      await f.close();
+    }
+  },
+);
+function bExpectedFailure(state: string, receipt: string, entry: string) {
+  if (state.startsWith("X")) return B_CLOSURE;
+  if (receipt === "missing") return "retirement_archive_receipt_required";
+  if (receipt === "outage")
+    return entry === "session-rpc" ? "retirement_recovery_failed" : "fixture receipt unavailable";
+  return B_CLOSURE;
+}
+
+test.each(
+  INTEGRATION_RECOVERY_STATES.flatMap((state) =>
+    ["routine-replay", "status"].map((entry) => ({ state, entry })),
+  ),
+)("B read-only $state $entry writes no bytes and invokes no Git", async ({ state, entry }) => {
+  const f = await interruptedRemovalFixture();
+  try {
+    bJournal(f, state);
+    const before = bReadBytes(f);
+    const git = vi.spyOn(gitCommands, "runGitCommand");
+    if (entry === "status")
+      expect(
+        (
+          await (
+            await import("./workspace-retirement.js")
+          ).getWorkspaceRetirementStatus(f.layout, f.operationId)
+        )?.terminal,
+      ).toBe(false);
+    else expect((await archiveByScope(f.deps, f.request)).retirement?.state).toBe("partial");
+    expect(bReadBytes(f)).toEqual(before);
+    expect(
+      git.mock.calls.filter(([args]) => args[0] === "worktree" && args[1] === "remove"),
+    ).toHaveLength(0);
+  } finally {
+    vi.restoreAllMocks();
+    await f.close();
+  }
+});
+
+test("B S7 wrong-generation confirmation changes no durable bytes", async () => {
+  const f = await interruptedRemovalFixture();
+  try {
+    bJournal(f, "S7");
+    const before = bReadBytes(f);
+    await expect(
+      recoverWorkspaceRetirement(f.deps, f.operationId, undefined, {
+        expectedBackingGeneration: "0".repeat(64),
+      }),
+    ).rejects.toThrow("retirement_backing_generation_changed");
+    expect(bReadBytes(f)).toEqual(before);
+  } finally {
+    vi.restoreAllMocks();
+    await f.close();
+  }
+});
+
+test("B rejected authority completion reuses v2 settlement with zero removals and identical rerun", async () => {
+  const f = await interruptedRemovalFixture();
+  try {
+    bJournal(f, "S6");
+    const commit = f.layout.commit.bind(f.layout);
+    let refuse = true;
+    vi.spyOn(f.layout, "commit").mockImplementation(async (intent) => {
+      if (refuse && intent.mutations.some((mutation) => mutation.kind === "complete-retirement"))
+        throw Error("fixture_completion_refused");
+      return commit(intent);
+    });
+    const git = vi.spyOn(gitCommands, "runGitCommand");
+    await expect(f.recover()).rejects.toThrow("fixture_completion_refused");
+    const saved = JSON.parse(readFileSync(f.journalFile, "utf8")).recoverySettlement;
+    expect(saved.schemaVersion).toBe(2);
+    refuse = false;
+    const result = await recoverWorkspaceRetirement(f.deps, f.operationId);
+    expect(result).toMatchObject(saved.result);
+    expect(await recoverWorkspaceRetirement(f.deps, f.operationId)).toEqual(result);
+    expect(
+      git.mock.calls.filter(([args]) => args[0] === "worktree" && args[1] === "remove"),
+    ).toHaveLength(0);
+    await expect(f.createPinned()).resolves.toMatchObject({ parentWorkspaceId: "pin-parent" });
+  } finally {
+    vi.restoreAllMocks();
+    await f.close();
+  }
+});
+
+test("B replaces the R3 no-launch probe with retained settlement, zero removal and released fence", async () => {
+  const f = await interruptedRemovalFixture();
+  try {
+    fixtureBeforeFirstRemoval(f.journalFile);
+    const git = vi.spyOn(gitCommands, "runGitCommand");
+    const result = await f.recover();
+    expect(result).toMatchObject({
+      removedDirectory: false,
+      slotKept: true,
+      directoryLeftBehind: { reason: "recovery_removal_not_attempted" },
+      retirement: { state: "complete" },
+    });
+    expect(existsSync(f.worktree.worktreePath)).toBe(true);
+    expect(await f.recover()).toEqual(result);
+    expect(
+      git.mock.calls.filter(([args]) => args[0] === "worktree" && args[1] === "remove"),
+    ).toHaveLength(0);
+    await expect(f.createPinned()).resolves.toMatchObject({ parentWorkspaceId: "pin-parent" });
+  } finally {
+    vi.restoreAllMocks();
+    await f.close();
+  }
+});
+
+test("B S6 after a crash remains partial with a durable reservation and zero removal", async () => {
+  const f = await interruptedRemovalFixture();
+  try {
+    bJournal(f, "S6");
+    const before = bReadBytes(f);
+    vi.resetModules();
+    const api = await import("./workspace-retirement.js");
+    const git = vi.spyOn(gitCommands, "runGitCommand");
+    await expect(
+      api.recoverCanonicalWorkspaceRetirement({
+        authority: f.layout,
+        operationId: f.operationId,
+        getRecord: f.deps.getWorkspace!,
+        nativeInventory: f.deps.listRetirementRecords!,
+        assertHolds: async () => {},
+      }),
+    ).rejects.toThrow(B_CLOSURE);
+    expect(bReadBytes(f)).toEqual(before);
+    expect(
+      git.mock.calls.filter(([args]) => args[0] === "worktree" && args[1] === "remove"),
+    ).toHaveLength(0);
+    await expect(f.createPinned()).rejects.toThrow("retirement_conflict");
+  } finally {
+    vi.restoreAllMocks();
+    await f.close();
+  }
+});
+
+test("B intermediate history remains parseable by the create fence", async () => {
+  const f = await interruptedRemovalFixture();
+  try {
+    bJournal(f, "S10");
+    await expect(f.createPinned()).rejects.toThrow("retirement_conflict");
+    await expect(
+      (await import("./workspace-retirement.js")).assertWorkspaceBackingAvailable(
+        f.home,
+        f.worktree.worktreePath,
+        await f.layout.inspect(),
+        "owner",
+      ),
+    ).rejects.toThrow("retirement_backing_reserved");
+  } finally {
+    vi.restoreAllMocks();
+    await f.close();
+  }
+});
+
+test("B rechecks legacy ENOENT before settlement and preserves a replacement backing", async () => {
+  const f = await interruptedRemovalFixture();
+  try {
+    bJournal(f, "S7");
+    rmSync(f.worktree.worktreePath, { recursive: true });
+    const before = bReadBytes(f);
+    const inspect = f.layout.inspect.bind(f.layout);
+    let reads = 0;
+    vi.spyOn(f.layout, "inspect").mockImplementation(async () => {
+      const snapshot = await inspect();
+      if (++reads === 2) {
+        mkdirSync(f.worktree.worktreePath);
+        writeFileSync(path.join(f.worktree.worktreePath, "replacement"), "keep new backing");
+      }
+      return snapshot;
+    });
+    const git = vi.spyOn(gitCommands, "runGitCommand");
+    await expect(f.recover()).rejects.toThrow("retirement_backing_generation_changed");
+    expect(bReadBytes(f)).toEqual(before);
+    expect(readFileSync(path.join(f.worktree.worktreePath, "replacement"), "utf8")).toBe(
+      "keep new backing",
+    );
+    expect(
+      git.mock.calls.filter(([args]) => args[0] === "worktree" && args[1] === "remove"),
+    ).toHaveLength(0);
+    await expect(f.createPinned()).rejects.toThrow("retirement_conflict");
+  } finally {
+    vi.restoreAllMocks();
+    await f.close();
+  }
+});

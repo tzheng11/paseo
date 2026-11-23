@@ -29,6 +29,11 @@ import {
 } from "./workspace-automation-gate.js";
 import { serializeWorkspaceBacking, nativeTransitionKey } from "./workspace-retirement-context.js";
 import { GitCommandError, GitCommandTimeoutError } from "../utils/run-git-command.js";
+import {
+  classifyRetirementRecovery,
+  type RecoveryObservation,
+  type RecoveryDecision,
+} from "./workspace-retirement-recovery.js";
 
 interface RetirementContext {
   operationId: string;
@@ -129,6 +134,7 @@ const JournalSchema = z.strictObject({
     .optional(),
   recoverySettlement: z
     .object({
+      schemaVersion: z.literal(2).optional(),
       operationId: z.string().uuid(),
       backingGeneration: z.string(),
       nativeGeneration: z.string(),
@@ -148,7 +154,7 @@ const JournalSchema = z.strictObject({
   closedWithoutReservation: z.boolean(),
   archiveTimestamp: z.string().datetime(),
 });
-type RetirementJournal = z.infer<typeof JournalSchema>;
+export type RetirementJournal = z.infer<typeof JournalSchema>;
 interface RetirementInput {
   operationId?: string;
   expectedProjectId?: string;
@@ -475,7 +481,8 @@ export async function retireCanonicalWorkspace(input: RetirementInput): Promise<
         },
         verify,
         step: async (name, effect) => {
-          assertStepMayStart(journal, name);
+          if (journal.steps[name])
+            throw new WorkspaceLayoutRefusal("retirement_effect_already_started");
           if (name === "remove-directory" || name.startsWith("path-teardown:")) {
             const stageSnapshot = await authority.inspect();
             if (
@@ -519,9 +526,6 @@ export async function retireCanonicalWorkspace(input: RetirementInput): Promise<
           getRecord: input.getRecord,
           nativeInventory: input.nativeInventory,
           assertHolds: input.assertHolds,
-          retryDirectory: async () => {
-            throw new WorkspaceLayoutRefusal("retirement_effect_already_started");
-          },
         },
         true,
       );
@@ -1161,10 +1165,6 @@ export interface RetirementRecoveryInput {
   getRecord: (id: string) => Promise<PersistedWorkspaceRecord | null>;
   nativeInventory: () => Promise<PersistedWorkspaceRecord[]>;
   assertHolds: (id: string) => Promise<void>;
-  retryDirectory: (
-    records: PersistedWorkspaceRecord[],
-    backing: string,
-  ) => Promise<RetirementResult>;
 }
 
 /** Explicit owner write. Status and ordinary archive replay remain read-only. */
@@ -1198,11 +1198,23 @@ async function recoverRetirement(
       matches.length ? "retirement_lookup_integrity_failed" : "retirement_operation_not_found",
     );
   const located = matches[0];
-  if (
+  const running =
     runningRetirementJournals.has(located.file) ||
-    (!ownerCompletion && runningCallerOperations.has(operationFile(authority, operationId)))
-  )
-    throw new WorkspaceLayoutRefusal("retirement_operation_in_progress");
+    (!ownerCompletion && runningCallerOperations.has(operationFile(authority, operationId)));
+  if (running) {
+    const decision = classifyRetirementRecovery(
+      located.journal,
+      {
+        running: true,
+        completionKnown: false,
+        receipt: { kind: "missing" },
+        guards: null,
+        backing: { kind: "unreadable", code: "retirement_observation_unavailable" },
+      },
+      input,
+    );
+    throwRecoveryDecision(decision);
+  }
   const reserve = located.journal.intents
     .flatMap((intent) => intent.mutations)
     .find((mutation) => mutation.kind === "reserve-retirement");
@@ -1220,233 +1232,67 @@ async function recoverRetirement(
       ],
     },
     async () => {
-      const journalRead = await readOptionalJournal(located.file);
-      if (!journalRead || journalRead.operationId !== operationId)
+      const journal = await readOptionalJournal(located.file);
+      if (!journal || journal.operationId !== operationId)
         throw new WorkspaceLayoutRefusal("retirement_journal_binding_changed");
-      const journal: RetirementJournal = journalRead;
-      validateRecoveryInput(input, journal);
-      const records = await Promise.all(
-        ids.map(async (id) => {
-          const record = await input.getRecord(id);
-          if (!record) throw new WorkspaceLayoutRefusal("retirement_native_generation_changed");
-          return record;
-        }),
-      );
-      const replayInput = {
-        authority,
-        records,
-        generation: nativeGeneration(records),
-        file: located.file,
-        journalDirectory: directory,
-        operationId,
-      };
-      let snapshot = await authority.inspect();
-      let operation = snapshot.retirements?.find(
-        (candidate) => candidate.operationId === operationId,
-      );
-      assertReplayBinding(journal, replayInput, operation);
-      if (completionKnown(journal, operation)) return completedReplay(journal, replayInput);
-      await verifyRecoveryArchive({ authority, journal, operation, reserve, ids });
-      const unsettled = Object.entries(journal.steps).filter(
-        ([name, state]) => state === "started" && destructiveStep(name),
-      );
-      if (!Object.keys(journal.steps).some(destructiveStep) && !journal.result)
-        throw new WorkspaceLayoutRefusal("retirement_recovery_no_path_intent");
-      verifyRecoveryClosure(input, journal, unsettled);
-      if (removalAttemptState(journal) === "unknown")
-        throw new WorkspaceLayoutRefusal("retirement_recovery_effect_closure_required");
-      const persist = () => writeFileDurably(located.file, JSON.stringify(journal));
-      const verify = async () => {
-        snapshot = await authority.inspect();
-        if (
-          snapshot.stamp.phase !== "active" ||
-          snapshot.ownerDomains?.find((domain) => domain.serverId === authority.options.serverId)
-            ?.state !== "adopted"
-        )
-          throw new WorkspaceLayoutRefusal("retirement_owner_unavailable");
-        await verifyRecoveryInventory(input, journal, snapshot, new Set(ids));
-        operation = snapshot.retirements?.find(
-          (candidate) => candidate.operationId === operationId,
-        );
-        assertReplayBinding(journal, replayInput, operation);
-        if (
-          !operation ||
-          operation.state !== "archived" ||
-          operation.archivedAt !== journal.archiveTimestamp
-        )
-          throw new WorkspaceLayoutRefusal("retirement_reservation_unverified");
-        for (const original of records) {
-          const current = await input.getRecord(original.workspaceId);
-          if (
-            !current ||
-            nativeGeneration([current]) !== nativeGeneration([original]) ||
-            current.archivedAt !== journal.archiveTimestamp
-          )
-            throw new WorkspaceLayoutRefusal("retirement_native_generation_changed");
-          if (nativeHold(current)) throw new WorkspaceLayoutRefusal("retirement_native_hold");
-          assertWorkspaceAutomationAllowed(current.untrustedSource);
-          await input.assertHolds(current.workspaceId);
-        }
-      };
-      await verify();
-      async function settleDirectory(): Promise<RetirementResult> {
-        const archivedWorkspaceIds = [...ids];
-        const archivedAgentIds = Object.keys(journal.steps)
-          .filter((name) => /^(agent|snapshot):/.test(name) && journal.steps[name] === "done")
-          .map((name) => name.slice(name.indexOf(":") + 1));
-        const retained = (reason: string): RetirementResult => ({
-          archivedWorkspaceIds,
-          archivedAgentIds,
-          removedDirectory: false,
-          slotKept: true,
-          directoryLeftBehind: { path: journal.backingPath, reason },
-        });
-        let result: RetirementResult;
-        const currentStat = await recoveryBackingStat(journal);
-        const observed = journal.backingObservations?.find(
-          (row) => row.path === journal.backingPath,
-        );
-        if (journal.recoverySettlement) return journal.recoverySettlement.result;
-        if (!currentStat)
-          result = {
-            archivedWorkspaceIds,
-            archivedAgentIds,
-            removedDirectory: true,
-            slotKept: false,
-          };
-        else if (unsettled.some(([name]) => name.startsWith("path-teardown:")))
-          result = retained("recovery_uncertain_teardown_retained");
-        else if (!observed) result = retained("recovery_backing_identity_unverified");
-        else if (removalAttemptState(journal) === "closed")
-          result = retained(
-            journal.effectClosures?.["remove-directory"] === "timed_out"
-              ? "git_removal_timed_out"
-              : "recovery_removal_attempt_retained",
-          );
-        else {
-          const priorAttempts = removalAttemptCount(journal);
-          try {
-            result = await withWorkspaceRetirement(
-              {
-                operationId,
-                backingGeneration: journal.backingGeneration,
-                home,
-                workspaceIds: new Set(ids),
-                archiveTimestamp: journal.archiveTimestamp,
-                verify,
-                verifyHook: async () => {
-                  throw new WorkspaceLayoutRefusal("retirement_recovery_hook_not_active");
-                },
-                archive: async () => {
-                  throw new WorkspaceLayoutRefusal("retirement_already_archived");
-                },
-                step: async (name, effect) => {
-                  assertStepMayStart(journal, name);
-                  if (name !== "remove-directory")
-                    throw new WorkspaceLayoutRefusal("retirement_recovery_hook_not_active");
-                  await verify();
-                  return executeRetirementStep({
-                    journal,
-                    name,
-                    effect,
-                    persist,
-                    beforeEffect: async () => {
-                      await verify();
-                      const boundary = await lstat(journal.backingPath);
-                      if (
-                        hashLayoutValue({
-                          dev: boundary.dev,
-                          ino: boundary.ino,
-                          birthtimeMs: boundary.birthtimeMs,
-                        }) !== hashLayoutValue(observed.stat)
-                      )
-                        throw new WorkspaceLayoutRefusal("retirement_backing_generation_changed");
-                    },
-                  });
-                },
-              },
-              () => input.retryDirectory(records, journal.backingPath),
-            );
-            const attempts = removalAttemptCount(journal);
-            if (attempts > priorAttempts && removalNeverInvoked(journal))
-              throw new WorkspaceLayoutRefusal("retirement_partial_teardown");
-          } catch (error) {
-            if (!(error instanceof GitCommandTimeoutError) || !error.processClosed) throw error;
-            result = (await recoveryBackingStat(journal))
-              ? retained("git_removal_timed_out")
-              : { archivedWorkspaceIds, archivedAgentIds, removedDirectory: true, slotKept: false };
-          }
-          result = {
-            ...result,
-            archivedAgentIds,
-            archivedWorkspaceIds,
-            slotKept: !result.removedDirectory,
-          };
-          if (!result.removedDirectory && !result.directoryLeftBehind)
-            result.directoryLeftBehind = {
-              path: journal.backingPath,
-              reason: "recovery_removal_failed",
-            };
-        }
-        return result;
+      const gathered = await gatherRecovery(input, journal, reserve, ids, located.file, directory);
+      const decision = classifyRetirementRecovery(journal, gathered.observation, input);
+      if (decision.kind === "fence" || decision.kind === "reject") {
+        const cause = gathered.errors.get(decision.code);
+        if (decision.kind === "fence" && cause) throw cause;
+        throwRecoveryDecision(decision);
       }
-      async function finish(result: RetirementResult): Promise<RetirementResult> {
-        await recoveryBackingStat(journal);
-        verifyRecoveryClosure(
-          { ...input, effectsClosed: false },
-          journal,
-          Object.entries(journal.steps).filter(
-            ([name, state]) => state === "started" && destructiveStep(name),
-          ),
-        );
+      if (decision.kind === "replay") return completedReplay(journal, gathered.replayInput);
+      if (decision.kind !== "settle")
+        throw new WorkspaceLayoutRefusal("retirement_recovery_effect_closure_required");
+      // No durable assignment precedes this read-only recheck. A stale ENOENT is
+      // unsafe even for a legacy journal without a recorded inode observation.
+      const fresh = await authority.inspect();
+      await verifyRecoveryGuards(
+        input,
+        journal,
+        gathered.records,
+        ids,
+        fresh,
+        gathered.replayInput,
+      );
+      const receipt = await observeArchiveReceipt(authority, journal, reserve, fresh);
+      if (receipt.kind !== "ok")
+        throw new WorkspaceLayoutRefusal("retirement_archive_receipt_required");
+      if (hashLayoutValue(await recoveryBackingStat(journal)) !== gathered.backingToken)
+        throw new WorkspaceLayoutRefusal("retirement_backing_generation_changed");
+      const result = decision.result;
+      runningRetirementJournals.add(located.file);
+      const persist = () => writeFileDurably(located.file, JSON.stringify(journal));
+      try {
         journal.recoveryResolutions ??= {};
         for (const [name, state] of Object.entries(journal.steps))
           if (state === "started" && destructiveStep(name))
             journal.recoveryResolutions[name] = result.removedDirectory ? "absent" : "retained";
-        await verify();
-        journal.recoverySettlement ??= {
+        journal.recoverySettlement = {
+          schemaVersion: 2,
           operationId,
           backingGeneration: journal.backingGeneration,
           nativeGeneration: journal.nativeGeneration,
           result,
         };
+        if (decision.recordConfirmation)
+          journal.recoveryClosure = {
+            schemaVersion: 2,
+            operationId,
+            backingGeneration: journal.backingGeneration,
+            acknowledgedAt: new Date().toISOString(),
+          };
         journal.result = {
           ...result,
           retirement: { operationId, state: "partial", code: "completion_pending" },
         };
         await persist();
-        let receipt;
-        for (let attempt = 0; ; attempt++) {
-          const fresh = await authority.inspect();
-          const intent: WorkspaceLayoutCommit = {
-            writerVersion: 3,
-            requestId: `retire:${operationId}:${journal.intents.length}`,
-            expected: fresh.stamp,
-            mutations: [{ kind: "complete-retirement", operationId }],
-          };
-          journal.intents.push(intent);
-          await persist();
-          try {
-            receipt = await authority.commit(intent);
-            break;
-          } catch (error) {
-            receipt = await authority.findReceipt(intent.requestId);
-            if (receipt) {
-              if (receipt.requestSha256 !== hashLayoutValue(intent))
-                throw new WorkspaceLayoutRefusal("retirement_receipt_conflict");
-              break;
-            }
-            if (
-              attempt < 2 &&
-              error instanceof Error &&
-              "code" in error &&
-              error.code === "stale_revision"
-            )
-              continue;
-            throw error;
-          }
-        }
-        journal.result = { ...result, retirement: { operationId, state: "complete", receipt } };
+        const completedReceipt = await commitRecoveryCompletion(authority, journal, persist);
+        journal.result = {
+          ...result,
+          retirement: { operationId, state: "complete", receipt: completedReceipt },
+        };
         await persist();
         const caller = await readCallerOperation(authority, operationId);
         if (caller) {
@@ -1454,15 +1300,227 @@ async function recoverRetirement(
           await writeFileDurably(operationFile(authority, operationId), JSON.stringify(caller));
         }
         return journal.result;
-      }
-      runningRetirementJournals.add(located.file);
-      try {
-        return await finish(await settleDirectory());
       } finally {
         runningRetirementJournals.delete(located.file);
       }
     },
   );
+}
+
+function throwRecoveryDecision(decision: RecoveryDecision): never {
+  if (decision.kind === "fence" || decision.kind === "reject")
+    throw new WorkspaceLayoutRefusal(
+      decision.code,
+      decision.kind === "reject" ? decision.diagnostic : undefined,
+    );
+  throw new WorkspaceLayoutRefusal("retirement_recovery_effect_closure_required");
+}
+
+function recoveryReadCode(error: unknown): string {
+  if (error instanceof WorkspaceLayoutRefusal) return error.code;
+  if (error instanceof WorkspaceAutomationBlockedError) return "workspace_automation_blocked";
+  if (error instanceof Error) return error.message;
+  return "retirement_observation_unavailable";
+}
+
+type RetirementReserve = Extract<WorkspaceLayoutMutation, { kind: "reserve-retirement" }>;
+async function observeArchiveReceipt(
+  authority: RetirementAuthority,
+  journal: RetirementJournal,
+  reserve: RetirementReserve,
+  snapshot: WorkspaceLayoutSnapshot,
+): Promise<RecoveryObservation["receipt"]> {
+  const operation = snapshot.retirements?.find(
+    (candidate) => candidate.operationId === journal.operationId,
+  );
+  if (
+    !operation ||
+    operation.state !== "archived" ||
+    operation.archivedAt !== journal.archiveTimestamp ||
+    reserve.ownerServerId !== authority.options.serverId ||
+    reserve.targets.some((target) => target.ref.serverId !== authority.options.serverId)
+  )
+    return { kind: "missing" };
+  const intent = journal.intents.findLast((candidate) =>
+    candidate.mutations.some(
+      (mutation) =>
+        mutation.kind === "archive-retirement" && mutation.operationId === journal.operationId,
+    ),
+  );
+  const receipt = intent && (await authority.findReceipt(intent.requestId));
+  return receipt && intent && receipt.requestSha256 === hashLayoutValue(intent)
+    ? { kind: "ok" }
+    : { kind: "missing" };
+}
+
+async function verifyRecoveryGuards(
+  input: RetirementRecoveryInput,
+  journal: RetirementJournal,
+  records: PersistedWorkspaceRecord[],
+  ids: string[],
+  snapshot: WorkspaceLayoutSnapshot,
+  replayInput: ReplayInput,
+): Promise<void> {
+  const { authority } = input;
+  if (
+    snapshot.stamp.phase !== "active" ||
+    snapshot.ownerDomains?.find((domain) => domain.serverId === authority.options.serverId)
+      ?.state !== "adopted"
+  )
+    throw new WorkspaceLayoutRefusal("retirement_owner_unavailable");
+  await verifyRecoveryInventory(input, journal, snapshot, new Set(ids));
+  const operation = snapshot.retirements?.find(
+    (candidate) => candidate.operationId === journal.operationId,
+  );
+  assertReplayBinding(journal, replayInput, operation);
+  if (
+    !operation ||
+    operation.state !== "archived" ||
+    operation.archivedAt !== journal.archiveTimestamp
+  )
+    throw new WorkspaceLayoutRefusal("retirement_reservation_unverified");
+  for (const original of records) {
+    const current = await input.getRecord(original.workspaceId);
+    if (
+      !current ||
+      nativeGeneration([current]) !== nativeGeneration([original]) ||
+      current.archivedAt !== journal.archiveTimestamp
+    )
+      throw new WorkspaceLayoutRefusal("retirement_native_generation_changed");
+    if (nativeHold(current)) throw new WorkspaceLayoutRefusal("retirement_native_hold");
+    assertWorkspaceAutomationAllowed(current.untrustedSource);
+    await input.assertHolds(current.workspaceId);
+  }
+}
+
+async function gatherRecovery(
+  input: RetirementRecoveryInput,
+  journal: RetirementJournal,
+  reserve: RetirementReserve,
+  ids: string[],
+  file: string,
+  directory: string,
+) {
+  const { authority } = input;
+  const errors = new Map<string, unknown>();
+  const capture = (error: unknown) => {
+    const code = recoveryReadCode(error);
+    errors.set(code, error);
+    return code;
+  };
+  let snapshot: WorkspaceLayoutSnapshot | undefined;
+  let records: PersistedWorkspaceRecord[] = [];
+  let guard: string | null = null;
+  let receipt: RecoveryObservation["receipt"] = { kind: "missing" };
+  try {
+    snapshot = await authority.inspect();
+  } catch (error) {
+    receipt = { kind: "outage", code: capture(error) };
+  }
+  try {
+    records = await Promise.all(
+      ids.map(async (id) => {
+        const record = await input.getRecord(id);
+        if (!record) throw new WorkspaceLayoutRefusal("retirement_native_generation_changed");
+        return record;
+      }),
+    );
+  } catch (error) {
+    guard = capture(error);
+  }
+  const replayInput: ReplayInput = {
+    authority,
+    records,
+    generation: nativeGeneration(records),
+    file,
+    journalDirectory: directory,
+    operationId: journal.operationId,
+  };
+  let completed = false;
+  if (snapshot) {
+    try {
+      receipt = await observeArchiveReceipt(authority, journal, reserve, snapshot);
+    } catch (error) {
+      receipt = { kind: "outage", code: capture(error) };
+    }
+    if (!guard) {
+      try {
+        const operation = snapshot.retirements?.find(
+          (candidate) => candidate.operationId === journal.operationId,
+        );
+        assertReplayBinding(journal, replayInput, operation);
+        completed = completionKnown(journal, operation);
+        if (!completed)
+          await verifyRecoveryGuards(input, journal, records, ids, snapshot, replayInput);
+      } catch (error) {
+        guard = capture(error);
+      }
+    }
+  }
+  let backing: RecoveryObservation["backing"];
+  let backingToken: string | undefined;
+  try {
+    const current = await recoveryBackingStat(journal);
+    backingToken = hashLayoutValue(current);
+    const recorded = journal.backingObservations?.some((row) => row.path === journal.backingPath);
+    if (!current) backing = { kind: "absent" };
+    else backing = { kind: recorded ? "present-match" : "present-unrecorded" };
+  } catch (error) {
+    const code = capture(error);
+    backing =
+      code === "retirement_backing_generation_changed"
+        ? { kind: "present-mismatch" }
+        : { kind: "unreadable", code };
+  }
+  return {
+    records,
+    replayInput,
+    backingToken,
+    errors,
+    observation: {
+      running: false,
+      completionKnown: completed,
+      receipt,
+      guards: guard,
+      backing,
+    } satisfies RecoveryObservation,
+  };
+}
+
+async function commitRecoveryCompletion(
+  authority: RetirementAuthority,
+  journal: RetirementJournal,
+  persist: () => Promise<void>,
+) {
+  for (let attempt = 0; ; attempt++) {
+    const fresh = await authority.inspect();
+    const intent: WorkspaceLayoutCommit = {
+      writerVersion: 3,
+      requestId: `retire:${journal.operationId}:${journal.intents.length}`,
+      expected: fresh.stamp,
+      mutations: [{ kind: "complete-retirement", operationId: journal.operationId }],
+    };
+    journal.intents.push(intent);
+    await persist();
+    try {
+      return await authority.commit(intent);
+    } catch (error) {
+      const receipt = await authority.findReceipt(intent.requestId);
+      if (receipt) {
+        if (receipt.requestSha256 !== hashLayoutValue(intent))
+          throw new WorkspaceLayoutRefusal("retirement_receipt_conflict");
+        return receipt;
+      }
+      if (
+        attempt < 2 &&
+        error instanceof Error &&
+        "code" in error &&
+        error.code === "stale_revision"
+      )
+        continue;
+      throw error;
+    }
+  }
 }
 
 async function recoveryBackingStat(journal: RetirementJournal) {
@@ -1477,68 +1535,6 @@ async function recoveryBackingStat(journal: RetirementJournal) {
   if (observed && current && hashLayoutValue(observed.stat) !== hashLayoutValue(current))
     throw new WorkspaceLayoutRefusal("retirement_backing_generation_changed");
   return current;
-}
-
-function removalAttemptState(
-  journal: RetirementJournal,
-): "none" | "not_started" | "closed" | "unknown" {
-  const name = "remove-directory";
-  const step = journal.steps[name];
-  const closure = journal.effectClosures?.[name];
-  const resolution = journal.recoveryResolutions?.[name];
-  const history = journal.effectAttemptHistory?.[name] ?? [];
-  if (!step && !closure && !resolution && history.length === 0)
-    return journal.recoveryEffectPending === true ? "unknown" : "none";
-  if (removalNeverInvoked(journal)) return "not_started";
-  if (recoveryClosureAcknowledged(journal)) return "closed";
-  if (
-    journal.recoveryEffectPending === true ||
-    history.some((previous) => previous !== "not_started")
-  )
-    return "unknown";
-  if (
-    step === "done" ||
-    (step === "started" && (closure === "closed" || closure === "timed_out" || resolution))
-  )
-    return "closed";
-  return "unknown";
-}
-
-function removalAttemptCount(journal: RetirementJournal): number {
-  return (
-    (journal.effectAttemptHistory?.["remove-directory"]?.length ?? 0) +
-    Number(journal.steps["remove-directory"] !== undefined)
-  );
-}
-
-function removalNeverInvoked(journal: RetirementJournal): boolean {
-  return (
-    journal.steps["remove-directory"] === "started" &&
-    journal.effectClosures?.["remove-directory"] === "not_started" &&
-    journal.recoveryEffectPending === false &&
-    !journal.recoveryResolutions?.["remove-directory"] &&
-    (journal.effectAttemptHistory?.["remove-directory"] ?? []).every(
-      (previous) => previous === "not_started",
-    )
-  );
-}
-
-function recoveryClosureAcknowledged(journal: RetirementJournal): boolean {
-  const closure = journal.recoveryClosure;
-  return (
-    closure?.schemaVersion === 2 &&
-    closure.operationId === journal.operationId &&
-    closure.backingGeneration === journal.backingGeneration &&
-    journal.recoveryEffectPending !== true
-  );
-}
-
-function assertStepMayStart(journal: RetirementJournal, name: string): void {
-  if (name === "remove-directory") {
-    const state = removalAttemptState(journal);
-    if (state === "none" || state === "not_started") return;
-  } else if (!journal.steps[name]) return;
-  throw new WorkspaceLayoutRefusal("retirement_effect_already_started");
 }
 
 async function verifyRecoveryInventory(
@@ -1596,132 +1592,30 @@ async function verifyRecoveryInventory(
   }
 }
 
-function validateRecoveryInput(input: RetirementRecoveryInput, journal: RetirementJournal): void {
-  const settlement = journal.recoverySettlement;
-  if (
-    settlement &&
-    (settlement.operationId !== journal.operationId ||
-      settlement.backingGeneration !== journal.backingGeneration ||
-      settlement.nativeGeneration !== journal.nativeGeneration)
-  )
-    throw new WorkspaceLayoutRefusal("retirement_journal_binding_changed");
-  if (
-    input.expectedBackingGeneration &&
-    input.expectedBackingGeneration !== journal.backingGeneration
-  )
-    throw new WorkspaceLayoutRefusal("retirement_backing_generation_changed");
-  if (input.effectsClosed && input.expectedBackingGeneration !== journal.backingGeneration)
-    throw new WorkspaceLayoutRefusal("retirement_recovery_confirmation_binding_required");
-  if (
-    journal.backingObservations &&
-    hashLayoutValue({
-      observed: journal.backingObservations,
-      generation: journal.nativeGeneration,
-    }) !== journal.backingGeneration
-  )
-    throw new WorkspaceLayoutRefusal("retirement_backing_generation_changed");
-}
-
-function verifyRecoveryClosure(
-  input: RetirementRecoveryInput,
-  journal: RetirementJournal,
-  unsettled: readonly [string, "started" | "done"][],
-): void {
-  const acknowledged = recoveryClosureAcknowledged(journal);
-  const producerClosed =
-    acknowledged || unsettled.every(([name]) => journal.effectClosures?.[name] !== undefined);
-  if (unsettled.length && !producerClosed && !input.effectsClosed)
-    throw new WorkspaceLayoutRefusal("retirement_recovery_effect_closure_required");
-  if (input.effectsClosed)
-    journal.recoveryClosure = {
-      schemaVersion: 2,
-      operationId: journal.operationId,
-      backingGeneration: journal.backingGeneration,
-      acknowledgedAt: new Date().toISOString(),
-    };
-  if (input.effectsClosed) journal.recoveryEffectPending = false;
-}
-
 async function executeRetirementStep<T>(input: {
   journal: RetirementJournal;
   name: string;
   effect: () => Promise<T>;
   persist: () => Promise<void>;
-  beforeEffect?: () => Promise<void>;
 }): Promise<T> {
   const { journal, name, effect, persist } = input;
-  assertStepMayStart(journal, name);
-  if (journal.steps[name]) {
-    // Preserve the proven pre-invocation failure before admitting the first
-    // effect. The pending write below makes any intervening crash ambiguous.
-    journal.effectAttemptHistory ??= {};
-    (journal.effectAttemptHistory[name] ??= []).push("not_started");
-  }
+  if (journal.steps[name]) throw new WorkspaceLayoutRefusal("retirement_effect_already_started");
   const destructive = destructiveStep(name);
-  if (destructive) {
-    journal.effectClosures ??= {};
-    delete journal.effectClosures[name];
-    delete journal.recoveryClosure;
-    journal.recoveryEffectPending = true;
-  }
+  if (destructive) journal.recoveryEffectPending = true;
   journal.steps[name] = "started";
-  let invoked = false;
   try {
     await persist();
-    await input.beforeEffect?.();
-    invoked = true;
     const value = await effect();
     journal.steps[name] = "done";
     return value;
   } catch (error) {
-    if (destructive) {
-      if (!invoked) journal.effectClosures![name] = "not_started";
-      else if (error instanceof GitCommandError && error.processClosed)
-        journal.effectClosures![name] =
-          error instanceof GitCommandTimeoutError ? "timed_out" : "closed";
-    }
+    if (destructive && error instanceof GitCommandError && error.processClosed)
+      (journal.effectClosures ??= {})[name] =
+        error instanceof GitCommandTimeoutError ? "timed_out" : "closed";
     throw error;
   } finally {
     if (destructive && (journal.steps[name] === "done" || journal.effectClosures?.[name]))
       journal.recoveryEffectPending = false;
     await persist();
   }
-}
-
-async function verifyRecoveryArchive(input: {
-  authority: RetirementAuthority;
-  journal: RetirementJournal;
-  operation: WorkspaceRetirement | undefined;
-  reserve: Extract<WorkspaceLayoutMutation, { kind: "reserve-retirement" }>;
-  ids: readonly string[];
-}): Promise<void> {
-  const { authority, journal, operation, reserve, ids } = input;
-  const operationId = journal.operationId;
-  if (
-    !operation ||
-    operation.state !== "archived" ||
-    operation.archivedAt !== journal.archiveTimestamp ||
-    reserve.ownerServerId !== authority.options.serverId ||
-    reserve.targets.some((target) => target.ref.serverId !== authority.options.serverId)
-  )
-    throw new WorkspaceLayoutRefusal("retirement_archive_receipt_required");
-  const archiveIntent = journal.intents.findLast((intent) =>
-    intent.mutations.some(
-      (mutation) => mutation.kind === "archive-retirement" && mutation.operationId === operationId,
-    ),
-  );
-  const archivedReceipt = archiveIntent && (await authority.findReceipt(archiveIntent.requestId));
-  if (
-    !archiveIntent ||
-    !archivedReceipt ||
-    archivedReceipt.requestSha256 !== hashLayoutValue(archiveIntent)
-  )
-    throw new WorkspaceLayoutRefusal("retirement_archive_receipt_required");
-  if (
-    !ids.every((id) => journal.steps[`native-archive:${id}`] === "done") ||
-    Object.entries(journal.steps).some(
-      ([name, state]) => state !== "done" && !destructiveStep(name),
-    )
-  )
-    throw new WorkspaceLayoutRefusal("retirement_recovery_non_path_effect_uncertain");
 }

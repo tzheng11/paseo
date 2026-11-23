@@ -107,6 +107,8 @@ export interface ArchiveResult {
 
 export interface ArchiveByScopeRequest {
   recoverRetirement?: boolean;
+  expectedBackingGeneration?: string;
+  effectsClosed?: boolean;
   operationId?: string;
   scope: ArchiveScope;
   requestId: string;
@@ -172,7 +174,15 @@ export async function archiveByScope(
   if (request.recoverRetirement) {
     if (!request.operationId || request.scope.kind !== "workspace")
       throw new Error("retirement_recovery_operation_required");
-    return recoverWorkspaceRetirement(dependencies, request.operationId, request.scope.workspaceId);
+    return recoverWorkspaceRetirement(
+      dependencies,
+      request.operationId,
+      request.scope.workspaceId,
+      {
+        expectedBackingGeneration: request.expectedBackingGeneration,
+        effectsClosed: request.effectsClosed,
+      },
+    );
   }
 
   if (request.operationId) {
@@ -1047,27 +1057,6 @@ export async function recoverWorkspaceRetirement(
     nativeInventory: dependencies.listRetirementRecords,
     assertHolds: async (id) => {
       await dependencies.assertWorkspaceAutomationAllowed?.(id);
-    },
-    retryDirectory: async (records, backingPath) => {
-      const backing = await resolveWorkspaceBackingDirectory(records[0], dependencies);
-      if (resolve(backing.path) !== resolve(backingPath))
-        throw new Error("retirement_backing_generation_changed");
-      const outcome = await maybeRemoveDirectory(
-        dependencies,
-        { requestId: `recover:${operationId}` },
-        {
-          backing,
-          workspaceIds: records.map((row) => row.workspaceId),
-          teardownTargets: [],
-          setupWorkspaceIds: [],
-        },
-        records.map((row) => row.workspaceId),
-      );
-      return {
-        archivedWorkspaceIds: records.map((row) => row.workspaceId),
-        archivedAgentIds: [],
-        ...outcome,
-      };
     },
   });
 }

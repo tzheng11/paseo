@@ -509,46 +509,40 @@ advertising `features.workspaceRetirementRecovery` can explicitly run
 `workspace.manage` and reuses the original operation, target footprint and authority
 receipt; it never selects a workspace by path or newest receipt.
 
-Recovery refuses while the original owner is running, or while non-path effects
-are unresolved. Closure proof is durable and specific to the destructive attempt.
-A legacy failed result alone proves neither timeout exit nor child closure.
-Without proof, the owner must first verify that the previous producer has ended,
-then confirm it using `--effects-closed` together with
-`--backing-generation <digest-from-retirement-status>`. The daemon validates and
-records that operation-bound assertion. Starting another effect invalidates its
-previous proof and confirmation; neither can authorize a later unknown attempt.
+Recovery never runs Git removal or teardown hooks. It only settles an observed
+absent directory, retains a present one honestly, or keeps the operation fenced.
+Retained directories go to the slotKept cleanup follow-up, which owns teardown
+planning and clean removal as a separate operation. No byte reclamation is claimed
+by `removedDirectory:false`, `slotKept:true`.
 
-After verified native archival, recovery holds the original backing and identity
-leases and rechecks native generations, holds and the archive receipt. An already
-absent directory needs no second removal. Missing legacy inode observations allow
-only conservative retention. A **known different inode is a refusal**, including
-one discovered after first-removal admission. No attempt, or a proven
-pre-invocation `not_started` failure, may admit the first removal through the same
-backing guards. The failed preflight record is kept in append-only attempt history
-before a fresh pending intent is persisted; a crash there is ambiguous and refuses
-another launch. A spawned attempt with proven closure settles the observed backing
-as absent or retained, without another Git removal. Unknown or contradictory launch
-or closure evidence stays partial and fenced. A failed archive-receipt lookup leaves the
-operation partial and fenced. Later recovery retries that lookup before settlement,
-including after an automatic timeout handoff failed. A still-present directory
-keeps `git_removal_timed_out` for a proven timeout, or
-`recovery_removal_attempt_retained` for another recorded attempt. Recovery can run
-the existing ownership/shared-reference/source checks and non-forcing Git removal
-only if no spawned removal is recorded and any previous pre-invocation failure is
-proven `not_started`. Status and ordinary routine replay remain read-only.
-Once a settlement is saved, completion retries reuse it and retry only the
-completion commit. They never run deletion again. A retained terminal receipt
-reports `removedDirectory:false`, `slotKept:true` and a reason; it does not claim
-bytes reclaimed.
+A pure classifier reads the unchanged journal, observations and confirmation.
+Contradictory launch evidence rejects before confirmation is considered. A saved
+acknowledgement alone, intermediate `not_started`/history fields and an unversioned
+settlement are not exit proof. Only the writer's own proven close, no started
+destructive producer, a bound v2 settlement, or fresh bound owner confirmation can
+allow settlement. Missing receipts, unknown closure, holds, changed references,
+unreadable backing and known inode replacement keep the fence. Fence and reject
+outcomes write neither the journal nor the caller-operation record. A settled v2
+result is reused if authority completion must be retried.
 
-An uncertain teardown hook is never replayed. Its directory is retained. Version-1
-journals without the saved backing observation also finish conservatively with
-`recovery_backing_identity_unverified`; they cannot authorize deletion of a later
-backing generation. Recovery resolutions are durable alongside the original step
-history, so interruption of completion can reconcile the same authority receipt
-without another teardown or deletion. Old native identities remain tombstoned;
-a completed old operation cannot select a replacement workspace at the same path.
-The capability is required before sending a recovery request to an older owner.
+For a legacy started step without close proof, its owner must establish producer
+exit before `--effects-closed --backing-generation <digest-from-retirement-status>`.
+Never use argv. Use one of these read-only proofs on the original owner:
+
+- Process window: `ps -A -o pid=,ppid=,lstart=,comm=`, converting local `lstart` to
+  UTC and retaining only `git`/`git-*` basenames started between the archive timestamp
+  floored to a second and the first recorded read that already showed the failed
+  step. No matching row proves exit; any match blocks that proof.
+- Boot time: `sysctl -n kern.boottime` later than that failure-observation time
+  proves the old producer has exited.
+
+A matching confirmation is exit proof only. When it is needed, its audit and the
+v2 settlement are written together after the decision and a read-only guard/backing
+recheck. Confirmation never rewrites pending, closure or launch-history evidence.
+A legacy journal without inode observations retains a present backing with
+`recovery_backing_identity_unverified`; an absent backing is reported absent.
+Old native identities remain tombstoned, and a completed operation replays its
+original result without selecting a replacement workspace at the same path.
 No configuration, import or activation change is involved.
 
 A definite, receipt-checked reservation refusal with no effects is terminal and
