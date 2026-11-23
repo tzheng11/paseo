@@ -159,7 +159,10 @@ export async function runCreateCommand(
     });
     if (!payload.workspace) {
       throw {
-        code: payload.errorCode ?? "WORKSPACE_CREATE_FAILED",
+        code:
+          payload.errorCode === "retirement_conflict"
+            ? "retirement_conflict"
+            : "WORKSPACE_CREATE_FAILED",
         message: payload.error ?? "Workspace creation failed",
       } satisfies CommandError;
     }

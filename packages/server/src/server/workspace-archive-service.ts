@@ -34,7 +34,8 @@ import type {
   WorkspaceRegistry,
 } from "./workspace-registry.js";
 import { createRealpathAwarePathMatcher } from "../utils/path.js";
-import { runWithGitCommandPriority } from "../utils/run-git-command.js";
+import { runWithGitCommandPriority, GitCommandTimeoutError } from "../utils/run-git-command.js";
+import { WorkspaceLayoutRefusal } from "./workspace-layout-store.js";
 import { WorkspaceAutomationBlockedError } from "./workspace-automation-gate.js";
 import { withTimeout } from "../utils/promise-timeout.js";
 import { assertWorkspaceRetirementAllowed } from "./workspace-layout-mode.js";
@@ -734,12 +735,20 @@ async function maybeRemoveDirectory(
     dependencies.github.invalidate({ cwd: backing.path });
     return { removedDirectory: true };
   } catch (error) {
+    if (canonicalRemovalMustRefuse(error)) throw error;
     dependencies.sessionLogger?.warn(
       { err: error, targetPath: backing.path, requestId: request.requestId },
       "Worktree disk removal failed during archive; workspace already archived",
     );
     return { removedDirectory: false };
   }
+}
+
+function canonicalRemovalMustRefuse(error: unknown): boolean {
+  return (
+    hasWorkspaceRetirement() &&
+    (error instanceof WorkspaceLayoutRefusal || error instanceof GitCommandTimeoutError)
+  );
 }
 
 async function filterAllowedTeardownTargets(

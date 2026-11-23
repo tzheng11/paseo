@@ -450,6 +450,33 @@ describe("runGitCommand", () => {
     expect(fakeSpawnController.peakActiveCount).toBe(1);
   });
 
+  it("REVISION1 destructive timeout keeps its caller pending until actual process close", async () => {
+    const { runGitCommand } = await loadRunGitCommand(1);
+    vi.useFakeTimers();
+    try {
+      enqueueSpawnBehaviors({ delayMs: 5000, killExitDelayMs: 100, killCloseDelayMs: 500 });
+      let outcome: unknown = null;
+      const command = runGitCommand(["worktree", "remove", "owned-fixture"], {
+        cwd: process.cwd(),
+        timeout: 20,
+        awaitExitOnTimeout: true,
+      }).catch((error: unknown) => {
+        outcome = error;
+      });
+      await vi.advanceTimersByTimeAsync(21);
+      expect(fakeSpawnController.processes[0]?.killed).toBe(true);
+      expect(outcome).toBeNull();
+      await vi.advanceTimersByTimeAsync(100);
+      expect(fakeSpawnController.processes[0]?.exited).toBe(true);
+      expect(outcome).toBeNull();
+      await vi.advanceTimersByTimeAsync(500);
+      await command;
+      expect(outcome).toMatchObject({ processClosed: true });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("finishes process metrics at exit without waiting for close", async () => {
     const { runGitCommand, startGitCommandMetrics, stopGitCommandMetrics } =
       await loadRunGitCommand(1);

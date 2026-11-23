@@ -1228,7 +1228,11 @@ export async function deletePaseoWorktree({
   if (requireCleanRemoval) {
     if (!cwd) throw new Error("A repository is required for clean worktree removal");
     // Git owns the final dirty/untracked check. Never fall through to forced recursive removal.
-    await runGitCommand(["worktree", "remove", resolvedWorktree], { cwd, timeout: 120_000 });
+    await runGitCommand(["worktree", "remove", resolvedWorktree], {
+      cwd,
+      timeout: 120_000,
+      awaitExitOnTimeout: true,
+    });
     return;
   }
   if (cwd) {

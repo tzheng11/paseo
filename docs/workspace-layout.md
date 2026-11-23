@@ -493,6 +493,15 @@ the operation without repeating removal or icon cleanup. A completed request ret
 its original outcome without touching a later project or slot generation.
 
 An interrupted or uncertain effect remains journaled and fenced, without a TTL.
+Canonical clean removal keeps the 120-second Git work deadline. Sending a kill or
+rejecting a promise is not proof that Git stopped: the backing lease stays held
+until the child and its stdio actually close. After a proven timeout close, the
+owner automatically settles and completes the **same operation** through its
+recovery path. It records either an already-absent directory or a retained one
+with `git_removal_timed_out`; it runs no second removal or teardown hook.
+If closure never arrives, the operation stays nonterminal and its lease/fence
+remains. A client deadline may expire while the owner drains that attempt.
+
 Status reads and ordinary archive replay never start recovery. An owner on a host
 advertising `features.workspaceRetirementRecovery` can explicitly run
 `paseo workspace retirement-recover <operation-id> --json`, or call
@@ -501,22 +510,24 @@ advertising `features.workspaceRetirementRecovery` can explicitly run
 receipt; it never selects a workspace by path or newest receipt.
 
 Recovery refuses while the original owner is running, or while non-path effects
-are unresolved. A durable failed result records that the original awaited producer
-returned. A crash with no such closure evidence instead requires the owner to
-confirm that the previous producer has ended, using `--effects-closed` together
-with `--backing-generation <digest-from-retirement-status>`. This is an explicit,
-operation-bound owner assertion, not a timeout heuristic or an automatic retry.
-The daemon refuses a missing/mismatched generation and records the assertion.
-Without closure evidence, it retains the existing fence rather than allowing an
-old cleanup process to affect a reused backing. After verified native archival it holds the original backing and
-identity leases, rechecks native generations, holds and the archive receipt, then
-settles the remaining directory obligation. An already-absent directory needs no
-second removal. For a still-present backing, a saved inode observation must match
-before retrying the existing ownership/shared-reference/source checks and
-non-forcing Git removal. The retry keeps the 120-second Git bound. If removal
-cannot finish, the same operation completes with `removedDirectory:false`,
-`slotKept:true` and `directoryLeftBehind.reason`, releasing its dependency fence.
-That receipt does not claim bytes reclaimed.
+are unresolved. Closure proof is durable and specific to the destructive attempt.
+A legacy failed result alone proves neither timeout exit nor child closure.
+Without proof, the owner must first verify that the previous producer has ended,
+then confirm it using `--effects-closed` together with
+`--backing-generation <digest-from-retirement-status>`. The daemon validates and
+records that operation-bound assertion. Starting another effect invalidates its
+previous proof and confirmation; neither can authorize a later unknown attempt.
+
+After verified native archival, recovery holds the original backing and identity
+leases and rechecks native generations, holds and the archive receipt. An already
+absent directory needs no second removal. Missing legacy inode observations allow
+only conservative retention. A **known different inode is a refusal**, including
+one discovered after retry admission. A verified original backing can retry the
+existing ownership/shared-reference/source checks and non-forcing Git removal.
+Once a settlement is saved, completion retries reuse it and retry only the
+completion commit. They never run deletion again. A retained terminal receipt
+reports `removedDirectory:false`, `slotKept:true` and a reason; it does not claim
+bytes reclaimed.
 
 An uncertain teardown hook is never replayed. Its directory is retained. Version-1
 journals without the saved backing observation also finish conservatively with

@@ -64,11 +64,23 @@ export interface GitCommandOptions {
   envOverlay?: ProcessEnvRecord;
   logger?: Pick<Logger, "trace">;
   timeout?: number;
+  /** Destructive callers retain ownership until the killed child's stdio has closed. */
+  awaitExitOnTimeout?: boolean;
   maxOutputBytes?: number;
   acceptExitCodes?: number[];
   /** User-requested ignore inventories share high-priority read admission. */
   inventoryLane?: "interactive";
 }
+
+export class GitCommandError extends Error {
+  constructor(
+    message: string,
+    public processClosed = false,
+  ) {
+    super(message);
+  }
+}
+export class GitCommandTimeoutError extends GitCommandError {}
 
 export interface GitCommandResult<Output = string> {
   stdout: Output;
@@ -361,7 +373,7 @@ function executeGitCommand<Output>(
       let metricFinished = false;
       let processError: Error | null = null;
       let processExit: { exitCode: number | null; signal: NodeJS.Signals | null } | null = null;
-      let timeoutError: Error | null = null;
+      let timeoutError: GitCommandTimeoutError | null = null;
       let truncated = false;
       let stdoutBytes = 0;
       let stderrBytes = 0;
@@ -459,16 +471,18 @@ function executeGitCommand<Output>(
       }
 
       timer = setTimeout(() => {
-        timeoutError = new Error(`Git command timed out after ${timeout}ms: ${command}`);
+        timeoutError = new GitCommandTimeoutError(
+          `Git command timed out after ${timeout}ms: ${command}`,
+        );
         killGitProcess(child);
-        settle(() => reject(timeoutError));
+        if (!options.awaitExitOnTimeout) settle(() => reject(timeoutError));
         if (processExit) {
           settleTimeoutTrace(processExit.exitCode, processExit.signal);
         }
       }, timeout);
 
       stdout.on("data", (chunk: Buffer | string) => {
-        if (settled || truncated) return;
+        if (settled || truncated || timeoutError) return;
 
         const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
         const remainingBytes = maxOutputBytes - stdoutBytes;
@@ -492,7 +506,7 @@ function executeGitCommand<Output>(
       });
 
       stderr.on("data", (chunk: Buffer | string) => {
-        if (settled || stderrBytes >= DEFAULT_STDERR_LIMIT) return;
+        if (settled || timeoutError || stderrBytes >= DEFAULT_STDERR_LIMIT) return;
 
         const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
         const remainingBytes = DEFAULT_STDERR_LIMIT - stderrBytes;
@@ -559,6 +573,8 @@ function executeGitCommand<Output>(
         }
 
         if (timeoutError) {
+          timeoutError.processClosed = true;
+          settle(() => reject(timeoutError));
           return;
         }
 
@@ -585,8 +601,9 @@ function executeGitCommand<Output>(
 
           settle(() =>
             reject(
-              new Error(
+              new GitCommandError(
                 `Git command failed: ${command}${truncationNote} (exit code: ${String(exitCode)}, signal: ${signal ?? "none"})\n${stderrPreview}`,
+                true,
               ),
             ),
           );
