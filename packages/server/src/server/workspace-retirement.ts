@@ -517,12 +517,9 @@ export async function retireCanonicalWorkspace(input: RetirementInput): Promise<
           getRecord: input.getRecord,
           nativeInventory: input.nativeInventory,
           assertHolds: input.assertHolds,
-          retryDirectory: async () => ({
-            ...failed,
-            removedDirectory: false,
-            slotKept: true,
-            directoryLeftBehind: { path: journal.backingPath, reason: "git_removal_timed_out" },
-          }),
+          retryDirectory: async () => {
+            throw new WorkspaceLayoutRefusal("retirement_effect_already_started");
+          },
         },
         true,
       );
@@ -1316,6 +1313,12 @@ async function recoverRetirement(
         else if (unsettled.some(([name]) => name.startsWith("path-teardown:")))
           result = retained("recovery_uncertain_teardown_retained");
         else if (!observed) result = retained("recovery_backing_identity_unverified");
+        else if (removalAttemptRecorded(journal))
+          result = retained(
+            journal.effectClosures?.["remove-directory"] === "timed_out"
+              ? "git_removal_timed_out"
+              : "recovery_removal_attempt_retained",
+          );
         else {
           try {
             result = await withWorkspaceRetirement(
@@ -1333,7 +1336,8 @@ async function recoverRetirement(
                   throw new WorkspaceLayoutRefusal("retirement_already_archived");
                 },
                 step: async (name, effect) => {
-                  if (journal.steps[name] === "done") return undefined as never;
+                  if (journal.steps[name])
+                    throw new WorkspaceLayoutRefusal("retirement_effect_already_started");
                   if (name !== "remove-directory")
                     throw new WorkspaceLayoutRefusal("retirement_recovery_hook_not_active");
                   await verify();
@@ -1468,6 +1472,14 @@ async function recoveryBackingStat(journal: RetirementJournal) {
   return current;
 }
 
+function removalAttemptRecorded(journal: RetirementJournal): boolean {
+  return (
+    journal.steps["remove-directory"] !== undefined ||
+    journal.effectClosures?.["remove-directory"] !== undefined ||
+    journal.recoveryResolutions?.["remove-directory"] !== undefined
+  );
+}
+
 async function verifyRecoveryInventory(
   input: RetirementRecoveryInput,
   journal: RetirementJournal,
@@ -1582,6 +1594,7 @@ async function executeRetirementStep<T>(input: {
   beforeEffect?: () => Promise<void>;
 }): Promise<T> {
   const { journal, name, effect, persist } = input;
+  if (journal.steps[name]) throw new WorkspaceLayoutRefusal("retirement_effect_already_started");
   const destructive = destructiveStep(name);
   if (destructive) {
     journal.effectClosures ??= {};

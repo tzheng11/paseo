@@ -522,8 +522,15 @@ After verified native archival, recovery holds the original backing and identity
 leases and rechecks native generations, holds and the archive receipt. An already
 absent directory needs no second removal. Missing legacy inode observations allow
 only conservative retention. A **known different inode is a refusal**, including
-one discovered after retry admission. A verified original backing can retry the
-existing ownership/shared-reference/source checks and non-forcing Git removal.
+one discovered after first-removal admission. Once any removal attempt is recorded,
+every recovery entry point settles the observed backing as absent or retained;
+it never issues another Git removal. A failed archive-receipt lookup leaves the
+operation partial and fenced. Later recovery retries that lookup before settlement,
+including after an automatic timeout handoff failed. A still-present directory
+keeps `git_removal_timed_out` for a proven timeout, or
+`recovery_removal_attempt_retained` for another recorded attempt. Recovery can run
+the existing ownership/shared-reference/source checks and non-forcing Git removal
+only if no removal attempt has been recorded.
 Once a settlement is saved, completion retries reuse it and retry only the
 completion commit. They never run deletion again. A retained terminal receipt
 reports `removedDirectory:false`, `slotKept:true` and a reason; it does not claim
