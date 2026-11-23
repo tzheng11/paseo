@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import {
   retireCanonicalWorkspace,
+  recoverCanonicalWorkspaceRetirement,
   type RetirementAuthority,
   nativeGeneration,
   commitWorkspaceRetirementArchive,
@@ -33,7 +34,8 @@ import type {
   WorkspaceRegistry,
 } from "./workspace-registry.js";
 import { createRealpathAwarePathMatcher } from "../utils/path.js";
-import { runWithGitCommandPriority } from "../utils/run-git-command.js";
+import { runWithGitCommandPriority, GitCommandTimeoutError } from "../utils/run-git-command.js";
+import { WorkspaceLayoutRefusal } from "./workspace-layout-store.js";
 import { WorkspaceAutomationBlockedError } from "./workspace-automation-gate.js";
 import { withTimeout } from "../utils/promise-timeout.js";
 import { assertWorkspaceRetirementAllowed } from "./workspace-layout-mode.js";
@@ -104,6 +106,9 @@ export interface ArchiveResult {
 }
 
 export interface ArchiveByScopeRequest {
+  recoverRetirement?: boolean;
+  expectedBackingGeneration?: string;
+  effectsClosed?: boolean;
   operationId?: string;
   scope: ArchiveScope;
   requestId: string;
@@ -166,6 +171,20 @@ export async function archiveByScope(
   dependencies: ArchiveDependencies,
   request: ArchiveByScopeRequest,
 ): Promise<ArchiveResult> {
+  if (request.recoverRetirement) {
+    if (!request.operationId || request.scope.kind !== "workspace")
+      throw new Error("retirement_recovery_operation_required");
+    return recoverWorkspaceRetirement(
+      dependencies,
+      request.operationId,
+      request.scope.workspaceId,
+      {
+        expectedBackingGeneration: request.expectedBackingGeneration,
+        effectsClosed: request.effectsClosed,
+      },
+    );
+  }
+
   if (request.operationId) {
     if (
       !dependencies.retirementAuthority ||
@@ -726,12 +745,20 @@ async function maybeRemoveDirectory(
     dependencies.github.invalidate({ cwd: backing.path });
     return { removedDirectory: true };
   } catch (error) {
+    if (canonicalRemovalMustRefuse(error)) throw error;
     dependencies.sessionLogger?.warn(
       { err: error, targetPath: backing.path, requestId: request.requestId },
       "Worktree disk removal failed during archive; workspace already archived",
     );
     return { removedDirectory: false };
   }
+}
+
+function canonicalRemovalMustRefuse(error: unknown): boolean {
+  return (
+    hasWorkspaceRetirement() &&
+    (error instanceof WorkspaceLayoutRefusal || error instanceof GitCommandTimeoutError)
+  );
 }
 
 async function filterAllowedTeardownTargets(
@@ -1010,4 +1037,26 @@ async function retirementSourceIsCleanAndLanded(
   } catch {
     return false;
   } // Failure retains the directory; it never authorizes forced deletion.
+}
+
+export async function recoverWorkspaceRetirement(
+  dependencies: ArchiveDependencies,
+  operationId: string,
+  expectedWorkspaceId?: string,
+  confirmation?: { expectedBackingGeneration?: string; effectsClosed?: boolean },
+): Promise<ArchiveResult> {
+  const authority = dependencies.retirementAuthority;
+  if (!authority || !dependencies.getWorkspace || !dependencies.listRetirementRecords)
+    throw new Error("canonical_retirement_recovery_required");
+  return recoverCanonicalWorkspaceRetirement({
+    authority,
+    operationId,
+    expectedWorkspaceId,
+    ...confirmation,
+    getRecord: dependencies.getWorkspace,
+    nativeInventory: dependencies.listRetirementRecords,
+    assertHolds: async (id) => {
+      await dependencies.assertWorkspaceAutomationAllowed?.(id);
+    },
+  });
 }

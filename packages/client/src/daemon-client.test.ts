@@ -9828,3 +9828,77 @@ test("REV69 retirement capability refusal is typed and not sent", async () => {
     await client.close();
   }
 });
+
+test("retirement recovery capability refuses before send and new hosts correlate the same UUID", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://fixture.invalid",
+    clientId: "recovery",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  const connected = client.connect();
+  mock.triggerOpen();
+  await connected;
+  const operationId = "00000000-0000-4000-8000-000000000001";
+  try {
+    await expect(client.recoverWorkspaceRetirement(operationId)).rejects.toThrow("Update the host");
+    expect(mock.sent).toHaveLength(0);
+  } finally {
+    await client.close();
+  }
+  const next = createMockTransport();
+  const modern = new DaemonClient({
+    url: "ws://fixture.invalid",
+    clientId: "recovery",
+    transportFactory: () => next.transport,
+    reconnect: { enabled: false },
+  });
+  const ready = modern.connect();
+  next.triggerOpen({ features: { workspaceRetirementRecovery: true } });
+  await ready;
+  try {
+    const pending = modern.recoverWorkspaceRetirement(operationId, "recovery-correlation");
+    expect(parseSentFrame(next.sent.at(-1))).toMatchObject({
+      type: "workspace.retirement.recover.request",
+      operationId,
+      requestId: "recovery-correlation",
+    });
+    const result = {
+      archivedWorkspaceIds: ["original"],
+      archivedAgentIds: [],
+      removedDirectory: false,
+      slotKept: true,
+      directoryLeftBehind: { path: "/fixture/original", reason: "recovery_removal_failed" },
+      retirement: { operationId, state: "complete" as const },
+    };
+    next.triggerMessage(
+      wrapSessionMessage({
+        type: "workspace.retirement.recover.response",
+        payload: { requestId: "recovery-correlation", result },
+      }),
+    );
+    await expect(pending).resolves.toEqual(result);
+    const confirmed = modern.recoverWorkspaceRetirement(operationId, {
+      requestId: "closure-correlation",
+      expectedBackingGeneration: "b".repeat(64),
+      effectsClosed: true,
+    });
+    expect(parseSentFrame(next.sent.at(-1))).toMatchObject({
+      type: "workspace.retirement.recover.request",
+      operationId,
+      requestId: "closure-correlation",
+      expectedBackingGeneration: "b".repeat(64),
+      effectsClosed: true,
+    });
+    next.triggerMessage(
+      wrapSessionMessage({
+        type: "workspace.retirement.recover.response",
+        payload: { requestId: "closure-correlation", result },
+      }),
+    );
+    await expect(confirmed).resolves.toEqual(result);
+  } finally {
+    await modern.close();
+  }
+});

@@ -493,11 +493,69 @@ the operation without repeating removal or icon cleanup. A completed request ret
 its original outcome without touching a later project or slot generation.
 
 An interrupted or uncertain effect remains journaled and fenced, without a TTL.
-A retry queries the same operation and reports partial/reconciliation-required;
-it does not repeat a completed or uncertain destructive command. A definite,
-receipt-checked reservation refusal with no effects is terminal and retained in
-journal history before a later fresh admission. Unrelated canonical branches
-remain writable while a reservation is outstanding.
+Canonical clean removal keeps the 120-second Git work deadline. Sending a kill or
+rejecting a promise is not proof that Git stopped: the backing lease stays held
+until the child and its stdio actually close. After a proven timeout close, the
+owner automatically settles and completes the **same operation** through its
+recovery path. It records either an already-absent directory or a retained one
+with `git_removal_timed_out`; it runs no second removal or teardown hook.
+If closure never arrives, the operation stays nonterminal and its lease/fence
+remains. A client deadline may expire while the owner drains that attempt.
+
+Status reads and ordinary archive replay never start recovery. An owner on a host
+advertising `features.workspaceRetirementRecovery` can explicitly run
+`paseo workspace retirement-recover <operation-id> --json`, or call
+`DaemonClient.recoverWorkspaceRetirement(operationId)`. This requires
+`workspace.manage` and reuses the original operation, target footprint and authority
+receipt; it never selects a workspace by path or newest receipt.
+
+Recovery never runs Git removal or teardown hooks. It only settles an observed
+absent directory, retains a present one honestly, or keeps the operation fenced.
+Retained directories go to the slotKept cleanup follow-up, which owns teardown
+planning and clean removal as a separate operation. No byte reclamation is claimed
+by `removedDirectory:false`, `slotKept:true`.
+
+A pure classifier reads the unchanged journal, observations and confirmation.
+Contradictory launch evidence rejects before confirmation is considered. A saved
+acknowledgement alone, intermediate `not_started`/history fields and an unversioned
+settlement are not exit proof. Only the writer's own proven close, no started
+destructive producer, a bound v2 settlement, or fresh bound owner confirmation can
+allow settlement. Missing receipts, unknown closure, holds, changed references,
+unreadable backing and known inode replacement keep the fence. Fence and reject
+outcomes write neither the journal nor the caller-operation record. A settled v2
+result is reused if authority completion must be retried.
+
+For a legacy started step without close proof, its owner must establish producer
+exit before `--effects-closed --backing-generation <digest-from-retirement-status>`.
+Never use argv. Use one of these read-only proofs on the original owner:
+
+- Process window, **only when the sole started destructive step is
+  `remove-directory` and every `path-teardown:*` step is `done`**:
+  `ps -A -o pid=,ppid=,lstart=,comm=`, converting local `lstart` to
+  UTC and retaining only `git`/`git-*` basenames started between the archive timestamp
+  floored to a second and the first recorded read that already showed the failed
+  step. No matching row proves the Git removal child's exit; any match blocks that
+  proof. This Git-only check does not establish teardown-hook exit.
+- Boot time: `sysctl -n kern.boottime` later than that failure-observation time
+  proves the old producer has exited. **This proof is required whenever any
+  `path-teardown:*` step is `started`**, including S13. A surviving shell or Node
+  teardown hook could pass a Git-only check, so the process window cannot be used
+  for those records. Without qualifying boot-time proof, keep the fence.
+
+A matching confirmation is exit proof only. When it is needed, its audit and the
+v2 settlement are written together after the decision and a read-only guard/backing
+recheck. Confirmation never rewrites pending, closure or launch-history evidence.
+A legacy journal without inode observations retains a present backing with
+`recovery_backing_identity_unverified`; an absent backing is reported absent.
+Old native identities remain tombstoned, and a completed operation replays its
+original result without selecting a replacement workspace at the same path.
+No configuration, import or activation change is involved.
+
+A definite, receipt-checked reservation refusal with no effects is terminal and
+retained in journal history before a later fresh admission. Unrelated canonical
+branches remain writable while a reservation is outstanding. A create blocked by
+a retirement reports its operation UUID and owner-qualified target, retaining the
+`retirement_conflict` code; it does not imply the create had no other effects.
 
 Directory removal requires owned backing, no remaining native references and a
 clean source checkout whose HEAD is proven landed in the main checkout's HEAD or

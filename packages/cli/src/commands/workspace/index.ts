@@ -4,6 +4,7 @@ import { addJsonAndDaemonHostOptions } from "../../utils/command-options.js";
 import {
   runArchiveCommand,
   runRetirementStatusCommand,
+  runRetirementRecoverCommand,
   runRetirementVerifyCommand,
 } from "./archive.js";
 import { runCreateCommand } from "./create.js";
@@ -90,6 +91,17 @@ export function createWorkspaceCommand(): Command {
       .description("Read a retirement operation without starting or retrying it")
       .argument("<operation-id>", "Retirement operation UUID"),
   ).action(withOutput(runRetirementStatusCommand));
+  addJsonAndDaemonHostOptions(
+    workspace
+      .command("retirement-recover")
+      .description("Recover a failed destructive retirement on the same owner operation")
+      .argument("<operation-id>", "Retirement operation UUID")
+      .option("--effects-closed", "Confirm that the prior destructive producer has ended")
+      .option(
+        "--backing-generation <sha256>",
+        "Bind confirmation to the original backing generation",
+      ),
+  ).action(withOutput(runRetirementRecoverCommand));
   addJsonAndDaemonHostOptions(
     workspace
       .command("retirement-verify")

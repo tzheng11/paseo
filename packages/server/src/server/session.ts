@@ -1,3 +1,4 @@
+import { WorkspaceLayoutRefusal } from "./workspace-layout-store.js";
 import { retireCanonicalProject } from "./project-retirement.js";
 import { assertWorkspaceRetirementAllowed } from "./workspace-layout-mode.js";
 import { NATIVE_WORKSPACE_LAYOUT_WRITER_REQUESTS } from "@getpaseo/protocol/workspace-layout";
@@ -279,6 +280,7 @@ import {
 } from "./worktree-session.js";
 import {
   archiveByScope,
+  recoverWorkspaceRetirement,
   type ActiveWorkspaceRef,
   type ArchiveDependencies,
 } from "./workspace-archive-service.js";
@@ -3211,6 +3213,8 @@ export class Session {
         return this.handleWorkspaceGithubSearchRepositoriesRequest(msg);
       case "project.github.clone.request":
         return this.handleProjectGithubCloneRequest(msg);
+      case "workspace.retirement.recover.request":
+        return this.handleRetirementRecoveryRequest(msg);
       case "archive_workspace_request":
         return this.handleArchiveWorkspaceRequest(msg);
       case "project.remove.request":
@@ -8099,6 +8103,39 @@ export class Session {
       stopWorkspaceSetup: (workspaceId) => this.workspaceSetupRuntime.stop(workspaceId),
       sessionLogger: this.sessionLogger,
     };
+  }
+
+  private async handleRetirementRecoveryRequest(
+    request: Extract<SessionInboundMessage, { type: "workspace.retirement.recover.request" }>,
+  ): Promise<void> {
+    try {
+      const result = await recoverWorkspaceRetirement(
+        this.workspaceArchiveDependencies(),
+        request.operationId,
+        undefined,
+        {
+          expectedBackingGeneration: request.expectedBackingGeneration,
+          effectsClosed: request.effectsClosed,
+        },
+      );
+      this.emit({
+        type: "workspace.retirement.recover.response",
+        payload: { requestId: request.requestId, result },
+      });
+    } catch (error) {
+      this.emit({
+        type: "rpc_error",
+        payload: {
+          requestId: request.requestId,
+          requestType: request.type,
+          code: error instanceof WorkspaceLayoutRefusal ? error.code : "retirement_recovery_failed",
+          error:
+            error instanceof WorkspaceLayoutRefusal
+              ? error.message
+              : "Retirement recovery could not be verified.",
+        },
+      });
+    }
   }
 
   private async handleArchiveWorkspaceRequest(
