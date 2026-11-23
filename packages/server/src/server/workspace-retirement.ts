@@ -124,6 +124,9 @@ const JournalSchema = z.strictObject({
     .optional(),
   recoveryEffectPending: z.boolean().optional(),
   effectClosures: z.record(z.string(), z.enum(["not_started", "closed", "timed_out"])).optional(),
+  effectAttemptHistory: z
+    .record(z.string(), z.array(z.enum(["not_started", "closed", "timed_out", "done", "unknown"])))
+    .optional(),
   recoverySettlement: z
     .object({
       operationId: z.string().uuid(),
@@ -472,8 +475,7 @@ export async function retireCanonicalWorkspace(input: RetirementInput): Promise<
         },
         verify,
         step: async (name, effect) => {
-          if (journal.steps[name])
-            throw new WorkspaceLayoutRefusal("retirement_effect_already_started");
+          assertStepMayStart(journal, name);
           if (name === "remove-directory" || name.startsWith("path-teardown:")) {
             const stageSnapshot = await authority.inspect();
             if (
@@ -1251,6 +1253,8 @@ async function recoverRetirement(
       if (!Object.keys(journal.steps).some(destructiveStep) && !journal.result)
         throw new WorkspaceLayoutRefusal("retirement_recovery_no_path_intent");
       verifyRecoveryClosure(input, journal, unsettled);
+      if (removalAttemptState(journal) === "unknown")
+        throw new WorkspaceLayoutRefusal("retirement_recovery_effect_closure_required");
       const persist = () => writeFileDurably(located.file, JSON.stringify(journal));
       const verify = async () => {
         snapshot = await authority.inspect();
@@ -1313,13 +1317,14 @@ async function recoverRetirement(
         else if (unsettled.some(([name]) => name.startsWith("path-teardown:")))
           result = retained("recovery_uncertain_teardown_retained");
         else if (!observed) result = retained("recovery_backing_identity_unverified");
-        else if (removalAttemptRecorded(journal))
+        else if (removalAttemptState(journal) === "closed")
           result = retained(
             journal.effectClosures?.["remove-directory"] === "timed_out"
               ? "git_removal_timed_out"
               : "recovery_removal_attempt_retained",
           );
         else {
+          const priorAttempts = removalAttemptCount(journal);
           try {
             result = await withWorkspaceRetirement(
               {
@@ -1336,8 +1341,7 @@ async function recoverRetirement(
                   throw new WorkspaceLayoutRefusal("retirement_already_archived");
                 },
                 step: async (name, effect) => {
-                  if (journal.steps[name])
-                    throw new WorkspaceLayoutRefusal("retirement_effect_already_started");
+                  assertStepMayStart(journal, name);
                   if (name !== "remove-directory")
                     throw new WorkspaceLayoutRefusal("retirement_recovery_hook_not_active");
                   await verify();
@@ -1363,6 +1367,9 @@ async function recoverRetirement(
               },
               () => input.retryDirectory(records, journal.backingPath),
             );
+            const attempts = removalAttemptCount(journal);
+            if (attempts > priorAttempts && removalNeverInvoked(journal))
+              throw new WorkspaceLayoutRefusal("retirement_partial_teardown");
           } catch (error) {
             if (!(error instanceof GitCommandTimeoutError) || !error.processClosed) throw error;
             result = (await recoveryBackingStat(journal))
@@ -1472,12 +1479,66 @@ async function recoveryBackingStat(journal: RetirementJournal) {
   return current;
 }
 
-function removalAttemptRecorded(journal: RetirementJournal): boolean {
+function removalAttemptState(
+  journal: RetirementJournal,
+): "none" | "not_started" | "closed" | "unknown" {
+  const name = "remove-directory";
+  const step = journal.steps[name];
+  const closure = journal.effectClosures?.[name];
+  const resolution = journal.recoveryResolutions?.[name];
+  const history = journal.effectAttemptHistory?.[name] ?? [];
+  if (!step && !closure && !resolution && history.length === 0)
+    return journal.recoveryEffectPending === true ? "unknown" : "none";
+  if (removalNeverInvoked(journal)) return "not_started";
+  if (recoveryClosureAcknowledged(journal)) return "closed";
+  if (
+    journal.recoveryEffectPending === true ||
+    history.some((previous) => previous !== "not_started")
+  )
+    return "unknown";
+  if (
+    step === "done" ||
+    (step === "started" && (closure === "closed" || closure === "timed_out" || resolution))
+  )
+    return "closed";
+  return "unknown";
+}
+
+function removalAttemptCount(journal: RetirementJournal): number {
   return (
-    journal.steps["remove-directory"] !== undefined ||
-    journal.effectClosures?.["remove-directory"] !== undefined ||
-    journal.recoveryResolutions?.["remove-directory"] !== undefined
+    (journal.effectAttemptHistory?.["remove-directory"]?.length ?? 0) +
+    Number(journal.steps["remove-directory"] !== undefined)
   );
+}
+
+function removalNeverInvoked(journal: RetirementJournal): boolean {
+  return (
+    journal.steps["remove-directory"] === "started" &&
+    journal.effectClosures?.["remove-directory"] === "not_started" &&
+    journal.recoveryEffectPending === false &&
+    !journal.recoveryResolutions?.["remove-directory"] &&
+    (journal.effectAttemptHistory?.["remove-directory"] ?? []).every(
+      (previous) => previous === "not_started",
+    )
+  );
+}
+
+function recoveryClosureAcknowledged(journal: RetirementJournal): boolean {
+  const closure = journal.recoveryClosure;
+  return (
+    closure?.schemaVersion === 2 &&
+    closure.operationId === journal.operationId &&
+    closure.backingGeneration === journal.backingGeneration &&
+    journal.recoveryEffectPending !== true
+  );
+}
+
+function assertStepMayStart(journal: RetirementJournal, name: string): void {
+  if (name === "remove-directory") {
+    const state = removalAttemptState(journal);
+    if (state === "none" || state === "not_started") return;
+  } else if (!journal.steps[name]) return;
+  throw new WorkspaceLayoutRefusal("retirement_effect_already_started");
 }
 
 async function verifyRecoveryInventory(
@@ -1566,12 +1627,7 @@ function verifyRecoveryClosure(
   journal: RetirementJournal,
   unsettled: readonly [string, "started" | "done"][],
 ): void {
-  const closure = journal.recoveryClosure;
-  const acknowledged =
-    closure?.schemaVersion === 2 &&
-    closure?.operationId === journal.operationId &&
-    closure.backingGeneration === journal.backingGeneration &&
-    journal.recoveryEffectPending !== true;
+  const acknowledged = recoveryClosureAcknowledged(journal);
   const producerClosed =
     acknowledged || unsettled.every(([name]) => journal.effectClosures?.[name] !== undefined);
   if (unsettled.length && !producerClosed && !input.effectsClosed)
@@ -1594,7 +1650,13 @@ async function executeRetirementStep<T>(input: {
   beforeEffect?: () => Promise<void>;
 }): Promise<T> {
   const { journal, name, effect, persist } = input;
-  if (journal.steps[name]) throw new WorkspaceLayoutRefusal("retirement_effect_already_started");
+  assertStepMayStart(journal, name);
+  if (journal.steps[name]) {
+    // Preserve the proven pre-invocation failure before admitting the first
+    // effect. The pending write below makes any intervening crash ambiguous.
+    journal.effectAttemptHistory ??= {};
+    (journal.effectAttemptHistory[name] ??= []).push("not_started");
+  }
   const destructive = destructiveStep(name);
   if (destructive) {
     journal.effectClosures ??= {};
