@@ -555,7 +555,9 @@ alive. PID birth timestamps cannot resolve same-second reuse or wall-clock corre
 `DAEMON_STATE_READ_FAILED` preserves the lock and authorizes neither takeover nor stop.
 A different known boot ID or dead PID still abandons the lock. The next packet rollout restarts
 the full supervisor and writes a UUID-bearing lock; a CLI-only replacement does not establish
-this transition. Existing locks are not rewritten.
+this transition. Darwin acquisition requires a valid kernel UUID before touching home or
+lock state, including an already-owned admission; lookup failure stops startup instead of
+publishing a UUID-less lock. Existing locks are not rewritten.
 
 Worker restart retains supervisor arguments/environment and rereads the configuration file. Updating a package and observing its new worker version do not refresh the running supervisor code; the launcher owns full-process replacement. See [CLI lifecycle contracts](../public-docs/cli.md#daemon-management).
 

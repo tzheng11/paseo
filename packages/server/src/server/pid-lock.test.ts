@@ -1,4 +1,4 @@
-import { mkdtemp, open, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -355,6 +355,74 @@ describe("pid-lock boot identity across sleep", () => {
       expect(f.module.currentBootId()).toBe(bootId);
       expect(f.exec).toHaveBeenCalledTimes(1);
       expect(f.readBootId).not.toHaveBeenCalled();
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test.each(
+    ["timeout", "error", "empty", "malformed"].flatMap((failure) =>
+      [false, true].map((existing) => ({ failure, existing })),
+    ),
+  )(
+    "Darwin startup refuses UUID $failure before any lock effect (existing=$existing)",
+    async ({ failure, existing }) => {
+      const f = await fixture();
+      f.exec.mockImplementation(() => {
+        if (failure === "timeout")
+          throw Object.assign(new Error("fixture timeout"), { code: "ETIMEDOUT" });
+        if (failure === "error") throw new Error("fixture sysctl failed");
+        return failure === "empty" ? " \n" : "not-a-uuid";
+      });
+      f.kill.mockImplementation(() => {
+        throw Object.assign(new Error("absent"), { code: "ESRCH" });
+      });
+      const parent = await mkdtemp(join(tmpdir(), "paseo-darwin-boot-required-"));
+      const home = join(parent, "home");
+      const bytes = JSON.stringify(lock());
+      try {
+        if (existing) {
+          await mkdir(home);
+          await writeFile(join(home, "paseo.pid"), bytes);
+        }
+        await expect(
+          f.module.acquirePidLock(home, null, { ownerPid: pid + 1 }),
+        ).rejects.toMatchObject({ name: "PidLockError", code: "DAEMON_STATE_READ_FAILED" });
+        expect(f.kill).not.toHaveBeenCalled();
+        if (existing) expect(await readFile(join(home, "paseo.pid"), "utf8")).toBe(bytes);
+        else await expect(stat(home)).rejects.toMatchObject({ code: "ENOENT" });
+        expect(f.exec).toHaveBeenCalledTimes(1);
+      } finally {
+        await rm(parent, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("Darwin cannot treat an existing UUID-less record as already owned at startup", async () => {
+    const f = await fixture();
+    const home = await mkdtemp(join(tmpdir(), "paseo-darwin-boot-already-owned-"));
+    const bytes = JSON.stringify({ ...lock(), startedAt: wakeTime.toISOString() });
+    try {
+      await writeFile(join(home, "paseo.pid"), bytes);
+      await expect(f.module.acquirePidLock(home, null, { ownerPid: pid })).rejects.toMatchObject({
+        name: "PidLockError",
+        code: "DAEMON_STATE_READ_FAILED",
+      });
+      expect(await readFile(join(home, "paseo.pid"), "utf8")).toBe(bytes);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("Darwin UUID-bearing already-owned admission stays idempotent", async () => {
+    const f = await fixture();
+    const home = await mkdtemp(join(tmpdir(), "paseo-darwin-boot-idempotent-"));
+    try {
+      await f.module.acquirePidLock(home, null, { ownerPid: pid });
+      const bytes = await readFile(join(home, "paseo.pid"), "utf8");
+      await expect(f.module.acquirePidLock(home, null, { ownerPid: pid })).resolves.toBeUndefined();
+      expect(await readFile(join(home, "paseo.pid"), "utf8")).toBe(bytes);
+      expect(f.exec).toHaveBeenCalledTimes(1);
     } finally {
       await rm(home, { recursive: true, force: true });
     }

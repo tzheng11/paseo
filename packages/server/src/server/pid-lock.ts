@@ -75,15 +75,21 @@ let cachedBootId: string | null | undefined;
 export function currentBootId(): string | null {
   if (cachedBootId === undefined) {
     try {
-      cachedBootId =
-        (process.platform === "darwin"
+      const bootId = (
+        process.platform === "darwin"
           ? execFileSync("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"], {
               encoding: "utf8",
               timeout: 1000,
               maxBuffer: 1024,
             })
           : readFileSync("/proc/sys/kernel/random/boot_id", "utf-8")
-        ).trim() || null;
+      ).trim();
+      cachedBootId =
+        bootId &&
+        (process.platform !== "darwin" ||
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(bootId))
+          ? bootId
+          : null;
     } catch {
       cachedBootId = null;
     }
@@ -194,6 +200,14 @@ async function clearExistingPidLock(
 ): Promise<"already_owned" | "cleared"> {
   const lockOwnerRunning = isPidLockOwnerRunning(existingLock);
   if (existingLock.pid === lockOwnerPid && lockOwnerRunning) {
+    if (process.platform === "darwin" && existingLock.bootId !== currentBootId()) {
+      throw Object.assign(
+        new PidLockError("Existing daemon lock has no matching kernel boot identity"),
+        {
+          code: "DAEMON_STATE_READ_FAILED",
+        },
+      );
+    }
     await touchPidLockFile(pidPath);
     return "already_owned";
   }
@@ -248,6 +262,17 @@ export async function acquirePidLock(
   listen: string | null,
   options?: AcquirePidLockOptions,
 ): Promise<void> {
+  // Full-supervisor rollout may report ready only after a UUID-bearing Darwin lock
+  // is published. Fail before touching any home/lock state if the kernel read fails.
+  const darwinBootId = process.platform === "darwin" ? currentBootId() : null;
+  if (process.platform === "darwin" && !darwinBootId) {
+    throw Object.assign(
+      new PidLockError("Cannot acquire daemon lock without kernel boot identity"),
+      {
+        code: "DAEMON_STATE_READ_FAILED",
+      },
+    );
+  }
   const pidPath = getPidFilePath(paseoHome);
 
   ensurePrivateDirectory(paseoHome);
@@ -267,7 +292,7 @@ export async function acquirePidLock(
   }
 
   // Create new lock with exclusive flag
-  const bootId = currentBootId();
+  const bootId = darwinBootId ?? currentBootId();
   const lockInfo: PidLockInfo = {
     pid: lockOwnerPid,
     startedAt: new Date().toISOString(),
