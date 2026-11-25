@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { open, readFile, stat, unlink, utimes } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
@@ -69,13 +70,20 @@ function precedesThisBoot(startedAt: string): boolean {
 
 let cachedBootId: string | null | undefined;
 
-// Linux names each boot. The wall-clock boot instant is not enough there: a VM paused while
-// its host sleeps keeps its uptime, so after it resumes the instant lands after locks its
-// running supervisor wrote.
+// Use the kernel boot identity on Linux and Darwin. Uptime-derived wall-clock instants
+// can advance past a live owner after a VM pause or a macOS sleep.
 export function currentBootId(): string | null {
   if (cachedBootId === undefined) {
     try {
-      cachedBootId = readFileSync("/proc/sys/kernel/random/boot_id", "utf-8").trim() || null;
+      cachedBootId =
+        (process.platform === "darwin"
+          ? execFileSync("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"], {
+              encoding: "utf8",
+              timeout: 1000,
+              maxBuffer: 1024,
+            })
+          : readFileSync("/proc/sys/kernel/random/boot_id", "utf-8")
+        ).trim() || null;
     } catch {
       cachedBootId = null;
     }
@@ -84,7 +92,7 @@ export function currentBootId(): string | null {
 }
 
 /**
- * Whether a record stamped with `startedAt` (and, on Linux, `bootId`) was written during the
+ * Whether a record stamped with `startedAt` (and a kernel `bootId`, when available) was written during the
  * current boot. Daemon locks and terminal worker records share this rule.
  */
 export function writtenDuringThisBoot(stamp: {
@@ -105,8 +113,41 @@ export function writtenDuringThisBoot(stamp: {
  * however alive its PID looks.
  */
 export function isPidLockOwnerRunning(lock: PidLockInfo): boolean {
-  if (!writtenDuringThisBoot(lock)) return false;
+  if (!writtenDuringThisBoot(lock)) {
+    // Existing Darwin locks have no UUID. Their boot instant may have shifted across
+    // sleep, so distinguish a surviving owner from a reused PID using its kernel birth.
+    // An explicit boot mismatch must never receive this legacy override.
+    if (process.platform === "darwin" && (!lock.bootId || !currentBootId())) {
+      if (!isPidRunning(lock.pid)) return false;
+      return legacyDarwinOwnerPredatesLock(lock);
+    }
+    return false;
+  }
   return isPidRunning(lock.pid);
+}
+
+function legacyDarwinOwnerPredatesLock(lock: PidLockInfo): boolean {
+  try {
+    const birth = execFileSync("/bin/ps", ["-p", String(lock.pid), "-o", "lstart="], {
+      encoding: "utf8",
+      timeout: 1000,
+      maxBuffer: 1024,
+      env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
+    }).trim();
+    if (!/^[A-Z][a-z]{2} [A-Z][a-z]{2}\s+\d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/.test(birth))
+      throw new Error("Invalid process birth");
+    const born = Date.parse(`${birth} UTC`);
+    if (!Number.isFinite(born)) throw new Error("Invalid process birth");
+    // lstart has whole-second precision. startedAt is lock acquisition, after
+    // process startup/imports; an older birth is valid, a later-second birth is not.
+    return born <= Math.floor(Date.parse(lock.startedAt) / 1000) * 1000;
+  } catch {
+    if (!isPidRunning(lock.pid)) return false;
+    // Unknown identity cannot authorize clearing the lock, takeover or signaling.
+    throw Object.assign(new PidLockError("Cannot verify legacy daemon lock owner birth time"), {
+      code: "DAEMON_STATE_READ_FAILED",
+    });
+  }
 }
 
 function getPidFilePath(paseoHome: string): string {
