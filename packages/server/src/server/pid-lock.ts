@@ -109,45 +109,23 @@ export function writtenDuringThisBoot(stamp: {
  *
  * A PID alone does not identify the supervisor: the operating system hands the number to
  * something else once the supervisor is gone, and a reboot reassigns it freely. A process
- * cannot predate the boot it runs under, so a lock written during another boot is abandoned
- * however alive its PID looks.
+ * cannot belong to another kernel boot, so a comparable boot-ID mismatch abandons the lock.
+ * Darwin's wall-clock estimate alone cannot prove that for an alive legacy owner.
  */
 export function isPidLockOwnerRunning(lock: PidLockInfo): boolean {
   if (!writtenDuringThisBoot(lock)) {
-    // Existing Darwin locks have no UUID. Their boot instant may have shifted across
-    // sleep, so distinguish a surviving owner from a reused PID using its kernel birth.
-    // An explicit boot mismatch must never receive this legacy override.
+    // No timestamp or PID birth can prove a legacy lock's boot after sleep or
+    // wall-clock correction. Unknown ownership must not permit takeover or stop.
     if (process.platform === "darwin" && (!lock.bootId || !currentBootId())) {
-      if (!isPidRunning(lock.pid)) return false;
-      return legacyDarwinOwnerPredatesLock(lock);
+      if (isPidRunning(lock.pid)) {
+        throw Object.assign(new PidLockError("Cannot verify boot identity of live daemon lock"), {
+          code: "DAEMON_STATE_READ_FAILED",
+        });
+      }
     }
     return false;
   }
   return isPidRunning(lock.pid);
-}
-
-function legacyDarwinOwnerPredatesLock(lock: PidLockInfo): boolean {
-  try {
-    const birth = execFileSync("/bin/ps", ["-p", String(lock.pid), "-o", "lstart="], {
-      encoding: "utf8",
-      timeout: 1000,
-      maxBuffer: 1024,
-      env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
-    }).trim();
-    if (!/^[A-Z][a-z]{2} [A-Z][a-z]{2}\s+\d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/.test(birth))
-      throw new Error("Invalid process birth");
-    const born = Date.parse(`${birth} UTC`);
-    if (!Number.isFinite(born)) throw new Error("Invalid process birth");
-    // lstart has whole-second precision. startedAt is lock acquisition, after
-    // process startup/imports; an older birth is valid, a later-second birth is not.
-    return born <= Math.floor(Date.parse(lock.startedAt) / 1000) * 1000;
-  } catch {
-    if (!isPidRunning(lock.pid)) return false;
-    // Unknown identity cannot authorize clearing the lock, takeover or signaling.
-    throw Object.assign(new PidLockError("Cannot verify legacy daemon lock owner birth time"), {
-      code: "DAEMON_STATE_READ_FAILED",
-    });
-  }
 }
 
 function getPidFilePath(paseoHome: string): string {

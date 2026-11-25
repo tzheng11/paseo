@@ -373,49 +373,53 @@ describe("pid-lock boot identity across sleep", () => {
     expect(f.exec.mock.calls.filter(([file]) => file === "/bin/ps")).toHaveLength(0);
   });
 
-  test.each(["Tue Nov 24 17:21:39 2026", "Tue Nov 24 17:19:00 2026"])(
-    "Darwin legacy live owner survives sleep with birth %s before lock acquisition",
-    async (birth) => {
-      const f = await fixture();
-      f.exec.mockImplementation((file) => (file === "/usr/sbin/sysctl" ? bootId : birth + "\n"));
-      expect(f.module.isPidLockOwnerRunning(lock())).toBe(true);
-      expect(f.exec).toHaveBeenCalledWith(
-        "/bin/ps",
-        ["-p", String(pid), "-o", "lstart="],
-        expect.objectContaining({
-          timeout: 1000,
-          maxBuffer: 1024,
-          env: expect.objectContaining({ LC_ALL: "C", TZ: "UTC" }),
-        }),
-      );
+  const ambiguousOwners = [
+    {
+      name: "same-second reused PID (17:21:39.900 vs lock .100)",
+      birth: "Tue Nov 24 17:21:39 2026",
     },
-  );
-
-  test.each(["Tue Nov 24 17:21:40 2026", "Wed Nov 25 02:38:09 2026"])(
-    "Darwin legacy later-born PID %s cannot inherit the lock",
-    async (birth) => {
-      const f = await fixture();
-      f.exec.mockImplementation((file) => (file === "/usr/sbin/sysctl" ? bootId : birth + "\n"));
-      expect(f.module.isPidLockOwnerRunning(lock())).toBe(false);
-    },
-  );
-
-  test("Darwin legacy discovery and acquisition preserve the same lock after sleep", async () => {
+    { name: "prior-boot PID born before wall-clock correction", birth: "Tue Nov 24 17:19:00 2026" },
+    { name: "later-second PID", birth: "Tue Nov 24 17:21:40 2026" },
+    { name: "later-boot PID", birth: "Wed Nov 25 02:38:09 2026" },
+  ];
+  test.each(ambiguousOwners)("Darwin legacy ownership stays unknown: $name", async ({ birth }) => {
     const f = await fixture();
-    const home = await mkdtemp(join(tmpdir(), "paseo-darwin-legacy-live-"));
+    f.exec.mockImplementation((file) => (file === "/usr/sbin/sysctl" ? bootId : birth + "\n"));
+    const home = await mkdtemp(join(tmpdir(), "paseo-darwin-legacy-uncertain-"));
     try {
-      const bytes = JSON.stringify(lock());
+      const bytes = JSON.stringify({ ...lock(), startedAt: "2026-11-24T17:21:39.100Z" });
+      const record = JSON.parse(bytes);
       await writeFile(join(home, "paseo.pid"), bytes);
-      const { readDaemonInstance } = await import("./daemon-instance.js");
-      expect(await readDaemonInstance(home)).toMatchObject({ pid, startedAt });
-      expect(await f.module.isLocked(home)).toMatchObject({ locked: true });
-      await expect(f.module.acquirePidLock(home, null, { ownerPid: pid + 1 })).rejects.toThrow(
-        "Another Paseo daemon is already running",
+      expect(() => f.module.isPidLockOwnerRunning(record)).toThrowError(
+        expect.objectContaining({ code: "DAEMON_STATE_READ_FAILED" }),
       );
+      const { readDaemonInstance, stopDaemonInstance } = await import("./daemon-instance.js");
+      await expect(readDaemonInstance(home)).rejects.toMatchObject({
+        code: "DAEMON_STATE_READ_FAILED",
+      });
+      await expect(f.module.isLocked(home)).rejects.toMatchObject({
+        code: "DAEMON_STATE_READ_FAILED",
+      });
+      await expect(
+        f.module.acquirePidLock(home, null, { ownerPid: pid + 1 }),
+      ).rejects.toMatchObject({ code: "DAEMON_STATE_READ_FAILED" });
+      await expect(stopDaemonInstance(home)).rejects.toMatchObject({
+        code: "DAEMON_STATE_READ_FAILED",
+      });
       expect(await readFile(join(home, "paseo.pid"), "utf8")).toBe(bytes);
+      expect(f.kill.mock.calls.every(([, signal]) => signal === 0)).toBe(true);
+      expect(f.exec.mock.calls.filter(([file]) => file === "/bin/ps")).toHaveLength(0);
     } finally {
       await rm(home, { recursive: true, force: true });
     }
+  });
+
+  test("Darwin legacy lock inside the unshifted boot estimate keeps existing behavior", async () => {
+    const f = await fixture();
+    expect(f.module.isPidLockOwnerRunning({ ...lock(), startedAt: wakeTime.toISOString() })).toBe(
+      true,
+    );
+    expect(f.exec.mock.calls.filter(([file]) => file === "/bin/ps")).toHaveLength(0);
   });
 
   test("Darwin a dead legacy PID remains abandoned without a birth lookup", async () => {
@@ -427,39 +431,8 @@ describe("pid-lock boot identity across sleep", () => {
     expect(f.exec.mock.calls.filter(([file]) => file === "/bin/ps")).toHaveLength(0);
   });
 
-  test.each(["error", "empty", "malformed"])(
-    "Darwin legacy birth %s is uncertain and cannot authorize takeover",
-    async (outcome) => {
-      const f = await fixture();
-      f.exec.mockImplementation((file) => {
-        if (file === "/usr/sbin/sysctl") return bootId;
-        if (outcome === "error") throw new Error("fixture command failed");
-        return outcome === "empty" ? "" : "not-a-birth";
-      });
-      const home = await mkdtemp(join(tmpdir(), "paseo-darwin-legacy-uncertain-"));
-      try {
-        const bytes = JSON.stringify(lock());
-        await writeFile(join(home, "paseo.pid"), bytes);
-        await expect(
-          f.module.acquirePidLock(home, null, { ownerPid: pid + 1 }),
-        ).rejects.toMatchObject({ name: "PidLockError", code: "DAEMON_STATE_READ_FAILED" });
-        const { readDaemonInstance, stopDaemonInstance } = await import("./daemon-instance.js");
-        await expect(readDaemonInstance(home)).rejects.toMatchObject({
-          code: "DAEMON_STATE_READ_FAILED",
-        });
-        await expect(stopDaemonInstance(home)).rejects.toMatchObject({
-          code: "DAEMON_STATE_READ_FAILED",
-        });
-        expect(f.kill.mock.calls.every(([, signal]) => signal === 0)).toBe(true);
-        expect(await readFile(join(home, "paseo.pid"), "utf8")).toBe(bytes);
-      } finally {
-        await rm(home, { recursive: true, force: true });
-      }
-    },
-  );
-
   test.each([undefined, "c6065930-45d4-4bd6-b2b2-813a470f4c87"])(
-    "Darwin unavailable boot UUID uses birth proof with recorded bootId=%s",
+    "Darwin unavailable boot UUID keeps ownership unknown with recorded bootId=%s",
     async (recordedBoot) => {
       const f = await fixture();
       f.exec.mockImplementation((file) => {
@@ -467,7 +440,10 @@ describe("pid-lock boot identity across sleep", () => {
         return "Tue Nov 24 17:21:39 2026\n";
       });
       expect(f.module.currentBootId()).toBeNull();
-      expect(f.module.isPidLockOwnerRunning(lock(recordedBoot))).toBe(true);
+      expect(() => f.module.isPidLockOwnerRunning(lock(recordedBoot))).toThrowError(
+        expect.objectContaining({ code: "DAEMON_STATE_READ_FAILED" }),
+      );
+      expect(f.exec.mock.calls.filter(([file]) => file === "/bin/ps")).toHaveLength(0);
     },
   );
 

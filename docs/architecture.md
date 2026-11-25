@@ -549,11 +549,13 @@ $PASEO_HOME/
 The supervisor alone publishes its ready worker's endpoint in `paseo.pid`, clears it before respawn, and fails if any worker exits before first readiness. CLI home selection trusts only that live record; config expresses desired state, never an endpoint fallback. POSIX home stop signals the captured supervisor without TCP. Windows graceful stop and ordinary RPCs trust the published endpoint. This metadata is not cryptographic listener ownership: edited endpoints, copied identities, PID reuse, and address takeover races remain outside that guarantee. A stale heartbeat never permits reclaiming a live lock.
 
 Linux and macOS PID locks record the kernel boot identity, so sleep or a paused VM cannot
-invalidate a live supervisor by moving the uptime-derived boot instant. A macOS lock from an
-older packet without a boot ID uses the recorded PID's birth time if that instant would reject
-it: birth must be no later than lock acquisition at whole-second precision. An unavailable birth
-read leaves daemon state uncertain and does not authorize lock takeover or stop. Locks with a
-different boot identity remain abandoned. This transition does not rewrite existing locks.
+invalidate a live supervisor by moving the uptime-derived boot instant. A macOS lock without
+a comparable boot ID stays uncertain if that instant rejects its timestamp but its PID is
+alive. PID birth timestamps cannot resolve same-second reuse or wall-clock correction, so
+`DAEMON_STATE_READ_FAILED` preserves the lock and authorizes neither takeover nor stop.
+A different known boot ID or dead PID still abandons the lock. The next packet rollout restarts
+the full supervisor and writes a UUID-bearing lock; a CLI-only replacement does not establish
+this transition. Existing locks are not rewritten.
 
 Worker restart retains supervisor arguments/environment and rereads the configuration file. Updating a package and observing its new worker version do not refresh the running supervisor code; the launcher owns full-process replacement. See [CLI lifecycle contracts](../public-docs/cli.md#daemon-management).
 

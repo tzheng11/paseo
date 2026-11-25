@@ -166,7 +166,7 @@
                 "linkSync",
                 "unlinkSync"
               ],
-              // Synchronous lock/CLI/terminal-worker identity: cache the boot ID once; bound legacy PID birth reads to one second. Async conversion needs a shared lifecycle change.
+              // Synchronous lock/CLI/terminal-worker identity: cache the kernel boot ID once; Darwin sysctl is bounded to one second. Async conversion needs a shared lifecycle change.
               "server/pid-lock.ts": ["readFileSync", "execFileSync"],
               // Startup builtin loader construction: select the bundled plugin root before loading plugins.
               "server/plugins/builtin/index.ts": ["existsSync"],

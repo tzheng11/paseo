@@ -44,12 +44,41 @@ describe("daemon instance identity across a reboot", () => {
     await rm(paseoHome, { recursive: true, force: true });
   });
 
-  test("a lock stamped before this boot has no running owner", async () => {
-    await writeLock(paseoHome, lockFor(process.pid, new Date(bootedAt() - 60 * 60_000)));
+  test.runIf(process.platform !== "darwin")(
+    "a lock stamped before this boot has no running owner",
+    async () => {
+      await writeLock(paseoHome, lockFor(process.pid, new Date(bootedAt() - 60 * 60_000)));
 
-    expect(await readDaemonInstance(paseoHome)).toBeNull();
-    expect(await isLocked(paseoHome)).toMatchObject({ locked: false });
-  });
+      expect(await readDaemonInstance(paseoHome)).toBeNull();
+      expect(await isLocked(paseoHome)).toMatchObject({ locked: false });
+    },
+  );
+
+  test.runIf(process.platform === "darwin").each(["read", "status", "acquire", "stop"] as const)(
+    "Darwin inferred-preboot live legacy owner is unknown for %s",
+    async (entry) => {
+      const bytes = JSON.stringify(lockFor(process.pid, new Date(bootedAt() - 60 * 60_000)));
+      await writeFile(join(paseoHome, "paseo.pid"), bytes);
+      const originalKill = process.kill.bind(process);
+      const kills = vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+        if (signal !== 0) throw new Error("Unexpected destructive signal");
+        return originalKill(pid, signal);
+      });
+      try {
+        const calls = {
+          read: () => readDaemonInstance(paseoHome),
+          status: () => isLocked(paseoHome),
+          acquire: () => acquirePidLock(paseoHome, null, { ownerPid: process.pid + 10_000 }),
+          stop: () => stopDaemonInstance(paseoHome),
+        };
+        await expect(calls[entry]()).rejects.toMatchObject({ code: "DAEMON_STATE_READ_FAILED" });
+        expect(await readFile(join(paseoHome, "paseo.pid"), "utf8")).toBe(bytes);
+        expect(kills.mock.calls.every(([, signal]) => signal === 0)).toBe(true);
+      } finally {
+        kills.mockRestore();
+      }
+    },
+  );
 
   test("a supervisor started during this boot still holds the lock", async () => {
     await writeLock(paseoHome, lockFor(process.pid, new Date()));
@@ -58,41 +87,47 @@ describe("daemon instance identity across a reboot", () => {
     expect(await isLocked(paseoHome)).toMatchObject({ locked: true });
   });
 
-  test("a new supervisor takes over a lock stamped before this boot", async () => {
-    await writeLock(paseoHome, lockFor(process.pid, new Date(bootedAt() - 60 * 60_000)));
+  test.runIf(process.platform !== "darwin")(
+    "a new supervisor takes over a lock stamped before this boot",
+    async () => {
+      await writeLock(paseoHome, lockFor(process.pid, new Date(bootedAt() - 60 * 60_000)));
 
-    await acquirePidLock(paseoHome, null, { ownerPid: process.pid + 10_000 });
+      await acquirePidLock(paseoHome, null, { ownerPid: process.pid + 10_000 });
 
-    expect(await getPidLockInfo(paseoHome)).toMatchObject({ pid: process.pid + 10_000 });
-  });
+      expect(await getPidLockInfo(paseoHome)).toMatchObject({ pid: process.pid + 10_000 });
+    },
+  );
 
-  test("stopping a lock stamped before this boot leaves the process holding that pid alone", async () => {
-    // Records delivery rather than dying of it, so a signal cannot be missed by arriving late.
-    const signalMarker = join(paseoHome, "bystander-signalled");
-    bystander = spawn(
-      process.execPath,
-      [
-        "-e",
-        `process.on("SIGTERM", () => require("node:fs").writeFileSync(${JSON.stringify(signalMarker)}, "SIGTERM"));` +
-          `setTimeout(() => {}, 120_000);`,
-      ],
-      { stdio: "ignore" },
-    );
-    const bystanderPid = bystander.pid;
-    if (bystanderPid === undefined) throw new Error("bystander process did not start");
-    let exited = false;
-    bystander.once("exit", () => {
-      exited = true;
-    });
+  test.runIf(process.platform !== "darwin")(
+    "stopping a lock stamped before this boot leaves the process holding that pid alone",
+    async () => {
+      // Records delivery rather than dying of it, so a signal cannot be missed by arriving late.
+      const signalMarker = join(paseoHome, "bystander-signalled");
+      bystander = spawn(
+        process.execPath,
+        [
+          "-e",
+          `process.on("SIGTERM", () => require("node:fs").writeFileSync(${JSON.stringify(signalMarker)}, "SIGTERM"));` +
+            `setTimeout(() => {}, 120_000);`,
+        ],
+        { stdio: "ignore" },
+      );
+      const bystanderPid = bystander.pid;
+      if (bystanderPid === undefined) throw new Error("bystander process did not start");
+      let exited = false;
+      bystander.once("exit", () => {
+        exited = true;
+      });
 
-    await writeLock(paseoHome, lockFor(bystanderPid, new Date(bootedAt() - 60 * 60_000)));
+      await writeLock(paseoHome, lockFor(bystanderPid, new Date(bootedAt() - 60 * 60_000)));
 
-    expect(await stopDaemonInstance(paseoHome)).toMatchObject({ action: "not_running" });
+      expect(await stopDaemonInstance(paseoHome)).toMatchObject({ action: "not_running" });
 
-    expect(existsSync(signalMarker)).toBe(false);
-    expect(exited).toBe(false);
-    await expect(readFile(join(paseoHome, "paseo.pid"), "utf-8")).rejects.toThrow(/ENOENT/);
-  });
+      expect(existsSync(signalMarker)).toBe(false);
+      expect(exited).toBe(false);
+      await expect(readFile(join(paseoHome, "paseo.pid"), "utf-8")).rejects.toThrow(/ENOENT/);
+    },
+  );
 });
 
 // Linux keeps a boot's id while a VM is paused for a host sleep, though the VM's wall clock
