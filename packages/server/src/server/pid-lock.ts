@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { open, readFile, stat, unlink, utimes } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
@@ -69,13 +70,26 @@ function precedesThisBoot(startedAt: string): boolean {
 
 let cachedBootId: string | null | undefined;
 
-// Linux names each boot. The wall-clock boot instant is not enough there: a VM paused while
-// its host sleeps keeps its uptime, so after it resumes the instant lands after locks its
-// running supervisor wrote.
+// Use the kernel boot identity on Linux and Darwin. Uptime-derived wall-clock instants
+// can advance past a live owner after a VM pause or a macOS sleep.
 export function currentBootId(): string | null {
   if (cachedBootId === undefined) {
     try {
-      cachedBootId = readFileSync("/proc/sys/kernel/random/boot_id", "utf-8").trim() || null;
+      const bootId = (
+        process.platform === "darwin"
+          ? execFileSync("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"], {
+              encoding: "utf8",
+              timeout: 1000,
+              maxBuffer: 1024,
+            })
+          : readFileSync("/proc/sys/kernel/random/boot_id", "utf-8")
+      ).trim();
+      cachedBootId =
+        bootId &&
+        (process.platform !== "darwin" ||
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(bootId))
+          ? bootId
+          : null;
     } catch {
       cachedBootId = null;
     }
@@ -84,7 +98,7 @@ export function currentBootId(): string | null {
 }
 
 /**
- * Whether a record stamped with `startedAt` (and, on Linux, `bootId`) was written during the
+ * Whether a record stamped with `startedAt` (and a kernel `bootId`, when available) was written during the
  * current boot. Daemon locks and terminal worker records share this rule.
  */
 export function writtenDuringThisBoot(stamp: {
@@ -101,11 +115,22 @@ export function writtenDuringThisBoot(stamp: {
  *
  * A PID alone does not identify the supervisor: the operating system hands the number to
  * something else once the supervisor is gone, and a reboot reassigns it freely. A process
- * cannot predate the boot it runs under, so a lock written during another boot is abandoned
- * however alive its PID looks.
+ * cannot belong to another kernel boot, so a comparable boot-ID mismatch abandons the lock.
+ * Darwin's wall-clock estimate alone cannot prove that for an alive legacy owner.
  */
 export function isPidLockOwnerRunning(lock: PidLockInfo): boolean {
-  if (!writtenDuringThisBoot(lock)) return false;
+  if (!writtenDuringThisBoot(lock)) {
+    // No timestamp or PID birth can prove a legacy lock's boot after sleep or
+    // wall-clock correction. Unknown ownership must not permit takeover or stop.
+    if (process.platform === "darwin" && (!lock.bootId || !currentBootId())) {
+      if (isPidRunning(lock.pid)) {
+        throw Object.assign(new PidLockError("Cannot verify boot identity of live daemon lock"), {
+          code: "DAEMON_STATE_READ_FAILED",
+        });
+      }
+    }
+    return false;
+  }
   return isPidRunning(lock.pid);
 }
 
@@ -175,6 +200,14 @@ async function clearExistingPidLock(
 ): Promise<"already_owned" | "cleared"> {
   const lockOwnerRunning = isPidLockOwnerRunning(existingLock);
   if (existingLock.pid === lockOwnerPid && lockOwnerRunning) {
+    if (process.platform === "darwin" && existingLock.bootId !== currentBootId()) {
+      throw Object.assign(
+        new PidLockError("Existing daemon lock has no matching kernel boot identity"),
+        {
+          code: "DAEMON_STATE_READ_FAILED",
+        },
+      );
+    }
     await touchPidLockFile(pidPath);
     return "already_owned";
   }
@@ -229,6 +262,17 @@ export async function acquirePidLock(
   listen: string | null,
   options?: AcquirePidLockOptions,
 ): Promise<void> {
+  // Full-supervisor rollout may report ready only after a UUID-bearing Darwin lock
+  // is published. Fail before touching any home/lock state if the kernel read fails.
+  const darwinBootId = process.platform === "darwin" ? currentBootId() : null;
+  if (process.platform === "darwin" && !darwinBootId) {
+    throw Object.assign(
+      new PidLockError("Cannot acquire daemon lock without kernel boot identity"),
+      {
+        code: "DAEMON_STATE_READ_FAILED",
+      },
+    );
+  }
   const pidPath = getPidFilePath(paseoHome);
 
   ensurePrivateDirectory(paseoHome);
@@ -248,7 +292,7 @@ export async function acquirePidLock(
   }
 
   // Create new lock with exclusive flag
-  const bootId = currentBootId();
+  const bootId = darwinBootId ?? currentBootId();
   const lockInfo: PidLockInfo = {
     pid: lockOwnerPid,
     startedAt: new Date().toISOString(),

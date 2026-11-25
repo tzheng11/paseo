@@ -166,8 +166,8 @@
                 "linkSync",
                 "unlinkSync"
               ],
-              // Startup pid identity: read and memoize the Linux boot id for the daemon lock.
-              "server/pid-lock.ts": ["readFileSync"],
+              // Synchronous lock/CLI/terminal-worker identity: cache the kernel boot ID once; Darwin sysctl is bounded to one second. Async conversion needs a shared lifecycle change.
+              "server/pid-lock.ts": ["readFileSync", "execFileSync"],
               // Startup builtin loader construction: select the bundled plugin root before loading plugins.
               "server/plugins/builtin/index.ts": ["existsSync"],
               // Build child process: plugin graph traversal and esbuild preparation run in the isolated compiler process.
